@@ -23,7 +23,6 @@ from dataclasses import dataclass, field
 from typing import AsyncGenerator, Generator, Optional
 
 import mlx.core as mx
-from mlx.utils import tree_flatten
 from mlx_lm import load, stream_generate
 from mlx_lm.models.cache import make_prompt_cache, save_prompt_cache, load_prompt_cache
 from mlx_lm.sample_utils import make_sampler
@@ -282,9 +281,6 @@ class MLXEngine:
 
     def _save_session_to_disk(self, session_id: str, session: SessionState):
         """Save session's KV cache to disk. Caller MUST hold _lock."""
-        import numpy as np
-        from safetensors.numpy import save_file as np_save_safetensors
-
         t0 = time.perf_counter()
         os.makedirs(self.cfg.cache_dir, exist_ok=True)
         path = self._session_cache_path(session_id)
@@ -294,21 +290,8 @@ class MLXEngine:
             "total_cache_tokens": str(session.total_cache_tokens),
             "last_used": str(session.last_used),
         }
-        # Snapshot under lock (caller holds it) + numpy copy to detach from Metal
-        cache_data = [c.state for c in session.cache]
-        cache_info = [c.meta_state for c in session.cache]
-        cache_classes = [type(c).__name__ for c in session.cache]
-        cache_data = dict(tree_flatten(cache_data))
-        cache_metadata = [cache_info, metadata, cache_classes]
-        cache_metadata = dict(tree_flatten(cache_metadata))
-        mx.eval(cache_data)
-        np_data = {k: np.array(v) for k, v in cache_data.items()}
-        t_snapshot = time.perf_counter() - t0
-        del cache_data  # release Metal references
-
-        # Save via safetensors numpy — no Metal access
-        str_metadata = {str(k): str(v) for k, v in cache_metadata.items()}
-        np_save_safetensors(np_data, path, metadata=str_metadata)
+        # Safe to use mx.save_safetensors directly — caller holds the GPU lock
+        save_prompt_cache(path, session.cache, metadata=metadata)
         elapsed = time.perf_counter() - t0
 
         if hasattr(self, "_disk_session_ids"):
@@ -317,7 +300,7 @@ class MLXEngine:
         logger.info(
             f"[KV Cache] session={session_id} | DISK SAVE | "
             f"{session.total_cache_tokens} tokens, {len(session.messages)} msgs, "
-            f"{fsize:.1f}MB, {elapsed:.2f}s (snapshot={t_snapshot:.2f}s)"
+            f"{fsize:.1f}MB, {elapsed:.2f}s"
         )
 
     def _mark_dirty(self, session_id: str):

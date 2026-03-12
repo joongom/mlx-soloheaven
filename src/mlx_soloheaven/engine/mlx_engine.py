@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import AsyncGenerator, Generator, Optional
 
 import mlx.core as mx
+from mlx.utils import tree_flatten
 from mlx_lm import load, stream_generate
 from mlx_lm.models.cache import make_prompt_cache, save_prompt_cache, load_prompt_cache
 from mlx_lm.sample_utils import make_sampler
@@ -277,7 +278,17 @@ class MLXEngine:
                 "total_cache_tokens": str(session.total_cache_tokens),
                 "last_used": str(session.last_used),
             }
-            save_prompt_cache(path, session.cache, metadata=metadata)
+            # Snapshot cache data under lock to avoid Metal concurrent access
+            with self._lock:
+                cache_data = [c.state for c in session.cache]
+                cache_info = [c.meta_state for c in session.cache]
+                cache_classes = [type(c).__name__ for c in session.cache]
+                cache_data = dict(tree_flatten(cache_data))
+                cache_metadata = [cache_info, metadata, cache_classes]
+                cache_metadata = dict(tree_flatten(cache_metadata))
+                mx.eval(cache_data)
+            # File I/O outside lock
+            mx.save_safetensors(path, cache_data, cache_metadata)
             elapsed = time.perf_counter() - t0
             if hasattr(self, "_disk_session_ids"):
                 self._disk_session_ids.add(session_id)

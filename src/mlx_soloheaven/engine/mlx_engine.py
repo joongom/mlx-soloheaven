@@ -111,6 +111,7 @@ class MLXEngine:
     _global_keepalive_started = False
     _global_last_gpu_activity = time.time()
     _global_keepalive_stop = threading.Event()
+    _all_engines: list["MLXEngine"] = []
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -129,6 +130,11 @@ class MLXEngine:
 
         # Base cache pool: system_hash -> BaseCacheEntry
         self._base_caches: dict[str, BaseCacheEntry] = {}
+
+        # Dirty session tracking for idle-time disk save
+        self._dirty_sessions: set[str] = set()
+        self._dirty_lock = threading.Lock()
+        MLXEngine._all_engines.append(self)
 
     def load_model(self):
         logger.info(f"Loading model: {self.cfg.model_path}")
@@ -224,6 +230,9 @@ class MLXEngine:
                                     f"[GPU Keepalive] ping #{self._keepalive_ping_count} "
                                     f"idle={idle:.1f}s, elapsed={elapsed:.0f}ms"
                                 )
+                            # Flush dirty sessions while GPU is idle and we hold the lock
+                            for engine in MLXEngine._all_engines:
+                                engine._flush_dirty_sessions()
                         except Exception as e:
                             logger.warning(f"[GPU Keepalive] ping failed: {e}")
                         finally:
@@ -238,7 +247,9 @@ class MLXEngine:
 
         def _shutdown(*args):
             MLXEngine._global_keepalive_stop.set()
-            logger.info("[GPU Keepalive] Shutdown signal received")
+            logger.info("[Shutdown] Flushing dirty sessions...")
+            MLXEngine._flush_all_on_shutdown()
+            logger.info("[Shutdown] Complete")
 
         atexit.register(_shutdown)
         # Handle SIGINT/SIGTERM so Ctrl+C stops keepalive immediately
@@ -267,39 +278,95 @@ class MLXEngine:
         return os.path.join(self.cfg.cache_dir, f"session_{session_id}.safetensors")
 
     def _save_session_to_disk(self, session_id: str, session: SessionState):
-        """Save session's KV cache + messages to disk."""
-        try:
-            t0 = time.perf_counter()
-            os.makedirs(self.cfg.cache_dir, exist_ok=True)
-            path = self._session_cache_path(session_id)
-            metadata = {
-                "session_id": session_id,
-                "messages": json.dumps(session.messages, ensure_ascii=False),
-                "total_cache_tokens": str(session.total_cache_tokens),
-                "last_used": str(session.last_used),
-            }
-            # Snapshot cache data under lock to avoid Metal concurrent access
-            with self._lock:
-                cache_data = [c.state for c in session.cache]
-                cache_info = [c.meta_state for c in session.cache]
-                cache_classes = [type(c).__name__ for c in session.cache]
-                cache_data = dict(tree_flatten(cache_data))
-                cache_metadata = [cache_info, metadata, cache_classes]
-                cache_metadata = dict(tree_flatten(cache_metadata))
-                mx.eval(cache_data)
-            # File I/O outside lock
-            mx.save_safetensors(path, cache_data, cache_metadata)
-            elapsed = time.perf_counter() - t0
-            if hasattr(self, "_disk_session_ids"):
-                self._disk_session_ids.add(session_id)
-            fsize = os.path.getsize(path) / 1e6
-            logger.info(
-                f"[KV Cache] session={session_id} | DISK SAVE | "
-                f"{session.total_cache_tokens} tokens, {len(session.messages)} msgs, "
-                f"{fsize:.1f}MB, {elapsed:.2f}s"
-            )
-        except Exception as e:
-            logger.error(f"[KV Cache] session={session_id} | DISK SAVE FAILED | {e}")
+        """Save session's KV cache to disk. Caller MUST hold _lock."""
+        import numpy as np
+        from safetensors.numpy import save_file as np_save_safetensors
+
+        t0 = time.perf_counter()
+        os.makedirs(self.cfg.cache_dir, exist_ok=True)
+        path = self._session_cache_path(session_id)
+        metadata = {
+            "session_id": session_id,
+            "messages": json.dumps(session.messages, ensure_ascii=False),
+            "total_cache_tokens": str(session.total_cache_tokens),
+            "last_used": str(session.last_used),
+        }
+        # Snapshot under lock (caller holds it) + numpy copy to detach from Metal
+        cache_data = [c.state for c in session.cache]
+        cache_info = [c.meta_state for c in session.cache]
+        cache_classes = [type(c).__name__ for c in session.cache]
+        cache_data = dict(tree_flatten(cache_data))
+        cache_metadata = [cache_info, metadata, cache_classes]
+        cache_metadata = dict(tree_flatten(cache_metadata))
+        mx.eval(cache_data)
+        np_data = {k: np.array(v) for k, v in cache_data.items()}
+        t_snapshot = time.perf_counter() - t0
+        del cache_data  # release Metal references
+
+        # Save via safetensors numpy — no Metal access
+        str_metadata = {str(k): str(v) for k, v in cache_metadata.items()}
+        np_save_safetensors(np_data, path, metadata=str_metadata)
+        elapsed = time.perf_counter() - t0
+
+        if hasattr(self, "_disk_session_ids"):
+            self._disk_session_ids.add(session_id)
+        fsize = os.path.getsize(path) / 1e6
+        logger.info(
+            f"[KV Cache] session={session_id} | DISK SAVE | "
+            f"{session.total_cache_tokens} tokens, {len(session.messages)} msgs, "
+            f"{fsize:.1f}MB, {elapsed:.2f}s (snapshot={t_snapshot:.2f}s)"
+        )
+
+    def _mark_dirty(self, session_id: str):
+        """Mark a session for disk save on next idle cycle."""
+        with self._dirty_lock:
+            self._dirty_sessions.add(session_id)
+
+    def _flush_dirty_sessions(self):
+        """Flush all dirty sessions to disk. Caller MUST hold _lock."""
+        with self._dirty_lock:
+            to_save = self._dirty_sessions.copy()
+            self._dirty_sessions.clear()
+
+        if not to_save:
+            return
+
+        saved = 0
+        for sid in to_save:
+            session = self._sessions.get(sid)
+            if session is None:
+                continue
+            try:
+                self._save_session_to_disk(sid, session)
+                saved += 1
+            except Exception as e:
+                logger.error(f"[KV Cache] session={sid} | FLUSH SAVE FAILED | {e}")
+                # Re-add to dirty set for retry
+                with self._dirty_lock:
+                    if sid in self._sessions:
+                        self._dirty_sessions.add(sid)
+
+        if saved:
+            logger.info(f"[Idle Flush] saved {saved}/{len(to_save)} dirty sessions")
+
+    @classmethod
+    def _flush_all_on_shutdown(cls):
+        """Save all dirty sessions across all engines on shutdown."""
+        for engine in cls._all_engines:
+            with engine._dirty_lock:
+                to_save = engine._dirty_sessions.copy()
+                engine._dirty_sessions.clear()
+            if not to_save:
+                continue
+            logger.info(f"[Shutdown] Flushing {len(to_save)} dirty sessions for {engine.model_id}")
+            with engine._lock:
+                for sid in to_save:
+                    session = engine._sessions.get(sid)
+                    if session:
+                        try:
+                            engine._save_session_to_disk(sid, session)
+                        except Exception as e:
+                            logger.error(f"[Shutdown] Failed to save session {sid}: {e}")
 
     def _load_session_from_disk(self, session_id: str) -> Optional[SessionState]:
         """Load session's KV cache + messages from disk."""
@@ -1108,11 +1175,7 @@ class MLXEngine:
                 f"{len(messages)} msgs, {session.total_cache_tokens} cached tokens"
             )
 
-            threading.Thread(
-                target=self._save_session_to_disk,
-                args=(session_id, session),
-                daemon=True,
-            ).start()
+            self._mark_dirty(session_id)
 
     def compact_session(self, session_id: str, messages: list[dict]) -> dict:
         """Replace a session's messages and rebuild KV cache from scratch.
@@ -1200,13 +1263,7 @@ class MLXEngine:
                         except Exception as e:
                             logger.warning(f"[Base Cache] registration failed: {e}")
 
-            # Disk save in background (no lock — save is read-only on cache data)
-            session = self._sessions[session_id]
-            threading.Thread(
-                target=self._save_session_to_disk,
-                args=(session_id, session),
-                daemon=True,
-            ).start()
+            self._mark_dirty(session_id)
 
             return {
                 "session_id": session_id,
@@ -1243,6 +1300,8 @@ class MLXEngine:
 
     def delete_session(self, session_id: str) -> bool:
         """Delete a session and its cache."""
+        with self._dirty_lock:
+            self._dirty_sessions.discard(session_id)
         if session_id in self._sessions:
             del self._sessions[session_id]
         # Remove disk cache

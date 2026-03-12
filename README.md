@@ -310,6 +310,10 @@ Add to your project's `opencode.json`:
 }
 ```
 
+### OpenClaw
+
+We also maintain a [modified fork of OpenClaw](https://github.com/joongom/openclaw-soloheaven) optimized for SoloHeaven with the same cache-aware enhancements.
+
 ### Any OpenAI SDK Client
 
 ```python

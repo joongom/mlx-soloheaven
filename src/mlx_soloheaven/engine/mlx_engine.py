@@ -245,7 +245,13 @@ class MLXEngine:
         import atexit
         import signal
 
+        _shutdown_done = False
+
         def _shutdown(*args):
+            nonlocal _shutdown_done
+            if _shutdown_done:
+                return
+            _shutdown_done = True
             MLXEngine._global_keepalive_stop.set()
             logger.info("[Shutdown] Flushing dirty sessions...")
             MLXEngine._flush_all_on_shutdown()
@@ -258,12 +264,9 @@ class MLXEngine:
 
         def _signal_handler(signum, frame):
             _shutdown()
-            prev = prev_sigint if signum == signal.SIGINT else prev_sigterm
-            if callable(prev):
-                prev(signum, frame)
-            elif prev == signal.SIG_DFL:
-                signal.signal(signum, signal.SIG_DFL)
-                os.kill(os.getpid(), signum)
+            # Restore default handler so next Ctrl+C forces quit
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
 
         signal.signal(signal.SIGINT, _signal_handler)
         signal.signal(signal.SIGTERM, _signal_handler)

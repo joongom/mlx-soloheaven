@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mlx-soloheaven"
+version = "0.1.0"
+description = "Single-user LLM inference server with KV cache optimization for Apple Silicon"
+readme = "README.md"
+license = "AGPL-3.0-only"
+requires-python = ">=3.11"
+authors = [
+    { name = "fai" },
+]
+keywords = ["mlx", "llm", "inference", "kv-cache", "apple-silicon"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "Operating System :: MacOS",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "mlx>=0.22",
+    "mlx-lm>=0.20",
+    "fastapi>=0.104",
+    "uvicorn[standard]>=0.24",
+    "aiosqlite>=0.19",
+    "pydantic>=2.0",
+    "python-dotenv>=1.0",
+    "sentencepiece>=0.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "httpx",
+    "ruff",
+]
+
+[project.scripts]
+mlx-soloheaven = "mlx_soloheaven.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/joongom/mlx-soloheaven"
+Repository = "https://github.com/joongom/mlx-soloheaven"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mlx_soloheaven"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100

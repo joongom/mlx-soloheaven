@@ -1,0 +1,29 @@
+{
+  "provider": {
+    "mlx-soloheaven": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "MLX Soloheaven",
+      "options": {
+        "baseURL": "http://localhost:8000/v1"
+      },
+      "models": {
+        "qwen3-coder-next": {
+          "id": "Qwen3-Coder-Next-8bit",
+          "name": "Qwen3 Coder Next (8bit)",
+          "temperature": true,
+          "limit": { "context": 200000, "output": 30000 },
+          "tool_call": true,
+          "options": { "thinking": false }
+        },
+        "qwen3.5-122b": {
+          "id": "Qwen3.5-122B-A10B-8bit",
+          "name": "Qwen3.5 122B A10B (8bit)",
+          "temperature": true,
+          "limit": { "context": 200000, "output": 30000 },
+          "tool_call": true
+        }
+      }
+    }
+  },
+  "model": "mlx-soloheaven/qwen3.5-122b"
+}

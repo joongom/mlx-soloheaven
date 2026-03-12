@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SoloHeaven Admin</title>
+    <style>
+        :root {
+            --bg-primary: #09090b;
+            --bg-secondary: #0f0f12;
+            --bg-tertiary: #18181b;
+            --bg-hover: #1f1f23;
+            --border: #27272a;
+            --border-light: #3f3f46;
+            --text-primary: #fafafa;
+            --text-secondary: #a1a1aa;
+            --text-muted: #71717a;
+            --accent: #3b82f6;
+            --green: #22c55e;
+            --yellow: #eab308;
+            --red: #ef4444;
+            --font-sans: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
+            --font-mono: 'SF Mono', 'Fira Code', 'JetBrains Mono', monospace;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: var(--font-sans);
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+        }
+
+        /* Header */
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px 24px;
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border);
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+        .logo {
+            font-size: 1.1rem;
+            font-weight: 800;
+            background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .badge {
+            font-size: 0.7rem;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-weight: 600;
+            background: rgba(239, 68, 68, 0.15);
+            color: var(--red);
+        }
+        .back-link {
+            color: var(--text-muted);
+            text-decoration: none;
+            font-size: 0.8rem;
+        }
+        .back-link:hover { color: var(--text-primary); }
+
+        /* Tabs */
+        .tabs {
+            display: flex;
+            gap: 0;
+            padding: 0 24px;
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border);
+        }
+        .tab {
+            padding: 10px 20px;
+            font-size: 0.82rem;
+            font-weight: 500;
+            color: var(--text-muted);
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            transition: all 0.15s;
+        }
+        .tab:hover { color: var(--text-secondary); }
+        .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+        /* Content */
+        .content { padding: 20px 24px; max-width: 1200px; margin: 0 auto; }
+        .panel { display: none; }
+        .panel.active { display: block; }
+
+        /* Cards */
+        .card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 16px 20px;
+            margin-bottom: 16px;
+        }
+        .card-title {
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 12px;
+        }
+
+        /* Stats grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+        .stat-card {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 14px 16px;
+        }
+        .stat-label {
+            font-size: 0.72rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            margin-bottom: 4px;
+        }
+        .stat-value {
+            font-size: 1.4rem;
+            font-weight: 700;
+            font-family: var(--font-mono);
+        }
+        .stat-sub {
+            font-size: 0.7rem;
+            color: var(--text-muted);
+            margin-top: 2px;
+        }
+
+        /* Tables */
+        table {
+            width: 100%;
+            border-collapse: separate;
+            border-spacing: 0;
+            font-size: 0.82rem;
+        }
+        th {
+            text-align: left;
+            padding: 8px 12px;
+            font-size: 0.72rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            border-bottom: 1px solid var(--border);
+        }
+        td {
+            padding: 8px 12px;
+            border-bottom: 1px solid rgba(39, 39, 42, 0.5);
+            color: var(--text-secondary);
+        }
+        tr:hover td { background: var(--bg-hover); }
+        .mono { font-family: var(--font-mono); font-size: 0.78rem; }
+
+        /* Log viewer */
+        #log-container {
+            background: #000;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            height: calc(100vh - 200px);
+            overflow-y: auto;
+            font-family: var(--font-mono);
+            font-size: 0.75rem;
+            line-height: 1.6;
+            padding: 12px;
+        }
+        .log-line {
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .log-line.INFO { color: #93c5fd; }
+        .log-line.DEBUG { color: #6b7280; }
+        .log-line.WARNING { color: #fbbf24; }
+        .log-line.ERROR { color: #f87171; }
+        .log-controls {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        .log-controls label {
+            font-size: 0.78rem;
+            color: var(--text-muted);
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            cursor: pointer;
+        }
+        .log-controls input[type="checkbox"] { accent-color: var(--accent); }
+        .log-filter {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 5px 10px;
+            color: var(--text-primary);
+            font-size: 0.78rem;
+            font-family: var(--font-mono);
+            outline: none;
+            flex: 1;
+            max-width: 300px;
+        }
+        .log-filter:focus { border-color: var(--accent); }
+        .log-status {
+            font-size: 0.72rem;
+            color: var(--text-muted);
+            margin-left: auto;
+        }
+        .log-dot {
+            display: inline-block;
+            width: 6px; height: 6px;
+            border-radius: 50%;
+            background: var(--green);
+            margin-right: 4px;
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+        /* Buttons */
+        .btn {
+            padding: 8px 16px;
+            border-radius: 8px;
+            font-size: 0.8rem;
+            font-weight: 500;
+            cursor: pointer;
+            border: 1px solid var(--border);
+            background: var(--bg-tertiary);
+            color: var(--text-secondary);
+            transition: all 0.15s;
+        }
+        .btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+        .btn-danger {
+            border-color: rgba(239, 68, 68, 0.3);
+            color: var(--red);
+        }
+        .btn-danger:hover {
+            background: rgba(239, 68, 68, 0.15);
+            border-color: var(--red);
+        }
+        .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        .btn-group { display: flex; gap: 8px; margin-top: 16px; }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 5px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+        @media (max-width: 768px) {
+            .content { padding: 12px; }
+            .stats-grid { grid-template-columns: repeat(2, 1fr); }
+            #log-container { height: calc(100vh - 240px); }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="header-left">
+            <span class="logo">SoloHeaven</span>
+            <span class="badge">ADMIN</span>
+        </div>
+        <a href="/" class="back-link">Back to Chat</a>
+    </div>
+
+    <div class="tabs">
+        <div class="tab active" onclick="showTab('logs')">Logs</div>
+        <div class="tab" onclick="showTab('cache')">Cache</div>
+        <div class="tab" onclick="showTab('db')">Database</div>
+    </div>
+
+    <div class="content">
+        <!-- LOGS PANEL -->
+        <div id="panel-logs" class="panel active">
+            <div class="log-controls">
+                <label><input type="checkbox" id="log-autoscroll" checked> Auto-scroll</label>
+                <label><input type="checkbox" id="log-show-debug"> DEBUG</label>
+                <input type="text" class="log-filter" id="log-filter" placeholder="Filter logs...">
+                <span class="log-status" id="log-status"><span class="log-dot"></span>Connected</span>
+                <button class="btn" onclick="clearLogs()">Clear</button>
+            </div>
+            <div id="log-container"></div>
+        </div>
+
+        <!-- CACHE PANEL -->
+        <div id="panel-cache" class="panel">
+            <div id="cache-stats"></div>
+            <div id="cache-engines"></div>
+            <div id="cache-disk"></div>
+            <div class="btn-group">
+                <button class="btn btn-danger" onclick="resetCache()">Reset Cache</button>
+                <button class="btn btn-danger" onclick="resetAll()">Reset All (Cache + DB)</button>
+                <button class="btn" onclick="loadCache()">Refresh</button>
+            </div>
+        </div>
+
+        <!-- DB PANEL -->
+        <div id="panel-db" class="panel">
+            <div id="db-stats"></div>
+            <div id="db-sessions"></div>
+            <div class="btn-group">
+                <button class="btn btn-danger" onclick="resetDb()">Reset DB</button>
+                <button class="btn" onclick="loadDb()">Refresh</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    const API = '';
+
+    // --- Tabs ---
+    function showTab(name) {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+        document.querySelector(`.tab[onclick="showTab('${name}')"]`).classList.add('active');
+        document.getElementById(`panel-${name}`).classList.add('active');
+        if (name === 'cache') loadCache();
+        if (name === 'db') loadDb();
+    }
+
+    // --- Logs ---
+    const logContainer = document.getElementById('log-container');
+    const logAutoscroll = document.getElementById('log-autoscroll');
+    const logShowDebug = document.getElementById('log-show-debug');
+    const logFilter = document.getElementById('log-filter');
+    const logStatus = document.getElementById('log-status');
+    let logCount = 0;
+
+    function clearLogs() {
+        logContainer.innerHTML = '';
+        logCount = 0;
+    }
+
+    function addLogLine(entry) {
+        if (!logShowDebug.checked && entry.level === 'DEBUG') return;
+        const filter = logFilter.value.toLowerCase();
+        if (filter && !entry.message.toLowerCase().includes(filter)) return;
+
+        const div = document.createElement('div');
+        div.className = `log-line ${entry.level}`;
+        div.textContent = entry.message;
+        logContainer.appendChild(div);
+        logCount++;
+
+        // Limit DOM nodes
+        while (logContainer.children.length > 2000) {
+            logContainer.removeChild(logContainer.firstChild);
+        }
+
+        if (logAutoscroll.checked) {
+            logContainer.scrollTop = logContainer.scrollHeight;
+        }
+    }
+
+    // SSE connection
+    let logSource = null;
+    function connectLogs() {
+        if (logSource) logSource.close();
+        logSource = new EventSource(`${API}/api/admin/logs/stream`);
+        logSource.onmessage = (e) => {
+            try {
+                const entry = JSON.parse(e.data);
+                addLogLine(entry);
+            } catch {}
+        };
+        logSource.onopen = () => {
+            logStatus.innerHTML = '<span class="log-dot"></span>Connected';
+        };
+        logSource.onerror = () => {
+            logStatus.innerHTML = '<span style="color:var(--red)">Disconnected</span>';
+            setTimeout(connectLogs, 3000);
+        };
+    }
+    connectLogs();
+
+    // Re-filter when toggling debug
+    logShowDebug.addEventListener('change', () => {
+        // Reconnect to re-populate with correct filter
+        logContainer.innerHTML = '';
+        fetch(`${API}/api/admin/logs/recent?limit=500`)
+            .then(r => r.json())
+            .then(entries => entries.forEach(addLogLine));
+    });
+
+    // --- Cache ---
+    async function loadCache() {
+        const data = await (await fetch(`${API}/api/admin/cache`)).json();
+
+        // Stats
+        document.getElementById('cache-stats').innerHTML = `
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Memory Usage</div>
+                    <div class="stat-value">${data.total_memory_gb} GB</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Disk Usage</div>
+                    <div class="stat-value">${data.total_disk_gb} GB</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Engines</div>
+                    <div class="stat-value">${Object.keys(data.engines).length}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Disk Files</div>
+                    <div class="stat-value">${data.disk_files.length}</div>
+                </div>
+            </div>`;
+
+        // Per-engine sessions
+        let enginesHtml = '';
+        for (const [modelId, info] of Object.entries(data.engines)) {
+            enginesHtml += `<div class="card">
+                <div class="card-title">${esc(info.model_id)} &middot; ${info.session_count} sessions &middot; thinking=${info.enable_thinking}</div>`;
+
+            if (info.base_caches.length > 0) {
+                enginesHtml += `<div style="margin-bottom:12px;font-size:0.75rem;color:var(--text-muted)">
+                    Base caches: ${info.base_caches.map(b => `${b.hash} (${b.token_count} tok, ${b.hit_count} hits)`).join(', ')}
+                </div>`;
+            }
+
+            if (info.sessions.length > 0) {
+                enginesHtml += `<table><thead><tr>
+                    <th>Session</th><th>Messages</th><th>Cache Tokens</th><th>Size</th><th>Last Used</th>
+                </tr></thead><tbody>`;
+                for (const s of info.sessions) {
+                    const age = s.age_s < 60 ? `${s.age_s}s ago` :
+                                s.age_s < 3600 ? `${Math.round(s.age_s/60)}m ago` :
+                                `${Math.round(s.age_s/3600)}h ago`;
+                    enginesHtml += `<tr>
+                        <td class="mono">${esc(s.session_id.substring(0, 24))}...</td>
+                        <td>${s.messages}</td>
+                        <td class="mono">${s.cache_tokens.toLocaleString()}</td>
+                        <td class="mono">${s.cache_size_mb} MB</td>
+                        <td>${age}</td>
+                    </tr>`;
+                }
+                enginesHtml += '</tbody></table>';
+            } else {
+                enginesHtml += '<div style="color:var(--text-muted);font-size:0.82rem">No active sessions</div>';
+            }
+            enginesHtml += '</div>';
+        }
+        document.getElementById('cache-engines').innerHTML = enginesHtml;
+
+        // Disk files
+        if (data.disk_files.length > 0) {
+            let diskHtml = `<div class="card"><div class="card-title">Disk Cache Files</div>
+                <table><thead><tr><th>File</th><th>Size</th><th>Model</th></tr></thead><tbody>`;
+            for (const f of data.disk_files) {
+                diskHtml += `<tr>
+                    <td class="mono">${esc(f.file)}</td>
+                    <td class="mono">${f.size_mb} MB</td>
+                    <td>${esc(f.model)}</td>
+                </tr>`;
+            }
+            diskHtml += '</tbody></table></div>';
+            document.getElementById('cache-disk').innerHTML = diskHtml;
+        } else {
+            document.getElementById('cache-disk').innerHTML = '';
+        }
+    }
+
+    // --- DB ---
+    async function loadDb() {
+        const data = await (await fetch(`${API}/api/admin/db`)).json();
+
+        document.getElementById('db-stats').innerHTML = `
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-label">DB Size</div>
+                    <div class="stat-value">${data.db_size_mb} MB</div>
+                    <div class="stat-sub">${esc(data.db_path)}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Sessions</div>
+                    <div class="stat-value">${data.total_sessions}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Messages</div>
+                    <div class="stat-value">${data.total_messages}</div>
+                    <div class="stat-sub">${Object.entries(data.message_by_role).map(([r,c]) => `${r}: ${c}`).join(', ')}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Memories</div>
+                    <div class="stat-value">${data.total_memories}</div>
+                </div>
+            </div>`;
+
+        if (data.sessions.length > 0) {
+            let html = `<div class="card"><div class="card-title">Sessions</div>
+                <table><thead><tr><th>ID</th><th>Title</th><th>Messages</th><th>Updated</th></tr></thead><tbody>`;
+            for (const s of data.sessions) {
+                const time = new Date(s.updated_at * 1000).toLocaleString();
+                html += `<tr>
+                    <td class="mono">${esc(s.id)}</td>
+                    <td>${esc(s.title || 'New Chat')}</td>
+                    <td>${s.msg_count}</td>
+                    <td>${time}</td>
+                </tr>`;
+            }
+            html += '</tbody></table></div>';
+            document.getElementById('db-sessions').innerHTML = html;
+        } else {
+            document.getElementById('db-sessions').innerHTML =
+                '<div class="card" style="color:var(--text-muted)">No sessions</div>';
+        }
+    }
+
+    // --- Reset actions ---
+    async function resetCache() {
+        if (!confirm('Clear all KV caches (memory + disk)?')) return;
+        const r = await fetch(`${API}/api/admin/cache/reset`, { method: 'POST' });
+        const data = await r.json();
+        alert(`Cleared: ${data.cleared.memory_sessions} sessions, ${data.cleared.disk_files} files, ${data.cleared.base_caches} base caches`);
+        loadCache();
+    }
+
+    async function resetDb() {
+        if (!confirm('Delete all sessions, messages, and memories from DB?')) return;
+        await fetch(`${API}/api/admin/db/reset`, { method: 'POST' });
+        alert('Database cleared');
+        loadDb();
+    }
+
+    async function resetAll() {
+        if (!confirm('Reset EVERYTHING? (KV caches + DB data)')) return;
+        if (!confirm('Are you sure? This cannot be undone.')) return;
+        await fetch(`${API}/api/admin/reset-all`, { method: 'POST' });
+        alert('All data cleared');
+        loadCache();
+        loadDb();
+    }
+
+    // --- Utilities ---
+    function esc(text) {
+        const d = document.createElement('div');
+        d.textContent = text || '';
+        return d.innerHTML;
+    }
+    </script>
+</body>
+</html>

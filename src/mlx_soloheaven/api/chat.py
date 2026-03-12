@@ -1,0 +1,433 @@
+"""
+Chat session API for the web frontend.
+Manages sessions, messages, and provides SSE streaming with stats.
+"""
+
+import asyncio
+import json
+import time
+import logging
+from typing import AsyncGenerator
+
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+from mlx_soloheaven.engine.mlx_engine import MLXEngine
+from mlx_soloheaven.engine.tool_parser import split_thinking_and_content
+from mlx_soloheaven.storage import database as db
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api")
+
+engine: MLXEngine = None  # type: ignore
+_engines: dict[str, MLXEngine] = {}
+
+
+def set_engine(e: MLXEngine):
+    global engine
+    engine = e
+
+
+def set_engines(engines: dict[str, MLXEngine], default: MLXEngine):
+    global engine, _engines
+    _engines = engines
+    engine = default
+
+
+def _get_engine(model: str | None) -> MLXEngine:
+    """Resolve model name to engine."""
+    if not model or not _engines:
+        return engine
+    if model in _engines:
+        return _engines[model]
+    model_lower = model.lower()
+    for key, eng in _engines.items():
+        if model_lower in key.lower() or model_lower in eng.model_id.lower():
+            return eng
+    return engine
+
+
+# --- Request models ---
+
+class CreateSessionRequest(BaseModel):
+    title: str = "New Chat"
+    system_prompt: str = ""
+
+
+class SendMessageRequest(BaseModel):
+    content: str
+    stream: bool = True
+    model: str | None = None
+
+
+class AddMemoryRequest(BaseModel):
+    content: str
+    category: str = "general"
+    importance: int = 5
+
+
+# --- Session endpoints ---
+
+@router.post("/sessions")
+async def create_session(req: CreateSessionRequest):
+    return await db.create_session(title=req.title, system_prompt=req.system_prompt)
+
+
+@router.get("/sessions")
+async def list_sessions():
+    return await db.list_sessions()
+
+
+@router.get("/sessions/{session_id}")
+async def get_session(session_id: str):
+    session = await db.get_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    return session
+
+
+@router.patch("/sessions/{session_id}")
+async def update_session(session_id: str, req: CreateSessionRequest):
+    await db.update_session(session_id, title=req.title, system_prompt=req.system_prompt)
+    return {"ok": True}
+
+
+@router.delete("/sessions/{session_id}")
+async def delete_session(session_id: str):
+    await db.delete_session(session_id)
+    return {"ok": True}
+
+
+@router.get("/sessions/{session_id}/messages")
+async def get_messages(session_id: str):
+    return await db.get_messages(session_id)
+
+
+# --- Chat endpoint (SSE streaming) ---
+
+@router.post("/sessions/{session_id}/chat")
+async def chat(session_id: str, req: SendMessageRequest):
+    session = await db.get_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+
+    # Add user message
+    await db.add_message(session_id, "user", content=req.content)
+
+    # Build messages with system prompt
+    messages = []
+    system_prompt = session.get("system_prompt", "")
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+
+    history = await db.get_messages(session_id)
+    for msg in history:
+        m = {"role": msg["role"]}
+        if msg.get("content"):
+            m["content"] = msg["content"]
+        if msg.get("tool_calls"):
+            m["tool_calls"] = msg["tool_calls"]
+        if msg.get("tool_call_id"):
+            m["tool_call_id"] = msg["tool_call_id"]
+        messages.append(m)
+
+    # Check if compaction is needed
+    current_tokens = await db.get_session_total_tokens(session_id)
+    window_limit = session.get("context_window_limit", 100000)
+    utilization = (current_tokens / window_limit * 100) if window_limit > 0 else 0
+    
+    # Trigger compaction at 90% utilization
+    if utilization >= 90:
+        logger.info(f"[Compaction] Session {session_id} at {utilization:.1f}% - triggering auto-compaction")
+        try:
+            # Perform auto-compaction
+            from mlx_soloheaven.engine.compaction import CompactionEngine, CompactionStrategy
+            
+            compaction_engine = CompactionEngine(_get_engine(req.model))
+            strategy_str = session.get("compaction_strategy", "summarize")
+            strategy = CompactionStrategy(strategy_str)
+            
+            result = await compaction_engine.compact(
+                messages=messages,
+                strategy=strategy,
+                target_tokens=window_limit // 2,  # Target 50% of limit
+                keep_recent_turns=10,
+            )
+            
+            # Record compaction
+            await db.record_compaction(
+                session_id=session_id,
+                old_tokens=current_tokens,
+                new_tokens=result["new_tokens"],
+                reduction_percent=result["reduction_percent"],
+                strategy=strategy.value,
+                summary_content=result.get("summary"),
+            )
+            
+            # Update session tokens
+            await db.update_session_tokens(session_id, result["new_tokens"])
+            
+            # Rebuild messages with compacted state
+            # For now, we'll use the original messages and let the engine handle it
+            # In a full implementation, you'd rebuild the message history here
+            
+            logger.info(
+                f"[Compaction] Auto-compaction complete: {current_tokens} → {result['new_tokens']} "
+                f"({result['reduction_percent']:.1f}% reduction)"
+            )
+        except Exception as e:
+            logger.error(f"[Compaction] Auto-compaction failed: {e}")
+            # Continue with original messages even if compaction fails
+
+    # Get generation parameters from session
+    use_engine = _get_engine(req.model)
+    temperature = session.get("temperature", 0.6)
+    thinking_budget = session.get("thinking_budget", 8192)
+    max_tokens = session.get("max_tokens", 32768)
+
+    if req.stream:
+        return StreamingResponse(
+            _stream_chat(
+                session_id, messages, use_engine,
+                temperature=temperature,
+                thinking_budget=thinking_budget,
+                max_tokens=max_tokens,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    else:
+        return await _sync_chat(session_id, messages, use_engine)
+
+
+async def _stream_chat(
+    session_id: str,
+    messages: list[dict],
+    eng: MLXEngine | None = None,
+    temperature: float = 0.6,
+    thinking_budget: int = 8192,
+    max_tokens: int = 32768,
+) -> AsyncGenerator[str, None]:
+    """Stream chat response with real-time stats."""
+    eng = eng or engine
+
+    t_start = time.perf_counter()
+    t_first_token = None
+    accumulated_text = ""
+    prompt_tokens = 0
+    completion_tokens = 0
+    gen_tps = 0.0
+    prompt_tps = 0.0
+    token_count = 0
+
+    # Cache info for stats
+    t_cache_check = time.perf_counter()
+    session_state = eng._sessions.get(session_id)
+    if not session_state and eng._has_disk_cache(session_id):
+        session_state = eng._load_session_from_disk(session_id)
+        if session_state:
+            eng._sessions[session_id] = session_state
+    cache_hit = False
+    cache_info = {"type": "none", "detail": "New session"}
+    if session_state:
+        if eng._messages_match(session_state.messages, messages):
+            cache_hit = session_state.cache is not None
+            cached_tokens = session_state.total_cache_tokens
+            new_msgs = messages[len(session_state.messages):]
+            suffix_desc = f"{len(new_msgs)} new message(s)" if new_msgs else "retry"
+            from_disk = (
+                session_id not in eng._sessions
+                or eng._sessions.get(session_id) is not session_state
+            )
+            source = "disk -> memory" if from_disk else "memory"
+            cache_info = {
+                "type": "kv_cache_hit" if cache_hit else "kv_cache_rebuild",
+                "detail": (
+                    f"KV Cache reuse ({source}): {cached_tokens} tokens cached, {suffix_desc}"
+                    if cache_hit
+                    else f"Rebuilding KV cache for {len(messages)} messages"
+                ),
+                "cached_tokens": cached_tokens,
+                "stored_msgs": len(session_state.messages),
+                "source": source,
+            }
+        else:
+            cache_info = {
+                "type": "kv_cache_miss",
+                "detail": f"Conversation changed, reprocessing {len(messages)} messages",
+                "stored_msgs": len(session_state.messages),
+                "incoming_msgs": len(messages),
+            }
+    t_cache_done = time.perf_counter()
+
+    start_event = json.dumps(
+        {"type": "start", "cache_hit": cache_hit, "cache_info": cache_info},
+        ensure_ascii=False,
+    )
+    yield f"data: {start_event}\n\n"
+
+    is_queued = eng._lock.locked()
+    if is_queued:
+        queued_event = json.dumps(
+            {"type": "queued", "message": "Another request is in progress. Please wait..."},
+            ensure_ascii=False,
+        )
+        yield f"data: {queued_event}\n\n"
+
+    t_gen_start = time.perf_counter()
+    t_gen_actual = None
+    queue_wait = 0.0
+    client_disconnected = False
+
+    try:
+        async for result in eng.generate_stream_async(
+            messages,
+            session_id=session_id,
+            temperature=temperature,
+            thinking_budget=thinking_budget,
+            max_tokens=max_tokens,
+        ):
+            if result.status == "generating":
+                t_gen_actual = time.perf_counter()
+                queue_wait = t_gen_actual - t_gen_start
+                continue
+
+            if result.finish_reason is not None:
+                prompt_tokens = result.prompt_tokens
+                completion_tokens = result.completion_tokens
+                gen_tps = result.generation_tps
+                prompt_tps = result.prompt_tps
+                break
+
+            if result.text:
+                token_count += 1
+                if t_first_token is None:
+                    t_first_token = time.perf_counter()
+
+                accumulated_text += result.text
+
+                event = json.dumps(
+                    {
+                        "type": "text",
+                        "content": result.text,
+                        "tps": round(result.generation_tps, 1) if result.generation_tps else 0,
+                    },
+                    ensure_ascii=False,
+                )
+                yield f"data: {event}\n\n"
+    except (asyncio.CancelledError, GeneratorExit):
+        client_disconnected = True
+        logger.info(f"[Stream] session={session_id} | client disconnected")
+
+    t_end = time.perf_counter()
+    engine_ttft = (t_first_token - (t_gen_actual or t_gen_start)) if t_first_token else 0
+    total_time = t_end - t_start
+
+    thinking, content = split_thinking_and_content(accumulated_text)
+
+    stats = {
+        "ttft": round(engine_ttft, 2),
+        "queue_wait": round(queue_wait, 2),
+        "total_time": round(total_time, 2),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "gen_tps": round(gen_tps, 1),
+        "prompt_tps": round(prompt_tps, 1),
+        "cache_hit": cache_hit,
+        "cache_info": cache_info,
+    }
+
+    if accumulated_text:
+        await db.add_message(
+            session_id,
+            "assistant",
+            content=content,
+            thinking=thinking,
+            token_count=completion_tokens,
+            stats=stats,
+        )
+
+        updated_messages = messages + [{"role": "assistant", "content": content}]
+        eng.update_session_messages(session_id, updated_messages)
+
+        # Update session total tokens
+        new_total = await db.get_session_total_tokens(session_id)
+        await db.update_session_tokens(session_id, new_total)
+
+        if len(messages) <= 2:
+            title = messages[-1].get("content", "")[:50]
+            if title:
+                await db.update_session(session_id, title=title)
+
+    if client_disconnected:
+        return
+
+    done_event = json.dumps(
+        {"type": "done", "thinking": thinking, "content": content, "stats": stats},
+        ensure_ascii=False,
+    )
+    yield f"data: {done_event}\n\n"
+
+
+async def _sync_chat(session_id: str, messages: list[dict], eng: MLXEngine | None = None) -> dict:
+    """Non-streaming chat response."""
+    eng = eng or engine
+    result = eng.complete(messages, session_id=session_id)
+
+    await db.add_message(
+        session_id,
+        "assistant",
+        content=result.content,
+        thinking=result.thinking,
+        token_count=result.completion_tokens,
+    )
+
+    updated_messages = messages + [{"role": "assistant", "content": result.content}]
+    eng.update_session_messages(session_id, updated_messages)
+
+    # Update session total tokens
+    new_total = await db.get_session_total_tokens(session_id)
+    await db.update_session_tokens(session_id, new_total)
+
+    return {
+        "content": result.content,
+        "thinking": result.thinking,
+        "usage": {
+            "prompt_tokens": result.prompt_tokens,
+            "completion_tokens": result.completion_tokens,
+        },
+    }
+
+
+# --- Memory endpoints ---
+
+@router.post("/memories")
+async def add_memory(req: AddMemoryRequest):
+    return await db.add_memory(
+        content=req.content, category=req.category, importance=req.importance,
+    )
+
+
+@router.get("/memories")
+async def get_memories(category: str | None = None):
+    return await db.get_memories(category=category)
+
+
+@router.get("/memories/search")
+async def search_memories(q: str):
+    return await db.search_memories(q)
+
+
+# --- Cache stats ---
+
+@router.get("/cache/stats")
+async def cache_stats():
+    return {
+        **engine.cache_manager.stats(),
+        **engine.session_stats(),
+    }

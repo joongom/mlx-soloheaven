@@ -6,4 +6,4 @@ MODEL_PATH="${SOLOHEAVEN_397B_PATH:-$HOME/.lmstudio/models/lmstudio-community/Qw
 cd "$(dirname "$0")"
 source .venv/bin/activate
 export SOLOHEAVEN_MODELS=""
-mlx-soloheaven --model "$MODEL_PATH" --gpu-keepalive --verbose "$@"
+mlx-soloheaven --model "$MODEL_PATH" --memory-budget-gb 50 --gpu-keepalive --verbose "$@"

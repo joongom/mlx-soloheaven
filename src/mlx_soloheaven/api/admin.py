@@ -123,6 +123,40 @@ async def recent_logs(limit: int = 200):
     return entries
 
 
+# --- Models overview ---
+
+@router.get("/models")
+async def models_overview():
+    """List loaded models with their default parameters."""
+    models = []
+    for model_id, engine in _engines.items():
+        cfg = engine.cfg
+        models.append({
+            "model_id": engine.model_id,
+            "model_path": cfg.model_path,
+            "defaults": {
+                "temperature": cfg.default_temperature,
+                "top_p": cfg.default_top_p,
+                "min_p": cfg.default_min_p,
+                "top_k": cfg.default_top_k,
+                "repetition_penalty": cfg.default_repetition_penalty,
+                "max_tokens": cfg.default_max_tokens,
+            },
+            "thinking": {
+                "enabled": cfg.enable_thinking,
+                "budget": cfg.thinking_budget,
+                "think_end_token": cfg.think_end_token,
+                "think_start_token": cfg.think_start_token,
+            },
+            "cache_budget": {
+                "memory_gb": cfg.memory_budget_gb,
+                "disk_gb": cfg.disk_budget_gb,
+            },
+            "sessions": len(engine._sessions),
+        })
+    return {"models": models}
+
+
 # --- Cache overview ---
 
 @router.get("/cache")

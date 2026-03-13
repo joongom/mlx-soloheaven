@@ -13,6 +13,10 @@ class ModelConfig:
 
     # Generation defaults (per-model override)
     default_temperature: float = 0.6
+    default_top_p: float = 1.0
+    default_min_p: float = 0.0
+    default_top_k: int = 0
+    default_repetition_penalty: float = 1.0
     default_max_tokens: int = 32768
     thinking_budget: int = 8192
     enable_thinking: bool = True
@@ -42,6 +46,10 @@ class Config:
 
     # Generation defaults (used as fallback for models without override)
     default_temperature: float = 0.6
+    default_top_p: float = 1.0
+    default_min_p: float = 0.0
+    default_top_k: int = 0
+    default_repetition_penalty: float = 1.0
     default_max_tokens: int = 32768
     thinking_budget: int = 8192
     enable_thinking: bool = True
@@ -53,7 +61,7 @@ class Config:
 
     # Cache budgets (no time-based TTL — evict LRU when over budget)
     memory_budget_gb: float = 200.0
-    disk_budget_gb: float = 1000.0
+    disk_budget_gb: float = 100.0
 
     # Paths
     data_dir: str = "./data"
@@ -78,11 +86,11 @@ class Config:
         if args.models:
             for spec in args.models:
                 # Format: "path", "alias=path", or "path:opt1:opt2"
-                # Options: no_thinking
+                # Options: :think (enable), :no_think_tag (disable)
                 alias = ""
                 enable_thinking = not args.no_thinking
 
-                # Split options (after last colon that's not part of path)
+                # Per-model thinking override
                 if ":no_think_tag" in spec:
                     spec = spec.replace(":no_think_tag", "")
                     enable_thinking = False
@@ -96,6 +104,10 @@ class Config:
                     model_path=path.strip(),
                     alias=alias.strip(),
                     default_temperature=args.temperature,
+                    default_top_p=args.top_p,
+                    default_min_p=args.min_p,
+                    default_top_k=args.top_k,
+                    default_repetition_penalty=args.repetition_penalty,
                     default_max_tokens=args.max_tokens,
                     thinking_budget=args.thinking_budget,
                     enable_thinking=enable_thinking,
@@ -104,6 +116,10 @@ class Config:
             models.append(ModelConfig(
                 model_path=args.model,
                 default_temperature=args.temperature,
+                default_top_p=args.top_p,
+                default_min_p=args.min_p,
+                default_top_k=args.top_k,
+                default_repetition_penalty=args.repetition_penalty,
                 default_max_tokens=args.max_tokens,
                 thinking_budget=args.thinking_budget,
                 enable_thinking=not args.no_thinking,
@@ -115,6 +131,10 @@ class Config:
             host=args.host,
             port=args.port,
             default_temperature=args.temperature,
+            default_top_p=args.top_p,
+            default_min_p=args.min_p,
+            default_top_k=args.top_k,
+            default_repetition_penalty=args.repetition_penalty,
             default_max_tokens=args.max_tokens,
             thinking_budget=args.thinking_budget,
             enable_thinking=not args.no_thinking,

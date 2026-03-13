@@ -9,6 +9,10 @@ router = APIRouter(prefix="/api")
 class SessionSettings(BaseModel):
     system_prompt: Optional[str] = None
     temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    min_p: Optional[float] = None
+    top_k: Optional[int] = None
+    repetition_penalty: Optional[float] = None
     thinking_budget: Optional[int] = None
     max_tokens: Optional[int] = None
     context_window_limit: Optional[int] = None

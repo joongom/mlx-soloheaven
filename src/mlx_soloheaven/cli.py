@@ -47,6 +47,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Default sampling temperature (default: 0.6)",
     )
     p.add_argument(
+        "--top-p",
+        type=float,
+        default=float(_env("TOP_P", "1.0")),
+        help="Default nucleus sampling top-p (default: 1.0, disabled)",
+    )
+    p.add_argument(
+        "--min-p",
+        type=float,
+        default=float(_env("MIN_P", "0.0")),
+        help="Default min-p sampling threshold (default: 0.0, disabled)",
+    )
+    p.add_argument(
+        "--top-k",
+        type=int,
+        default=int(_env("TOP_K", "0")),
+        help="Default top-k sampling (default: 0, disabled)",
+    )
+    p.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=float(_env("REPETITION_PENALTY", "1.0")),
+        help="Default repetition penalty (default: 1.0, disabled)",
+    )
+    p.add_argument(
         "--max-tokens",
         type=int,
         default=int(_env("MAX_TOKENS", "32768")),
@@ -67,8 +91,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--disk-budget-gb",
         type=float,
-        default=float(_env("DISK_BUDGET_GB", "1000")),
-        help="On-disk KV cache budget in GB (default: 1000)",
+        default=float(_env("DISK_BUDGET_GB", "100")),
+        help="On-disk KV cache budget in GB (default: 100)",
     )
     p.add_argument(
         "--data-dir",
@@ -78,7 +102,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--no-thinking",
         action="store_true",
-        help="Disable thinking mode (no <think> tags in prompt)",
+        help="Disable thinking mode globally (default: on). Per-model: use :no_think_tag suffix",
     )
     p.add_argument(
         "--verbose", "-v",

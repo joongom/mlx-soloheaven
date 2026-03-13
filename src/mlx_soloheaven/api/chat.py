@@ -182,15 +182,23 @@ async def chat(session_id: str, req: SendMessageRequest):
 
     # Get generation parameters from session
     use_engine = _get_engine(req.model)
-    temperature = session.get("temperature", 0.6)
-    thinking_budget = session.get("thinking_budget", 8192)
-    max_tokens = session.get("max_tokens", 32768)
+    temperature = session.get("temperature", use_engine.cfg.default_temperature)
+    top_p = session.get("top_p", use_engine.cfg.default_top_p)
+    min_p = session.get("min_p", use_engine.cfg.default_min_p)
+    top_k = session.get("top_k", use_engine.cfg.default_top_k)
+    repetition_penalty = session.get("repetition_penalty", use_engine.cfg.default_repetition_penalty)
+    thinking_budget = session.get("thinking_budget", use_engine.cfg.thinking_budget)
+    max_tokens = session.get("max_tokens", use_engine.cfg.default_max_tokens)
 
     if req.stream:
         return StreamingResponse(
             _stream_chat(
                 session_id, messages, use_engine,
                 temperature=temperature,
+                top_p=top_p,
+                min_p=min_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
                 thinking_budget=thinking_budget,
                 max_tokens=max_tokens,
             ),
@@ -210,6 +218,10 @@ async def _stream_chat(
     messages: list[dict],
     eng: MLXEngine | None = None,
     temperature: float = 0.6,
+    top_p: float = 1.0,
+    min_p: float = 0.0,
+    top_k: int = 0,
+    repetition_penalty: float = 1.0,
     thinking_budget: int = 8192,
     max_tokens: int = 32768,
 ) -> AsyncGenerator[str, None]:
@@ -289,6 +301,10 @@ async def _stream_chat(
             messages,
             session_id=session_id,
             temperature=temperature,
+            top_p=top_p,
+            min_p=min_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
             thinking_budget=thinking_budget,
             max_tokens=max_tokens,
         ):

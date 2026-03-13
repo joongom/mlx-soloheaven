@@ -1,6 +1,31 @@
-"""Thinking budget processor for models with thinking/reasoning modes."""
+"""Logits processors for generation control."""
 
 import mlx.core as mx
+
+
+class RepetitionPenaltyProcessor:
+    """
+    Logits processor that applies repetition penalty to previously generated tokens.
+
+    penalty > 1.0 discourages repetition, < 1.0 encourages it, 1.0 = no effect.
+    """
+
+    def __init__(self, penalty: float):
+        self.penalty = penalty
+
+    def __call__(self, tokens: mx.array, logits: mx.array) -> mx.array:
+        if tokens.size == 0 or self.penalty == 1.0:
+            return logits
+        # Get unique token IDs from generated sequence
+        selected_logits = logits[:, tokens]
+        # Apply penalty: divide positive logits, multiply negative logits
+        selected_logits = mx.where(
+            selected_logits > 0,
+            selected_logits / self.penalty,
+            selected_logits * self.penalty,
+        )
+        logits[:, tokens] = selected_logits
+        return logits
 
 
 class ThinkingBudgetProcessor:

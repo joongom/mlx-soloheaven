@@ -197,15 +197,20 @@ All settings can be passed via CLI flags or environment variables:
 mlx-soloheaven \
   --model ~/models/Qwen3.5-122B-A10B-bf16 \
   --port 8000 \
+  --temperature 0.6 \
+  --top-p 1.0 \
+  --min-p 0.0 \
+  --top-k 0 \
+  --repetition-penalty 1.0 \
   --thinking-budget 8192 \
   --memory-budget-gb 200 \
-  --temperature 0.6 \
   --gpu-keepalive \
   --verbose
 
 # Or use environment variables (prefix: SOLOHEAVEN_)
 export SOLOHEAVEN_MODEL=~/models/Qwen3.5-122B-A10B-bf16
 export SOLOHEAVEN_PORT=8000
+export SOLOHEAVEN_TEMPERATURE=0.6
 export SOLOHEAVEN_THINKING_BUDGET=8192
 mlx-soloheaven
 ```
@@ -227,15 +232,51 @@ Options:
   --host                Bind address (default: 0.0.0.0)
   --port, -p            Listen port (default: 8000)
   --temperature         Default sampling temperature (default: 0.6)
+  --top-p               Nucleus sampling top-p (default: 1.0, disabled)
+  --min-p               Min-p sampling threshold (default: 0.0, disabled)
+  --top-k               Top-k sampling (default: 0, disabled)
+  --repetition-penalty  Repetition penalty (default: 1.0, disabled)
   --max-tokens          Default max generation tokens (default: 32768)
   --thinking-budget     Max thinking tokens before forcing </think> (default: 8192, 0=unlimited)
   --memory-budget-gb    In-memory KV cache budget in GB (default: 200)
-  --disk-budget-gb      On-disk KV cache budget in GB (default: 1000)
+  --disk-budget-gb      On-disk KV cache budget in GB (default: 100)
   --data-dir            Directory for SQLite DB and cache files (default: ./data)
   --no-thinking         Disable thinking mode globally
   --gpu-keepalive       Keep Metal GPU warm to avoid idle penalty (env: SOLOHEAVEN_GPU_KEEPALIVE)
   --verbose, -v         Enable verbose logging (env: SOLOHEAVEN_VERBOSE)
 ```
+
+### Sampling Parameters
+
+Default sampling parameters applied to all generation requests. Each can be overridden per-request via the API.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `temperature` | 0.6 | Controls randomness. 0 = deterministic (argmax), higher = more creative |
+| `top_p` | 1.0 | Nucleus sampling. 1.0 = disabled, lower values focus on high-probability tokens |
+| `min_p` | 0.0 | Minimum probability threshold (scaled by top token). 0.0 = disabled |
+| `top_k` | 0 | Top-k sampling. 0 = disabled, positive values limit token candidates |
+| `repetition_penalty` | 1.0 | Penalizes repeated tokens. 1.0 = disabled, >1.0 discourages repetition |
+
+Configure via CLI (`--temperature 0.6`), environment variables (`SOLOHEAVEN_TEMPERATURE=0.6`), or `.env` file.
+
+Per-request override via the OpenAI API:
+
+```json
+{
+  "model": "default",
+  "messages": [...],
+  "temperature": 0.8,
+  "top_p": 0.95,
+  "top_k": 40,
+  "min_p": 0.05,
+  "repetition_penalty": 1.1,
+  "frequency_penalty": 0.5,
+  "presence_penalty": 0.3
+}
+```
+
+> `frequency_penalty` and `presence_penalty` (OpenAI standard) are mapped to `repetition_penalty` when `repetition_penalty` is not explicitly set.
 
 ### Multi-Model Setup
 
@@ -260,6 +301,7 @@ SOLOHEAVEN_MODELS=/path/to/model-A,/path/to/model-B,/path/to/model-C:no_think_ta
 Access the admin dashboard at `http://localhost:8000/admin`:
 
 - **Logs** — Real-time server log streaming via SSE with level filtering and search
+- **Models** — Loaded models with default sampling parameters, thinking config, and cache budgets
 - **Cache** — Per-model session cache overview (tokens, size, age), base cache stats, disk files
 - **Database** — Session/message/memory counts, DB size, session list
 - **Reset** — Clear caches only, DB only, or everything (with confirmation)
@@ -489,6 +531,7 @@ Qwen3.5 uses a hybrid architecture: 36 DeltaNet layers (linear attention with re
 |--------|------|-------------|
 | GET | `/api/admin/logs/stream` | SSE real-time log streaming |
 | GET | `/api/admin/logs/recent` | Recent log entries |
+| GET | `/api/admin/models` | Loaded models with default parameters |
 | GET | `/api/admin/cache` | Cache overview (all models) |
 | GET | `/api/admin/db` | Database overview |
 | POST | `/api/admin/reset` | Reset caches, DB, or all |
@@ -501,13 +544,20 @@ SoloHeaven extends the OpenAI API with optional fields:
 {
   "user": "session-id",
   "thinking": true,
-  "thinking_budget": 4096
+  "thinking_budget": 4096,
+  "top_k": 40,
+  "min_p": 0.05,
+  "repetition_penalty": 1.1
 }
 ```
 
 - `user` — Session ID for KV cache reuse (see below)
 - `thinking` — Override server config for this request (`true`/`false`)
 - `thinking_budget` — Override thinking token budget for this request
+- `top_k` — Top-k sampling override for this request
+- `min_p` — Min-p threshold override for this request
+- `repetition_penalty` — Repetition penalty override for this request
+- `frequency_penalty` / `presence_penalty` — OpenAI-standard penalties (mapped to `repetition_penalty`)
 
 **`user` field behavior:**
 

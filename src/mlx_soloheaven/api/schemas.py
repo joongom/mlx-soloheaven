@@ -49,6 +49,12 @@ class ChatCompletionRequest(BaseModel):
     user: Optional[str] = None
     thinking: Optional[bool] = None  # Enable/disable thinking (default: server config)
     thinking_budget: Optional[int] = None  # Override thinking token budget
+    # Extended sampling parameters
+    top_k: Optional[int] = None
+    min_p: Optional[float] = None
+    repetition_penalty: Optional[float] = None
+    frequency_penalty: Optional[float] = None  # OpenAI compat (mapped to repetition_penalty)
+    presence_penalty: Optional[float] = None   # OpenAI compat (mapped to repetition_penalty)
 
 
 # --- Response schemas ---

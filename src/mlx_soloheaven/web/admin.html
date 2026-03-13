@@ -277,6 +277,7 @@
 
     <div class="tabs">
         <div class="tab active" onclick="showTab('logs')">Logs</div>
+        <div class="tab" onclick="showTab('models')">Models</div>
         <div class="tab" onclick="showTab('cache')">Cache</div>
         <div class="tab" onclick="showTab('db')">Database</div>
     </div>
@@ -292,6 +293,14 @@
                 <button class="btn" onclick="clearLogs()">Clear</button>
             </div>
             <div id="log-container"></div>
+        </div>
+
+        <!-- MODELS PANEL -->
+        <div id="panel-models" class="panel">
+            <div id="models-content"></div>
+            <div class="btn-group">
+                <button class="btn" onclick="loadModels()">Refresh</button>
+            </div>
         </div>
 
         <!-- CACHE PANEL -->
@@ -326,6 +335,7 @@
         document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
         document.querySelector(`.tab[onclick="showTab('${name}')"]`).classList.add('active');
         document.getElementById(`panel-${name}`).classList.add('active');
+        if (name === 'models') loadModels();
         if (name === 'cache') loadCache();
         if (name === 'db') loadDb();
     }
@@ -393,6 +403,64 @@
             .then(r => r.json())
             .then(entries => entries.forEach(addLogLine));
     });
+
+    // --- Models ---
+    async function loadModels() {
+        const data = await (await fetch(`${API}/api/admin/models`)).json();
+        let html = '';
+
+        if (data.models.length === 0) {
+            html = '<div class="card" style="color:var(--text-muted)">No models loaded</div>';
+        } else {
+            html += `<div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Loaded Models</div>
+                    <div class="stat-value">${data.models.length}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Total Sessions</div>
+                    <div class="stat-value">${data.models.reduce((a, m) => a + m.sessions, 0)}</div>
+                </div>
+            </div>`;
+
+            for (const m of data.models) {
+                const d = m.defaults;
+                const t = m.thinking;
+                html += `<div class="card">
+                    <div class="card-title">${esc(m.model_id)}</div>
+                    <div style="font-size:0.78rem;color:var(--text-muted);margin-bottom:12px;word-break:break-all">
+                        ${esc(m.model_path)}
+                    </div>
+                    <table>
+                        <thead><tr><th>Parameter</th><th>Value</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><td>temperature</td><td class="mono">${d.temperature}</td><td style="color:var(--text-muted)">Sampling randomness (0=deterministic)</td></tr>
+                            <tr><td>top_p</td><td class="mono">${d.top_p}</td><td style="color:var(--text-muted)">Nucleus sampling (1.0=off)</td></tr>
+                            <tr><td>min_p</td><td class="mono">${d.min_p}</td><td style="color:var(--text-muted)">Min probability threshold (0.0=off)</td></tr>
+                            <tr><td>top_k</td><td class="mono">${d.top_k}</td><td style="color:var(--text-muted)">Top-k candidates (0=off)</td></tr>
+                            <tr><td>repetition_penalty</td><td class="mono">${d.repetition_penalty}</td><td style="color:var(--text-muted)">Repeat penalty (1.0=off)</td></tr>
+                            <tr><td>max_tokens</td><td class="mono">${d.max_tokens.toLocaleString()}</td><td style="color:var(--text-muted)">Max output tokens</td></tr>
+                            <tr style="border-top:1px solid var(--border)">
+                                <td>thinking</td>
+                                <td class="mono">${t.enabled ? '<span style="color:var(--green)">on</span>' : '<span style="color:var(--text-muted)">off</span>'}</td>
+                                <td style="color:var(--text-muted)">Think tag injection</td>
+                            </tr>
+                            <tr><td>thinking_budget</td><td class="mono">${t.budget.toLocaleString()}</td><td style="color:var(--text-muted)">Max thinking tokens (0=unlimited)</td></tr>
+                            <tr style="border-top:1px solid var(--border)">
+                                <td>memory_budget</td>
+                                <td class="mono">${m.cache_budget.memory_gb} GB</td>
+                                <td style="color:var(--text-muted)">In-memory KV cache limit</td>
+                            </tr>
+                            <tr><td>disk_budget</td><td class="mono">${m.cache_budget.disk_gb} GB</td><td style="color:var(--text-muted)">On-disk KV cache limit</td></tr>
+                            <tr><td>active_sessions</td><td class="mono">${m.sessions}</td><td style="color:var(--text-muted)">In-memory sessions</td></tr>
+                        </tbody>
+                    </table>
+                </div>`;
+            }
+        }
+
+        document.getElementById('models-content').innerHTML = html;
+    }
 
     // --- Cache ---
     async function loadCache() {

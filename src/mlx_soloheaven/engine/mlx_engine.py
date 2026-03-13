@@ -28,7 +28,7 @@ from mlx_lm.models.cache import make_prompt_cache, save_prompt_cache, load_promp
 from mlx_lm.sample_utils import make_sampler
 
 from mlx_soloheaven.config import Config
-from mlx_soloheaven.engine.thinking import ThinkingBudgetProcessor
+from mlx_soloheaven.engine.thinking import ThinkingBudgetProcessor, RepetitionPenaltyProcessor
 from mlx_soloheaven.engine.tool_parser import parse_tool_calls, split_thinking_and_content
 from mlx_soloheaven.cache.manager import CacheManager
 
@@ -760,6 +760,10 @@ class MLXEngine:
         *,
         max_tokens: int | None = None,
         temperature: float | None = None,
+        top_p: float | None = None,
+        min_p: float | None = None,
+        top_k: int | None = None,
+        repetition_penalty: float | None = None,
         session_id: str | None = None,
         tools: list | None = None,
         cancel_event: threading.Event | None = None,
@@ -776,8 +780,12 @@ class MLXEngine:
             yield GenerationResult(status="generating")
             yield from self._generate_locked(
                 messages,
-                max_tokens=max_tokens or self.cfg.default_max_tokens,
-                temperature=temperature or self.cfg.default_temperature,
+                max_tokens=max_tokens if max_tokens is not None else self.cfg.default_max_tokens,
+                temperature=temperature if temperature is not None else self.cfg.default_temperature,
+                top_p=top_p if top_p is not None else self.cfg.default_top_p,
+                min_p=min_p if min_p is not None else self.cfg.default_min_p,
+                top_k=top_k if top_k is not None else self.cfg.default_top_k,
+                repetition_penalty=repetition_penalty if repetition_penalty is not None else self.cfg.default_repetition_penalty,
                 session_id=session_id,
                 tools=tools,
                 cancel_event=cancel_event,
@@ -795,6 +803,10 @@ class MLXEngine:
         cancel_event: threading.Event | None = None,
         thinking: bool | None = None,
         thinking_budget: int | None = None,
+        top_p: float = 1.0,
+        min_p: float = 0.0,
+        top_k: int = 0,
+        repetition_penalty: float = 1.0,
     ) -> Generator[GenerationResult, None, None]:
         """Core generation logic (must hold lock)."""
         self._touch_gpu()
@@ -919,9 +931,11 @@ class MLXEngine:
                     prompt_cache = make_prompt_cache(self.model)
 
         # Setup generation
-        sampler = make_sampler(temp=temperature)
+        sampler = make_sampler(temp=temperature, top_p=top_p, min_p=min_p, top_k=top_k)
 
         logits_processors = []
+        if repetition_penalty != 1.0:
+            logits_processors.append(RepetitionPenaltyProcessor(penalty=repetition_penalty))
         budget = thinking_budget if thinking_budget is not None else self.cfg.thinking_budget
         if (
             use_thinking
@@ -945,9 +959,18 @@ class MLXEngine:
             "total_prompt_tokens": total_prompt_tokens,
         }
 
+        sampling_info = f"temp={temperature}"
+        if top_p < 1.0:
+            sampling_info += f", top_p={top_p}"
+        if min_p > 0.0:
+            sampling_info += f", min_p={min_p}"
+        if top_k > 0:
+            sampling_info += f", top_k={top_k}"
+        if repetition_penalty != 1.0:
+            sampling_info += f", rep_pen={repetition_penalty}"
         logger.info(
             f"[Generate] prompt={len(prompt_tokens)} tokens, max={max_tokens}, "
-            f"temp={temperature}, cache_mode={cache_mode}"
+            f"{sampling_info}, cache_mode={cache_mode}"
         )
 
         # Stream generate
@@ -1105,6 +1128,10 @@ class MLXEngine:
         *,
         max_tokens: int | None = None,
         temperature: float | None = None,
+        top_p: float | None = None,
+        min_p: float | None = None,
+        top_k: int | None = None,
+        repetition_penalty: float | None = None,
         tools: list | None = None,
         session_id: str | None = None,
         thinking: bool | None = None,
@@ -1118,6 +1145,10 @@ class MLXEngine:
             messages,
             max_tokens=max_tokens,
             temperature=temperature,
+            top_p=top_p,
+            min_p=min_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
             session_id=session_id,
             tools=tools,
             thinking=thinking,
@@ -1305,6 +1336,10 @@ class MLXEngine:
         *,
         max_tokens: int | None = None,
         temperature: float | None = None,
+        top_p: float | None = None,
+        min_p: float | None = None,
+        top_k: int | None = None,
+        repetition_penalty: float | None = None,
         session_id: str | None = None,
         tools: list | None = None,
         thinking: bool | None = None,
@@ -1321,6 +1356,10 @@ class MLXEngine:
                     messages,
                     max_tokens=max_tokens,
                     temperature=temperature,
+                    top_p=top_p,
+                    min_p=min_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
                     session_id=session_id,
                     tools=tools,
                     cancel_event=cancel_event,

@@ -110,10 +110,22 @@ def _sync_completion(request: ChatCompletionRequest, engine: MLXEngine) -> ChatC
     tools = [t.model_dump() for t in request.tools] if request.tools else None
 
     enable_thinking = request.thinking if request.thinking is not None else engine.cfg.enable_thinking
+    # Map OpenAI frequency/presence_penalty to repetition_penalty if not explicitly set
+    rep_penalty = request.repetition_penalty
+    if rep_penalty is None and (request.frequency_penalty or request.presence_penalty):
+        # Approximate: OpenAI penalties are additive [-2,2], repetition_penalty is multiplicative [0.1, 2.0]
+        fp = request.frequency_penalty or 0.0
+        pp = request.presence_penalty or 0.0
+        rep_penalty = 1.0 + (fp + pp) * 0.25  # rough mapping
+
     result = engine.complete(
         messages,
         max_tokens=request.max_tokens or request.max_completion_tokens,
         temperature=request.temperature,
+        top_p=request.top_p,
+        min_p=request.min_p,
+        top_k=request.top_k,
+        repetition_penalty=rep_penalty,
         tools=tools,
         session_id=request.user,
         thinking=enable_thinking,
@@ -178,6 +190,13 @@ async def _stream_completion(
     enable_thinking = request.thinking if request.thinking is not None else engine.cfg.enable_thinking
     thinking_budget = request.thinking_budget
 
+    # Map OpenAI frequency/presence_penalty to repetition_penalty if not explicitly set
+    rep_penalty = request.repetition_penalty
+    if rep_penalty is None and (request.frequency_penalty or request.presence_penalty):
+        fp = request.frequency_penalty or 0.0
+        pp = request.presence_penalty or 0.0
+        rep_penalty = 1.0 + (fp + pp) * 0.25
+
     # Send opening <think> tag if thinking is enabled
     if enable_thinking:
         think_chunk = _make_content_chunk(chunk_id, created, model, "<think>\n")
@@ -198,6 +217,10 @@ async def _stream_completion(
         messages,
         max_tokens=request.max_tokens or request.max_completion_tokens,
         temperature=request.temperature,
+        top_p=request.top_p,
+        min_p=request.min_p,
+        top_k=request.top_k,
+        repetition_penalty=rep_penalty,
         session_id=request.user,
         tools=tools,
         thinking=enable_thinking,

@@ -12,6 +12,7 @@ because thinking tokens in the cache don't appear in the client's messages.
 
 import asyncio
 import contextlib
+import copy
 import hashlib
 import json
 import logging
@@ -63,6 +64,9 @@ class CompletionResult:
     cache_info: Optional[dict] = None
 
 
+DEFAULT_MAX_CHECKPOINTS = 50
+
+
 @dataclass
 class SessionState:
     """Tracks a conversation session's KV cache and message history."""
@@ -70,6 +74,13 @@ class SessionState:
     messages: list[dict]  # messages represented in the cache
     last_used: float = field(default_factory=time.time)
     total_cache_tokens: int = 0
+
+    # Branching checkpoints (memory only, not persisted to disk)
+    turn_offsets: dict[int, int] = field(default_factory=dict)
+    deltanet_snapshots: dict[int, list] = field(default_factory=dict)
+
+    # Cache build time from last branch/regenerate BUILD (seconds, consumed once)
+    pending_build_time: float = 0.0
 
     def touch(self):
         self.last_used = time.time()
@@ -279,8 +290,11 @@ class MLXEngine:
     def _session_cache_path(self, session_id: str) -> str:
         return os.path.join(self.cfg.cache_dir, f"session_{session_id}.safetensors")
 
+    def _session_ckpt_path(self, session_id: str) -> str:
+        return os.path.join(self.cfg.cache_dir, f"session_{session_id}_ckpt.safetensors")
+
     def _save_session_to_disk(self, session_id: str, session: SessionState):
-        """Save session's KV cache to disk. Caller MUST hold _lock."""
+        """Save session's KV cache + checkpoints to disk. Caller MUST hold _lock."""
         t0 = time.perf_counter()
         os.makedirs(self.cfg.cache_dir, exist_ok=True)
         path = self._session_cache_path(session_id)
@@ -290,18 +304,52 @@ class MLXEngine:
             "total_cache_tokens": str(session.total_cache_tokens),
             "last_used": str(session.last_used),
         }
-        # Safe to use mx.save_safetensors directly — caller holds the GPU lock
         save_prompt_cache(path, session.cache, metadata=metadata)
-        elapsed = time.perf_counter() - t0
 
+        # Save DeltaNet checkpoints
+        self._save_checkpoints_to_disk(session_id, session)
+
+        elapsed = time.perf_counter() - t0
         if hasattr(self, "_disk_session_ids"):
             self._disk_session_ids.add(session_id)
         fsize = os.path.getsize(path) / 1e6
+        n_ckpt = len(session.deltanet_snapshots)
         logger.info(
             f"[KV Cache] session={session_id} | DISK SAVE | "
             f"{session.total_cache_tokens} tokens, {len(session.messages)} msgs, "
-            f"{fsize:.1f}MB, {elapsed:.2f}s"
+            f"{n_ckpt} checkpoints, {fsize:.1f}MB, {elapsed:.2f}s"
         )
+
+    def _save_checkpoints_to_disk(self, session_id: str, session: SessionState):
+        """Save DeltaNet snapshots to a separate safetensors file."""
+        ckpt_path = self._session_ckpt_path(session_id)
+        if not session.deltanet_snapshots:
+            if os.path.exists(ckpt_path):
+                os.remove(ckpt_path)
+            return
+
+        arrays = {}
+        structure = {}
+
+        for turn_key, snapshot in session.deltanet_snapshots.items():
+            structure[str(turn_key)] = len(snapshot)
+            for layer_idx, cache_obj in enumerate(snapshot):
+                states = cache_obj.state if isinstance(cache_obj.state, list) else [cache_obj.state]
+                for state_idx, arr in enumerate(states):
+                    if isinstance(arr, mx.array):
+                        arrays[f"t{turn_key}_l{layer_idx}_s{state_idx}"] = arr
+
+        metadata = {
+            "turn_offsets": json.dumps(
+                {str(k): v for k, v in session.turn_offsets.items()}
+            ),
+            "structure": json.dumps(structure),
+        }
+
+        try:
+            mx.save_safetensors(ckpt_path, arrays, metadata=metadata)
+        except Exception as e:
+            logger.warning(f"[Checkpoint] SAVE FAILED for {session_id}: {e}")
 
     def _mark_dirty(self, session_id: str):
         """Mark a session for disk save on next idle cycle."""
@@ -394,16 +442,83 @@ class MLXEngine:
                 total_cache_tokens=loaded_offset,
                 last_used=last_used,
             )
+
+            # Load checkpoints if available
+            turn_offsets, deltanet_snapshots = self._load_checkpoints_from_disk(session_id)
+            if turn_offsets:
+                session.turn_offsets = turn_offsets
+                session.deltanet_snapshots = deltanet_snapshots
+
             fsize = os.path.getsize(path) / 1e6
+            n_ckpt = len(session.deltanet_snapshots)
             logger.info(
                 f"[KV Cache] session={session_id} | DISK LOAD | "
                 f"{loaded_offset} tokens, {len(messages)} msgs, "
-                f"{fsize:.1f}MB, {elapsed:.2f}s"
+                f"{n_ckpt} checkpoints, {fsize:.1f}MB, {elapsed:.2f}s"
             )
             return session
         except Exception as e:
             logger.error(f"[KV Cache] session={session_id} | DISK LOAD FAILED | {e}")
             return None
+
+    def _load_checkpoints_from_disk(self, session_id: str) -> tuple[dict, dict]:
+        """Load DeltaNet snapshots from disk. Returns (turn_offsets, deltanet_snapshots)."""
+        ckpt_path = self._session_ckpt_path(session_id)
+        if not os.path.exists(ckpt_path):
+            return {}, {}
+
+        try:
+            from safetensors import safe_open
+
+            # Load arrays natively (handles bfloat16)
+            loaded = mx.load(ckpt_path)
+            # Load metadata separately
+            with safe_open(ckpt_path, framework="numpy") as f:
+                metadata = f.metadata()
+
+            turn_offsets = {
+                int(k): v
+                for k, v in json.loads(metadata["turn_offsets"]).items()
+            }
+            structure = json.loads(metadata["structure"])
+
+            # Get template ArraysCache objects from model
+            model_cache = make_prompt_cache(self.model)
+            template_arrays_caches = [
+                c for c in model_cache if type(c).__name__ == "ArraysCache"
+            ]
+
+            deltanet_snapshots = {}
+            for turn_key_str, n_layers in structure.items():
+                turn_key = int(turn_key_str)
+                snapshot = []
+                for layer_idx in range(n_layers):
+                    # Collect state arrays for this layer
+                    states = []
+                    s = 0
+                    while f"t{turn_key}_l{layer_idx}_s{s}" in loaded:
+                        states.append(loaded[f"t{turn_key}_l{layer_idx}_s{s}"])
+                        s += 1
+
+                    # Create ArraysCache from template with loaded state
+                    template = copy.deepcopy(template_arrays_caches[layer_idx])
+                    if len(states) == 1:
+                        template.state = states[0]
+                    else:
+                        template.state = states
+                    snapshot.append(template)
+
+                deltanet_snapshots[turn_key] = snapshot
+
+            logger.debug(
+                f"[Checkpoint] LOADED for {session_id} | "
+                f"{len(deltanet_snapshots)} checkpoints"
+            )
+            return turn_offsets, deltanet_snapshots
+
+        except Exception as e:
+            logger.warning(f"[Checkpoint] LOAD FAILED for {session_id}: {e}")
+            return {}, {}
 
     def _build_disk_index(self):
         """Scan cache_dir for saved session caches."""
@@ -414,7 +529,7 @@ class MLXEngine:
         self._disk_session_ids: set[str] = set()
         count = 0
         for fname in os.listdir(cache_dir):
-            if fname.startswith("session_") and fname.endswith(".safetensors"):
+            if fname.startswith("session_") and fname.endswith(".safetensors") and "_ckpt" not in fname:
                 sid = fname[len("session_"):-len(".safetensors")]
                 self._disk_session_ids.add(sid)
                 count += 1
@@ -867,14 +982,56 @@ class MLXEngine:
                     f"{len(prompt_tokens)} suffix tokens | {new_roles}"
                 )
         else:
-            prev_cached = (
-                self._get_cache_offset(session.cache) if session and session.cache else 0
-            )
-            prompt_tokens = self.tokenize_messages(messages, tools=tools, thinking=use_thinking)
-            total_prompt_tokens = len(prompt_tokens)
+            # Try branch detection first (incoming shorter than stored, prefix matches)
+            branch_restored = False
+            if session and session.cache is not None:
+                branch_point = self._check_branch_match(session.messages, messages)
+                if branch_point is not None:
+                    checkpoint_turn = None
+                    for turn in sorted(session.turn_offsets.keys(), reverse=True):
+                        if turn <= branch_point:
+                            checkpoint_turn = turn
+                            break
+                    if checkpoint_turn is not None and checkpoint_turn in session.deltanet_snapshots:
+                        target_offset = session.turn_offsets[checkpoint_turn]
+                        deltanet_states = session.deltanet_snapshots[checkpoint_turn]
+                        new_cache = []
+                        dn_idx = 0
+                        for c in session.cache:
+                            if type(c).__name__ == "ArraysCache":
+                                new_cache.append(copy.deepcopy(deltanet_states[dn_idx]))
+                                dn_idx += 1
+                            else:
+                                sliced = copy.deepcopy(c)
+                                if hasattr(sliced, 'keys') and sliced.keys is not None:
+                                    sliced.keys = sliced.keys[..., :target_offset, :]
+                                    sliced.values = sliced.values[..., :target_offset, :]
+                                    sliced.offset = target_offset
+                                new_cache.append(sliced)
+                        prompt_cache = new_cache
+                        new_msgs = messages[branch_point:]
+                        if len(new_msgs) == 1 and new_msgs[0]["role"] == "user":
+                            prompt_tokens = self._make_suffix_tokens(new_msgs[0]["content"], thinking=use_thinking)
+                        else:
+                            prompt_tokens = self._make_suffix_tokens_tool_result(new_msgs, thinking=use_thinking)
+                        total_prompt_tokens = target_offset + len(prompt_tokens)
+                        cache_mode = "branch"
+                        branch_restored = True
+                        logger.info(
+                            f"[KV Cache] session={session_id} | BRANCH | "
+                            f"branch_point={branch_point}, checkpoint={checkpoint_turn}, "
+                            f"restored {target_offset} tokens + {len(prompt_tokens)} suffix"
+                        )
+
+            if not branch_restored:
+                prev_cached = (
+                    self._get_cache_offset(session.cache) if session and session.cache else 0
+                )
+                prompt_tokens = self.tokenize_messages(messages, tools=tools, thinking=use_thinking)
+                total_prompt_tokens = len(prompt_tokens)
 
             # Try base cache: reuse system prompt KV cache
-            base = self._find_base_cache(messages, tools=tools)
+            base = self._find_base_cache(messages, tools=tools) if not branch_restored else None
             if base and len(prompt_tokens) >= base.token_count:
                 # Verify token prefix matches
                 if prompt_tokens[:base.token_count] == base.tokens:
@@ -958,6 +1115,10 @@ class MLXEngine:
             "new_tokens": len(prompt_tokens),
             "total_prompt_tokens": total_prompt_tokens,
         }
+        # Include pending build time from branch/regenerate BUILD
+        if session and session.pending_build_time > 0:
+            response_cache_info["build_time"] = round(session.pending_build_time, 2)
+            session.pending_build_time = 0.0  # consume once
 
         sampling_info = f"temp={temperature}"
         if top_p < 1.0:
@@ -1052,15 +1213,40 @@ class MLXEngine:
         if session_id:
             new_offset = self._get_cache_offset(prompt_cache)
             prev_offset = session.total_cache_tokens if session else 0
+
+            # Preserve existing checkpoints
+            prev_turn_offsets = session.turn_offsets if session else {}
+            prev_deltanet_snapshots = session.deltanet_snapshots if session else {}
+
             self._sessions[session_id] = SessionState(
                 cache=prompt_cache,
                 messages=messages,
                 total_cache_tokens=new_offset,
+                turn_offsets=prev_turn_offsets,
+                deltanet_snapshots=prev_deltanet_snapshots,
             )
+
+            # Save checkpoint: DeltaNet snapshot + KVCache offset
+            session_state = self._sessions[session_id]
+            turn_key = len(messages)
+            session_state.turn_offsets[turn_key] = new_offset
+            session_state.deltanet_snapshots[turn_key] = [
+                copy.deepcopy(c) for c in prompt_cache
+                if type(c).__name__ == "ArraysCache"
+            ]
+            # Prune old checkpoints
+            max_ckpt = self.cfg.max_checkpoints if hasattr(self.cfg, 'max_checkpoints') else DEFAULT_MAX_CHECKPOINTS
+            if max_ckpt > 0:
+                while len(session_state.deltanet_snapshots) > max_ckpt:
+                    oldest_key = min(session_state.deltanet_snapshots.keys())
+                    del session_state.deltanet_snapshots[oldest_key]
+                    del session_state.turn_offsets[oldest_key]
+
             logger.debug(
                 f"[KV Cache] session={session_id} | SAVED | "
                 f"offset: {prev_offset} -> {new_offset} tokens "
-                f"(+{new_offset - prev_offset})"
+                f"(+{new_offset - prev_offset}), "
+                f"checkpoints={len(session_state.turn_offsets)}"
             )
 
         # Auto-register base cache on full miss (system prompt not yet cached)
@@ -1321,10 +1507,10 @@ class MLXEngine:
             self._dirty_sessions.discard(session_id)
         if session_id in self._sessions:
             del self._sessions[session_id]
-        # Remove disk cache
-        path = self._session_cache_path(session_id)
-        if os.path.exists(path):
-            os.remove(path)
+        # Remove disk cache + checkpoints
+        for p in [self._session_cache_path(session_id), self._session_ckpt_path(session_id)]:
+            if os.path.exists(p):
+                os.remove(p)
         if hasattr(self, "_disk_session_ids"):
             self._disk_session_ids.discard(session_id)
         logger.info(f"[Session] DELETED | session={session_id}")
@@ -1395,6 +1581,314 @@ class MLXEngine:
             cancel_event.set()
             logger.debug("[Stream] Client disconnected — cancelling generation")
             raise
+
+    # --- Branching & Regeneration ---
+
+    def branch_from_turn(
+        self,
+        source_session_id: str,
+        new_session_id: str,
+        branch_turn: int,
+        branch_messages: list[dict] | None = None,
+    ) -> dict:
+        """Branch a new session from a specific turn of an existing session.
+
+        If a checkpoint exists at or before branch_turn, restore from it
+        (fast: DeltaNet deepcopy + KVCache slice).
+        Otherwise, build the cache from scratch by processing branch_messages
+        through the model (slower but always works).
+        """
+        source = self._sessions.get(source_session_id)
+
+        # Load from disk if not in memory
+        if not source and self._has_disk_cache(source_session_id):
+            source = self._load_session_from_disk(source_session_id)
+            if source:
+                self._sessions[source_session_id] = source
+
+        # Determine branch messages from source or caller
+        if source:
+            engine_messages = source.messages[:branch_turn]
+        elif branch_messages:
+            engine_messages = branch_messages
+        else:
+            return {"error": "source session not found and no messages provided"}
+
+        # Fast path 1: full copy (branch at end of conversation — no checkpoint needed)
+        if source and source.cache is not None and branch_turn >= len(source.messages):
+            with self._lock:
+                new_cache = copy.deepcopy(source.cache)
+                target_offset = source.total_cache_tokens
+                new_session = SessionState(
+                    cache=new_cache,
+                    messages=list(source.messages),
+                    total_cache_tokens=target_offset,
+                )
+                # Copy all existing checkpoints
+                for turn, offset in source.turn_offsets.items():
+                    new_session.turn_offsets[turn] = offset
+                    if turn in source.deltanet_snapshots:
+                        new_session.deltanet_snapshots[turn] = copy.deepcopy(
+                            source.deltanet_snapshots[turn]
+                        )
+                self._sessions[new_session_id] = new_session
+                self._mark_dirty(new_session_id)
+
+            logger.info(
+                f"[Branch] {source_session_id} -> {new_session_id} | "
+                f"COPY | cached_tokens={target_offset}, messages={len(source.messages)}"
+            )
+            return {
+                "status": "ok",
+                "method": "copy",
+                "cached_tokens": target_offset,
+                "messages": len(source.messages),
+            }
+
+        # Fast path 2: checkpoint restore (branch at earlier turn)
+        checkpoint_turn = None
+        if source:
+            for turn in sorted(source.turn_offsets.keys(), reverse=True):
+                if turn <= branch_turn:
+                    checkpoint_turn = turn
+                    break
+
+        if checkpoint_turn is not None and source:
+            # Restore from checkpoint
+            with self._lock:
+                deltanet_states = source.deltanet_snapshots[checkpoint_turn]
+                target_offset = source.turn_offsets[checkpoint_turn]
+
+                new_cache = []
+                dn_idx = 0
+                for c in source.cache:
+                    if type(c).__name__ == "ArraysCache":
+                        new_cache.append(copy.deepcopy(deltanet_states[dn_idx]))
+                        dn_idx += 1
+                    else:
+                        sliced = copy.deepcopy(c)
+                        if hasattr(sliced, 'keys') and sliced.keys is not None:
+                            sliced.keys = sliced.keys[..., :target_offset, :]
+                            sliced.values = sliced.values[..., :target_offset, :]
+                            sliced.offset = target_offset
+                        new_cache.append(sliced)
+
+                new_session = SessionState(
+                    cache=new_cache,
+                    messages=engine_messages,
+                    total_cache_tokens=target_offset,
+                )
+                for turn, offset in source.turn_offsets.items():
+                    if turn <= checkpoint_turn:
+                        new_session.turn_offsets[turn] = offset
+                        if turn in source.deltanet_snapshots:
+                            new_session.deltanet_snapshots[turn] = copy.deepcopy(
+                                source.deltanet_snapshots[turn]
+                            )
+                self._sessions[new_session_id] = new_session
+                self._mark_dirty(new_session_id)
+
+            logger.info(
+                f"[Branch] {source_session_id} -> {new_session_id} | "
+                f"CHECKPOINT | turn={branch_turn}, checkpoint={checkpoint_turn}, "
+                f"cached_tokens={target_offset}, messages={len(engine_messages)}"
+            )
+            return {
+                "status": "ok",
+                "method": "checkpoint",
+                "cached_tokens": target_offset,
+                "messages": len(engine_messages),
+            }
+        else:
+            # Slow path: build cache from scratch by processing messages
+            with self._lock:
+                self._touch_gpu()
+                t0 = time.perf_counter()
+                prompt_tokens = self.tokenize_messages(engine_messages)
+
+                # Try base cache first
+                prompt_cache = None
+                base = self._find_base_cache(engine_messages)
+                if base and len(prompt_tokens) >= base.token_count:
+                    if prompt_tokens[:base.token_count] == base.tokens:
+                        prompt_cache = self._clone_base_cache(base)
+                        prompt_tokens = prompt_tokens[base.token_count:]
+
+                if prompt_cache is None:
+                    prompt_cache = make_prompt_cache(self.model)
+
+                # Process tokens through model (no generation)
+                if prompt_tokens:
+                    tokens_array = mx.array(prompt_tokens)
+                    step_size = 512
+                    for i in range(0, len(prompt_tokens), step_size):
+                        chunk = tokens_array[i : i + step_size]
+                        self.model(chunk[None], cache=prompt_cache)
+                    self._eval_cache(prompt_cache)
+
+                new_offset = self._get_cache_offset(prompt_cache)
+                elapsed = time.perf_counter() - t0
+
+                new_session = SessionState(
+                    cache=prompt_cache,
+                    messages=engine_messages,
+                    total_cache_tokens=new_offset,
+                )
+                new_session.pending_build_time = elapsed
+                # Save checkpoint so immediate regen/delete is fast
+                turn_key = len(engine_messages)
+                new_session.turn_offsets[turn_key] = new_offset
+                new_session.deltanet_snapshots[turn_key] = [
+                    copy.deepcopy(c) for c in prompt_cache
+                    if type(c).__name__ == "ArraysCache"
+                ]
+                self._sessions[new_session_id] = new_session
+                self._mark_dirty(new_session_id)
+
+            logger.info(
+                f"[Branch] {source_session_id} -> {new_session_id} | "
+                f"BUILD | turn={branch_turn}, "
+                f"cached_tokens={new_offset}, messages={len(engine_messages)}, "
+                f"{elapsed:.2f}s"
+            )
+            return {
+                "status": "ok",
+                "method": "build",
+                "build_time": round(elapsed, 2),
+                "cached_tokens": new_offset,
+                "messages": len(engine_messages),
+            }
+
+    def prepare_regenerate(self, session_id: str) -> dict:
+        """Remove last assistant+user pair and restore cache to before them.
+
+        Delegates to truncate_session for cache restoration.
+        """
+        session = self._sessions.get(session_id)
+        if not session or len(session.messages) < 2:
+            return {"error": "nothing to regenerate"}
+
+        last_msg = session.messages[-1]
+        if last_msg.get("role") != "assistant":
+            return {"error": "last message is not assistant"}
+
+        restore_to = len(session.messages) - 2  # before user msg
+        result = self.truncate_session(session_id, restore_to)
+        if result.get("status") == "ok":
+            result["turn"] = restore_to
+        return result
+
+    def truncate_session(self, session_id: str, target_msg_count: int) -> dict:
+        """Truncate session to target_msg_count messages, restoring cache.
+
+        Used by delete-last-message and regenerate.
+        Tries checkpoint first, falls back to BUILD.
+        """
+        session = self._sessions.get(session_id)
+        # Load from disk if not in memory
+        if not session and self._has_disk_cache(session_id):
+            session = self._load_session_from_disk(session_id)
+            if session:
+                self._sessions[session_id] = session
+        if not session:
+            return {"error": "session not found"}
+        if target_msg_count >= len(session.messages):
+            return {"error": "nothing to truncate"}
+
+        restore_messages = session.messages[:target_msg_count]
+
+        # Try checkpoint restore
+        checkpoint_turn = None
+        for turn in sorted(session.turn_offsets.keys(), reverse=True):
+            if turn <= target_msg_count:
+                checkpoint_turn = turn
+                break
+
+        if checkpoint_turn is not None and checkpoint_turn in session.deltanet_snapshots:
+            target_offset = session.turn_offsets[checkpoint_turn]
+            deltanet_states = session.deltanet_snapshots[checkpoint_turn]
+
+            new_cache = []
+            dn_idx = 0
+            for c in session.cache:
+                if type(c).__name__ == "ArraysCache":
+                    new_cache.append(copy.deepcopy(deltanet_states[dn_idx]))
+                    dn_idx += 1
+                else:
+                    sliced = copy.deepcopy(c)
+                    if hasattr(sliced, 'keys') and sliced.keys is not None:
+                        sliced.keys = sliced.keys[..., :target_offset, :]
+                        sliced.values = sliced.values[..., :target_offset, :]
+                        sliced.offset = target_offset
+                    new_cache.append(sliced)
+
+            session.cache = new_cache
+            session.messages = restore_messages
+            session.total_cache_tokens = target_offset
+            logger.info(
+                f"[Truncate] session={session_id} | CHECKPOINT | "
+                f"turn={checkpoint_turn}, offset={target_offset}, msgs={target_msg_count}"
+            )
+            return {"status": "ok", "method": "checkpoint", "cached_tokens": target_offset}
+        else:
+            with self._lock:
+                self._touch_gpu()
+                t0 = time.perf_counter()
+                prompt_tokens = self.tokenize_messages(restore_messages)
+
+                prompt_cache = None
+                base = self._find_base_cache(restore_messages)
+                if base and len(prompt_tokens) >= base.token_count:
+                    if prompt_tokens[:base.token_count] == base.tokens:
+                        prompt_cache = self._clone_base_cache(base)
+                        prompt_tokens = prompt_tokens[base.token_count:]
+                if prompt_cache is None:
+                    prompt_cache = make_prompt_cache(self.model)
+
+                if prompt_tokens:
+                    tokens_array = mx.array(prompt_tokens)
+                    step_size = 512
+                    for i in range(0, len(prompt_tokens), step_size):
+                        chunk = tokens_array[i : i + step_size]
+                        self.model(chunk[None], cache=prompt_cache)
+                    self._eval_cache(prompt_cache)
+
+                new_offset = self._get_cache_offset(prompt_cache)
+                elapsed = time.perf_counter() - t0
+
+                session.cache = prompt_cache
+                session.messages = restore_messages
+                session.total_cache_tokens = new_offset
+                session.pending_build_time = elapsed
+                # Save checkpoint
+                turn_key = len(restore_messages)
+                session.turn_offsets[turn_key] = new_offset
+                session.deltanet_snapshots[turn_key] = [
+                    copy.deepcopy(c) for c in prompt_cache
+                    if type(c).__name__ == "ArraysCache"
+                ]
+
+            logger.info(
+                f"[Truncate] session={session_id} | BUILD | "
+                f"{new_offset} tokens, msgs={target_msg_count}, {elapsed:.2f}s"
+            )
+            return {"status": "ok", "method": "build", "build_time": round(elapsed, 2), "cached_tokens": new_offset}
+
+    def _check_branch_match(self, stored: list[dict], incoming: list[dict]) -> int | None:
+        """If incoming is shorter than stored and prefix matches, return branch point."""
+        if len(incoming) >= len(stored):
+            return None
+        prefix_len = len(incoming) - 1
+        if prefix_len <= 0:
+            return None
+        for i in range(prefix_len):
+            s_msg = stored[i]
+            i_msg = incoming[i]
+            if s_msg.get("role") != i_msg.get("role"):
+                return None
+            if s_msg.get("content") != i_msg.get("content"):
+                return None
+        return prefix_len
 
     def session_stats(self) -> dict:
         return {

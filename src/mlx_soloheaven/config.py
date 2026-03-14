@@ -63,6 +63,9 @@ class Config:
     memory_budget_gb: float = 200.0
     disk_budget_gb: float = 100.0
 
+    # Branching: max DeltaNet checkpoints per session (0=unlimited)
+    max_checkpoints: int = 50
+
     # Paths
     data_dir: str = "./data"
 
@@ -140,6 +143,7 @@ class Config:
             enable_thinking=not args.no_thinking,
             memory_budget_gb=args.memory_budget_gb,
             disk_budget_gb=args.disk_budget_gb,
+            max_checkpoints=args.max_checkpoints,
             data_dir=args.data_dir,
             verbose=args.verbose,
             gpu_keepalive=args.gpu_keepalive,

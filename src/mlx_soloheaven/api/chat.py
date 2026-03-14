@@ -67,6 +67,10 @@ class AddMemoryRequest(BaseModel):
     importance: int = 5
 
 
+class BranchRequest(BaseModel):
+    turn: int  # message index to branch from (0-based, inclusive)
+
+
 # --- Session endpoints ---
 
 @router.post("/sessions")
@@ -295,6 +299,7 @@ async def _stream_chat(
     t_gen_actual = None
     queue_wait = 0.0
     client_disconnected = False
+    engine_cache_info = None
 
     try:
         async for result in eng.generate_stream_async(
@@ -318,6 +323,9 @@ async def _stream_chat(
                 completion_tokens = result.completion_tokens
                 gen_tps = result.generation_tps
                 prompt_tps = result.prompt_tps
+                # Merge engine cache_info (includes build_time from branch/regenerate)
+                if result.cache_info:
+                    engine_cache_info = result.cache_info
                 break
 
             if result.text:
@@ -346,10 +354,16 @@ async def _stream_chat(
 
     thinking, content = split_thinking_and_content(accumulated_text)
 
+    # Include build_time from branch/regenerate BUILD if available
+    build_time = 0.0
+    if engine_cache_info and "build_time" in engine_cache_info:
+        build_time = engine_cache_info["build_time"]
+
     stats = {
         "ttft": round(engine_ttft, 2),
         "queue_wait": round(queue_wait, 2),
         "total_time": round(total_time, 2),
+        "build_time": build_time,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "gen_tps": round(gen_tps, 1),
@@ -418,6 +432,126 @@ async def _sync_chat(session_id: str, messages: list[dict], eng: MLXEngine | Non
             "completion_tokens": result.completion_tokens,
         },
     }
+
+
+# --- Branch & Regenerate ---
+
+@router.post("/sessions/{session_id}/branch")
+async def branch_session(session_id: str, req: BranchRequest):
+    """Branch a new session from a specific turn."""
+    source = await db.get_session(session_id)
+    if not source:
+        raise HTTPException(404, "Session not found")
+
+    source_messages = await db.get_messages(session_id)
+    branch_messages = source_messages[:req.turn]
+
+    title = (source.get("title", "New Chat") + " (branch)")[:50]
+    new_session = await db.create_session(
+        title=title,
+        system_prompt=source.get("system_prompt", ""),
+        branched_from=session_id,
+        branch_turn=req.turn,
+    )
+    new_id = new_session["id"]
+
+    for msg in branch_messages:
+        await db.add_message(
+            new_id, msg["role"],
+            content=msg.get("content"),
+            tool_calls=msg.get("tool_calls"),
+            tool_call_id=msg.get("tool_call_id"),
+            thinking=msg.get("thinking"),
+            token_count=msg.get("token_count", 0),
+            stats=msg.get("stats"),
+        )
+
+    # Build engine messages (with system prompt, same format as chat endpoint)
+    engine_msgs = []
+    system_prompt = source.get("system_prompt", "")
+    if system_prompt:
+        engine_msgs.append({"role": "system", "content": system_prompt})
+    for msg in branch_messages:
+        m = {"role": msg["role"]}
+        if msg.get("content"):
+            m["content"] = msg["content"]
+        if msg.get("tool_calls"):
+            m["tool_calls"] = msg["tool_calls"]
+        if msg.get("tool_call_id"):
+            m["tool_call_id"] = msg["tool_call_id"]
+        engine_msgs.append(m)
+
+    # Engine branch: checkpoint restore (fast) or build from scratch (slow)
+    eng = _get_engine(None)
+    engine_turn = len(engine_msgs)
+    result = eng.branch_from_turn(session_id, new_id, engine_turn, branch_messages=engine_msgs)
+
+    return {
+        "session_id": new_id,
+        "title": title,
+        "cached_tokens": result.get("cached_tokens", 0),
+        "method": result.get("method", "none"),
+        "messages": len(branch_messages),
+    }
+
+
+@router.post("/sessions/{session_id}/delete-last")
+async def delete_last_turn(session_id: str):
+    """Delete the last user+assistant pair and restore cache state."""
+    messages = await db.get_messages(session_id)
+    if len(messages) < 2:
+        raise HTTPException(400, "Not enough messages to delete")
+
+    # Delete assistant then user (last pair)
+    await db.delete_last_message(session_id)
+    await db.delete_last_message(session_id)
+
+    # Build engine messages for remaining
+    source = await db.get_session(session_id)
+    remaining_db = messages[:-2]
+    engine_msgs = []
+    system_prompt = source.get("system_prompt", "") if source else ""
+    if system_prompt:
+        engine_msgs.append({"role": "system", "content": system_prompt})
+    for msg in remaining_db:
+        m = {"role": msg["role"]}
+        if msg.get("content"):
+            m["content"] = msg["content"]
+        if msg.get("tool_calls"):
+            m["tool_calls"] = msg["tool_calls"]
+        if msg.get("tool_call_id"):
+            m["tool_call_id"] = msg["tool_call_id"]
+        engine_msgs.append(m)
+
+    # Truncate engine session
+    eng = _get_engine(None)
+    result = eng.truncate_session(session_id, len(engine_msgs))
+
+    return {
+        "status": "ok",
+        "remaining_messages": len(remaining_db),
+        **result,
+    }
+
+
+@router.post("/sessions/{session_id}/regenerate")
+async def regenerate_session(session_id: str):
+    """Remove last assistant+user pair and prepare for regeneration."""
+    messages = await db.get_messages(session_id)
+    if not messages or messages[-1]["role"] != "assistant":
+        raise HTTPException(400, "Nothing to regenerate")
+
+    # Delete assistant message
+    await db.delete_last_message(session_id)
+
+    # Restore engine cache
+    eng = _get_engine(None)
+    result = eng.prepare_regenerate(session_id)
+
+    # Delete user message (frontend will re-send it)
+    await db.delete_last_message(session_id)
+
+    return {"status": "ok", "remaining_messages": len(messages) - 2, **result}
 
 
 # --- Memory endpoints ---

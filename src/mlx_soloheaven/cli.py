@@ -95,6 +95,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="On-disk KV cache budget in GB (default: 100)",
     )
     p.add_argument(
+        "--max-checkpoints",
+        type=int,
+        default=int(_env("MAX_CHECKPOINTS", "50")),
+        help="Max DeltaNet checkpoints per session for branching (default: 50, 0=unlimited)",
+    )
+    p.add_argument(
         "--data-dir",
         default=_env("DATA_DIR", "./data"),
         help="Directory for SQLite DB and KV cache files (default: ./data)",

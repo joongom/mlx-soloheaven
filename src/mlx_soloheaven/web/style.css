@@ -502,6 +502,41 @@ body {
     font-style: italic;
 }
 
+/* ===== MESSAGE ACTIONS (Branch/Regenerate) ===== */
+.msg-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+    opacity: 0;
+    transition: opacity 0.15s;
+}
+.msg:hover .msg-actions { opacity: 1; }
+.msg-action-btn {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 3px 10px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-family: var(--font-sans);
+    transition: all 0.12s;
+}
+.msg-action-btn:hover {
+    color: var(--text-primary);
+    border-color: var(--accent);
+    background: var(--accent-subtle);
+}
+.msg-action-btn svg { flex-shrink: 0; }
+.msg-action-delete:hover {
+    color: #ef4444;
+    border-color: #ef4444;
+    background: rgba(239, 68, 68, 0.1);
+}
+
 /* ===== STREAMING CURSOR (pure CSS — always tracks last content) ===== */
 .msg-assistant.streaming #live-content > *:last-child::after,
 .msg-assistant.streaming .thinking-body.show > *:last-child::after {

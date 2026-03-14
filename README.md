@@ -15,8 +15,11 @@ SoloHeaven turns your Mac into a personal AI server with sub-second response tim
 - **Budget-based cache eviction** — No time-based TTL, evicts LRU only when memory/disk budget exceeded
 - **GPU keepalive** — Optional Metal idle prevention with periodic micro-computations (`--gpu-keepalive`)
 - **Full OpenAI API compatibility** — Streaming SSE, tool calling, `developer` role, `/v1/chat/completions`, `/v1/models`
-- **Built-in web UI** — Chat interface with model selector, live thinking display, TPS stats, and cache hit indicators
+- **Built-in web UI** — Chat interface with model selector, live thinking display, TPS stats, cache hit indicators, branch/regenerate/delete controls
 - **Admin dashboard** — Real-time log viewer, cache/DB overview, and reset controls at `/admin`
+- **Conversation branching** — Fork any conversation at any turn with instant KV cache restore from DeltaNet checkpoints
+- **Regenerate & Delete** — Re-roll the last response or remove turns, with cache state automatically restored
+- **DeltaNet checkpoint persistence** — Turn-level snapshots saved to disk, survive server restarts
 - **Disk persistence** — KV caches survive server restarts via safetensors serialization
 - **Client disconnect handling** — Frees the generation lock immediately, tolerates content mismatches on reconnect
 - **Base cache pool** — System prompt KV caches shared across sessions for fast cold starts
@@ -399,6 +402,9 @@ SoloHeaven handles common quirks of OpenAI-compatible clients:
 │  ├── /api/admin/*          (Admin dashboard) │
 │  ├── /api/sessions/*/settings  (per-session) │
 │  ├── /api/sessions/*/compact   (compaction)  │
+│  ├── /api/sessions/*/branch    (branching)   │
+│  ├── /api/sessions/*/regenerate              │
+│  ├── /api/sessions/*/delete-last             │
 │  └── /health                                 │
 ├──────────────────────────────────────────────┤
 │  MLX Engine (per model, shared GPU lock)     │
@@ -408,8 +414,9 @@ SoloHeaven handles common quirks of OpenAI-compatible clients:
 │  ├── Thinking budget processor (logits)      │
 │  ├── Tool call parser (XML ↔ OpenAI JSON)    │
 │  ├── GPU keepalive thread (optional)         │
+│  ├── DeltaNet checkpoints (branch/regen)     │
 │  ├── Client disconnect cancellation          │
-│  └── Disk persistence (safetensors)          │
+│  └── Disk persistence (safetensors + ckpt)   │
 ├──────────────────────────────────────────────┤
 │  Cache Manager                               │
 │  ├── Budget-based LRU eviction               │
@@ -442,6 +449,7 @@ This works because OpenAI API clients always send the full conversation history,
 | `hit_multi` | Multiple new messages (e.g., tool results) | Reuse cached prefix, process all new messages |
 | `base_hit` | System prompt matches base cache pool | Clone base cache, process remaining tokens |
 | `base_build` | New system prompt, no base cache | Process system tokens, register base cache |
+| `branch` | Incoming shorter than stored, prefix matches | Restore from DeltaNet checkpoint, process new suffix |
 | `retry` | Same session, messages don't match | Discard stale cache, full re-process |
 | `miss` | New session | Full process from scratch |
 
@@ -493,7 +501,45 @@ Qwen3.5 uses a hybrid architecture: 36 DeltaNet layers (linear attention with re
 
 - **DeltaNet layers (ArraysCache)** store compressed recurrent state — cannot be sliced or partially reused
 - **Full attention layers (KVCache)** store standard key-value pairs — can be sliced but must stay consistent with DeltaNet state
-- **Cache must be all-or-nothing** — partial cache cutting is impossible because DeltaNet recurrent state cannot be rolled back to an arbitrary position
+- **DeltaNet state is non-reversible** — cannot be rolled back to an arbitrary position. SoloHeaven solves this with turn-level DeltaNet snapshots (checkpoints) that enable instant cache restoration at any turn boundary
+
+### Conversation Branching & Regeneration
+
+SoloHeaven supports branching conversations at any turn, regenerating responses, and deleting turns — all with instant KV cache restoration.
+
+**The challenge:** In Qwen3.5's hybrid architecture, KVCache (full attention) can be sliced by offset, but DeltaNet (linear attention) is a recurrent state that cannot be reversed. To branch at turn 5 of a 10-turn conversation, you need the exact DeltaNet state at turn 5.
+
+**The solution:** Save a DeltaNet snapshot (`deepcopy`) at every turn boundary. These checkpoints are persisted to disk alongside the main cache.
+
+```
+Turn 1: [sys, user1] → generate → checkpoint #1 (DeltaNet snapshot + KV offset)
+Turn 2: [sys, user1, asst1, user2] → generate → checkpoint #2
+Turn 3: [sys, user1, asst1, user2, asst2, user3] → generate → checkpoint #3
+...
+Branch at Turn 2:
+  1. Find checkpoint #2
+  2. Restore DeltaNet state (deepcopy from snapshot)
+  3. Slice KVCache to checkpoint offset
+  4. New session ready — next message is a cache HIT
+```
+
+**Branch modes:**
+
+| Mode | When | Speed |
+|------|------|-------|
+| **COPY** | Branch at last turn (full conversation copy) | Instant (deepcopy) |
+| **CHECKPOINT** | Branch at earlier turn, checkpoint exists | Instant (snapshot restore + KV slice) |
+| **BUILD** | No checkpoint available (e.g., pre-existing sessions) | 2-3s (prefill from scratch) |
+
+**Disk persistence:**
+
+Each session stores two files:
+- `session_{id}.safetensors` — KV cache (existing)
+- `session_{id}_ckpt.safetensors` — DeltaNet snapshots at each turn boundary
+
+After server restart, checkpoints are loaded from disk — branching and regeneration remain instant without needing to rebuild.
+
+**Storage cost:** ~5MB per checkpoint (36 DeltaNet layers × fixed-size state), max 50 checkpoints per session (~250MB). Negligible compared to the KV cache itself (100-200MB per session).
 
 ## API Reference
 
@@ -515,6 +561,9 @@ Qwen3.5 uses a hybrid architecture: 36 DeltaNet layers (linear attention with re
 | DELETE | `/api/sessions/{id}` | Delete session |
 | GET | `/api/sessions/{id}/messages` | Get all messages |
 | POST | `/api/sessions/{id}/chat` | Send message (SSE streaming) |
+| POST | `/api/sessions/{id}/branch` | Branch conversation at a specific turn |
+| POST | `/api/sessions/{id}/regenerate` | Remove last turn and regenerate |
+| POST | `/api/sessions/{id}/delete-last` | Delete last user+assistant turn |
 
 ### Settings & Compaction
 

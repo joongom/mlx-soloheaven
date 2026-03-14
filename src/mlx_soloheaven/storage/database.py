@@ -143,6 +143,18 @@ async def init_db():
         except Exception:
             pass
 
+        try:
+            await db.execute("ALTER TABLE sessions ADD COLUMN branched_from TEXT")
+            await db.commit()
+        except Exception:
+            pass
+
+        try:
+            await db.execute("ALTER TABLE sessions ADD COLUMN branch_turn INTEGER")
+            await db.commit()
+        except Exception:
+            pass
+
 
 # --- Sessions ---
 
@@ -154,16 +166,19 @@ async def create_session(
     max_tokens: int = 32768,
     context_window_limit: int = 100000,
     compaction_strategy: str = "summarize",
+    branched_from: str | None = None,
+    branch_turn: int | None = None,
 ) -> dict:
     now = time.time()
     sid = uuid.uuid4().hex[:16]
     async with get_db() as db:
         await db.execute(
             "INSERT INTO sessions (id, title, system_prompt, temperature, thinking_budget, "
-            "max_tokens, context_window_limit, compaction_strategy, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "max_tokens, context_window_limit, compaction_strategy, branched_from, branch_turn, "
+            "created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (sid, title, system_prompt, temperature, thinking_budget, max_tokens,
-             context_window_limit, compaction_strategy, now, now),
+             context_window_limit, compaction_strategy, branched_from, branch_turn, now, now),
         )
         await db.commit()
     return {
@@ -175,6 +190,8 @@ async def create_session(
         "max_tokens": max_tokens,
         "context_window_limit": context_window_limit,
         "compaction_strategy": compaction_strategy,
+        "branched_from": branched_from,
+        "branch_turn": branch_turn,
         "created_at": now,
         "updated_at": now,
     }
@@ -406,6 +423,18 @@ async def update_session_compacted_state(
     # 2. Insert new compacted messages
     # 3. Update total_prompt_tokens
     pass
+
+
+async def delete_last_message(session_id: str):
+    """Delete the last message in a session."""
+    async with get_db() as db:
+        await db.execute(
+            "DELETE FROM messages WHERE id = ("
+            "  SELECT id FROM messages WHERE session_id = ? "
+            "  ORDER BY created_at DESC LIMIT 1"
+            ")", (session_id,)
+        )
+        await db.commit()
 
 
 # --- Memories (long-term) ---

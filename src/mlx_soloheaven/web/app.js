@@ -159,9 +159,10 @@ async function loadMessages(sessionId) {
         messagesEl.innerHTML = emptyState();
         return;
     }
-    messagesEl.innerHTML = messages.map(m => {
+    const lastIdx = messages.length - 1;
+    messagesEl.innerHTML = messages.map((m, i) => {
         if (m.role === 'user') return userMsgHtml(m.content);
-        if (m.role === 'assistant') return assistantMsgHtml(m.content, m.thinking, m.stats);
+        if (m.role === 'assistant') return assistantMsgHtml(m.content, m.thinking, m.stats, i, i === lastIdx);
         return '';
     }).join('');
     scrollBottom();
@@ -343,6 +344,24 @@ async function sendMessage() {
         msgEl.insertAdjacentHTML('beforeend', buildStatsBar(stats));
     }
 
+    // Add action buttons (Branch + Regenerate + Delete)
+    msgEl.insertAdjacentHTML('beforeend', `<div class="msg-actions">
+        <button class="msg-action-btn" onclick="branchFromEl(this)" title="Branch from here">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="6" y1="3" x2="6" y2="15"></line><circle cx="18" cy="6" r="3"></circle>
+                <circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path>
+            </svg> Branch</button>
+        <button class="msg-action-btn" onclick="regenerate()" title="Regenerate response">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="23 4 23 10 17 10"></polyline>
+                <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+            </svg> Regenerate</button>
+        <button class="msg-action-btn msg-action-delete" onclick="deleteLast()" title="Delete last message">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+            </svg> Delete</button>
+    </div>`);
+
     isStreaming = false;
     _sending = false;
     sendBtn.disabled = false;
@@ -367,7 +386,7 @@ function userMsgHtml(content) {
     </div>`;
 }
 
-function assistantMsgHtml(content, thinking, stats) {
+function assistantMsgHtml(content, thinking, stats, msgIndex, isLast) {
     let html = '<div class="msg msg-assistant"><div class="msg-header">Assistant</div>';
     if (thinking) {
         html += `<div class="thinking-block">
@@ -380,6 +399,26 @@ function assistantMsgHtml(content, thinking, stats) {
     }
     html += `<div class="msg-body">${renderMarkdown(content || '')}</div>`;
     if (stats) html += buildStatsBar(stats);
+    if (msgIndex !== undefined) {
+        html += `<div class="msg-actions">`;
+        html += `<button class="msg-action-btn" onclick="branchFrom(${msgIndex})" title="Branch from here">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="6" y1="3" x2="6" y2="15"></line><circle cx="18" cy="6" r="3"></circle>
+                <circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path>
+            </svg> Branch</button>`;
+        if (isLast) {
+            html += `<button class="msg-action-btn" onclick="regenerate()" title="Regenerate response">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="23 4 23 10 17 10"></polyline>
+                    <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+                </svg> Regenerate</button>`;
+            html += `<button class="msg-action-btn msg-action-delete" onclick="deleteLast()" title="Delete last message">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                </svg> Delete</button>`;
+        }
+        html += `</div>`;
+    }
     html += '</div>';
     return html;
 }
@@ -397,8 +436,12 @@ function buildStatsBar(stats) {
     const queueTag = stats.queue_wait > 0
         ? `<span class="stat-item"><span class="stat-label">Queue</span> <span class="stat-value" style="color:var(--yellow)">${stats.queue_wait}s</span></span>`
         : '';
+    const buildTag = stats.build_time > 0
+        ? `<span class="stat-item"><span class="stat-label">Cache Build</span> <span class="stat-value" style="color:var(--accent)">${stats.build_time}s</span></span>`
+        : '';
     return `<div class="stats-bar">
         ${cacheTag}
+        ${buildTag}
         <span class="stat-item"><span class="stat-label">TTFT</span> <span class="stat-value">${stats.ttft}s</span></span>
         ${queueTag}
         <span class="stat-item"><span class="stat-label">TPS</span> <span class="stat-value">${stats.gen_tps}</span></span>
@@ -413,6 +456,70 @@ function toggleThink(headerEl) {
     const body = headerEl.nextElementSibling;
     icon.classList.toggle('open');
     body.classList.toggle('show');
+}
+
+// ===== BRANCH & REGENERATE =====
+
+function branchFromEl(btnEl) {
+    // Find message index from DOM position
+    const msgEl = btnEl.closest('.msg');
+    const allMsgs = Array.from(messagesEl.querySelectorAll('.msg'));
+    const msgIndex = allMsgs.indexOf(msgEl);
+    if (msgIndex >= 0) branchFrom(msgIndex);
+}
+
+async function branchFrom(msgIndex) {
+    if (!currentSessionId || isStreaming) return;
+    if (!confirm('Create a branch from this point?')) return;
+    try {
+        const res = await fetch(`${API}/api/sessions/${currentSessionId}/branch`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ turn: msgIndex + 1 }),
+        });
+        if (!res.ok) { alert('Branch failed: ' + res.statusText); return; }
+        const data = await res.json();
+        await loadSessions();
+        await switchSession(data.session_id);
+    } catch (err) { alert('Branch failed: ' + err.message); }
+}
+
+async function regenerate() {
+    if (!currentSessionId || isStreaming) return;
+    try {
+        const msgs = await (await fetch(`${API}/api/sessions/${currentSessionId}/messages`)).json();
+        const last = msgs[msgs.length - 1];
+        if (!last || last.role !== 'assistant') return;
+        const userMsg = msgs[msgs.length - 2];
+        if (!userMsg || userMsg.role !== 'user') return;
+        const userContent = userMsg.content;
+
+        await fetch(`${API}/api/sessions/${currentSessionId}/regenerate`, { method: 'POST' });
+
+        // Remove last assistant + user from UI
+        const allMsgs = messagesEl.querySelectorAll('.msg');
+        if (allMsgs.length >= 2) {
+            allMsgs[allMsgs.length - 1].remove();
+            allMsgs[allMsgs.length - 2].remove();
+        }
+
+        // Re-send through normal flow
+        inputEl.value = userContent;
+        await sendMessage();
+    } catch (err) { alert('Regenerate failed: ' + err.message); }
+}
+
+async function deleteLast() {
+    if (!currentSessionId || isStreaming) return;
+    try {
+        const res = await fetch(`${API}/api/sessions/${currentSessionId}/delete-last`, {
+            method: 'POST',
+        });
+        if (!res.ok) { alert('Delete failed: ' + res.statusText); return; }
+
+        // Reload messages (button state, last-message markers)
+        await loadMessages(currentSessionId);
+    } catch (err) { alert('Delete failed: ' + err.message); }
 }
 
 // ===== UTILITIES =====
@@ -440,8 +547,12 @@ async function loadCacheStats() {
     try {
         const r = await fetch(`${API}/api/cache/stats`);
         const s = await r.json();
+        const sessions = s.sessions || {};
+        const cached = Object.keys(sessions).length;
+        const totalTokens = Object.values(sessions).reduce((sum, v) => sum + (v.cache_tokens || 0), 0);
+        const tokensK = (totalTokens / 1000).toFixed(1);
         cacheStatsText.innerHTML =
-            `${s.active_sessions || 0} sessions &middot; ${s.memory_caches || 0} cached &middot; ${s.memory_usage_gb || 0}GB`;
+            `${s.active_sessions || 0} sessions &middot; ${cached} cached &middot; ${tokensK}K tokens`;
     } catch { cacheStatsText.textContent = ''; }
 }
 

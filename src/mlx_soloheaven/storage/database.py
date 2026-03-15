@@ -425,6 +425,16 @@ async def update_session_compacted_state(
     pass
 
 
+async def delete_messages_before(session_id: str, before_created_at: float):
+    """Delete all messages in a session created before the given timestamp."""
+    async with get_db() as db:
+        await db.execute(
+            "DELETE FROM messages WHERE session_id = ? AND created_at < ?",
+            (session_id, before_created_at),
+        )
+        await db.commit()
+
+
 async def delete_last_message(session_id: str):
     """Delete the last message in a session."""
     async with get_db() as db:

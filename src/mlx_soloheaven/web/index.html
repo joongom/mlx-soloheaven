@@ -90,6 +90,21 @@
                     </select>
                 </div>
                 <button id="save-settings-btn" class="primary-btn">Save Changes</button>
+
+                <div class="settings-divider"></div>
+                <div class="setting-item">
+                    <label>Context Compaction</label>
+                    <div id="compaction-status" class="compaction-status"></div>
+                    <div class="setting-item">
+                        <label>Keep Recent Turns</label>
+                        <input type="number" id="compact-keep-recent" value="3" min="1" max="20">
+                    </div>
+                    <details class="compact-prompt-details">
+                        <summary>Compaction Prompt</summary>
+                        <textarea id="compact-prompt" rows="6" placeholder="Custom prompt (leave empty for default)"></textarea>
+                    </details>
+                    <button id="compact-btn" class="compact-btn" disabled>Compact Now</button>
+                </div>
             </div>
         </aside>
 

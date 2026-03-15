@@ -161,7 +161,13 @@ async function loadMessages(sessionId) {
     }
     const lastIdx = messages.length - 1;
     messagesEl.innerHTML = messages.map((m, i) => {
-        if (m.role === 'user') return userMsgHtml(m.content);
+        if (m.role === 'user') {
+            // Detect compaction summary message
+            if (m.content && m.content.startsWith('The conversation history before this point was compacted')) {
+                return compactionMsgHtml(m.content);
+            }
+            return userMsgHtml(m.content);
+        }
         if (m.role === 'assistant') return assistantMsgHtml(m.content, m.thinking, m.stats, i, i === lastIdx);
         return '';
     }).join('');
@@ -317,6 +323,10 @@ async function sendMessage() {
                         thinkText = event.thinking;
                         thinkBody.innerHTML = renderMarkdown(thinkText);
                     }
+                    // Auto-compaction trigger
+                    if (event.needs_compaction) {
+                        setTimeout(() => autoCompact(), 500);
+                    }
                 }
             }
         }
@@ -376,6 +386,21 @@ function emptyState() {
     return `<div class="empty-state">
         <div class="empty-logo">SoloHeaven</div>
         <p>Single-user LLM with KV Cache Optimization</p>
+    </div>`;
+}
+
+function compactionMsgHtml(content) {
+    // Extract summary from <summary>...</summary> tags
+    const match = (content || '').match(/<summary>\n?([\s\S]*?)\n?<\/summary>/);
+    const summary = match ? match[1] : content;
+    return `<div class="msg msg-compaction">
+        <div class="msg-header">Context Compacted</div>
+        <div class="compaction-block">
+            <div class="compaction-header" onclick="toggleThink(this)">
+                <div class="thinking-label"><span class="icon">&#9654;</span> Conversation Summary</div>
+            </div>
+            <div class="thinking-body">${renderMarkdown(summary)}</div>
+        </div>
     </div>`;
 }
 
@@ -675,6 +700,7 @@ async function loadSessionSettings() {
     document.getElementById('thinking-budget').value = s.thinking_budget || 8192;
     document.getElementById('max-tokens').value = s.max_tokens || 32768;
     document.getElementById('context-limit').value = s.context_window_limit || 100000;
+    loadCompactionStatus();
 }
 
 document.getElementById('temp-range').addEventListener('input', (e) => {
@@ -700,3 +726,89 @@ saveSettingsBtn.addEventListener('click', async () => {
         settingsSidebar.classList.remove('open');
     }
 });
+
+// Compaction
+const compactBtn = document.getElementById('compact-btn');
+const compactionStatusEl = document.getElementById('compaction-status');
+
+async function loadCompactionStatus() {
+    if (!currentSessionId) return;
+    try {
+        const res = await fetch(`${API}/api/sessions/${currentSessionId}/compaction-status`);
+        const s = await res.json();
+        const pct = s.utilization_percent || 0;
+        const tokensK = (s.current_tokens / 1000).toFixed(1);
+        const limitK = (s.window_limit / 1000).toFixed(0);
+        compactionStatusEl.innerHTML =
+            `<span class="${pct >= 90 ? 'status-warn' : 'status-ok'}">${tokensK}K / ${limitK}K tokens (${pct}%)</span>`;
+        compactBtn.disabled = isStreaming || !currentSessionId;
+    } catch { compactionStatusEl.textContent = ''; }
+}
+
+compactBtn.addEventListener('click', async () => {
+    if (!currentSessionId || isStreaming) return;
+    if (!confirm('Compact conversation? Old messages will be summarized and removed.')) return;
+
+    compactBtn.disabled = true;
+    compactBtn.textContent = 'Compacting...';
+
+    try {
+        const customPrompt = document.getElementById('compact-prompt').value.trim() || null;
+        const keepRecent = parseInt(document.getElementById('compact-keep-recent').value) || 3;
+
+        const res = await fetch(`${API}/api/sessions/${currentSessionId}/compact`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                keep_recent_turns: keepRecent,
+                custom_prompt: customPrompt,
+            }),
+        });
+        const data = await res.json();
+
+        if (data.success) {
+            alert(`Compacted: ${data.summarized_count} messages summarized, ${data.remaining_messages} remaining (${data.reduction_percent}% reduction)`);
+            await loadMessages(currentSessionId);
+            await loadCompactionStatus();
+        } else {
+            alert('Compaction failed: ' + (data.error || 'unknown error'));
+        }
+    } catch (err) {
+        alert('Compaction failed: ' + err.message);
+    }
+
+    compactBtn.disabled = false;
+    compactBtn.textContent = 'Compact Now';
+});
+
+async function autoCompact() {
+    if (!currentSessionId || isStreaming) return;
+
+    // Show compacting indicator
+    const banner = document.createElement('div');
+    banner.className = 'compacting-banner';
+    banner.innerHTML = '<span class="compacting-spinner"></span> Compacting conversation...';
+    messagesEl.appendChild(banner);
+    scrollBottom();
+
+    try {
+        const keepRecent = parseInt(document.getElementById('compact-keep-recent').value) || 3;
+        const res = await fetch(`${API}/api/sessions/${currentSessionId}/compact`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ keep_recent_turns: keepRecent }),
+        });
+        const data = await res.json();
+
+        banner.remove();
+
+        if (data.success) {
+            await loadMessages(currentSessionId);
+            loadCacheStats();
+        } else {
+            logger.error?.('[AutoCompact] failed:', data.error);
+        }
+    } catch (err) {
+        banner.remove();
+    }
+}

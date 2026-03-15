@@ -1875,7 +1875,10 @@ class MLXEngine:
             return {"status": "ok", "method": "build", "build_time": round(elapsed, 2), "cached_tokens": new_offset}
 
     def _check_branch_match(self, stored: list[dict], incoming: list[dict]) -> int | None:
-        """If incoming is shorter than stored and prefix matches, return branch point."""
+        """If incoming is shorter than stored and prefix matches, return branch point.
+
+        Uses the same normalization as _messages_match (list→string, thinking strip, etc.).
+        """
         if len(incoming) >= len(stored):
             return None
         prefix_len = len(incoming) - 1
@@ -1885,9 +1888,57 @@ class MLXEngine:
             s_msg = stored[i]
             i_msg = incoming[i]
             if s_msg.get("role") != i_msg.get("role"):
+                logger.debug(
+                    f"[BranchMatch] FAIL at msg[{i}]: "
+                    f"role {s_msg.get('role')!r} != {i_msg.get('role')!r}"
+                )
                 return None
-            if s_msg.get("content") != i_msg.get("content"):
+
+            s_content = s_msg.get("content", "") or ""
+            i_content = i_msg.get("content", "") or ""
+            role = s_msg.get("role", "")
+
+            # Normalize list-format content to string
+            if isinstance(s_content, list):
+                s_content = "\n".join(
+                    p["text"] if isinstance(p, dict) and "text" in p else str(p)
+                    for p in s_content
+                )
+            if isinstance(i_content, list):
+                i_content = "\n".join(
+                    p["text"] if isinstance(p, dict) and "text" in p else str(p)
+                    for p in i_content
+                )
+
+            # Assistant tool_call content tolerance (same as _messages_match)
+            if role == "assistant" and s_content != i_content:
+                import re
+                tc_pattern = r"\n*<tool_call>"
+                s_stripped = re.split(tc_pattern, s_content, maxsplit=1)[0].rstrip()
+                i_stripped = re.split(tc_pattern, i_content, maxsplit=1)[0].rstrip()
+                if s_stripped == i_stripped:
+                    continue
+
+            # Normalize and compare
+            s_norm = self._normalize_for_match(s_content, role)
+            i_norm = self._normalize_for_match(i_content, role)
+            if s_norm != i_norm:
+                # Tool content cleared by client
+                if role == "tool" and i_content.startswith("[") and "cleared]" in i_content:
+                    continue
+                # Last stored assistant tolerance
+                if role == "assistant" and i == prefix_len - 1:
+                    continue
+                logger.debug(
+                    f"[BranchMatch] FAIL at msg[{i}] role={role}: "
+                    f"content mismatch (stored_len={len(s_content)}, incoming_len={len(i_content)})"
+                )
                 return None
+
+        logger.info(
+            f"[BranchMatch] OK | prefix={prefix_len} msgs match "
+            f"(stored={len(stored)}, incoming={len(incoming)})"
+        )
         return prefix_len
 
     def session_stats(self) -> dict:

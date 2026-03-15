@@ -771,3 +771,100 @@ body {
     border: none; border-radius: 4px; cursor: pointer; font-weight: 600;
 }
 #settings-toggle { margin-right: 10px; }
+
+/* Compaction settings */
+.settings-divider {
+    border-top: 1px solid var(--border);
+    margin: 20px 0;
+}
+.compaction-status {
+    font-size: 0.78rem;
+    font-family: var(--font-mono);
+    margin-bottom: 12px;
+    padding: 6px 8px;
+    background: var(--bg-tertiary);
+    border-radius: 4px;
+}
+.status-ok { color: var(--green); }
+.status-warn { color: var(--yellow); }
+.compact-btn {
+    width: 100%; padding: 10px;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    border-radius: 4px; cursor: pointer;
+    font-weight: 500;
+    transition: all 0.15s;
+}
+.compact-btn:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--text-primary);
+}
+.compact-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.compact-prompt-details {
+    margin-bottom: 12px;
+    font-size: 0.78rem;
+    color: var(--text-muted);
+}
+.compact-prompt-details summary {
+    cursor: pointer;
+    margin-bottom: 6px;
+}
+.compact-prompt-details textarea {
+    font-size: 0.78rem;
+    font-family: var(--font-mono);
+}
+
+/* Compaction message block */
+.msg-compaction {
+    padding: 12px 24px;
+}
+.msg-compaction .msg-header {
+    color: #a78bfa;
+}
+.compaction-block {
+    background: rgba(167, 139, 250, 0.08);
+    border: 1px solid rgba(167, 139, 250, 0.25);
+    border-radius: 8px;
+    overflow: hidden;
+}
+.compaction-header {
+    display: flex;
+    align-items: center;
+    padding: 8px 12px;
+    cursor: pointer;
+    user-select: none;
+}
+.compaction-header:hover { background: rgba(255,255,255,0.03); }
+.compaction-block .thinking-label { color: #a78bfa; }
+.compaction-block .thinking-body {
+    padding: 0 12px 12px;
+    font-size: 0.82rem;
+    color: var(--text-muted);
+    line-height: 1.55;
+    max-height: 400px;
+    overflow-y: auto;
+}
+
+/* Compacting banner */
+.compacting-banner {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 24px;
+    max-width: 820px;
+    margin: 8px auto;
+    font-size: 0.82rem;
+    color: #a78bfa;
+    background: rgba(167, 139, 250, 0.08);
+    border: 1px solid rgba(167, 139, 250, 0.25);
+    border-radius: 8px;
+}
+.compacting-spinner {
+    width: 14px; height: 14px;
+    border: 2px solid rgba(167, 139, 250, 0.3);
+    border-top-color: #a78bfa;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }

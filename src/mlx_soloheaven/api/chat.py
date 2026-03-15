@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from mlx_soloheaven.engine.mlx_engine import MLXEngine
 from mlx_soloheaven.engine.tool_parser import split_thinking_and_content
 from mlx_soloheaven.storage import database as db
+from mlx_soloheaven.api.compaction import build_post_compaction_messages
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
@@ -119,22 +120,10 @@ async def chat(session_id: str, req: SendMessageRequest):
     # Add user message
     await db.add_message(session_id, "user", content=req.content)
 
-    # Build messages with system prompt
-    messages = []
+    # Build messages from last compaction point (or all if no compaction)
     system_prompt = session.get("system_prompt", "")
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-
     history = await db.get_messages(session_id)
-    for msg in history:
-        m = {"role": msg["role"]}
-        if msg.get("content"):
-            m["content"] = msg["content"]
-        if msg.get("tool_calls"):
-            m["tool_calls"] = msg["tool_calls"]
-        if msg.get("tool_call_id"):
-            m["tool_call_id"] = msg["tool_call_id"]
-        messages.append(m)
+    messages = build_post_compaction_messages(system_prompt, history)
 
     # Check if compaction is needed
     current_tokens = await db.get_session_total_tokens(session_id)
@@ -397,8 +386,24 @@ async def _stream_chat(
     if client_disconnected:
         return
 
+    # Check if compaction is needed
+    needs_compaction = False
+    if accumulated_text:
+        session_data = await db.get_session(session_id)
+        if session_data:
+            current_tokens = await db.get_session_total_tokens(session_id)
+            window_limit = session_data.get("context_window_limit", 100000)
+            if window_limit > 0 and current_tokens >= window_limit * 0.9:
+                needs_compaction = True
+
     done_event = json.dumps(
-        {"type": "done", "thinking": thinking, "content": content, "stats": stats},
+        {
+            "type": "done",
+            "thinking": thinking,
+            "content": content,
+            "stats": stats,
+            "needs_compaction": needs_compaction,
+        },
         ensure_ascii=False,
     )
     yield f"data: {done_event}\n\n"

@@ -7,7 +7,7 @@ name = "mlx-soloheaven"
 version = "0.1.0"
 description = "Single-user LLM inference server with KV cache optimization for Apple Silicon"
 readme = "README.md"
-license = "AGPL-3.0-only"
+license = "MIT"
 requires-python = ">=3.11"
 authors = [
     { name = "fai" },
@@ -16,7 +16,7 @@ keywords = ["mlx", "llm", "inference", "kv-cache", "apple-silicon"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "License :: OSI Approved :: MIT License",
     "Operating System :: MacOS",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]

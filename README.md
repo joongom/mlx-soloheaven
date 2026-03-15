@@ -694,4 +694,4 @@ Special thanks to [Clover Games](https://www.clovergames.com) — Lord of Heroes
 
 ## License
 
-AGPL-3.0
+[MIT](LICENSE)

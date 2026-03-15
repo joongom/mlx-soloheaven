@@ -8,6 +8,11 @@ let currentSessionId = null;
 let isStreaming = false;
 let selectedModel = null; // null = default (first model)
 
+// Pagination
+const PAGE_SIZE = 20;
+let loadedTotal = 0;
+let loadedCount = 0;
+
 // DOM
 const messagesEl = document.getElementById('messages');
 const inputEl = document.getElementById('input');
@@ -76,6 +81,24 @@ function renderMarkdown(text) {
 
 // Cursor is now pure CSS (::after on last child) — no JS injection needed
 
+function addCopyButtons() {
+    messagesEl.querySelectorAll('pre code[data-lang]').forEach(code => {
+        const pre = code.parentElement;
+        if (pre.querySelector('.code-copy-btn')) return;
+        const btn = document.createElement('button');
+        btn.className = 'code-copy-btn';
+        btn.textContent = 'Copy';
+        btn.onclick = () => {
+            navigator.clipboard.writeText(code.textContent).then(() => {
+                btn.textContent = 'Copied';
+                setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+            });
+        };
+        pre.style.position = 'relative';
+        pre.appendChild(btn);
+    });
+}
+
 // ===== SESSIONS =====
 
 let allSessions = [];
@@ -130,6 +153,10 @@ async function switchSession(id) {
     currentSessionId = id;
     const session = allSessions.find(s => s.id === id);
     headerTitle.textContent = session?.title || 'Chat';
+    // Update URL without reload
+    const url = new URL(window.location);
+    url.searchParams.set('session', id);
+    history.replaceState(null, '', url);
     await loadMessages(id);
     renderSessionList(allSessions);
     if (isMobile()) closeSidebar();
@@ -153,25 +180,79 @@ async function deleteSession(id) {
 }
 
 async function loadMessages(sessionId) {
-    const res = await fetch(`${API}/api/sessions/${sessionId}/messages`);
-    const messages = await res.json();
+    const res = await fetch(`${API}/api/sessions/${sessionId}/messages?limit=${PAGE_SIZE}`);
+    const data = await res.json();
+    const messages = data.messages || data;  // backwards compat
+    loadedTotal = data.total || messages.length;
+    loadedCount = messages.length;
+
     if (messages.length === 0) {
         messagesEl.innerHTML = emptyState();
         return;
     }
+
+    let html = '';
+    // "Load earlier" button if there are more messages
+    if (loadedCount < loadedTotal) {
+        html += loadMoreHtml(loadedTotal - loadedCount);
+    }
+    html += renderMessages(messages);
+    messagesEl.innerHTML = html;
+    scrollBottom();
+    // Second scroll after layout settles (content-visibility deferred rendering)
+    setTimeout(scrollBottom, 100);
+    try { addCopyButtons(); } catch(e) { console.warn('addCopyButtons error:', e); }
+}
+
+async function loadMoreMessages() {
+    if (!currentSessionId || loadedCount >= loadedTotal) return;
+    const btn = messagesEl.querySelector('.load-more-btn');
+    if (btn) { btn.textContent = 'Loading...'; btn.disabled = true; }
+
+    const newLimit = Math.min(loadedCount + PAGE_SIZE, loadedTotal);
+    const res = await fetch(`${API}/api/sessions/${currentSessionId}/messages?limit=${newLimit}`);
+    const data = await res.json();
+    const messages = data.messages || data;
+    loadedTotal = data.total || messages.length;
+    loadedCount = messages.length;
+
+    // Preserve scroll position
+    const prevHeight = messagesEl.scrollHeight;
+    const prevScroll = messagesEl.scrollTop;
+
+    let html = '';
+    if (loadedCount < loadedTotal) {
+        html += loadMoreHtml(loadedTotal - loadedCount);
+    }
+    html += renderMessages(messages);
+    messagesEl.innerHTML = html;
+    addCopyButtons();
+
+    // Restore scroll position (content was prepended)
+    const newHeight = messagesEl.scrollHeight;
+    messagesEl.scrollTop = prevScroll + (newHeight - prevHeight);
+}
+
+function renderMessages(messages) {
     const lastIdx = messages.length - 1;
-    messagesEl.innerHTML = messages.map((m, i) => {
+    return messages.map((m, i) => {
         if (m.role === 'user') {
-            // Detect compaction summary message
             if (m.content && m.content.startsWith('The conversation history before this point was compacted')) {
-                return compactionMsgHtml(m.content);
+                return compactionMsgHtml(m.content, i, i === lastIdx);
             }
             return userMsgHtml(m.content);
         }
         if (m.role === 'assistant') return assistantMsgHtml(m.content, m.thinking, m.stats, i, i === lastIdx);
         return '';
     }).join('');
-    scrollBottom();
+}
+
+function loadMoreHtml(remaining) {
+    return `<div class="load-more-container">
+        <button class="load-more-btn" onclick="loadMoreMessages()">
+            Load ${Math.min(remaining, PAGE_SIZE)} earlier messages (${remaining} remaining)
+        </button>
+    </div>`;
 }
 
 // ===== SEND MESSAGE =====
@@ -354,7 +435,12 @@ async function sendMessage() {
         msgEl.insertAdjacentHTML('beforeend', buildStatsBar(stats));
     }
 
-    // Add action buttons (Branch + Regenerate + Delete)
+    // Remove Regenerate/Delete from previous messages (only last should have them)
+    messagesEl.querySelectorAll('.msg-actions').forEach(el => {
+        el.querySelectorAll('.msg-action-btn:not([onclick*="branchFrom"])').forEach(btn => btn.remove());
+    });
+
+    // Add action buttons to this (latest) message
     msgEl.insertAdjacentHTML('beforeend', `<div class="msg-actions">
         <button class="msg-action-btn" onclick="branchFromEl(this)" title="Branch from here">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -389,19 +475,36 @@ function emptyState() {
     </div>`;
 }
 
-function compactionMsgHtml(content) {
+function compactionMsgHtml(content, msgIndex, isLast) {
     // Extract summary from <summary>...</summary> tags
     const match = (content || '').match(/<summary>\n?([\s\S]*?)\n?<\/summary>/);
     const summary = match ? match[1] : content;
-    return `<div class="msg msg-compaction">
+    let html = `<div class="msg msg-compaction">
         <div class="msg-header">Context Compacted</div>
+        <div class="compaction-notice">The conversation above was compacted into this summary. Messages sent to the model start from this point.</div>
         <div class="compaction-block">
             <div class="compaction-header" onclick="toggleThink(this)">
-                <div class="thinking-label"><span class="icon">&#9654;</span> Conversation Summary</div>
+                <div class="thinking-label"><span class="icon open">&#9654;</span> Conversation Summary</div>
             </div>
-            <div class="thinking-body">${renderMarkdown(summary)}</div>
-        </div>
-    </div>`;
+            <div class="thinking-body show">${renderMarkdown(summary)}</div>
+        </div>`;
+    if (msgIndex !== undefined) {
+        html += `<div class="msg-actions">`;
+        html += `<button class="msg-action-btn" onclick="branchFrom(${msgIndex})" title="Branch from here">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="6" y1="3" x2="6" y2="15"></line><circle cx="18" cy="6" r="3"></circle>
+                <circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path>
+            </svg> Branch</button>`;
+        if (isLast) {
+            html += `<button class="msg-action-btn msg-action-delete" onclick="deleteLast()" title="Delete compaction">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                </svg> Delete</button>`;
+        }
+        html += `</div>`;
+    }
+    html += `</div>`;
+    return html;
 }
 
 function userMsgHtml(content) {
@@ -496,11 +599,15 @@ function branchFromEl(btnEl) {
 async function branchFrom(msgIndex) {
     if (!currentSessionId || isStreaming) return;
     if (!confirm('Create a branch from this point?')) return;
+    // Adjust for pagination offset: msgIndex is within loaded array,
+    // but API needs actual DB position
+    const offset = loadedTotal - loadedCount;
+    const dbIndex = offset + msgIndex;
     try {
         const res = await fetch(`${API}/api/sessions/${currentSessionId}/branch`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ turn: msgIndex + 1 }),
+            body: JSON.stringify({ turn: dbIndex + 1 }),
         });
         if (!res.ok) { alert('Branch failed: ' + res.statusText); return; }
         const data = await res.json();
@@ -512,7 +619,8 @@ async function branchFrom(msgIndex) {
 async function regenerate() {
     if (!currentSessionId || isStreaming) return;
     try {
-        const msgs = await (await fetch(`${API}/api/sessions/${currentSessionId}/messages`)).json();
+        const msgsData = await (await fetch(`${API}/api/sessions/${currentSessionId}/messages`)).json();
+        const msgs = msgsData.messages || msgsData;
         const last = msgs[msgs.length - 1];
         if (!last || last.role !== 'assistant') return;
         const userMsg = msgs[msgs.length - 2];
@@ -550,7 +658,9 @@ async function deleteLast() {
 // ===== UTILITIES =====
 
 function scrollBottom() {
-    messagesEl.scrollTop = messagesEl.scrollHeight;
+    requestAnimationFrame(() => {
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+    });
 }
 
 function esc(text) {
@@ -670,7 +780,10 @@ modelSelect.addEventListener('change', () => {
     } catch { /* ignore */ }
 
     const sessions = await loadSessions();
-    if (sessions.length > 0) {
+    const urlSession = new URLSearchParams(window.location.search).get('session');
+    if (urlSession && sessions.find(s => s.id === urlSession)) {
+        await switchSession(urlSession);
+    } else if (sessions.length > 0) {
         await switchSession(sessions[0].id);
     } else {
         messagesEl.innerHTML = emptyState();
@@ -731,6 +844,46 @@ saveSettingsBtn.addEventListener('click', async () => {
 const compactBtn = document.getElementById('compact-btn');
 const compactionStatusEl = document.getElementById('compaction-status');
 
+const DEFAULT_COMPACT_PROMPT = `Please summarize the conversation above. Create a structured context checkpoint summary that another LLM will use to continue the work.
+
+Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.
+
+Use this EXACT format:
+
+## Goal
+[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
+
+## Constraints & Preferences
+- [Any constraints, preferences, or requirements mentioned by user]
+- [Or "(none)" if none were mentioned]
+
+## Progress
+### Done
+- [x] [Completed tasks/changes]
+
+### In Progress
+- [ ] [Current work]
+
+### Blocked
+- [Issues preventing progress, if any]
+
+## Key Decisions
+- **[Decision]**: [Brief rationale]
+
+## Next Steps
+1. [Ordered list of what should happen next]
+
+## Critical Context
+- [Any data, examples, or references needed to continue]
+- [Or "(none)" if not applicable]
+
+Keep each section concise. Preserve exact file paths, function names, and error messages.`;
+
+// Fill default prompt on first load
+if (document.getElementById('compact-prompt')) {
+    document.getElementById('compact-prompt').value = DEFAULT_COMPACT_PROMPT;
+}
+
 async function loadCompactionStatus() {
     if (!currentSessionId) return;
     try {
@@ -747,15 +900,52 @@ async function loadCompactionStatus() {
 
 compactBtn.addEventListener('click', async () => {
     if (!currentSessionId || isStreaming) return;
-    if (!confirm('Compact conversation? Old messages will be summarized and removed.')) return;
+    if (!confirm('Compact conversation? A summary will be generated.')) return;
 
     compactBtn.disabled = true;
     compactBtn.textContent = 'Compacting...';
+    settingsSidebar.classList.remove('open');
+
+    const customPrompt = document.getElementById('compact-prompt').value.trim() || null;
+    const keepRecent = parseInt(document.getElementById('compact-keep-recent').value) || 3;
+    await runCompaction(keepRecent, customPrompt);
+
+    compactBtn.disabled = false;
+    compactBtn.textContent = 'Compact Now';
+});
+
+async function autoCompact() {
+    if (!currentSessionId || isStreaming) return;
+    await runCompaction(
+        parseInt(document.getElementById('compact-keep-recent').value) || 3,
+        null,
+    );
+}
+
+async function runCompaction(keepRecent, customPrompt) {
+    if (!currentSessionId || isStreaming) return;
+
+    // Add streaming compaction block to chat
+    const blockEl = document.createElement('div');
+    blockEl.className = 'msg msg-compaction';
+    blockEl.innerHTML = `
+        <div class="msg-header">Context Compacting...</div>
+        <div class="compaction-block">
+            <div class="compaction-header">
+                <div class="thinking-label"><span class="compacting-spinner"></span> Generating Summary</div>
+            </div>
+            <div class="thinking-body show" id="compact-live" style="display:block"></div>
+        </div>
+    `;
+    messagesEl.appendChild(blockEl);
+    scrollBottom();
+
+    const liveEl = document.getElementById('compact-live');
+    let fullText = '';
+    let thinkingDone = false;
+    let summaryText = '';
 
     try {
-        const customPrompt = document.getElementById('compact-prompt').value.trim() || null;
-        const keepRecent = parseInt(document.getElementById('compact-keep-recent').value) || 3;
-
         const res = await fetch(`${API}/api/sessions/${currentSessionId}/compact`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -764,51 +954,60 @@ compactBtn.addEventListener('click', async () => {
                 custom_prompt: customPrompt,
             }),
         });
-        const data = await res.json();
 
-        if (data.success) {
-            alert(`Compacted: ${data.summarized_count} messages summarized, ${data.remaining_messages} remaining (${data.reduction_percent}% reduction)`);
-            await loadMessages(currentSessionId);
-            await loadCompactionStatus();
-        } else {
-            alert('Compaction failed: ' + (data.error || 'unknown error'));
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                let event;
+                try { event = JSON.parse(line.slice(6)); } catch { continue; }
+
+                if (event.type === 'text') {
+                    fullText += event.content;
+                    // Show content after </think>
+                    if (!thinkingDone) {
+                        const endIdx = fullText.indexOf('</think>');
+                        if (endIdx !== -1) {
+                            thinkingDone = true;
+                            summaryText = fullText.substring(endIdx + 8).trimStart();
+                            liveEl.innerHTML = renderMarkdown(summaryText);
+                        }
+                    } else {
+                        summaryText += event.content;
+                        liveEl.innerHTML = renderMarkdown(summaryText);
+                    }
+                    scrollBottom();
+                }
+
+                if (event.type === 'done') {
+                    if (event.summary) {
+                        liveEl.innerHTML = renderMarkdown(event.summary);
+                    }
+                }
+
+                if (event.type === 'error') {
+                    liveEl.innerHTML = `<span style="color:#ef4444">Error: ${event.error}</span>`;
+                }
+            }
         }
+
+        // Reload messages to show final state
+        blockEl.remove();
+        await loadMessages(currentSessionId);
+        loadCacheStats();
+
     } catch (err) {
+        blockEl.remove();
         alert('Compaction failed: ' + err.message);
-    }
-
-    compactBtn.disabled = false;
-    compactBtn.textContent = 'Compact Now';
-});
-
-async function autoCompact() {
-    if (!currentSessionId || isStreaming) return;
-
-    // Show compacting indicator
-    const banner = document.createElement('div');
-    banner.className = 'compacting-banner';
-    banner.innerHTML = '<span class="compacting-spinner"></span> Compacting conversation...';
-    messagesEl.appendChild(banner);
-    scrollBottom();
-
-    try {
-        const keepRecent = parseInt(document.getElementById('compact-keep-recent').value) || 3;
-        const res = await fetch(`${API}/api/sessions/${currentSessionId}/compact`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ keep_recent_turns: keepRecent }),
-        });
-        const data = await res.json();
-
-        banner.remove();
-
-        if (data.success) {
-            await loadMessages(currentSessionId);
-            loadCacheStats();
-        } else {
-            logger.error?.('[AutoCompact] failed:', data.error);
-        }
-    } catch (err) {
-        banner.remove();
     }
 }

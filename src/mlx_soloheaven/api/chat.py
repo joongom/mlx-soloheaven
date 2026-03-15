@@ -105,8 +105,22 @@ async def delete_session(session_id: str):
 
 
 @router.get("/sessions/{session_id}/messages")
-async def get_messages(session_id: str):
-    return await db.get_messages(session_id)
+async def get_messages(session_id: str, limit: int | None = None):
+    total = await db.get_message_count(session_id)
+
+    if limit:
+        # Find messages after last compaction to ensure it's always included
+        post_compact = await db.count_messages_after_last_compaction(session_id)
+        effective_limit = max(limit, post_compact)
+        messages = await db.get_messages(session_id, limit=effective_limit)
+    else:
+        messages = await db.get_messages(session_id)
+
+    return {
+        "messages": messages,
+        "total": total,
+        "returned": len(messages),
+    }
 
 
 # --- Chat endpoint (SSE streaming) ---
@@ -502,14 +516,23 @@ async def branch_session(session_id: str, req: BranchRequest):
 
 @router.post("/sessions/{session_id}/delete-last")
 async def delete_last_turn(session_id: str):
-    """Delete the last user+assistant pair and restore cache state."""
+    """Delete the last turn. Removes user+assistant pair, or single compaction message."""
     messages = await db.get_messages(session_id)
-    if len(messages) < 2:
-        raise HTTPException(400, "Not enough messages to delete")
+    if not messages:
+        raise HTTPException(400, "No messages to delete")
 
-    # Delete assistant then user (last pair)
-    await db.delete_last_message(session_id)
-    await db.delete_last_message(session_id)
+    last_content = messages[-1].get("content", "") or ""
+    is_compaction = last_content.startswith("The conversation history before this point was compacted")
+
+    if is_compaction:
+        # Compaction message: delete just this one
+        await db.delete_last_message(session_id)
+    else:
+        # Normal turn: delete assistant + user pair
+        if len(messages) < 2:
+            raise HTTPException(400, "Not enough messages to delete")
+        await db.delete_last_message(session_id)
+        await db.delete_last_message(session_id)
 
     # Build engine messages for remaining
     source = await db.get_session(session_id)

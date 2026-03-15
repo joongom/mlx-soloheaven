@@ -8,10 +8,12 @@ After compaction:
 - Engine cache is rebuilt with the compacted message set
 """
 
+import json
 import logging
-from typing import Optional
+from typing import AsyncGenerator, Optional
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from mlx_soloheaven.storage import database as db
@@ -40,10 +42,7 @@ class CompactionRequest(BaseModel):
 
 @router.post("/sessions/{session_id}/compact")
 async def compact_session(session_id: str, req: CompactionRequest):
-    """Compact conversation history into a structured summary.
-
-    Old messages are preserved. A compaction summary is inserted at the boundary.
-    """
+    """Compact conversation history via SSE streaming."""
     session = await db.get_session(session_id)
     if not session:
         raise HTTPException(404, "Session not found")
@@ -51,7 +50,19 @@ async def compact_session(session_id: str, req: CompactionRequest):
     if not engine:
         raise HTTPException(500, "Engine not initialized")
 
-    # Build full message list for summarization
+    return StreamingResponse(
+        _stream_compact(session_id, session, req),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
+async def _stream_compact(
+    session_id: str, session: dict, req: CompactionRequest
+) -> AsyncGenerator[str, None]:
+    """SSE stream for compaction: streams summary generation, then finalizes."""
+
+    # Build full message list
     messages = []
     system_prompt = session.get("system_prompt", "")
     if system_prompt:
@@ -59,64 +70,47 @@ async def compact_session(session_id: str, req: CompactionRequest):
 
     db_messages = await db.get_messages(session_id)
     for msg in db_messages:
-        m = {"role": msg["role"]}
-        if msg.get("content"):
-            m["content"] = msg["content"]
-        if msg.get("tool_calls"):
-            m["tool_calls"] = msg["tool_calls"]
-        if msg.get("tool_call_id"):
-            m["tool_call_id"] = msg["tool_call_id"]
-        messages.append(m)
+        messages.append(_to_engine_msg(msg))
 
     keep_recent = (req.keep_recent_turns or 3) * 2
 
-    # Generate summary
+    # Prepare summarization
     compaction_engine = CompactionEngine(engine)
-    result = await compaction_engine.summarize(
+    prep = await compaction_engine.summarize(
         messages=messages,
         keep_recent=keep_recent,
         custom_prompt=req.custom_prompt,
+        session_id=session_id,
     )
 
-    if "error" in result:
-        return {"success": False, "error": result["error"]}
+    if "error" in prep:
+        yield f"data: {json.dumps({'type': 'error', 'error': prep['error']})}\n\n"
+        return
 
-    summary = result["summary"]
-    kept_from = result["kept_from"]  # index in full messages array
-    summarized_count = result["summarized_count"]
+    summary_messages = prep["messages"]
+    kept_from = prep["kept_from"]
+    summarized_count = prep["summarized_count"]
 
-    # Insert compaction summary message at the boundary
-    # Timestamp: just before the first kept message
-    has_system = 1 if system_prompt else 0
-    db_kept_from = kept_from - has_system
-    if db_kept_from > 0 and db_kept_from < len(db_messages):
-        boundary_time = db_messages[db_kept_from]["created_at"] - 0.001
-    else:
-        boundary_time = None  # use current time
+    # Stream: start
+    yield f"data: {json.dumps({'type': 'start', 'summarizing': summarized_count})}\n\n"
 
-    wrapped_summary = CompactionEngine.wrap_summary(summary)
-    compaction_msg = await db.add_message(
-        session_id, "user",
-        content=wrapped_summary,
-        token_count=0,
-    )
+    # Stream: summary generation token-by-token
+    summary = ""
+    async for event in compaction_engine.generate_summary_stream(summary_messages, session_id=session_id):
+        if event["type"] == "text":
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        elif event["type"] == "result":
+            summary = event["summary"]
 
-    # Fix timestamp to be at the boundary
-    if boundary_time is not None:
-        async with db.get_db() as conn:
-            await conn.execute(
-                "UPDATE messages SET created_at = ? WHERE id = ?",
-                (boundary_time, compaction_msg["id"]),
-            )
-            await conn.commit()
+    # Finalize: insert compaction message + rebuild cache
+    wrapped_summary = CompactionEngine.wrap_summary(summary, keep_recent=keep_recent)
+    await db.add_message(session_id, "user", content=wrapped_summary, token_count=0)
 
-    # Rebuild engine cache with post-compaction messages
     post_compact_msgs = build_post_compaction_messages(
         system_prompt, await db.get_messages(session_id)
     )
     rebuild_result = engine.compact_session(session_id, post_compact_msgs)
 
-    # Record compaction
     old_tokens = session.get("total_prompt_tokens", 0)
     new_tokens = rebuild_result.get("cached_tokens", 0)
     reduction = ((old_tokens - new_tokens) / old_tokens * 100) if old_tokens > 0 else 0
@@ -137,7 +131,9 @@ async def compact_session(session_id: str, req: CompactionRequest):
         f"tokens: {old_tokens} -> {new_tokens}"
     )
 
-    return {
+    # Stream: done
+    done_event = {
+        "type": "done",
         "success": True,
         "summary": summary,
         "summarized_count": summarized_count,
@@ -145,39 +141,70 @@ async def compact_session(session_id: str, req: CompactionRequest):
         "new_tokens": new_tokens,
         "reduction_percent": round(reduction, 1),
     }
+    yield f"data: {json.dumps(done_event, ensure_ascii=False)}\n\n"
 
 
 def build_post_compaction_messages(system_prompt: str, db_messages: list[dict]) -> list[dict]:
-    """Build message list starting from the last compaction point.
+    """Build message list for the model, using compaction if available.
 
-    Scans for the last compaction summary message and returns
-    [system_prompt, compaction_summary, messages_after...].
+    Returns [system_prompt, compaction_summary, recent_messages, new_messages...].
+    The compaction block is placed first (after system), followed by
+    keep_recent messages from before it, then any messages after it.
     """
+    import re
+
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
 
     # Find last compaction message
     last_compact_idx = -1
+    keep_recent = 0
     for i, msg in enumerate(db_messages):
         content = msg.get("content", "") or ""
-        if content.startswith(COMPACTION_SUMMARY_PREFIX.split("\n")[0]):
+        if content.startswith("The conversation history before this point was compacted"):
             last_compact_idx = i
+            # Extract keep_recent from <!-- keep_recent:N -->
+            m = re.search(r'<!-- keep_recent:(\d+) -->', content)
+            if m:
+                keep_recent = int(m.group(1))
 
-    # If compaction exists, start from it; otherwise use all messages
-    start_idx = last_compact_idx if last_compact_idx >= 0 else 0
+    if last_compact_idx < 0:
+        # No compaction — use all messages
+        for msg in db_messages:
+            messages.append(_to_engine_msg(msg))
+        return messages
 
-    for msg in db_messages[start_idx:]:
-        m = {"role": msg["role"]}
-        if msg.get("content"):
-            m["content"] = msg["content"]
-        if msg.get("tool_calls"):
-            m["tool_calls"] = msg["tool_calls"]
-        if msg.get("tool_call_id"):
-            m["tool_call_id"] = msg["tool_call_id"]
-        messages.append(m)
+    # Compaction found: assemble [compaction] + [recent before it] + [after it]
+    compact_msg = db_messages[last_compact_idx]
+
+    # 1. Add compaction summary (strip keep_recent comment for model)
+    compact_content = compact_msg.get("content", "")
+    compact_content = re.sub(r'\n<!-- keep_recent:\d+ -->', '', compact_content)
+    messages.append({"role": "user", "content": compact_content})
+
+    # 2. Add keep_recent messages BEFORE compaction
+    recent_start = max(0, last_compact_idx - keep_recent)
+    for msg in db_messages[recent_start:last_compact_idx]:
+        messages.append(_to_engine_msg(msg))
+
+    # 3. Add messages AFTER compaction (new chats since compaction)
+    for msg in db_messages[last_compact_idx + 1:]:
+        messages.append(_to_engine_msg(msg))
 
     return messages
+
+
+def _to_engine_msg(msg: dict) -> dict:
+    """Convert a DB message to engine format."""
+    m = {"role": msg["role"]}
+    if msg.get("content"):
+        m["content"] = msg["content"]
+    if msg.get("tool_calls"):
+        m["tool_calls"] = msg["tool_calls"]
+    if msg.get("tool_call_id"):
+        m["tool_call_id"] = msg["tool_call_id"]
+    return m
 
 
 @router.get("/sessions/{session_id}/compactions")

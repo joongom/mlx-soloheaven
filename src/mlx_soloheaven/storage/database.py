@@ -313,12 +313,21 @@ async def add_message(
     }
 
 
-async def get_messages(session_id: str) -> list[dict]:
+async def get_messages(session_id: str, limit: int | None = None) -> list[dict]:
     async with get_db() as db:
-        rows = await db.execute_fetchall(
-            "SELECT * FROM messages WHERE session_id = ? ORDER BY created_at",
-            (session_id,),
-        )
+        if limit:
+            # Get last N messages (most recent)
+            rows = await db.execute_fetchall(
+                "SELECT * FROM ("
+                "  SELECT * FROM messages WHERE session_id = ? ORDER BY created_at DESC LIMIT ?"
+                ") ORDER BY created_at",
+                (session_id, limit),
+            )
+        else:
+            rows = await db.execute_fetchall(
+                "SELECT * FROM messages WHERE session_id = ? ORDER BY created_at",
+                (session_id,),
+            )
         result = []
         for r in rows:
             d = dict(r)
@@ -328,6 +337,36 @@ async def get_messages(session_id: str) -> list[dict]:
                 d["stats"] = json.loads(d["stats"])
             result.append(d)
         return result
+
+
+async def count_messages_after_last_compaction(session_id: str) -> int:
+    """Count messages from the last compaction point (inclusive) to end."""
+    async with get_db() as db:
+        # Find the last compaction message
+        rows = await db.execute_fetchall(
+            "SELECT created_at FROM messages WHERE session_id = ? "
+            "AND content LIKE 'The conversation history before this point was compacted%' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (session_id,),
+        )
+        if not rows:
+            return 0  # no compaction → don't force extra loading
+
+        compact_time = rows[0]["created_at"]
+        count_rows = await db.execute_fetchall(
+            "SELECT COUNT(*) as cnt FROM messages WHERE session_id = ? AND created_at >= ?",
+            (session_id, compact_time),
+        )
+        return (count_rows[0]["cnt"] if count_rows else 0) + 1  # +1 to include compaction msg itself
+
+
+async def get_message_count(session_id: str) -> int:
+    async with get_db() as db:
+        rows = await db.execute_fetchall(
+            "SELECT COUNT(*) as cnt FROM messages WHERE session_id = ?",
+            (session_id,),
+        )
+        return rows[0]["cnt"] if rows else 0
 
 
 async def get_session_total_tokens(session_id: str) -> int:

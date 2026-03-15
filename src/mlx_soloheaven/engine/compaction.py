@@ -64,6 +64,7 @@ class CompactionEngine:
         messages: list[dict],
         keep_recent: int = 6,
         custom_prompt: str | None = None,
+        session_id: str | None = None,
     ) -> dict:
         """Summarize conversation history, keeping recent messages.
 
@@ -94,32 +95,41 @@ class CompactionEngine:
         summary_messages = list(messages[:end_idx])
         summary_messages.append({"role": "user", "content": prompt})
 
-        try:
-            summary_text = ""
-            async for chunk in self.engine.generate_stream_async(
-                summary_messages,
-                max_tokens=4096,
-                temperature=0.3,
-                thinking_budget=2048,
-            ):
-                if chunk.text:
-                    summary_text += chunk.text
+        return {
+            "messages": summary_messages,
+            "kept_from": end_idx,
+            "summarized_count": len(msgs_to_summarize),
+        }
 
-            # Strip thinking tags if present
-            from mlx_soloheaven.engine.tool_parser import split_thinking_and_content
-            _, summary_content = split_thinking_and_content(summary_text)
-            summary_content = (summary_content or summary_text).strip()
+    async def generate_summary_stream(
+        self,
+        summary_messages: list[dict],
+        session_id: str | None = None,
+    ):
+        """Async generator that yields text chunks during summary generation."""
+        from mlx_soloheaven.engine.tool_parser import split_thinking_and_content
 
-            return {
-                "summary": summary_content,
-                "kept_from": end_idx,
-                "summarized_count": len(msgs_to_summarize),
-            }
-        except Exception as e:
-            logger.error(f"[Compaction] Summary generation failed: {e}")
-            return {"error": str(e)}
+        full_text = ""
+        async for chunk in self.engine.generate_stream_async(
+            summary_messages,
+            max_tokens=4096,
+            temperature=0.3,
+            thinking_budget=2048,
+            session_id=session_id,
+        ):
+            if chunk.text:
+                full_text += chunk.text
+                yield {"type": "text", "content": chunk.text}
+
+        # Final: strip thinking, return clean summary
+        _, summary_content = split_thinking_and_content(full_text)
+        summary_content = (summary_content or full_text).strip()
+        yield {"type": "result", "summary": summary_content}
 
     @staticmethod
-    def wrap_summary(summary: str) -> str:
+    def wrap_summary(summary: str, keep_recent: int = 0) -> str:
         """Wrap summary in OpenClaw-compatible format for LLM consumption."""
-        return COMPACTION_SUMMARY_PREFIX + summary + COMPACTION_SUMMARY_SUFFIX
+        content = COMPACTION_SUMMARY_PREFIX + summary + COMPACTION_SUMMARY_SUFFIX
+        if keep_recent > 0:
+            content += f"\n<!-- keep_recent:{keep_recent} -->"
+        return content

@@ -502,6 +502,50 @@ body {
     font-style: italic;
 }
 
+/* ===== MESSAGE PERFORMANCE ===== */
+.msg {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 120px;
+}
+.msg.streaming { content-visibility: visible; }
+
+/* ===== LOAD MORE ===== */
+.load-more-container {
+    text-align: center;
+    padding: 16px;
+}
+.load-more-btn {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 20px;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+.load-more-btn:hover { border-color: var(--accent); color: var(--text-primary); }
+.load-more-btn:disabled { opacity: 0.5; cursor: default; }
+
+/* ===== CODE COPY BUTTON ===== */
+.code-copy-btn {
+    position: absolute;
+    top: 4px;
+    right: 36px;
+    background: var(--bg-tertiary);
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 0.65rem;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s;
+    z-index: 1;
+}
+pre:hover .code-copy-btn { opacity: 1; }
+.code-copy-btn:hover { color: var(--text-primary); border-color: var(--accent); }
+
 /* ===== MESSAGE ACTIONS (Branch/Regenerate) ===== */
 .msg-actions {
     display: flex;
@@ -822,6 +866,13 @@ body {
 .msg-compaction .msg-header {
     color: #a78bfa;
 }
+.compaction-notice {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    font-style: italic;
+    margin-bottom: 8px;
+    padding: 0 4px;
+}
 .compaction-block {
     background: rgba(167, 139, 250, 0.08);
     border: 1px solid rgba(167, 139, 250, 0.25);
@@ -838,6 +889,7 @@ body {
 .compaction-header:hover { background: rgba(255,255,255,0.03); }
 .compaction-block .thinking-label { color: #a78bfa; }
 .compaction-block .thinking-body {
+    display: block;
     padding: 0 12px 12px;
     font-size: 0.82rem;
     color: var(--text-muted);

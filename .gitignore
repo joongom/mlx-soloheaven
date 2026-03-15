@@ -9,3 +9,6 @@ data/
 .env
 .DS_Store
 *.log
+test_branch.py
+test_branch2.py
+test_branch_openai.py

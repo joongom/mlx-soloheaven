@@ -4,6 +4,8 @@
 
 SoloHeaven turns your Mac into a personal AI server with sub-second response times, even on 100K+ token conversations. It exposes an OpenAI-compatible API, making it a drop-in backend for tools like [OpenCode](https://opencode.ai), [Continue](https://continue.dev), [OpenClaw](https://openclaw.com), or any OpenAI SDK client.
 
+![SoloHeaven Demo](docs/demo.gif)
+
 ## Key Features
 
 - **Session-based KV cache reuse** — Only process new tokens each turn, not the entire conversation

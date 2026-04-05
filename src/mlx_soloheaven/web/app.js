@@ -366,11 +366,52 @@ async function sendMessage() {
                     if (event.tps > 0) liveTps.textContent = event.tps.toFixed(1);
 
                     if (!thinkingDone) {
-                        const endIdx = fullText.indexOf('</think>');
-                        if (endIdx !== -1) {
+                        // Server signals thinking end via thinking_done flag (most reliable)
+                        // Also detect by text patterns as fallback
+                        let serverSignal = event.thinking_done === true;
+                        let endIdx = fullText.indexOf('</think>');
+                        let endLen = 8;
+                        if (endIdx === -1) {
+                            endIdx = fullText.indexOf('<channel|>');
+                            endLen = 10;
+                        }
+
+                        // Detect NO thinking: no thinking start pattern after a few tokens
+                        // Gemma 4 may generate "thought\n" without "<|channel>" when
+                        // sliding window loses <|think|> from system prompt
+                        const hasThinkingStart = fullText.startsWith('<|channel>thought')
+                            || fullText.startsWith('thought\n')
+                            || fullText.includes('</think>');
+                        const noThinking = tokenCount > 5
+                            && endIdx === -1 && !serverSignal
+                            && !hasThinkingStart;
+
+                        if (noThinking) {
+                            // No thinking at all — show directly in content
                             thinkingDone = true;
-                            thinkText = fullText.substring(0, endIdx);
-                            respText = fullText.substring(endIdx + 8).trimStart();
+                            thinkBlock.style.display = 'none';
+                            respText = fullText;
+                            contentEl.innerHTML = renderMarkdown(respText);
+                        } else if (serverSignal || endIdx !== -1) {
+                            // Thinking ended — split thinking and content
+                            thinkingDone = true;
+                            if (endIdx !== -1) {
+                                thinkText = fullText.substring(0, endIdx);
+                                respText = fullText.substring(endIdx + endLen).trimStart();
+                            } else {
+                                // Server signal but marker not in text yet — use accumulated
+                                thinkText = fullText;
+                                respText = '';
+                            }
+                            // Strip Gemma 4 channel prefix (any partial match)
+                            for (const p of ['<|channel>thought\n', '<|channel>thought', '<|channel>', 'thought\n', 'thought']) {
+                                if (thinkText.startsWith(p)) { thinkText = thinkText.substring(p.length); break; }
+                            }
+                            // Strip <think> for ChatML
+                            if (thinkText.startsWith('<think>\n')) thinkText = thinkText.substring(8);
+                            else if (thinkText.startsWith('<think>')) thinkText = thinkText.substring(7);
+                            // Strip <channel|> if it ended up in thinkText
+                            thinkText = thinkText.replace(/<channel\|>/g, '').trimEnd();
 
                             thinkBody.innerHTML = renderMarkdown(thinkText);
                             thinkCount.textContent = `${countTokens(thinkText)} tok`;
@@ -382,13 +423,32 @@ async function sendMessage() {
 
                             contentEl.innerHTML = renderMarkdown(respText);
                         } else {
-                            thinkText = fullText;
-                            thinkBody.innerHTML = renderMarkdown(thinkText);
-                            thinkCount.textContent = `${countTokens(thinkText)} tok`;
+                            // Still thinking — display in thinking block
+                            // Strip Gemma 4 thinking prefix progressively
+                            // (tokens arrive as <|channel>, thought, \n separately)
+                            let displayThink = fullText;
+                            const prefixes = ['<|channel>thought\n', '<|channel>thought', '<|channel>', 'thought\n', 'thought'];
+                            for (const p of prefixes) {
+                                if (displayThink.startsWith(p)) {
+                                    displayThink = displayThink.substring(p.length);
+                                    break;
+                                }
+                            }
+                            // Also strip <think> for ChatML
+                            if (displayThink.startsWith('<think>\n')) {
+                                displayThink = displayThink.substring(8);
+                            } else if (displayThink.startsWith('<think>')) {
+                                displayThink = displayThink.substring(7);
+                            }
+                            thinkBody.innerHTML = renderMarkdown(displayThink);
+                            thinkCount.textContent = `${countTokens(displayThink)} tok`;
                             thinkBody.scrollTop = thinkBody.scrollHeight;
                         }
                     } else {
-                        respText += event.content;
+                        // Content mode: strip any leftover thinking markers
+                        let ct = event.content;
+                        ct = ct.replace(/<\|channel>thought\n?/g, '').replace(/<channel\|>/g, '');
+                        respText += ct;
                         contentEl.innerHTML = renderMarkdown(respText);
                     }
                     scrollBottom();
@@ -974,12 +1034,17 @@ async function runCompaction(keepRecent, customPrompt) {
 
                 if (event.type === 'text') {
                     fullText += event.content;
-                    // Show content after </think>
+                    // Show content after thinking end marker
                     if (!thinkingDone) {
-                        const endIdx = fullText.indexOf('</think>');
+                        let endIdx = fullText.indexOf('</think>');
+                        let endLen = 8;
+                        if (endIdx === -1) {
+                            endIdx = fullText.indexOf('<channel|>');
+                            endLen = 10;
+                        }
                         if (endIdx !== -1) {
                             thinkingDone = true;
-                            summaryText = fullText.substring(endIdx + 8).trimStart();
+                            summaryText = fullText.substring(endIdx + endLen).trimStart();
                             liveEl.innerHTML = renderMarkdown(summaryText);
                         }
                     } else {

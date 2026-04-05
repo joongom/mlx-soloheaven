@@ -331,18 +331,27 @@ async def _stream_chat(
                     engine_cache_info = result.cache_info
                 break
 
-            if result.text:
+            if result.text or result.token:
                 token_count += 1
                 if t_first_token is None:
                     t_first_token = time.perf_counter()
 
                 accumulated_text += result.text
 
+                # Detect thinking end token for real-time SSE notification
+                thinking_end_detected = False
+                model_family = getattr(eng, '_model_family', 'chatml')
+                if model_family == "gemma4":
+                    thinking_end_detected = (result.token == eng.cfg.think_end_token)
+                elif "</think>" in result.text:
+                    thinking_end_detected = True
+
                 event = json.dumps(
                     {
                         "type": "text",
                         "content": result.text,
                         "tps": round(result.generation_tps, 1) if result.generation_tps else 0,
+                        **({"thinking_done": True} if thinking_end_detected else {}),
                     },
                     ensure_ascii=False,
                 )
@@ -355,7 +364,9 @@ async def _stream_chat(
     engine_ttft = (t_first_token - (t_gen_actual or t_gen_start)) if t_first_token else 0
     total_time = t_end - t_start
 
-    thinking, content = split_thinking_and_content(accumulated_text)
+    thinking, content = split_thinking_and_content(
+        accumulated_text, model_family=getattr(eng, '_model_family', 'chatml')
+    )
 
     # Include build_time from branch/regenerate BUILD if available
     build_time = 0.0

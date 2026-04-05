@@ -24,11 +24,12 @@ from dataclasses import dataclass, field
 from typing import AsyncGenerator, Generator, Optional
 
 import mlx.core as mx
-from mlx_lm import load, stream_generate
+from mlx_lm import load as lm_load, stream_generate
 from mlx_lm.models.cache import make_prompt_cache, save_prompt_cache, load_prompt_cache
 from mlx_lm.sample_utils import make_sampler
 
 from mlx_soloheaven.config import Config
+from mlx_soloheaven.engine.chat_format import get_chat_format
 from mlx_soloheaven.engine.thinking import ThinkingBudgetProcessor, RepetitionPenaltyProcessor
 from mlx_soloheaven.engine.tool_parser import parse_tool_calls, split_thinking_and_content
 from mlx_soloheaven.cache.manager import CacheManager
@@ -98,6 +99,28 @@ def _detect_token_id(tokenizer, text: str) -> int:
     return -1
 
 
+class _VLMAdapter:
+    """Wraps a VLM language_model to return raw mx.array for mlx-lm compatibility.
+
+    mlx-lm's generate_step expects model(tokens, cache=...) → mx.array.
+    VLM language_model returns LanguageModelOutput(logits=...).
+    This adapter extracts .logits so mlx-lm's stream_generate works unchanged.
+    All other attributes (make_cache, layers, parameters, etc.) are forwarded.
+    """
+
+    def __init__(self, language_model):
+        self._lm = language_model
+
+    def __call__(self, *args, **kwargs):
+        out = self._lm(*args, **kwargs)
+        return out.logits if hasattr(out, "logits") else out
+
+    def __getattr__(self, name):
+        if name == "_lm":
+            raise AttributeError(name)
+        return getattr(self._lm, name)
+
+
 @dataclass
 class BaseCacheEntry:
     """A cached KV state for a shared system prompt prefix."""
@@ -149,31 +172,76 @@ class MLXEngine:
     def load_model(self):
         logger.info(f"Loading model: {self.cfg.model_path}")
         t0 = time.perf_counter()
-        self.model, self.tokenizer = load(self.cfg.model_path)
+
+        # Detect model type from config.json
+        model_config = {}
+        config_path = os.path.join(self.cfg.model_path, "config.json")
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                model_config = json.load(f)
+        self._model_type = model_config.get("model_type", "")
+
+        # Try mlx-vlm first (handles VLM + some text models), fall back to mlx-lm
+        self._is_vlm = False
+        self._vlm_model = None
+        self._processor = None
+        try:
+            from mlx_vlm import load as vlm_load
+            vlm_model, processor = vlm_load(self.cfg.model_path)
+
+            if hasattr(vlm_model, "language_model"):
+                self.model = _VLMAdapter(vlm_model.language_model)
+                self._vlm_model = vlm_model
+            else:
+                self.model = vlm_model
+
+            # Extract tokenizer from processor
+            raw_tok = getattr(processor, "tokenizer", processor)
+            self.tokenizer = self._wrap_tokenizer(raw_tok, model_config)
+            self._processor = processor
+            self._is_vlm = True
+            logger.info(f"Loaded via mlx-vlm (is_vlm={self._vlm_model is not None})")
+        except Exception as e:
+            logger.info(f"VLM load failed ({e}), falling back to mlx-lm")
+            self.model, self.tokenizer = lm_load(self.cfg.model_path)
+
         elapsed = time.perf_counter() - t0
 
         # Derive model ID from directory name
         self.model_id = os.path.basename(self.cfg.model_path.rstrip("/"))
         logger.info(f"Model loaded in {elapsed:.1f}s — {self.model_id}")
 
-        # Auto-detect special token IDs
-        if self.cfg.think_end_token < 0:
-            self.cfg.think_end_token = _detect_token_id(self.tokenizer, "</think>")
-        if self.cfg.think_start_token < 0:
-            self.cfg.think_start_token = _detect_token_id(self.tokenizer, "<think>")
-        if self.cfg.im_end_token < 0:
-            self.cfg.im_end_token = _detect_token_id(self.tokenizer, "<|im_end|>")
+        # Detect model family + chat format
+        self._model_family = self._detect_model_family()
+        self._chat_format = get_chat_format(self._model_family)
+        logger.info(f"Model family: {self._model_family}, chat format: {type(self._chat_format).__name__}")
 
-        logger.debug(
-            f"Token IDs: </think>={self.cfg.think_end_token}, "
-            f"<think>={self.cfg.think_start_token}, "
-            f"<|im_end|>={self.cfg.im_end_token}"
-        )
+        # Auto-detect special token IDs (model-family-specific)
+        self._detect_special_tokens()
+
+        # Detect cache layer types (for optimization strategy)
+        test_cache = make_prompt_cache(self.model)
+        self._has_deltanet = any(type(c).__name__ == "ArraysCache" for c in test_cache)
+        self._has_rotating_cache = any(type(c).__name__ == "RotatingKVCache" for c in test_cache)
+        self._sliding_window_size = 0
+        if self._has_rotating_cache:
+            for c in test_cache:
+                if type(c).__name__ == "RotatingKVCache" and hasattr(c, "max_size"):
+                    self._sliding_window_size = c.max_size
+                    break
+        del test_cache
+        if self._has_deltanet:
+            logger.info(f"[{self.model_id}] DeltaNet layers detected — checkpoints enabled")
+        if self._has_rotating_cache:
+            logger.info(
+                f"[{self.model_id}] RotatingKVCache detected — "
+                f"sliding_window={self._sliding_window_size}"
+            )
 
         if self.cfg.think_end_token < 0 and self.cfg.enable_thinking:
             self.cfg.enable_thinking = False
             logger.info(
-                f"[{self.model_id}] </think> token not found — auto-disabled thinking"
+                f"[{self.model_id}] think_end token not found — auto-disabled thinking"
             )
 
         logger.debug(
@@ -209,6 +277,67 @@ class MLXEngine:
         if self.cfg.gpu_keepalive:
             self._start_gpu_keepalive()
             logger.info(f"[{self.model_id}] GPU keepalive enabled (interval={self.GPU_KEEPALIVE_INTERVAL}s)")
+
+    # --- Model detection helpers ---
+
+    def _detect_model_family(self) -> str:
+        """Detect model family from model_type in config.json."""
+        mt = self._model_type.lower()
+        if "gemma4" in mt:
+            return "gemma4"
+        # Default: ChatML family (Qwen, GLM, MiniMax, etc.)
+        return "chatml"
+
+    def _detect_special_tokens(self):
+        """Auto-detect special token IDs based on model family."""
+        if self._model_family == "gemma4":
+            self.cfg.think_end_token = _detect_token_id(self.tokenizer, "<channel|>")
+            self.cfg.think_start_token = _detect_token_id(self.tokenizer, "<|channel>")
+            self.cfg.im_end_token = _detect_token_id(self.tokenizer, "<turn|>")
+        else:
+            if self.cfg.think_end_token < 0:
+                self.cfg.think_end_token = _detect_token_id(self.tokenizer, "</think>")
+            if self.cfg.think_start_token < 0:
+                self.cfg.think_start_token = _detect_token_id(self.tokenizer, "<think>")
+            if self.cfg.im_end_token < 0:
+                self.cfg.im_end_token = _detect_token_id(self.tokenizer, "<|im_end|>")
+
+        logger.info(
+            f"[{self.model_id}] model_family={self._model_family} | "
+            f"Token IDs: think_end={self.cfg.think_end_token}, "
+            f"think_start={self.cfg.think_start_token}, "
+            f"eos/im_end={self.cfg.im_end_token}"
+        )
+
+    def _wrap_tokenizer(self, raw_tok, config: dict):
+        """Wrap a VLM processor's tokenizer for mlx-lm compatibility."""
+        from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+        # Ensure chat_template is set (some models store it in a file)
+        if not getattr(raw_tok, "chat_template", None):
+            template_path = os.path.join(self.cfg.model_path, "chat_template.jinja")
+            if os.path.exists(template_path):
+                with open(template_path) as f:
+                    raw_tok.chat_template = f.read()
+                logger.info(f"Loaded chat_template from {template_path}")
+
+        wrapped = TokenizerWrapper(raw_tok)
+
+        # Ensure correct EOS token IDs
+        eos_ids = config.get("eos_token_id", [])
+        if isinstance(eos_ids, int):
+            eos_ids = [eos_ids]
+
+        # Gemma 4: <turn|> (106) is the chat turn-end token
+        if self._model_type == "gemma4":
+            turn_end = _detect_token_id(raw_tok, "<turn|>")
+            if turn_end >= 0 and turn_end not in eos_ids:
+                eos_ids.append(turn_end)
+
+        if eos_ids:
+            wrapped.eos_token_ids = set(eos_ids)
+
+        return wrapped
 
     # --- GPU keepalive ---
 
@@ -546,14 +675,22 @@ class MLXEngine:
 
     @staticmethod
     def _system_hash(messages: list[dict], tools: list | None = None) -> str | None:
-        """Hash the first system message (+ tools) for base cache lookup."""
+        """Hash the first system message (+ tools) for base cache lookup.
+
+        Returns a hash even when there's no explicit system message — uses empty
+        string as content. This supports models where the template auto-generates
+        a system prefix (e.g. Gemma 4).
+        """
         if messages and messages[0].get("role") in ("system", "developer"):
             content = messages[0].get("content", "")
-            h = hashlib.sha256(content.encode())
-            if tools:
-                h.update(json.dumps(tools, sort_keys=True, ensure_ascii=False).encode())
-            return h.hexdigest()[:16]
-        return None
+        else:
+            # No explicit system message — use empty content as hash key
+            # (template may still generate a system prefix)
+            content = ""
+        h = hashlib.sha256(content.encode())
+        if tools:
+            h.update(json.dumps(tools, sort_keys=True, ensure_ascii=False).encode())
+        return h.hexdigest()[:16]
 
     def _find_base_cache(self, messages: list[dict], tools: list | None = None) -> BaseCacheEntry | None:
         """Find a matching base cache for the given messages' system prompt."""
@@ -567,26 +704,30 @@ class MLXEngine:
 
         Uses dummy user message to tokenize system+user, then strips dummy suffix
         to get pure system prompt tokens.
+
+        For models with RotatingKVCache (e.g. Gemma 4), also handles the case where
+        no explicit system message exists but the template auto-generates a system
+        prefix (e.g. <bos><|turn>system\n<|think|><turn|>).
         """
-        if not messages or messages[0].get("role") not in ("system", "developer"):
-            return None
+        has_system = messages and messages[0].get("role") in ("system", "developer")
+        if not has_system and not self._has_rotating_cache:
+            return None  # Only needed for explicit system or sliding window models
         h = self._system_hash(messages, tools=tools)
         if h and h in self._base_caches:
             return None  # Already have base cache for this system prompt
         try:
             enable_thinking = thinking if thinking is not None else self.cfg.enable_thinking
-            system_with_dummy = [messages[0], {"role": "user", "content": "hi"}]
-            full_with_dummy = self.tokenize_messages(system_with_dummy, tools=tools, thinking=thinking)
-            if enable_thinking:
-                dummy_suffix = self.tokenizer.encode(
-                    "\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n",
-                    add_special_tokens=False,
-                )
+            if has_system:
+                system_with_dummy = [messages[0], {"role": "user", "content": "hi"}]
             else:
-                dummy_suffix = self.tokenizer.encode(
-                    "\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n",
-                    add_special_tokens=False,
-                )
+                # No explicit system message — use just a dummy user to extract
+                # the template's auto-generated system prefix (e.g. Gemma 4: <bos><|turn>system\n<|think|><turn|>)
+                system_with_dummy = [{"role": "user", "content": "hi"}]
+            full_with_dummy = self.tokenize_messages(system_with_dummy, tools=tools, thinking=thinking)
+            dummy_suffix = self.tokenizer.encode(
+                self._chat_format.dummy_suffix(enable_thinking),
+                add_special_tokens=False,
+            )
             if len(full_with_dummy) > len(dummy_suffix):
                 system_tokens = full_with_dummy[: len(full_with_dummy) - len(dummy_suffix)]
                 # Verify these tokens are a prefix of the full tokens
@@ -636,6 +777,8 @@ class MLXEngine:
         """Clone a base cache for a new session."""
         import copy
         cloned = copy.deepcopy(base.cache)
+        # Force evaluation of cloned arrays to avoid lazy-eval aliasing issues
+        self._eval_cache(cloned)
         base.hit_count += 1
         logger.debug(
             f"[Base Cache] CLONE | hash={base.system_hash} | "
@@ -655,7 +798,18 @@ class MLXEngine:
             for e in self._base_caches.values()
         ]
 
-    def _get_cache_offset(self, cache: list) -> int:
+    @staticmethod
+    def _get_cache_offset(cache: list) -> int:
+        """Get the total number of tokens processed by this cache.
+
+        Prefers KVCache (full attention, accurate cumulative offset) over
+        RotatingKVCache (offset is cumulative but size() caps at max_size).
+        """
+        # First pass: look for unbounded KVCache (full attention layers)
+        for c in cache:
+            if type(c).__name__ == "KVCache" and hasattr(c, "offset"):
+                return c.offset
+        # Fallback: any cache with offset (RotatingKVCache, ArraysCache, etc.)
         for c in cache:
             if hasattr(c, "offset"):
                 return c.offset
@@ -679,6 +833,14 @@ class MLXEngine:
             mx.eval(*arrays)
 
     @staticmethod
+    def _is_compacted_tool(s_content: str, i_content: str) -> bool:
+        """Check if either side is a compacted/cleared tool result placeholder."""
+        for c in (s_content, i_content):
+            if c.startswith("[") and ("cleared]" in c or "compacted:" in c):
+                return True
+        return False
+
+    @staticmethod
     def _normalize_for_match(content: str, role: str) -> str:
         """Normalize message content for comparison."""
         import re
@@ -699,7 +861,12 @@ class MLXEngine:
         # Strip thinking text from assistant messages
         # Server stores content without thinking, but client may send full text
         if role == "assistant":
-            # Case 1: <think>...</think>content
+            # Gemma 4: <|channel>thought\n...<channel|>content
+            content = re.sub(r"<\|channel>thought\n.*?<channel\|>\s*", "", content, flags=re.DOTALL)
+            m2 = re.match(r".*?<channel\|>\s*(.*)", content, re.DOTALL)
+            if m2:
+                content = m2.group(1)
+            # ChatML: <think>...</think>content
             m = re.match(r"<think>.*?</think>\s*(.*)", content, re.DOTALL)
             if m:
                 content = m.group(1)
@@ -748,11 +915,11 @@ class MLXEngine:
             s_norm = self._normalize_for_match(s_content, role)
             i_norm = self._normalize_for_match(i_content, role)
             if s_norm != i_norm:
-                # Client cleared old tool results (e.g. "[Old tool result content cleared]")
+                # Tool content compacted/cleared by client (either direction)
                 # KV cache still valid — the tokens were already processed.
-                if role == "tool" and i_content.startswith("[") and "cleared]" in i_content:
+                if role == "tool" and self._is_compacted_tool(s_content, i_content):
                     logger.debug(
-                        f"[Match] msg[{i}] tool content cleared by client — "
+                        f"[Match] msg[{i}] tool content compacted — "
                         f"accepting (stored={len(s_content)}, incoming={len(i_content)})"
                     )
                     continue
@@ -786,27 +953,11 @@ class MLXEngine:
 
     def _make_suffix_tokens(self, query: str, thinking: bool = True) -> list[int]:
         """Create suffix tokens for a new user turn."""
-        assistant_suffix = "\n<|im_start|>assistant\n<think>\n" if thinking else "\n<|im_start|>assistant\n"
-        suffix_text = f"\n<|im_start|>user\n{query}<|im_end|>{assistant_suffix}"
-        return self.tokenizer.encode(suffix_text, add_special_tokens=False)
+        return self._chat_format.suffix_user(self.tokenizer, query, thinking)
 
     def _make_suffix_tokens_tool_result(self, messages: list[dict], thinking: bool = True) -> list[int]:
         """Create suffix tokens for tool result messages."""
-        parts = []
-        for msg in messages:
-            if msg["role"] == "tool":
-                parts.append(
-                    f"\n<|im_start|>user\n<tool_response>\n"
-                    f"{msg.get('content', '')}\n</tool_response><|im_end|>"
-                )
-            elif msg["role"] == "user":
-                parts.append(
-                    f"\n<|im_start|>user\n{msg.get('content', '')}<|im_end|>"
-                )
-        assistant_suffix = "\n<|im_start|>assistant\n<think>\n" if thinking else "\n<|im_start|>assistant\n"
-        parts.append(assistant_suffix)
-        suffix_text = "".join(parts)
-        return self.tokenizer.encode(suffix_text, add_special_tokens=False)
+        return self._chat_format.suffix_tool_result(self.tokenizer, messages, thinking)
 
     def tokenize_messages(
         self,
@@ -942,7 +1093,11 @@ class MLXEngine:
         cache_mode = "miss"
         total_prompt_tokens = 0  # Full prompt token count for usage reporting
 
-        # Determine if we can reuse existing session cache
+        # Suffix mode: reuse session KV cache, append only new user message tokens.
+        # Works for all models because thinking tokens stay in the cache naturally
+        # (the model generated them — they're part of the KV state).
+        _suffix_safe = True
+
         if (
             session
             and session.cache is not None
@@ -962,7 +1117,7 @@ class MLXEngine:
                     f"discarding {cache_offset} cached tokens, "
                     f"re-processing {len(prompt_tokens)} tokens"
                 )
-            elif len(new_messages) == 1 and new_messages[0]["role"] == "user":
+            elif _suffix_safe and len(new_messages) == 1 and new_messages[0]["role"] == "user":
                 cache_mode = "hit"
                 prompt_tokens = self._make_suffix_tokens(new_messages[0]["content"], thinking=use_thinking)
                 total_prompt_tokens = cache_offset + len(prompt_tokens)
@@ -971,7 +1126,7 @@ class MLXEngine:
                     f"reusing {cache_offset} cached tokens + "
                     f"{len(prompt_tokens)} suffix tokens"
                 )
-            else:
+            elif _suffix_safe:
                 cache_mode = "hit_multi"
                 prompt_tokens = self._make_suffix_tokens_tool_result(new_messages, thinking=use_thinking)
                 total_prompt_tokens = cache_offset + len(prompt_tokens)
@@ -981,6 +1136,58 @@ class MLXEngine:
                     f"reusing {cache_offset} cached tokens + "
                     f"{len(prompt_tokens)} suffix tokens | {new_roles}"
                 )
+            else:
+                # Suffix-unsafe model (e.g. Gemma 4): full retokenization
+                # Template strips thinking from history → KV state diverges → must rebuild
+                prompt_tokens = self.tokenize_messages(messages, tools=tools, thinking=use_thinking)
+                total_prompt_tokens = len(prompt_tokens)
+
+
+                # Try to reuse base cache (system prompt KV) even for retokenization
+                base = self._find_base_cache(messages, tools=tools)
+                if base and len(prompt_tokens) >= base.token_count:
+                    if prompt_tokens[:base.token_count] == base.tokens:
+                        prompt_cache = self._clone_base_cache(base)
+                        prompt_tokens = prompt_tokens[base.token_count:]
+                        cache_mode = "retok_base"
+                        logger.info(
+                            f"[KV Cache] session={session_id} | RETOKENIZE+BASE | "
+                            f"reusing {base.token_count} base tokens, "
+                            f"processing {len(prompt_tokens)} remaining tokens "
+                            f"(was {cache_offset} cached)"
+                        )
+                    else:
+                        base = None  # token mismatch — fall through
+
+                if base is None:
+                    # No usable base cache — build system cache inline to protect from rotation
+                    system_tokens = self._extract_system_tokens(
+                        messages, prompt_tokens, tools=tools, thinking=use_thinking,
+                    )
+                    if system_tokens and len(system_tokens) < len(prompt_tokens):
+                        prompt_cache = make_prompt_cache(self.model)
+                        sys_array = mx.array(system_tokens)
+                        step_size = 512
+                        for i in range(0, len(system_tokens), step_size):
+                            chunk = sys_array[i : i + step_size]
+                            self.model(chunk[None], cache=prompt_cache)
+                        self._eval_cache(prompt_cache)
+
+                        self._register_base_cache(messages, prompt_cache, system_tokens, tools=tools)
+                        prompt_tokens = prompt_tokens[len(system_tokens):]
+                        cache_mode = "retok_build"
+                        logger.info(
+                            f"[KV Cache] session={session_id} | RETOKENIZE+BUILD | "
+                            f"built base ({len(system_tokens)} sys tokens), "
+                            f"processing {len(prompt_tokens)} remaining"
+                        )
+                    else:
+                        prompt_cache = make_prompt_cache(self.model)
+                        cache_mode = "miss"
+                        logger.info(
+                            f"[KV Cache] session={session_id} | RETOKENIZE | "
+                            f"full rebuild {total_prompt_tokens} tokens"
+                        )
         else:
             # Try branch detection first (incoming shorter than stored, prefix matches)
             branch_restored = False
@@ -992,7 +1199,14 @@ class MLXEngine:
                         if turn <= branch_point:
                             checkpoint_turn = turn
                             break
-                    if checkpoint_turn is not None and checkpoint_turn in session.deltanet_snapshots:
+                    # Guard: RotatingKVCache cannot be safely sliced (circular buffer)
+                    has_rotating = any(type(c).__name__ == "RotatingKVCache" for c in session.cache)
+                    if has_rotating:
+                        logger.info(
+                            f"[KV Cache] session={session_id} | BRANCH skipped — "
+                            f"RotatingKVCache cannot be sliced, falling through to BUILD"
+                        )
+                    elif checkpoint_turn is not None and checkpoint_turn in session.deltanet_snapshots:
                         target_offset = session.turn_offsets[checkpoint_turn]
                         deltanet_states = session.deltanet_snapshots[checkpoint_turn]
                         new_cache = []
@@ -1103,6 +1317,7 @@ class MLXEngine:
                 budget=budget,
                 think_end_token=self.cfg.think_end_token,
                 think_start_token=self.cfg.think_start_token,
+                model_family=self._model_family,
             )
             thinking_proc.reset()
             logits_processors.append(thinking_proc)
@@ -1139,6 +1354,8 @@ class MLXEngine:
         last_resp = None
         t_gen_start = time.perf_counter()
         t_first_token = None
+
+
 
         cancelled = False
         for resp in stream_generate(
@@ -1192,7 +1409,7 @@ class MLXEngine:
         # This prevents poisoning the cache with degenerate outputs
         if generated_tokens and session_id:
             gen_text = self.tokenizer.decode(generated_tokens)
-            thinking, content = split_thinking_and_content(gen_text)
+            thinking, content = split_thinking_and_content(gen_text, model_family=self._model_family)
             if not content or not content.strip():
                 logger.warning(
                     f"[KV Cache] session={session_id} | SKIP SAVE | "
@@ -1230,10 +1447,11 @@ class MLXEngine:
             session_state = self._sessions[session_id]
             turn_key = len(messages)
             session_state.turn_offsets[turn_key] = new_offset
-            session_state.deltanet_snapshots[turn_key] = [
-                copy.deepcopy(c) for c in prompt_cache
-                if type(c).__name__ == "ArraysCache"
-            ]
+            if self._has_deltanet:
+                session_state.deltanet_snapshots[turn_key] = [
+                    copy.deepcopy(c) for c in prompt_cache
+                    if type(c).__name__ == "ArraysCache"
+                ]
             # Prune old checkpoints
             max_ckpt = self.cfg.max_checkpoints if hasattr(self.cfg, 'max_checkpoints') else DEFAULT_MAX_CHECKPOINTS
             if max_ckpt > 0:
@@ -1250,34 +1468,37 @@ class MLXEngine:
             )
 
         # Auto-register base cache on full miss (system prompt not yet cached)
-        if cache_mode in ("miss",) and messages and messages[0].get("role") in ("system", "developer"):
+        # For RotatingKVCache models (e.g. Gemma 4), also register when template auto-generates system prefix
+        has_system_or_rotating = (
+            (messages and messages[0].get("role") in ("system", "developer"))
+            or self._has_rotating_cache
+        )
+        if cache_mode in ("miss",) and messages and has_system_or_rotating:
             sys_hash = self._system_hash(messages, tools=tools)
             if sys_hash and sys_hash not in self._base_caches:
                 # Tokenize system prompt with dummy user to satisfy chat template
-                system_with_dummy = [messages[0], {"role": "user", "content": "hi"}]
+                has_system = messages[0].get("role") in ("system", "developer")
+                system_with_dummy = (
+                    [messages[0], {"role": "user", "content": "hi"}]
+                    if has_system
+                    else [{"role": "user", "content": "hi"}]
+                )
                 full_tokens = self.tokenize_messages(system_with_dummy, tools=tools, thinking=use_thinking)
-                if use_thinking:
-                    dummy_suffix = self.tokenizer.encode(
-                        "\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n",
-                        add_special_tokens=False,
-                    )
-                else:
-                    dummy_suffix = self.tokenizer.encode(
-                        "\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n",
-                        add_special_tokens=False,
-                    )
+                dummy_suffix = self.tokenizer.encode(
+                    self._chat_format.dummy_suffix(use_thinking),
+                    add_special_tokens=False,
+                )
                 system_tokens = full_tokens[: len(full_tokens) - len(dummy_suffix)]
                 if system_tokens:
                     try:
                         base_cache = make_prompt_cache(self.model)
-                        for _ in stream_generate(
-                            self.model,
-                            self.tokenizer,
-                            prompt=system_tokens,
-                            max_tokens=1,
-                            prompt_cache=base_cache,
-                        ):
-                            break  # just process prompt, don't need output
+                        # Process system tokens directly (no generation) to avoid
+                        # polluting the base cache with an extra generated token
+                        sys_array = mx.array(system_tokens)
+                        step_size = 512
+                        for i in range(0, len(system_tokens), step_size):
+                            chunk = sys_array[i : i + step_size]
+                            self.model(chunk[None], cache=base_cache)
                         self._eval_cache(base_cache)
                         self._register_base_cache(messages, base_cache, system_tokens, tools=tools)
                     except Exception as e:
@@ -1290,7 +1511,7 @@ class MLXEngine:
 
         if has_tools and generated_tokens:
             full_text = self.tokenizer.decode(generated_tokens)
-            _, tool_calls = parse_tool_calls(full_text)
+            _, tool_calls = parse_tool_calls(full_text, model_family=self._model_family)
             if tool_calls:
                 finish_reason = "tool_calls"
 
@@ -1351,11 +1572,11 @@ class MLXEngine:
                 result.cache_info = chunk.cache_info
 
         full_text = "".join(all_text)
-        thinking, content = split_thinking_and_content(full_text)
+        thinking, content = split_thinking_and_content(full_text, model_family=self._model_family)
         result.thinking = thinking
 
         if tools:
-            text_part, tool_calls = parse_tool_calls(content)
+            text_part, tool_calls = parse_tool_calls(content, model_family=self._model_family)
             if tool_calls:
                 result.tool_calls = tool_calls
                 result.content = text_part if text_part else None
@@ -1446,7 +1667,7 @@ class MLXEngine:
                     system_with_dummy = [messages[0], {"role": "user", "content": "hi"}]
                     full_tokens = self.tokenize_messages(system_with_dummy)
                     dummy_suffix = self.tokenizer.encode(
-                        "\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n",
+                        self._chat_format.dummy_suffix(True),
                         add_special_tokens=False,
                     )
                     system_tokens = full_tokens[: len(full_tokens) - len(dummy_suffix)]
@@ -1653,7 +1874,15 @@ class MLXEngine:
                     checkpoint_turn = turn
                     break
 
-        if checkpoint_turn is not None and source:
+        # Guard: RotatingKVCache cannot be safely sliced (circular buffer)
+        has_rotating = source and any(type(c).__name__ == "RotatingKVCache" for c in source.cache)
+
+        if (
+            checkpoint_turn is not None
+            and source
+            and not has_rotating
+            and checkpoint_turn in source.deltanet_snapshots
+        ):
             # Restore from checkpoint
             with self._lock:
                 deltanet_states = source.deltanet_snapshots[checkpoint_turn]
@@ -1738,10 +1967,11 @@ class MLXEngine:
                 # Save checkpoint so immediate regen/delete is fast
                 turn_key = len(engine_messages)
                 new_session.turn_offsets[turn_key] = new_offset
-                new_session.deltanet_snapshots[turn_key] = [
-                    copy.deepcopy(c) for c in prompt_cache
-                    if type(c).__name__ == "ArraysCache"
-                ]
+                if self._has_deltanet:
+                    new_session.deltanet_snapshots[turn_key] = [
+                        copy.deepcopy(c) for c in prompt_cache
+                        if type(c).__name__ == "ArraysCache"
+                    ]
                 self._sessions[new_session_id] = new_session
                 self._mark_dirty(new_session_id)
 
@@ -1804,7 +2034,14 @@ class MLXEngine:
                 checkpoint_turn = turn
                 break
 
-        if checkpoint_turn is not None and checkpoint_turn in session.deltanet_snapshots:
+        # Guard: RotatingKVCache cannot be safely sliced (circular buffer)
+        has_rotating = any(type(c).__name__ == "RotatingKVCache" for c in session.cache)
+
+        if (
+            checkpoint_turn is not None
+            and not has_rotating
+            and checkpoint_turn in session.deltanet_snapshots
+        ):
             target_offset = session.turn_offsets[checkpoint_turn]
             deltanet_states = session.deltanet_snapshots[checkpoint_turn]
 
@@ -1863,10 +2100,11 @@ class MLXEngine:
                 # Save checkpoint
                 turn_key = len(restore_messages)
                 session.turn_offsets[turn_key] = new_offset
-                session.deltanet_snapshots[turn_key] = [
-                    copy.deepcopy(c) for c in prompt_cache
-                    if type(c).__name__ == "ArraysCache"
-                ]
+                if self._has_deltanet:
+                    session.deltanet_snapshots[turn_key] = [
+                        copy.deepcopy(c) for c in prompt_cache
+                        if type(c).__name__ == "ArraysCache"
+                    ]
 
             logger.info(
                 f"[Truncate] session={session_id} | BUILD | "
@@ -1923,8 +2161,8 @@ class MLXEngine:
             s_norm = self._normalize_for_match(s_content, role)
             i_norm = self._normalize_for_match(i_content, role)
             if s_norm != i_norm:
-                # Tool content cleared by client
-                if role == "tool" and i_content.startswith("[") and "cleared]" in i_content:
+                # Tool content compacted/cleared (either direction)
+                if role == "tool" and self._is_compacted_tool(s_content, i_content):
                     continue
                 # Last stored assistant tolerance
                 if role == "assistant" and i == prefix_len - 1:

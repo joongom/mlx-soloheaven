@@ -23,6 +23,7 @@ classifiers = [
 dependencies = [
     "mlx>=0.22",
     "mlx-lm>=0.20",
+    "mlx-vlm>=0.4",
     "fastapi>=0.104",
     "uvicorn[standard]>=0.24",
     "aiosqlite>=0.19",

@@ -8,6 +8,16 @@ let currentSessionId = null;
 let isStreaming = false;
 let selectedModel = null; // null = default (first model)
 
+/** Strip thinking prefix markers from text (Gemma 4 + ChatML). */
+function stripThinkingPrefix(text) {
+    for (const p of ['<|channel>thought\n', '<|channel>thought', '<|channel>', 'thought\n', 'thought']) {
+        if (text.startsWith(p)) return text.substring(p.length);
+    }
+    if (text.startsWith('<think>\n')) return text.substring(8);
+    if (text.startsWith('<think>')) return text.substring(7);
+    return text;
+}
+
 // Pagination
 const PAGE_SIZE = 20;
 let loadedTotal = 0;
@@ -403,13 +413,7 @@ async function sendMessage() {
                                 thinkText = fullText;
                                 respText = '';
                             }
-                            // Strip Gemma 4 channel prefix (any partial match)
-                            for (const p of ['<|channel>thought\n', '<|channel>thought', '<|channel>', 'thought\n', 'thought']) {
-                                if (thinkText.startsWith(p)) { thinkText = thinkText.substring(p.length); break; }
-                            }
-                            // Strip <think> for ChatML
-                            if (thinkText.startsWith('<think>\n')) thinkText = thinkText.substring(8);
-                            else if (thinkText.startsWith('<think>')) thinkText = thinkText.substring(7);
+                            thinkText = stripThinkingPrefix(thinkText);
                             // Strip <channel|> if it ended up in thinkText
                             thinkText = thinkText.replace(/<channel\|>/g, '').trimEnd();
 
@@ -424,22 +428,7 @@ async function sendMessage() {
                             contentEl.innerHTML = renderMarkdown(respText);
                         } else {
                             // Still thinking — display in thinking block
-                            // Strip Gemma 4 thinking prefix progressively
-                            // (tokens arrive as <|channel>, thought, \n separately)
-                            let displayThink = fullText;
-                            const prefixes = ['<|channel>thought\n', '<|channel>thought', '<|channel>', 'thought\n', 'thought'];
-                            for (const p of prefixes) {
-                                if (displayThink.startsWith(p)) {
-                                    displayThink = displayThink.substring(p.length);
-                                    break;
-                                }
-                            }
-                            // Also strip <think> for ChatML
-                            if (displayThink.startsWith('<think>\n')) {
-                                displayThink = displayThink.substring(8);
-                            } else if (displayThink.startsWith('<think>')) {
-                                displayThink = displayThink.substring(7);
-                            }
+                            let displayThink = stripThinkingPrefix(fullText);
                             thinkBody.innerHTML = renderMarkdown(displayThink);
                             thinkCount.textContent = `${countTokens(displayThink)} tok`;
                             thinkBody.scrollTop = thinkBody.scrollHeight;

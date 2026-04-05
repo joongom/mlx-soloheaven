@@ -212,9 +212,9 @@ class MLXEngine:
         logger.info(f"Model loaded in {elapsed:.1f}s — {self.model_id}")
 
         # Detect model family + chat format
-        self._model_family = self._detect_model_family()
-        self._chat_format = get_chat_format(self._model_family)
-        logger.info(f"Model family: {self._model_family}, chat format: {type(self._chat_format).__name__}")
+        self.model_family = self._detect_model_family()
+        self._chat_format = get_chat_format(self.model_family)
+        logger.info(f"Model family: {self.model_family}, chat format: {type(self._chat_format).__name__}")
 
         # Auto-detect special token IDs (model-family-specific)
         self._detect_special_tokens()
@@ -290,7 +290,7 @@ class MLXEngine:
 
     def _detect_special_tokens(self):
         """Auto-detect special token IDs based on model family."""
-        if self._model_family == "gemma4":
+        if self.model_family == "gemma4":
             self.cfg.think_end_token = _detect_token_id(self.tokenizer, "<channel|>")
             self.cfg.think_start_token = _detect_token_id(self.tokenizer, "<|channel>")
             self.cfg.im_end_token = _detect_token_id(self.tokenizer, "<turn|>")
@@ -303,7 +303,7 @@ class MLXEngine:
                 self.cfg.im_end_token = _detect_token_id(self.tokenizer, "<|im_end|>")
 
         logger.info(
-            f"[{self.model_id}] model_family={self._model_family} | "
+            f"[{self.model_id}] model_family={self.model_family} | "
             f"Token IDs: think_end={self.cfg.think_end_token}, "
             f"think_start={self.cfg.think_start_token}, "
             f"eos/im_end={self.cfg.im_end_token}"
@@ -832,6 +832,16 @@ class MLXEngine:
         if arrays:
             mx.eval(*arrays)
 
+    _PREFILL_STEP = 512
+
+    def _prefill_cache(self, cache: list, tokens: list[int]):
+        """Process tokens through the model to populate a KV cache."""
+        arr = mx.array(tokens)
+        for i in range(0, len(tokens), self._PREFILL_STEP):
+            chunk = arr[i : i + self._PREFILL_STEP]
+            self.model(chunk[None], cache=cache)
+        self._eval_cache(cache)
+
     @staticmethod
     def _is_compacted_tool(s_content: str, i_content: str) -> bool:
         """Check if either side is a compacted/cleared tool result placeholder."""
@@ -1166,12 +1176,7 @@ class MLXEngine:
                     )
                     if system_tokens and len(system_tokens) < len(prompt_tokens):
                         prompt_cache = make_prompt_cache(self.model)
-                        sys_array = mx.array(system_tokens)
-                        step_size = 512
-                        for i in range(0, len(system_tokens), step_size):
-                            chunk = sys_array[i : i + step_size]
-                            self.model(chunk[None], cache=prompt_cache)
-                        self._eval_cache(prompt_cache)
+                        self._prefill_cache(prompt_cache, system_tokens)
 
                         self._register_base_cache(messages, prompt_cache, system_tokens, tools=tools)
                         prompt_tokens = prompt_tokens[len(system_tokens):]
@@ -1200,7 +1205,7 @@ class MLXEngine:
                             checkpoint_turn = turn
                             break
                     # Guard: RotatingKVCache cannot be safely sliced (circular buffer)
-                    has_rotating = any(type(c).__name__ == "RotatingKVCache" for c in session.cache)
+                    has_rotating = self._has_rotating_cache
                     if has_rotating:
                         logger.info(
                             f"[KV Cache] session={session_id} | BRANCH skipped — "
@@ -1281,13 +1286,7 @@ class MLXEngine:
                 system_tokens = self._extract_system_tokens(messages, prompt_tokens, tools=tools, thinking=use_thinking)
                 if system_tokens and len(system_tokens) < len(prompt_tokens):
                     prompt_cache = make_prompt_cache(self.model)
-                    # Process system tokens through model
-                    sys_array = mx.array(system_tokens)
-                    step_size = 512
-                    for i in range(0, len(system_tokens), step_size):
-                        chunk = sys_array[i : i + step_size]
-                        self.model(chunk[None], cache=prompt_cache)
-                    self._eval_cache(prompt_cache)
+                    self._prefill_cache(prompt_cache, system_tokens)
                     # Register as base cache immediately
                     self._register_base_cache(messages, prompt_cache, system_tokens, tools=tools)
                     # Continue with remaining tokens only
@@ -1317,7 +1316,7 @@ class MLXEngine:
                 budget=budget,
                 think_end_token=self.cfg.think_end_token,
                 think_start_token=self.cfg.think_start_token,
-                model_family=self._model_family,
+                model_family=self.model_family,
             )
             thinking_proc.reset()
             logits_processors.append(thinking_proc)
@@ -1409,7 +1408,7 @@ class MLXEngine:
         # This prevents poisoning the cache with degenerate outputs
         if generated_tokens and session_id:
             gen_text = self.tokenizer.decode(generated_tokens)
-            thinking, content = split_thinking_and_content(gen_text, model_family=self._model_family)
+            thinking, content = split_thinking_and_content(gen_text, model_family=self.model_family)
             if not content or not content.strip():
                 logger.warning(
                     f"[KV Cache] session={session_id} | SKIP SAVE | "
@@ -1494,12 +1493,7 @@ class MLXEngine:
                         base_cache = make_prompt_cache(self.model)
                         # Process system tokens directly (no generation) to avoid
                         # polluting the base cache with an extra generated token
-                        sys_array = mx.array(system_tokens)
-                        step_size = 512
-                        for i in range(0, len(system_tokens), step_size):
-                            chunk = sys_array[i : i + step_size]
-                            self.model(chunk[None], cache=base_cache)
-                        self._eval_cache(base_cache)
+                        self._prefill_cache(base_cache, system_tokens)
                         self._register_base_cache(messages, base_cache, system_tokens, tools=tools)
                     except Exception as e:
                         logger.warning(f"[Base Cache] registration failed: {e}")
@@ -1511,7 +1505,7 @@ class MLXEngine:
 
         if has_tools and generated_tokens:
             full_text = self.tokenizer.decode(generated_tokens)
-            _, tool_calls = parse_tool_calls(full_text, model_family=self._model_family)
+            _, tool_calls = parse_tool_calls(full_text, model_family=self.model_family)
             if tool_calls:
                 finish_reason = "tool_calls"
 
@@ -1572,11 +1566,11 @@ class MLXEngine:
                 result.cache_info = chunk.cache_info
 
         full_text = "".join(all_text)
-        thinking, content = split_thinking_and_content(full_text, model_family=self._model_family)
+        thinking, content = split_thinking_and_content(full_text, model_family=self.model_family)
         result.thinking = thinking
 
         if tools:
-            text_part, tool_calls = parse_tool_calls(content, model_family=self._model_family)
+            text_part, tool_calls = parse_tool_calls(content, model_family=self.model_family)
             if tool_calls:
                 result.tool_calls = tool_calls
                 result.content = text_part if text_part else None
@@ -1631,12 +1625,7 @@ class MLXEngine:
 
             # Process tokens through model to build cache (no generation)
             if feed_tokens:
-                step_size = 512
-                tokens_array = mx.array(feed_tokens)
-                for i in range(0, len(feed_tokens), step_size):
-                    chunk = tokens_array[i : i + step_size]
-                    self.model(chunk[None], cache=prompt_cache)
-                mx.eval([c.state for c in prompt_cache if hasattr(c, "state") and c.state is not None])
+                self._prefill_cache(prompt_cache, feed_tokens)
             self._eval_cache(prompt_cache)
 
             new_offset = self._get_cache_offset(prompt_cache)
@@ -1875,7 +1864,7 @@ class MLXEngine:
                     break
 
         # Guard: RotatingKVCache cannot be safely sliced (circular buffer)
-        has_rotating = source and any(type(c).__name__ == "RotatingKVCache" for c in source.cache)
+        has_rotating = self._has_rotating_cache
 
         if (
             checkpoint_turn is not None
@@ -1948,12 +1937,7 @@ class MLXEngine:
 
                 # Process tokens through model (no generation)
                 if prompt_tokens:
-                    tokens_array = mx.array(prompt_tokens)
-                    step_size = 512
-                    for i in range(0, len(prompt_tokens), step_size):
-                        chunk = tokens_array[i : i + step_size]
-                        self.model(chunk[None], cache=prompt_cache)
-                    self._eval_cache(prompt_cache)
+                    self._prefill_cache(prompt_cache, prompt_tokens)
 
                 new_offset = self._get_cache_offset(prompt_cache)
                 elapsed = time.perf_counter() - t0
@@ -2035,7 +2019,7 @@ class MLXEngine:
                 break
 
         # Guard: RotatingKVCache cannot be safely sliced (circular buffer)
-        has_rotating = any(type(c).__name__ == "RotatingKVCache" for c in session.cache)
+        has_rotating = self._has_rotating_cache
 
         if (
             checkpoint_turn is not None
@@ -2083,12 +2067,7 @@ class MLXEngine:
                     prompt_cache = make_prompt_cache(self.model)
 
                 if prompt_tokens:
-                    tokens_array = mx.array(prompt_tokens)
-                    step_size = 512
-                    for i in range(0, len(prompt_tokens), step_size):
-                        chunk = tokens_array[i : i + step_size]
-                        self.model(chunk[None], cache=prompt_cache)
-                    self._eval_cache(prompt_cache)
+                    self._prefill_cache(prompt_cache, prompt_tokens)
 
                 new_offset = self._get_cache_offset(prompt_cache)
                 elapsed = time.perf_counter() - t0

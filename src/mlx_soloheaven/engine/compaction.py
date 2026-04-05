@@ -122,7 +122,7 @@ class CompactionEngine:
                 yield {"type": "text", "content": chunk.text}
 
         # Final: strip thinking, return clean summary
-        model_family = getattr(self.engine, '_model_family', 'chatml')
+        model_family = self.engine.model_family
         _, summary_content = split_thinking_and_content(full_text, model_family=model_family)
         summary_content = (summary_content or full_text).strip()
         yield {"type": "result", "summary": summary_content}

@@ -210,7 +210,7 @@ async def _stream_completion(
     final_completion_tokens = 0
     final_cache_info = None
 
-    model_family = getattr(engine, '_model_family', 'chatml')
+    model_family = engine.model_family
     TOOL_CALL_TAG = "<|tool_call>" if model_family == "gemma4" else "<tool_call>"
     holdback = ""
 
@@ -276,7 +276,7 @@ async def _stream_completion(
     if tool_call_buffer:
         _, tool_calls = parse_tool_calls(
             tool_call_buffer,
-            model_family=getattr(engine, '_model_family', 'chatml'),
+            model_family=model_family,
         )
         if tool_calls:
             finish_reason = "tool_calls"
@@ -329,7 +329,7 @@ async def _stream_completion(
     # Update session
     if request.user:
         thinking, content = split_thinking_and_content(
-            accumulated_text, model_family=getattr(engine, '_model_family', 'chatml')
+            accumulated_text, model_family=model_family
         )
         assistant_msg = {"role": "assistant", "content": content or ""}
         engine.update_session_messages(request.user, messages + [assistant_msg])

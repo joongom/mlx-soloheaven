@@ -255,7 +255,10 @@ async def _stream_chat(
     cache_info = {"type": "none", "detail": "New session"}
     if session_state:
         if eng._messages_match(session_state.messages, messages):
-            cache_hit = session_state.cache is not None
+            cache_hit = (
+                session_state.cache_state is not None
+                and session_state.cache_state.cache is not None
+            )
             cached_tokens = session_state.total_cache_tokens
             new_msgs = messages[len(session_state.messages):]
             suffix_desc = f"{len(new_msgs)} new message(s)" if new_msgs else "retry"
@@ -305,6 +308,8 @@ async def _stream_chat(
     engine_cache_info = None
     model_family = eng.model_family
     think_end_token = eng.cfg.think_end_token
+    enable_thinking = eng.cfg.enable_thinking
+    thinking_prefix_sent = False
 
     try:
         async for result in eng.generate_stream_async(
@@ -337,14 +342,24 @@ async def _stream_chat(
                 if t_first_token is None:
                     t_first_token = time.perf_counter()
 
+                    # Send thinking prefix on first token for non-Gemma models
+                    # (Gemma generates its own <|channel>thought prefix;
+                    #  ChatML/GLM have <think> in prompt suffix, not in output)
+                    if enable_thinking and model_family != "gemma4" and not thinking_prefix_sent:
+                        thinking_prefix_sent = True
+                        prefix_event = json.dumps(
+                            {"type": "text", "content": "<think>\n"},
+                            ensure_ascii=False,
+                        )
+                        yield f"data: {prefix_event}\n\n"
+                        accumulated_text += "<think>\n"
+
                 accumulated_text += result.text
 
                 # Detect thinking end token for real-time SSE notification
-                thinking_end_detected = False
-                if model_family == "gemma4":
-                    thinking_end_detected = (result.token == think_end_token)
-                elif "</think>" in result.text:
-                    thinking_end_detected = True
+                thinking_end_detected = (
+                    think_end_token >= 0 and result.token == think_end_token
+                )
 
                 event = json.dumps(
                     {

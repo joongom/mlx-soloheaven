@@ -197,8 +197,11 @@ async def _stream_completion(
         pp = request.presence_penalty or 0.0
         rep_penalty = 1.0 + (fp + pp) * 0.25
 
+    model_family = engine.model_family
+
     # Send opening <think> tag if thinking is enabled
-    if enable_thinking:
+    # Skip for Gemma 4 — it uses <|channel>thought...<channel|> natively
+    if enable_thinking and model_family != "gemma4":
         think_chunk = _make_content_chunk(chunk_id, created, model, "<think>\n")
         yield f"data: {think_chunk}\n\n"
 
@@ -209,8 +212,6 @@ async def _stream_completion(
     final_prompt_tokens = 0
     final_completion_tokens = 0
     final_cache_info = None
-
-    model_family = engine.model_family
     TOOL_CALL_TAG = "<|tool_call>" if model_family == "gemma4" else "<tool_call>"
     holdback = ""
 

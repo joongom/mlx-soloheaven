@@ -387,10 +387,9 @@ async function sendMessage() {
                         }
 
                         // Detect NO thinking: no thinking start pattern after a few tokens
-                        // Gemma 4 may generate "thought\n" without "<|channel>" when
-                        // sliding window loses <|think|> from system prompt
                         const hasThinkingStart = fullText.startsWith('<|channel>thought')
                             || fullText.startsWith('thought\n')
+                            || fullText.startsWith('<think>')
                             || fullText.includes('</think>');
                         const noThinking = tokenCount > 5
                             && endIdx === -1 && !serverSignal

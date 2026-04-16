@@ -1,13 +1,19 @@
 """
-MLX Engine — model loading, tokenization, and generation with KV cache reuse.
+MLX Engine — model loading and generation with KV cache reuse.
 
-Core optimization: session-based KV cache management.
-- Each session maintains a KV cache with full conversation history (including thinking)
-- New turns only feed suffix tokens (new user message + generation prompt)
-- When conversation history doesn't match, starts fresh
+Uses mlx-vlm as the unified generation backend for both text-only and
+vision-language models.  Session-based KV cache management is built on
+mlx-vlm's PromptCacheState which does prefix-matching on token IDs.
 
-This is fundamentally different from prefix-matching on tokenized messages,
-because thinking tokens in the cache don't appear in the client's messages.
+Cache reuse across turns:
+- Engine-internal messages store full assistant content (including thinking)
+- apply_chat_template(tokenize=True) produces tokens matching stored IDs
+- PromptCacheState.find_prefix_length() reuses the common prefix
+- Only new user-message tokens are processed each turn
+
+Cross-session sharing:
+- Base cache pool stores system-prompt KV snapshots
+- New sessions are seeded from the base cache via PromptCacheState
 """
 
 import asyncio
@@ -19,17 +25,21 @@ import logging
 import os
 import threading
 import time
-import uuid
 from dataclasses import dataclass, field
 from typing import AsyncGenerator, Generator, Optional
 
 import mlx.core as mx
-from mlx_lm import load as lm_load, stream_generate
+from mlx_lm import load as lm_load
+from mlx_lm import stream_generate as lm_stream_generate
 from mlx_lm.models.cache import make_prompt_cache, save_prompt_cache, load_prompt_cache
 from mlx_lm.sample_utils import make_sampler
+from mlx_vlm import load as vlm_load
+from mlx_vlm.generate import (
+    stream_generate as vlm_stream_generate,
+    PromptCacheState,
+)
 
 from mlx_soloheaven.config import Config
-from mlx_soloheaven.engine.chat_format import get_chat_format
 from mlx_soloheaven.engine.thinking import ThinkingBudgetProcessor, RepetitionPenaltyProcessor
 from mlx_soloheaven.engine.tool_parser import parse_tool_calls, split_thinking_and_content
 from mlx_soloheaven.cache.manager import CacheManager
@@ -65,22 +75,20 @@ class CompletionResult:
     cache_info: Optional[dict] = None
 
 
-DEFAULT_MAX_CHECKPOINTS = 50
-
-
 @dataclass
 class SessionState:
-    """Tracks a conversation session's KV cache and message history."""
-    cache: list  # mlx-lm prompt_cache object
-    messages: list[dict]  # messages represented in the cache
+    """Tracks a conversation session's KV cache and message history.
+
+    Engine-internal messages include full assistant content (thinking + content)
+    so that apply_chat_template(tokenize=True) produces tokens matching the
+    stored PromptCacheState.token_ids for prefix-matching cache reuse.
+    """
+    cache_state: PromptCacheState  # mlx-vlm native: KV cache + token history
+    messages: list[dict]  # messages WITH thinking in assistant content
     last_used: float = field(default_factory=time.time)
     total_cache_tokens: int = 0
 
-    # Branching checkpoints (memory only, not persisted to disk)
-    turn_offsets: dict[int, int] = field(default_factory=dict)
-    deltanet_snapshots: dict[int, list] = field(default_factory=dict)
-
-    # Cache build time from last branch/regenerate BUILD (seconds, consumed once)
+    # Cache build time from last truncate/rebuild (seconds, consumed once)
     pending_build_time: float = 0.0
 
     def touch(self):
@@ -97,28 +105,6 @@ def _detect_token_id(tokenizer, text: str) -> int:
     if len(ids) == 1:
         return ids[0]
     return -1
-
-
-class _VLMAdapter:
-    """Wraps a VLM language_model to return raw mx.array for mlx-lm compatibility.
-
-    mlx-lm's generate_step expects model(tokens, cache=...) → mx.array.
-    VLM language_model returns LanguageModelOutput(logits=...).
-    This adapter extracts .logits so mlx-lm's stream_generate works unchanged.
-    All other attributes (make_cache, layers, parameters, etc.) are forwarded.
-    """
-
-    def __init__(self, language_model):
-        self._lm = language_model
-
-    def __call__(self, *args, **kwargs):
-        out = self._lm(*args, **kwargs)
-        return out.logits if hasattr(out, "logits") else out
-
-    def __getattr__(self, name):
-        if name == "_lm":
-            raise AttributeError(name)
-        return getattr(self._lm, name)
 
 
 @dataclass
@@ -148,7 +134,9 @@ class MLXEngine:
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.model = None
+        self._vlm_model = None
+        self._language_model = None
+        self._processor = None
         self.tokenizer = None
         self._lock = MLXEngine._global_gpu_lock  # shared lock
         self.cache_manager = CacheManager(
@@ -181,29 +169,29 @@ class MLXEngine:
                 model_config = json.load(f)
         self._model_type = model_config.get("model_type", "")
 
-        # Try mlx-vlm first (handles VLM + some text models), fall back to mlx-lm
-        self._is_vlm = False
-        self._vlm_model = None
-        self._processor = None
-        try:
-            from mlx_vlm import load as vlm_load
-            vlm_model, processor = vlm_load(self.cfg.model_path)
+        # VLM-capable model types (skip mlx-vlm for known text-only types)
+        _vlm_types = {"gemma4", "gemma3", "gemma3n"}
+        self._use_vlm = False
 
-            if hasattr(vlm_model, "language_model"):
-                self.model = _VLMAdapter(vlm_model.language_model)
-                self._vlm_model = vlm_model
-            else:
-                self.model = vlm_model
+        if self._model_type in _vlm_types:
+            try:
+                self._vlm_model, self._processor = vlm_load(self.cfg.model_path)
+                self._language_model = getattr(
+                    self._vlm_model, "language_model", self._vlm_model
+                )
+                self.tokenizer = getattr(self._processor, "tokenizer", self._processor)
+                self._use_vlm = True
+                logger.info("Loaded via mlx-vlm")
+            except Exception as e:
+                logger.info(f"mlx-vlm load failed ({e}), falling back to mlx-lm")
 
-            # Extract tokenizer from processor
-            raw_tok = getattr(processor, "tokenizer", processor)
-            self.tokenizer = self._wrap_tokenizer(raw_tok, model_config)
-            self._processor = processor
-            self._is_vlm = True
-            logger.info(f"Loaded via mlx-vlm (is_vlm={self._vlm_model is not None})")
-        except Exception as e:
-            logger.info(f"VLM load failed ({e}), falling back to mlx-lm")
-            self.model, self.tokenizer = lm_load(self.cfg.model_path)
+        if not self._use_vlm:
+            model, tokenizer = lm_load(self.cfg.model_path)
+            self._vlm_model = model
+            self._language_model = model
+            self._processor = None
+            self.tokenizer = tokenizer
+            logger.info("Loaded via mlx-lm")
 
         elapsed = time.perf_counter() - t0
 
@@ -211,18 +199,18 @@ class MLXEngine:
         self.model_id = os.path.basename(self.cfg.model_path.rstrip("/"))
         logger.info(f"Model loaded in {elapsed:.1f}s — {self.model_id}")
 
-        # Detect model family + chat format
+        # Detect model family
         self.model_family = self._detect_model_family()
-        self._chat_format = get_chat_format(self.model_family)
-        logger.info(f"Model family: {self.model_family}, chat format: {type(self._chat_format).__name__}")
+        logger.info(f"Model family: {self.model_family}")
 
-        # Auto-detect special token IDs (model-family-specific)
+        # Auto-detect thinking end token (needed for SSE thinking_done signal)
         self._detect_special_tokens()
 
-        # Detect cache layer types (for optimization strategy)
-        test_cache = make_prompt_cache(self.model)
-        self._has_deltanet = any(type(c).__name__ == "ArraysCache" for c in test_cache)
-        self._has_rotating_cache = any(type(c).__name__ == "RotatingKVCache" for c in test_cache)
+        # Detect cache layer types (for logging/diagnostics)
+        test_cache = make_prompt_cache(self._language_model)
+        self._has_rotating_cache = any(
+            type(c).__name__ == "RotatingKVCache" for c in test_cache
+        )
         self._sliding_window_size = 0
         if self._has_rotating_cache:
             for c in test_cache:
@@ -230,8 +218,6 @@ class MLXEngine:
                     self._sliding_window_size = c.max_size
                     break
         del test_cache
-        if self._has_deltanet:
-            logger.info(f"[{self.model_id}] DeltaNet layers detected — checkpoints enabled")
         if self._has_rotating_cache:
             logger.info(
                 f"[{self.model_id}] RotatingKVCache detected — "
@@ -254,9 +240,9 @@ class MLXEngine:
             mx.set_wired_limit(max_rec)
             logger.debug(f"Metal wired limit set to {max_rec / 1e9:.1f}GB")
 
-            # Patch wired_limit: keep synchronize but skip set/reset cycle.
+            # Patch wired_limit in mlx_vlm: keep synchronize but skip set/reset cycle.
             # The set/reset cycle degrades Metal TTFT on repeated calls.
-            import mlx_lm.generate as gen_module
+            import mlx_vlm.generate as vlm_gen_module
 
             @contextlib.contextmanager
             def _stable_wired_limit(model, streams=None):
@@ -269,7 +255,7 @@ class MLXEngine:
                     else:
                         mx.synchronize()
 
-            gen_module.wired_limit = _stable_wired_limit
+            vlm_gen_module.wired_limit = _stable_wired_limit
             logger.debug("Patched wired_limit: stable (set once at startup)")
 
         self._build_disk_index()
@@ -285,59 +271,24 @@ class MLXEngine:
         mt = self._model_type.lower()
         if "gemma4" in mt:
             return "gemma4"
-        # Default: ChatML family (Qwen, GLM, MiniMax, etc.)
+        if "glm" in mt:
+            return "glm"
+        # Default: ChatML family (Qwen, MiniMax, etc.)
         return "chatml"
 
     def _detect_special_tokens(self):
-        """Auto-detect special token IDs based on model family."""
+        """Detect thinking end token for SSE thinking_done signal."""
         if self.model_family == "gemma4":
             self.cfg.think_end_token = _detect_token_id(self.tokenizer, "<channel|>")
-            self.cfg.think_start_token = _detect_token_id(self.tokenizer, "<|channel>")
-            self.cfg.im_end_token = _detect_token_id(self.tokenizer, "<turn|>")
         else:
+            # ChatML and GLM both use </think>
             if self.cfg.think_end_token < 0:
                 self.cfg.think_end_token = _detect_token_id(self.tokenizer, "</think>")
-            if self.cfg.think_start_token < 0:
-                self.cfg.think_start_token = _detect_token_id(self.tokenizer, "<think>")
-            if self.cfg.im_end_token < 0:
-                self.cfg.im_end_token = _detect_token_id(self.tokenizer, "<|im_end|>")
 
         logger.info(
             f"[{self.model_id}] model_family={self.model_family} | "
-            f"Token IDs: think_end={self.cfg.think_end_token}, "
-            f"think_start={self.cfg.think_start_token}, "
-            f"eos/im_end={self.cfg.im_end_token}"
+            f"think_end_token={self.cfg.think_end_token}"
         )
-
-    def _wrap_tokenizer(self, raw_tok, config: dict):
-        """Wrap a VLM processor's tokenizer for mlx-lm compatibility."""
-        from mlx_lm.tokenizer_utils import TokenizerWrapper
-
-        # Ensure chat_template is set (some models store it in a file)
-        if not getattr(raw_tok, "chat_template", None):
-            template_path = os.path.join(self.cfg.model_path, "chat_template.jinja")
-            if os.path.exists(template_path):
-                with open(template_path) as f:
-                    raw_tok.chat_template = f.read()
-                logger.info(f"Loaded chat_template from {template_path}")
-
-        wrapped = TokenizerWrapper(raw_tok)
-
-        # Ensure correct EOS token IDs
-        eos_ids = config.get("eos_token_id", [])
-        if isinstance(eos_ids, int):
-            eos_ids = [eos_ids]
-
-        # Gemma 4: <turn|> (106) is the chat turn-end token
-        if self._model_type == "gemma4":
-            turn_end = _detect_token_id(raw_tok, "<turn|>")
-            if turn_end >= 0 and turn_end not in eos_ids:
-                eos_ids.append(turn_end)
-
-        if eos_ids:
-            wrapped.eos_token_ids = set(eos_ids)
-
-        return wrapped
 
     # --- GPU keepalive ---
 
@@ -419,11 +370,13 @@ class MLXEngine:
     def _session_cache_path(self, session_id: str) -> str:
         return os.path.join(self.cfg.cache_dir, f"session_{session_id}.safetensors")
 
-    def _session_ckpt_path(self, session_id: str) -> str:
-        return os.path.join(self.cfg.cache_dir, f"session_{session_id}_ckpt.safetensors")
-
     def _save_session_to_disk(self, session_id: str, session: SessionState):
-        """Save session's KV cache + checkpoints to disk. Caller MUST hold _lock."""
+        """Save session's KV cache + token history to disk. Caller MUST hold _lock.
+
+        Returns True on success, False if save is not possible (e.g. empty arrays).
+        """
+        if session.cache_state is None or session.cache_state.cache is None:
+            return True
         t0 = time.perf_counter()
         os.makedirs(self.cfg.cache_dir, exist_ok=True)
         path = self._session_cache_path(session_id)
@@ -432,53 +385,30 @@ class MLXEngine:
             "messages": json.dumps(session.messages, ensure_ascii=False),
             "total_cache_tokens": str(session.total_cache_tokens),
             "last_used": str(session.last_used),
+            "token_ids": json.dumps(session.cache_state.token_ids or []),
         }
-        save_prompt_cache(path, session.cache, metadata=metadata)
-
-        # Save DeltaNet checkpoints
-        self._save_checkpoints_to_disk(session_id, session)
+        try:
+            save_prompt_cache(path, session.cache_state.cache, metadata=metadata)
+        except Exception as e:
+            if "empty array" in str(e).lower() or "cannot serialize" in str(e).lower():
+                # Some models (GLM MoE) have empty arrays that safetensors can't handle
+                logger.info(
+                    f"[KV Cache] session={session_id} | DISK SAVE SKIP | "
+                    f"cache not serializable: {e}"
+                )
+                return False  # permanent failure, don't retry
+            raise  # re-raise unexpected errors
 
         elapsed = time.perf_counter() - t0
         if hasattr(self, "_disk_session_ids"):
             self._disk_session_ids.add(session_id)
         fsize = os.path.getsize(path) / 1e6
-        n_ckpt = len(session.deltanet_snapshots)
         logger.info(
             f"[KV Cache] session={session_id} | DISK SAVE | "
             f"{session.total_cache_tokens} tokens, {len(session.messages)} msgs, "
-            f"{n_ckpt} checkpoints, {fsize:.1f}MB, {elapsed:.2f}s"
+            f"{fsize:.1f}MB, {elapsed:.2f}s"
         )
-
-    def _save_checkpoints_to_disk(self, session_id: str, session: SessionState):
-        """Save DeltaNet snapshots to a separate safetensors file."""
-        ckpt_path = self._session_ckpt_path(session_id)
-        if not session.deltanet_snapshots:
-            if os.path.exists(ckpt_path):
-                os.remove(ckpt_path)
-            return
-
-        arrays = {}
-        structure = {}
-
-        for turn_key, snapshot in session.deltanet_snapshots.items():
-            structure[str(turn_key)] = len(snapshot)
-            for layer_idx, cache_obj in enumerate(snapshot):
-                states = cache_obj.state if isinstance(cache_obj.state, list) else [cache_obj.state]
-                for state_idx, arr in enumerate(states):
-                    if isinstance(arr, mx.array):
-                        arrays[f"t{turn_key}_l{layer_idx}_s{state_idx}"] = arr
-
-        metadata = {
-            "turn_offsets": json.dumps(
-                {str(k): v for k, v in session.turn_offsets.items()}
-            ),
-            "structure": json.dumps(structure),
-        }
-
-        try:
-            mx.save_safetensors(ckpt_path, arrays, metadata=metadata)
-        except Exception as e:
-            logger.warning(f"[Checkpoint] SAVE FAILED for {session_id}: {e}")
+        return True
 
     def _mark_dirty(self, session_id: str):
         """Mark a session for disk save on next idle cycle."""
@@ -500,11 +430,12 @@ class MLXEngine:
             if session is None:
                 continue
             try:
-                self._save_session_to_disk(sid, session)
-                saved += 1
+                success = self._save_session_to_disk(sid, session)
+                if success:
+                    saved += 1
+                # If success=False (permanent failure like empty arrays), don't retry
             except Exception as e:
                 logger.error(f"[KV Cache] session={sid} | FLUSH SAVE FAILED | {e}")
-                # Re-add to dirty set for retry
                 with self._dirty_lock:
                     if sid in self._sessions:
                         self._dirty_sessions.add(sid)
@@ -532,7 +463,7 @@ class MLXEngine:
                             logger.error(f"[Shutdown] Failed to save session {sid}: {e}")
 
     def _load_session_from_disk(self, session_id: str) -> Optional[SessionState]:
-        """Load session's KV cache + messages from disk."""
+        """Load session's KV cache + token history from disk."""
         path = self._session_cache_path(session_id)
         if not os.path.exists(path):
             return None
@@ -542,9 +473,10 @@ class MLXEngine:
             messages = json.loads(metadata.get("messages", "[]"))
             total_tokens = int(metadata.get("total_cache_tokens", "0"))
             last_used = float(metadata.get("last_used", "0"))
+            token_ids = json.loads(metadata.get("token_ids", "[]"))
 
             # Verify loaded cache matches model structure
-            model_cache = make_prompt_cache(self.model)
+            model_cache = make_prompt_cache(self._language_model)
             if len(cache) != len(model_cache):
                 logger.error(
                     f"[KV Cache] session={session_id} | DISK LOAD FAILED | "
@@ -565,89 +497,28 @@ class MLXEngine:
             loaded_offset = self._get_cache_offset(cache)
             elapsed = time.perf_counter() - t0
 
+            # Reconstruct PromptCacheState
+            cache_state = PromptCacheState()
+            cache_state.cache = cache
+            cache_state.token_ids = token_ids if token_ids else None
+
             session = SessionState(
-                cache=cache,
+                cache_state=cache_state,
                 messages=messages,
                 total_cache_tokens=loaded_offset,
                 last_used=last_used,
             )
 
-            # Load checkpoints if available
-            turn_offsets, deltanet_snapshots = self._load_checkpoints_from_disk(session_id)
-            if turn_offsets:
-                session.turn_offsets = turn_offsets
-                session.deltanet_snapshots = deltanet_snapshots
-
             fsize = os.path.getsize(path) / 1e6
-            n_ckpt = len(session.deltanet_snapshots)
             logger.info(
                 f"[KV Cache] session={session_id} | DISK LOAD | "
                 f"{loaded_offset} tokens, {len(messages)} msgs, "
-                f"{n_ckpt} checkpoints, {fsize:.1f}MB, {elapsed:.2f}s"
+                f"{fsize:.1f}MB, {elapsed:.2f}s"
             )
             return session
         except Exception as e:
             logger.error(f"[KV Cache] session={session_id} | DISK LOAD FAILED | {e}")
             return None
-
-    def _load_checkpoints_from_disk(self, session_id: str) -> tuple[dict, dict]:
-        """Load DeltaNet snapshots from disk. Returns (turn_offsets, deltanet_snapshots)."""
-        ckpt_path = self._session_ckpt_path(session_id)
-        if not os.path.exists(ckpt_path):
-            return {}, {}
-
-        try:
-            from safetensors import safe_open
-
-            # Load arrays natively (handles bfloat16)
-            loaded = mx.load(ckpt_path)
-            # Load metadata separately
-            with safe_open(ckpt_path, framework="numpy") as f:
-                metadata = f.metadata()
-
-            turn_offsets = {
-                int(k): v
-                for k, v in json.loads(metadata["turn_offsets"]).items()
-            }
-            structure = json.loads(metadata["structure"])
-
-            # Get template ArraysCache objects from model
-            model_cache = make_prompt_cache(self.model)
-            template_arrays_caches = [
-                c for c in model_cache if type(c).__name__ == "ArraysCache"
-            ]
-
-            deltanet_snapshots = {}
-            for turn_key_str, n_layers in structure.items():
-                turn_key = int(turn_key_str)
-                snapshot = []
-                for layer_idx in range(n_layers):
-                    # Collect state arrays for this layer
-                    states = []
-                    s = 0
-                    while f"t{turn_key}_l{layer_idx}_s{s}" in loaded:
-                        states.append(loaded[f"t{turn_key}_l{layer_idx}_s{s}"])
-                        s += 1
-
-                    # Create ArraysCache from template with loaded state
-                    template = copy.deepcopy(template_arrays_caches[layer_idx])
-                    if len(states) == 1:
-                        template.state = states[0]
-                    else:
-                        template.state = states
-                    snapshot.append(template)
-
-                deltanet_snapshots[turn_key] = snapshot
-
-            logger.debug(
-                f"[Checkpoint] LOADED for {session_id} | "
-                f"{len(deltanet_snapshots)} checkpoints"
-            )
-            return turn_offsets, deltanet_snapshots
-
-        except Exception as e:
-            logger.warning(f"[Checkpoint] LOAD FAILED for {session_id}: {e}")
-            return {}, {}
 
     def _build_disk_index(self):
         """Scan cache_dir for saved session caches."""
@@ -699,53 +570,52 @@ class MLXEngine:
             return self._base_caches[h]
         return None
 
-    def _extract_system_tokens(self, messages: list[dict], full_tokens: list[int], tools: list | None = None, thinking: bool | None = None) -> list[int] | None:
+    def _extract_system_tokens(
+        self, messages: list[dict], full_tokens: list[int],
+        tools: list | None = None, thinking: bool | None = None,
+    ) -> list[int] | None:
         """Extract system prompt tokens from the full tokenized messages.
 
-        Uses dummy user message to tokenize system+user, then strips dummy suffix
-        to get pure system prompt tokens.
-
-        For models with RotatingKVCache (e.g. Gemma 4), also handles the case where
-        no explicit system message exists but the template auto-generates a system
-        prefix (e.g. <bos><|turn>system\n<|think|><turn|>).
+        Tokenizes [system + dummy user] then subtracts a [dummy user only]
+        tokenization to get pure system tokens. Verifies they are a prefix
+        of full_tokens.
         """
         has_system = messages and messages[0].get("role") in ("system", "developer")
         if not has_system and not self._has_rotating_cache:
-            return None  # Only needed for explicit system or sliding window models
+            return None
         h = self._system_hash(messages, tools=tools)
         if h and h in self._base_caches:
-            return None  # Already have base cache for this system prompt
+            return None  # already registered
         try:
             enable_thinking = thinking if thinking is not None else self.cfg.enable_thinking
             if has_system:
                 system_with_dummy = [messages[0], {"role": "user", "content": "hi"}]
             else:
-                # No explicit system message — use just a dummy user to extract
-                # the template's auto-generated system prefix (e.g. Gemma 4: <bos><|turn>system\n<|think|><turn|>)
                 system_with_dummy = [{"role": "user", "content": "hi"}]
-            full_with_dummy = self.tokenize_messages(system_with_dummy, tools=tools, thinking=thinking)
-            dummy_suffix = self.tokenizer.encode(
-                self._chat_format.dummy_suffix(enable_thinking),
-                add_special_tokens=False,
+            # Tokenize system + dummy user
+            full_with_dummy = self._tokenize_prompt(
+                system_with_dummy, tools=tools, thinking=enable_thinking,
             )
-            if len(full_with_dummy) > len(dummy_suffix):
-                system_tokens = full_with_dummy[: len(full_with_dummy) - len(dummy_suffix)]
-                # Verify these tokens are a prefix of the full tokens
+            # Tokenize just dummy user (to strip)
+            dummy_only = self._tokenize_prompt(
+                [{"role": "user", "content": "hi"}], tools=tools, thinking=enable_thinking,
+            )
+            # System tokens = full_with_dummy minus the dummy user suffix
+            # Heuristic: find where full_with_dummy diverges from dummy_only (from end)
+            # Simpler: system tokens are the leading tokens that differ from dummy_only
+            if has_system and len(full_with_dummy) > len(dummy_only):
+                system_tokens = full_with_dummy[: len(full_with_dummy) - len(dummy_only)]
+                # For models with auto-system prefix, adjust
+                if not system_tokens:
+                    return None
+                # Verify prefix of full tokens
                 if full_tokens[:len(system_tokens)] == system_tokens:
                     return system_tokens
-                else:
-                    # Find divergence point for debugging
-                    for j in range(min(len(system_tokens), len(full_tokens))):
-                        if system_tokens[j] != full_tokens[j]:
-                            logger.debug(
-                                f"[Base Cache] Token mismatch at pos {j}/{len(system_tokens)} | "
-                                f"sys={system_tokens[max(0,j-2):j+3]} vs full={full_tokens[max(0,j-2):j+3]}"
-                            )
-                            break
-                    else:
-                        logger.debug(
-                            f"[Base Cache] Length mismatch: system={len(system_tokens)} vs full_prefix={len(full_tokens)}"
-                        )
+            elif not has_system and len(full_with_dummy) > 0:
+                # Models like Gemma 4 may auto-generate system prefix
+                # The full_with_dummy == dummy_only in this case, check if there's
+                # a shared prefix with the full conversation tokens
+                return None
         except Exception as e:
             logger.warning(f"[Base Cache] Failed to extract system tokens: {e}")
         return None
@@ -835,11 +705,11 @@ class MLXEngine:
     _PREFILL_STEP = 512
 
     def _prefill_cache(self, cache: list, tokens: list[int]):
-        """Process tokens through the model to populate a KV cache."""
+        """Process tokens through the language model to populate a KV cache."""
         arr = mx.array(tokens)
         for i in range(0, len(tokens), self._PREFILL_STEP):
             chunk = arr[i : i + self._PREFILL_STEP]
-            self.model(chunk[None], cache=cache)
+            self._language_model(chunk[None], cache=cache)
         self._eval_cache(cache)
 
     @staticmethod
@@ -868,23 +738,21 @@ class MLXEngine:
             content,
             flags=re.DOTALL,
         )
-        # Strip thinking text from assistant messages
-        # Server stores content without thinking, but client may send full text
+        # Strip thinking and tool calls from assistant messages for comparison.
+        # Only the actual text content matters for cache matching.
         if role == "assistant":
-            # Gemma 4: <|channel>thought\n...<channel|>content
-            content = re.sub(r"<\|channel>thought\n.*?<channel\|>\s*", "", content, flags=re.DOTALL)
-            m2 = re.match(r".*?<channel\|>\s*(.*)", content, re.DOTALL)
-            if m2:
-                content = m2.group(1)
-            # ChatML: <think>...</think>content
-            m = re.match(r"<think>.*?</think>\s*(.*)", content, re.DOTALL)
-            if m:
-                content = m.group(1)
+            # Strip thinking blocks
+            if "<channel|>" in content:
+                content = content[content.rindex("<channel|>") + len("<channel|>"):]
+            elif "</think>" in content:
+                content = content[content.rindex("</think>") + len("</think>"):]
             else:
-                # Case 2: thinking...\n</think>\n\ncontent (prompt ends inside <think>)
-                m = re.match(r".*?</think>\s*(.*)", content, re.DOTALL)
-                if m:
-                    content = m.group(1)
+                content = re.sub(r"^<think>\n?", "", content)
+                content = re.sub(r"^<\|channel>thought\n?", "", content)
+                content = re.sub(r"^thought\n", "", content)
+            # Strip tool call blocks (both ChatML and Gemma 4 formats)
+            content = re.sub(r"<\|?tool_call>.*?<\|?tool_call\|?>", "", content, flags=re.DOTALL)
+            content = re.sub(r"<tool_call>.*?</tool_call>", "", content, flags=re.DOTALL)
         return content.strip()
 
     def _messages_match(self, stored: list[dict], incoming: list[dict]) -> bool:
@@ -961,21 +829,8 @@ class MLXEngine:
                 return False
         return True
 
-    def _make_suffix_tokens(self, query: str, thinking: bool = True) -> list[int]:
-        """Create suffix tokens for a new user turn."""
-        return self._chat_format.suffix_user(self.tokenizer, query, thinking)
-
-    def _make_suffix_tokens_tool_result(self, messages: list[dict], thinking: bool = True) -> list[int]:
-        """Create suffix tokens for tool result messages."""
-        return self._chat_format.suffix_tool_result(self.tokenizer, messages, thinking)
-
-    def tokenize_messages(
-        self,
-        messages: list[dict],
-        tools: list[dict] | None = None,
-        thinking: bool | None = None,
-    ) -> list[int]:
-        """Convert OpenAI-format messages to token IDs using model's chat template."""
+    def _format_messages(self, messages: list[dict]) -> list[dict]:
+        """Normalize messages for chat template: fix roles, flatten content."""
         formatted = []
         for msg in messages:
             role = msg["role"]
@@ -984,7 +839,6 @@ class MLXEngine:
             m = {"role": role}
             if msg.get("content") is not None:
                 content = msg["content"]
-                # Normalize list-format content to plain string
                 if isinstance(content, list):
                     parts = []
                     for part in content:
@@ -995,7 +849,6 @@ class MLXEngine:
                     content = "\n".join(parts)
                 m["content"] = content
             if msg.get("tool_calls"):
-                # Ensure tool_call arguments are dicts (Jinja template calls .items())
                 normalized_tcs = []
                 for tc in msg["tool_calls"]:
                     tc_copy = dict(tc) if isinstance(tc, dict) else tc
@@ -1012,23 +865,132 @@ class MLXEngine:
             if msg.get("tool_call_id"):
                 m["tool_call_id"] = msg["tool_call_id"]
             formatted.append(m)
+        return formatted
 
-        enable_thinking = thinking if thinking is not None else self.cfg.enable_thinking
+    def _build_prompt_text(
+        self, messages: list[dict], thinking: bool = True, tools: list | None = None,
+    ) -> str:
+        """Build prompt text from messages using chat template (tokenize=False)."""
+        formatted = self._format_messages(messages)
+        kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+            "enable_thinking": thinking,
+        }
+        if tools:
+            kwargs["tools"] = [
+                t.model_dump() if hasattr(t, "model_dump") else t for t in tools
+            ]
+        return self.tokenizer.apply_chat_template(formatted, **kwargs)
+
+    def _tokenize_prompt(
+        self, messages: list[dict], thinking: bool = True, tools: list | None = None,
+    ) -> list[int]:
+        """Tokenize messages using chat template (tokenize=True)."""
+        formatted = self._format_messages(messages)
         kwargs = {
             "tokenize": True,
             "add_generation_prompt": True,
-            "enable_thinking": enable_thinking,
+            "enable_thinking": thinking,
         }
         if tools:
-            tool_defs = []
-            for t in tools:
-                if hasattr(t, "model_dump"):
-                    tool_defs.append(t.model_dump())
-                elif isinstance(t, dict):
-                    tool_defs.append(t)
-            kwargs["tools"] = tool_defs
+            kwargs["tools"] = [
+                t.model_dump() if hasattr(t, "model_dump") else t for t in tools
+            ]
+        result = self.tokenizer.apply_chat_template(formatted, **kwargs)
+        # Some tokenizers return BatchEncoding instead of list[int]
+        if hasattr(result, "input_ids"):
+            return list(result.input_ids)
+        return list(result)
 
-        return self.tokenizer.apply_chat_template(formatted, **kwargs)
+    def _suffix_tokens(
+        self, new_messages: list[dict], thinking: bool = True,
+    ) -> list[int]:
+        """Compute suffix tokens for new messages to append to stored token_ids.
+
+        This avoids full re-tokenization (which breaks special token round-trip)
+        by directly encoding only the new message suffix in model-specific format.
+        """
+        if self.model_family == "gemma4":
+            return self._suffix_tokens_gemma4(new_messages, thinking)
+        if self.model_family == "glm":
+            return self._suffix_tokens_glm(new_messages, thinking)
+        return self._suffix_tokens_chatml(new_messages, thinking)
+
+    def _suffix_tokens_gemma4(
+        self, new_messages: list[dict], thinking: bool,
+    ) -> list[int]:
+        """Gemma 4 suffix: <turn|>\\n<|turn>user\\n{content}<turn|>\\n<|turn>model\\n"""
+        parts = ["<turn|>"]
+        for msg in new_messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "") or ""
+            if isinstance(content, list):
+                content = "\n".join(
+                    p["text"] if isinstance(p, dict) and "text" in p else str(p)
+                    for p in content
+                )
+            if role == "assistant":
+                continue  # already in cache
+            elif role == "tool":
+                parts.append(
+                    f"\n<|turn>user\n<|tool_response>\n"
+                    f"response:{msg.get('name', '')}{{{content}}}\n"
+                    f"<tool_response|><turn|>"
+                )
+            else:
+                parts.append(f"\n<|turn>user\n{content}<turn|>")
+        parts.append("\n<|turn>model\n")
+        return self.tokenizer.encode("".join(parts), add_special_tokens=False)
+
+    def _suffix_tokens_chatml(
+        self, new_messages: list[dict], thinking: bool,
+    ) -> list[int]:
+        """ChatML suffix: \\n<|im_start|>user\\n{content}<|im_end|>\\n<|im_start|>assistant\\n<think>\\n"""
+        parts = []
+        for msg in new_messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "") or ""
+            if isinstance(content, list):
+                content = "\n".join(
+                    p["text"] if isinstance(p, dict) and "text" in p else str(p)
+                    for p in content
+                )
+            if role == "assistant":
+                continue
+            elif role == "tool":
+                parts.append(
+                    f"\n<|im_start|>user\n<tool_response>\n"
+                    f"{content}\n</tool_response><|im_end|>"
+                )
+            else:
+                parts.append(f"\n<|im_start|>user\n{content}<|im_end|>")
+        gen_prompt = "\n<|im_start|>assistant\n<think>\n" if thinking else "\n<|im_start|>assistant\n"
+        parts.append(gen_prompt)
+        return self.tokenizer.encode("".join(parts), add_special_tokens=False)
+
+    def _suffix_tokens_glm(
+        self, new_messages: list[dict], thinking: bool,
+    ) -> list[int]:
+        """GLM suffix: <|user|>{content}<|assistant|><think>"""
+        parts = []
+        for msg in new_messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "") or ""
+            if isinstance(content, list):
+                content = "\n".join(
+                    p["text"] if isinstance(p, dict) and "text" in p else str(p)
+                    for p in content
+                )
+            if role == "assistant":
+                continue
+            elif role == "tool":
+                parts.append(f"<|user|><tool_response>\n{content}\n</tool_response>")
+            else:
+                parts.append(f"<|user|>{content}")
+        gen_prompt = "<|assistant|><think>" if thinking else "<|assistant|>"
+        parts.append(gen_prompt)
+        return self.tokenizer.encode("".join(parts), add_special_tokens=False)
 
     def generate_stream(
         self,
@@ -1084,7 +1046,12 @@ class MLXEngine:
         top_k: int = 0,
         repetition_penalty: float = 1.0,
     ) -> Generator[GenerationResult, None, None]:
-        """Core generation logic (must hold lock)."""
+        """Core generation logic using mlx-vlm (must hold lock).
+
+        Session messages include thinking in assistant content so that
+        PromptCacheState prefix matching covers generated tokens from
+        previous turns.
+        """
         self._touch_gpu()
 
         has_tools = bool(tools)
@@ -1101,174 +1068,57 @@ class MLXEngine:
                 self._sessions[session_id] = session
 
         cache_mode = "miss"
-        total_prompt_tokens = 0  # Full prompt token count for usage reporting
 
-        # Suffix mode: reuse session KV cache, append only new user message tokens.
-        # Works for all models because thinking tokens stay in the cache naturally
-        # (the model generated them — they're part of the KV state).
-        _suffix_safe = True
+        # Determine prompt messages:
+        # - On cache hit: use session's stored messages (with thinking) + new messages
+        # - On cache miss: use incoming messages as-is
+        prompt_messages = messages
+        cache_state = PromptCacheState()
 
         if (
             session
-            and session.cache is not None
+            and session.cache_state is not None
+            and session.cache_state.cache is not None
             and self._messages_match(session.messages, messages)
         ):
             new_messages = messages[len(session.messages):]
-            prompt_cache = session.cache
-            cache_offset = self._get_cache_offset(prompt_cache)
-
             if not new_messages:
+                # Retry: discard cache, start fresh
                 cache_mode = "retry"
-                prompt_cache = make_prompt_cache(self.model)
-                prompt_tokens = self.tokenize_messages(messages, tools=tools, thinking=use_thinking)
-                total_prompt_tokens = len(prompt_tokens)
+                prompt_messages = messages
+                cache_state = PromptCacheState()
                 logger.info(
                     f"[KV Cache] session={session_id} | RETRY | "
-                    f"discarding {cache_offset} cached tokens, "
-                    f"re-processing {len(prompt_tokens)} tokens"
-                )
-            elif _suffix_safe and len(new_messages) == 1 and new_messages[0]["role"] == "user":
-                cache_mode = "hit"
-                prompt_tokens = self._make_suffix_tokens(new_messages[0]["content"], thinking=use_thinking)
-                total_prompt_tokens = cache_offset + len(prompt_tokens)
-                logger.info(
-                    f"[KV Cache] session={session_id} | HIT | "
-                    f"reusing {cache_offset} cached tokens + "
-                    f"{len(prompt_tokens)} suffix tokens"
-                )
-            elif _suffix_safe:
-                cache_mode = "hit_multi"
-                prompt_tokens = self._make_suffix_tokens_tool_result(new_messages, thinking=use_thinking)
-                total_prompt_tokens = cache_offset + len(prompt_tokens)
-                new_roles = [m["role"] for m in new_messages]
-                logger.info(
-                    f"[KV Cache] session={session_id} | HIT (multi-msg) | "
-                    f"reusing {cache_offset} cached tokens + "
-                    f"{len(prompt_tokens)} suffix tokens | {new_roles}"
+                    f"discarding cache, re-processing {len(messages)} messages"
                 )
             else:
-                # Suffix-unsafe model (e.g. Gemma 4): full retokenization
-                # Template strips thinking from history → KV state diverges → must rebuild
-                prompt_tokens = self.tokenize_messages(messages, tools=tools, thinking=use_thinking)
-                total_prompt_tokens = len(prompt_tokens)
-
-
-                # Try to reuse base cache (system prompt KV) even for retokenization
-                base = self._find_base_cache(messages, tools=tools)
-                if base and len(prompt_tokens) >= base.token_count:
-                    if prompt_tokens[:base.token_count] == base.tokens:
-                        prompt_cache = self._clone_base_cache(base)
-                        prompt_tokens = prompt_tokens[base.token_count:]
-                        cache_mode = "retok_base"
-                        logger.info(
-                            f"[KV Cache] session={session_id} | RETOKENIZE+BASE | "
-                            f"reusing {base.token_count} base tokens, "
-                            f"processing {len(prompt_tokens)} remaining tokens "
-                            f"(was {cache_offset} cached)"
-                        )
-                    else:
-                        base = None  # token mismatch — fall through
-
-                if base is None:
-                    # No usable base cache — build system cache inline to protect from rotation
-                    system_tokens = self._extract_system_tokens(
-                        messages, prompt_tokens, tools=tools, thinking=use_thinking,
-                    )
-                    if system_tokens and len(system_tokens) < len(prompt_tokens):
-                        prompt_cache = make_prompt_cache(self.model)
-                        self._prefill_cache(prompt_cache, system_tokens)
-
-                        self._register_base_cache(messages, prompt_cache, system_tokens, tools=tools)
-                        prompt_tokens = prompt_tokens[len(system_tokens):]
-                        cache_mode = "retok_build"
-                        logger.info(
-                            f"[KV Cache] session={session_id} | RETOKENIZE+BUILD | "
-                            f"built base ({len(system_tokens)} sys tokens), "
-                            f"processing {len(prompt_tokens)} remaining"
-                        )
-                    else:
-                        prompt_cache = make_prompt_cache(self.model)
-                        cache_mode = "miss"
-                        logger.info(
-                            f"[KV Cache] session={session_id} | RETOKENIZE | "
-                            f"full rebuild {total_prompt_tokens} tokens"
-                        )
-        else:
-            # Try branch detection first (incoming shorter than stored, prefix matches)
-            branch_restored = False
-            if session and session.cache is not None:
-                branch_point = self._check_branch_match(session.messages, messages)
-                if branch_point is not None:
-                    checkpoint_turn = None
-                    for turn in sorted(session.turn_offsets.keys(), reverse=True):
-                        if turn <= branch_point:
-                            checkpoint_turn = turn
-                            break
-                    # Guard: RotatingKVCache cannot be safely sliced (circular buffer)
-                    has_rotating = self._has_rotating_cache
-                    if has_rotating:
-                        logger.info(
-                            f"[KV Cache] session={session_id} | BRANCH skipped — "
-                            f"RotatingKVCache cannot be sliced, falling through to BUILD"
-                        )
-                    elif checkpoint_turn is not None and checkpoint_turn in session.deltanet_snapshots:
-                        target_offset = session.turn_offsets[checkpoint_turn]
-                        deltanet_states = session.deltanet_snapshots[checkpoint_turn]
-                        new_cache = []
-                        dn_idx = 0
-                        for c in session.cache:
-                            if type(c).__name__ == "ArraysCache":
-                                new_cache.append(copy.deepcopy(deltanet_states[dn_idx]))
-                                dn_idx += 1
-                            else:
-                                sliced = copy.deepcopy(c)
-                                if hasattr(sliced, 'keys') and sliced.keys is not None:
-                                    sliced.keys = sliced.keys[..., :target_offset, :]
-                                    sliced.values = sliced.values[..., :target_offset, :]
-                                    sliced.offset = target_offset
-                                new_cache.append(sliced)
-                        prompt_cache = new_cache
-                        new_msgs = messages[branch_point:]
-                        if len(new_msgs) == 1 and new_msgs[0]["role"] == "user":
-                            prompt_tokens = self._make_suffix_tokens(new_msgs[0]["content"], thinking=use_thinking)
-                        else:
-                            prompt_tokens = self._make_suffix_tokens_tool_result(new_msgs, thinking=use_thinking)
-                        total_prompt_tokens = target_offset + len(prompt_tokens)
-                        cache_mode = "branch"
-                        branch_restored = True
-                        logger.info(
-                            f"[KV Cache] session={session_id} | BRANCH | "
-                            f"branch_point={branch_point}, checkpoint={checkpoint_turn}, "
-                            f"restored {target_offset} tokens + {len(prompt_tokens)} suffix"
-                        )
-
-            if not branch_restored:
-                prev_cached = (
-                    self._get_cache_offset(session.cache) if session and session.cache else 0
+                # Cache hit: extend stored token_ids with suffix for new messages.
+                # This avoids full re-tokenization which breaks special token
+                # round-trip (e.g. Gemma 4 <|channel>/<channel|>).
+                cache_mode = "hit"
+                cache_state = session.cache_state
+                cached_tokens = session.total_cache_tokens
+                suffix = self._suffix_tokens(new_messages, thinking=use_thinking)
+                prompt_token_ids = list(cache_state.token_ids or []) + suffix
+                logger.info(
+                    f"[KV Cache] session={session_id} | HIT | "
+                    f"reusing {cached_tokens} cached tokens + "
+                    f"{len(suffix)} suffix tokens"
                 )
-                prompt_tokens = self.tokenize_messages(messages, tools=tools, thinking=use_thinking)
-                total_prompt_tokens = len(prompt_tokens)
-
-            # Try base cache: reuse system prompt KV cache
-            base = self._find_base_cache(messages, tools=tools) if not branch_restored else None
-            if base and len(prompt_tokens) >= base.token_count:
-                # Verify token prefix matches
-                if prompt_tokens[:base.token_count] == base.tokens:
-                    prompt_cache = self._clone_base_cache(base)
-                    remaining_tokens = prompt_tokens[base.token_count:]
-                    cache_mode = "base_hit"
-                    logger.info(
-                        f"[KV Cache] session={session_id} | BASE HIT | "
-                        f"reusing {base.token_count} base tokens, "
-                        f"processing {len(remaining_tokens)} remaining tokens "
-                        f"(was {prev_cached} cached)"
-                    )
-                    prompt_tokens = remaining_tokens
-                else:
-                    # Token mismatch — fall through to full miss
-                    base = None
-
-            if cache_mode == "miss":
+        else:
+            # Cache miss — seed from base cache if available
+            prev_cached = session.total_cache_tokens if session else 0
+            base = self._find_base_cache(messages, tools=tools)
+            if base:
+                cache_state.cache = self._clone_base_cache(base)
+                cache_state.token_ids = list(base.tokens)
+                cache_mode = "base_hit"
+                logger.info(
+                    f"[KV Cache] session={session_id} | BASE HIT | "
+                    f"seeding {base.token_count} base tokens "
+                    f"(was {prev_cached} cached)"
+                )
+            else:
                 if prev_cached:
                     logger.info(
                         f"[KV Cache] session={session_id} | MISS | "
@@ -1281,58 +1131,47 @@ class MLXEngine:
                         f"processing {len(messages)} messages"
                     )
 
-                # Build base cache eagerly on MISS: process system prompt
-                # tokens first, register as base cache, then continue with rest
-                system_tokens = self._extract_system_tokens(messages, prompt_tokens, tools=tools, thinking=use_thinking)
-                if system_tokens and len(system_tokens) < len(prompt_tokens):
-                    prompt_cache = make_prompt_cache(self.model)
-                    self._prefill_cache(prompt_cache, system_tokens)
-                    # Register as base cache immediately
-                    self._register_base_cache(messages, prompt_cache, system_tokens, tools=tools)
-                    # Continue with remaining tokens only
-                    prompt_tokens = prompt_tokens[len(system_tokens):]
-                    cache_mode = "base_build"
-                    logger.debug(
-                        f"[Base Cache] EAGER BUILD | "
-                        f"system={len(system_tokens)} tokens, "
-                        f"remaining={len(prompt_tokens)} tokens"
-                    )
-                else:
-                    prompt_cache = make_prompt_cache(self.model)
+        # Tokenize prompt — only needed for MISS/RETRY (HIT already computed above)
+        if cache_mode != "hit":
+            prompt_token_ids = self._tokenize_prompt(
+                prompt_messages, thinking=use_thinking, tools=tools,
+            )
+        total_prompt_tokens = len(prompt_token_ids)
 
-        # Setup generation
-        sampler = make_sampler(temp=temperature, top_p=top_p, min_p=min_p, top_k=top_k)
+        # Determine how many tokens will actually be processed (for cache info)
+        if cache_state.token_ids:
+            reused = cache_state.find_prefix_length(prompt_token_ids)
+        else:
+            reused = 0
+        new_token_count = total_prompt_tokens - reused
 
+        # Build logits processors
         logits_processors = []
         if repetition_penalty != 1.0:
             logits_processors.append(RepetitionPenaltyProcessor(penalty=repetition_penalty))
         budget = thinking_budget if thinking_budget is not None else self.cfg.thinking_budget
-        if (
-            use_thinking
-            and budget > 0
-            and self.cfg.think_end_token >= 0
-        ):
-            thinking_proc = ThinkingBudgetProcessor(
+        if use_thinking and budget > 0 and self.cfg.think_end_token >= 0:
+            think_start = _detect_token_id(
+                self.tokenizer,
+                "<|channel>" if self.model_family == "gemma4" else "<think>",
+            )
+            logits_processors.append(ThinkingBudgetProcessor(
                 budget=budget,
                 think_end_token=self.cfg.think_end_token,
-                think_start_token=self.cfg.think_start_token,
+                think_start_token=think_start,
                 model_family=self.model_family,
-            )
-            thinking_proc.reset()
-            logits_processors.append(thinking_proc)
+            ))
 
-        # Build cache info for response
-        cached_tokens = total_prompt_tokens - len(prompt_tokens)
+        # Build response cache info
         response_cache_info = {
             "cache_mode": cache_mode,
-            "cached_tokens": cached_tokens,
-            "new_tokens": len(prompt_tokens),
+            "cached_tokens": reused,
+            "new_tokens": new_token_count,
             "total_prompt_tokens": total_prompt_tokens,
         }
-        # Include pending build time from branch/regenerate BUILD
         if session and session.pending_build_time > 0:
             response_cache_info["build_time"] = round(session.pending_build_time, 2)
-            session.pending_build_time = 0.0  # consume once
+            session.pending_build_time = 0.0
 
         sampling_info = f"temp={temperature}"
         if top_p < 1.0:
@@ -1344,168 +1183,190 @@ class MLXEngine:
         if repetition_penalty != 1.0:
             sampling_info += f", rep_pen={repetition_penalty}"
         logger.info(
-            f"[Generate] prompt={len(prompt_tokens)} tokens, max={max_tokens}, "
-            f"{sampling_info}, cache_mode={cache_mode}"
+            f"[Generate] prompt={new_token_count} new tokens "
+            f"(reused={reused}, total={total_prompt_tokens}), "
+            f"max={max_tokens}, {sampling_info}, cache_mode={cache_mode}"
         )
 
-        # Stream generate
-        generated_tokens = []
-        last_resp = None
+        # Stream generate — mlx-vlm for VLM models, mlx-lm for text models
+        accumulated_text = ""
         t_gen_start = time.perf_counter()
         t_first_token = None
-
-
-
+        last_prompt_tps = 0.0
+        last_gen_tps = 0.0
+        gen_token_count = 0
         cancelled = False
-        for resp in stream_generate(
-            self.model,
-            self.tokenizer,
-            prompt=prompt_tokens,
-            max_tokens=max_tokens,
-            sampler=sampler,
-            prompt_cache=prompt_cache,
-            logits_processors=logits_processors if logits_processors else None,
-        ):
+
+        if self._use_vlm:
+            input_ids = mx.array([prompt_token_ids])
+            gen_iter = vlm_stream_generate(
+                self._vlm_model,
+                self._processor,
+                "",  # prompt text ignored when input_ids is provided
+                input_ids=input_ids,
+                prompt_cache_state=cache_state,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                min_p=min_p,
+                top_k=top_k,
+                logits_processors=logits_processors if logits_processors else None,
+            )
+        else:
+            # mlx-lm path: manage cache manually via prompt_cache
+            full_prompt_token_ids = list(prompt_token_ids)  # save before trimming
+            prompt_cache = cache_state.cache
+            if prompt_cache is None:
+                prompt_cache = make_prompt_cache(self._language_model)
+            else:
+                # Trim cache to match prefix
+                stored_ids = cache_state.token_ids or []
+                prefix_len = 0
+                for j in range(min(len(stored_ids), len(prompt_token_ids))):
+                    if stored_ids[j] != prompt_token_ids[j]:
+                        break
+                    prefix_len = j + 1
+                # Trim KV cache to prefix length
+                for c in prompt_cache:
+                    if hasattr(c, "keys") and c.keys is not None:
+                        cached_len = c.keys.shape[2] if len(c.keys.shape) > 2 else 0
+                        if cached_len > prefix_len:
+                            c.keys = c.keys[..., :prefix_len, :]
+                            c.values = c.values[..., :prefix_len, :]
+                            if hasattr(c, "offset"):
+                                c.offset = prefix_len
+                # Only feed tokens after prefix
+                prompt_token_ids = prompt_token_ids[prefix_len:]
+
+            sampler = make_sampler(temp=temperature, top_p=top_p, min_p=min_p, top_k=top_k)
+            gen_iter = lm_stream_generate(
+                self._language_model,
+                self.tokenizer,
+                prompt=prompt_token_ids,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                prompt_cache=prompt_cache,
+                logits_processors=logits_processors if logits_processors else None,
+            )
+
+        for resp in gen_iter:
             if cancel_event and cancel_event.is_set():
                 logger.debug(f"[Generate] session={session_id} | CANCELLED")
                 cancelled = True
                 break
-            generated_tokens.append(resp.token)
+
+            gen_token_count += 1
+            text = resp.text if hasattr(resp, "text") else ""
+            token = (resp.token if hasattr(resp, "token") and resp.token is not None
+                     else 0)
+            prompt_tps = getattr(resp, "prompt_tps", 0.0) or 0.0
+            gen_tps = getattr(resp, "generation_tps", 0.0) or 0.0
+
+            accumulated_text += text
+
             if t_first_token is None:
                 t_first_token = time.perf_counter()
+                last_prompt_tps = prompt_tps
                 logger.info(
                     f"[Generate] TTFT={round((t_first_token - t_gen_start)*1000)}ms"
                 )
-            last_resp = resp
+
+            last_gen_tps = gen_tps
 
             yield GenerationResult(
-                text=resp.text,
-                token=resp.token,
+                text=text,
+                token=token,
                 prompt_tokens=total_prompt_tokens,
-                completion_tokens=len(generated_tokens),
-                prompt_tps=resp.prompt_tps if hasattr(resp, "prompt_tps") else 0,
-                generation_tps=(
-                    resp.generation_tps if hasattr(resp, "generation_tps") else 0
-                ),
+                completion_tokens=gen_token_count,
+                prompt_tps=prompt_tps,
+                generation_tps=gen_tps,
             )
 
         self._touch_gpu()
 
         # Log generated text for debugging
-        if generated_tokens:
-            gen_text = self.tokenizer.decode(generated_tokens)
-            preview = gen_text[:200].replace('\n', '\\n')
+        if accumulated_text:
+            preview = accumulated_text[:200].replace('\n', '\\n')
             logger.debug(
                 f"[Generate] session={session_id} | "
-                f"tokens={len(generated_tokens)} | cancelled={cancelled} | "
+                f"tokens={gen_token_count} | cancelled={cancelled} | "
                 f"text={preview!r}"
             )
 
         if cancelled:
             return
 
-        # Guard: detect empty response (only </think><|im_end|>, no real content)
-        # This prevents poisoning the cache with degenerate outputs
-        if generated_tokens and session_id:
-            gen_text = self.tokenizer.decode(generated_tokens)
-            thinking, content = split_thinking_and_content(gen_text, model_family=self.model_family)
+        # Guard: detect empty response (no content after thinking)
+        if accumulated_text and session_id:
+            _, content = split_thinking_and_content(
+                accumulated_text, model_family=self.model_family,
+            )
             if not content or not content.strip():
                 logger.warning(
                     f"[KV Cache] session={session_id} | SKIP SAVE | "
-                    f"empty response detected ({len(generated_tokens)} tokens, "
-                    f"no content after </think>) — not updating cache"
+                    f"empty response ({gen_token_count} tokens, no content)"
                 )
-                # Still yield final result, but don't save to cache
-                finish_reason = "stop"
                 yield GenerationResult(
                     text="",
-                    finish_reason=finish_reason,
+                    finish_reason="stop",
                     prompt_tokens=total_prompt_tokens,
-                    completion_tokens=len(generated_tokens),
+                    completion_tokens=gen_token_count,
                 )
                 return
 
-        # Save cache to session
+        # For mlx-lm path: manually update PromptCacheState
+        # (mlx-vlm does this automatically in stream_generate)
+        if not self._use_vlm and not cancelled:
+            cache_state.cache = prompt_cache
+            cache_state.token_ids = full_prompt_token_ids  # full IDs before trim
+
+        # Save session
         if session_id:
-            new_offset = self._get_cache_offset(prompt_cache)
+            new_offset = (
+                self._get_cache_offset(cache_state.cache)
+                if cache_state.cache else total_prompt_tokens + gen_token_count
+            )
             prev_offset = session.total_cache_tokens if session else 0
 
-            # Preserve existing checkpoints
-            prev_turn_offsets = session.turn_offsets if session else {}
-            prev_deltanet_snapshots = session.deltanet_snapshots if session else {}
+            # Build full assistant content for engine-internal messages
+            # This includes thinking so next turn's suffix extends correctly
+            full_assistant_content = self._make_full_assistant_content(
+                accumulated_text, use_thinking,
+            )
+            # On HIT: extend session.messages with new incoming + assistant
+            # On MISS: use incoming messages + assistant
+            if cache_mode == "hit" and session:
+                base_messages = list(session.messages) + new_messages
+            else:
+                base_messages = list(messages)
+            updated_messages = base_messages + [
+                {"role": "assistant", "content": full_assistant_content}
+            ]
 
             self._sessions[session_id] = SessionState(
-                cache=prompt_cache,
-                messages=messages,
+                cache_state=cache_state,
+                messages=updated_messages,
                 total_cache_tokens=new_offset,
-                turn_offsets=prev_turn_offsets,
-                deltanet_snapshots=prev_deltanet_snapshots,
             )
-
-            # Save checkpoint: DeltaNet snapshot + KVCache offset
-            session_state = self._sessions[session_id]
-            turn_key = len(messages)
-            session_state.turn_offsets[turn_key] = new_offset
-            if self._has_deltanet:
-                session_state.deltanet_snapshots[turn_key] = [
-                    copy.deepcopy(c) for c in prompt_cache
-                    if type(c).__name__ == "ArraysCache"
-                ]
-            # Prune old checkpoints
-            max_ckpt = self.cfg.max_checkpoints if hasattr(self.cfg, 'max_checkpoints') else DEFAULT_MAX_CHECKPOINTS
-            if max_ckpt > 0:
-                while len(session_state.deltanet_snapshots) > max_ckpt:
-                    oldest_key = min(session_state.deltanet_snapshots.keys())
-                    del session_state.deltanet_snapshots[oldest_key]
-                    del session_state.turn_offsets[oldest_key]
 
             logger.debug(
                 f"[KV Cache] session={session_id} | SAVED | "
                 f"offset: {prev_offset} -> {new_offset} tokens "
-                f"(+{new_offset - prev_offset}), "
-                f"checkpoints={len(session_state.turn_offsets)}"
+                f"(+{new_offset - prev_offset})"
             )
 
-        # Auto-register base cache on full miss (system prompt not yet cached)
-        # For RotatingKVCache models (e.g. Gemma 4), also register when template auto-generates system prefix
-        has_system_or_rotating = (
-            (messages and messages[0].get("role") in ("system", "developer"))
-            or self._has_rotating_cache
-        )
-        if cache_mode in ("miss",) and messages and has_system_or_rotating:
-            sys_hash = self._system_hash(messages, tools=tools)
-            if sys_hash and sys_hash not in self._base_caches:
-                # Tokenize system prompt with dummy user to satisfy chat template
-                has_system = messages[0].get("role") in ("system", "developer")
-                system_with_dummy = (
-                    [messages[0], {"role": "user", "content": "hi"}]
-                    if has_system
-                    else [{"role": "user", "content": "hi"}]
-                )
-                full_tokens = self.tokenize_messages(system_with_dummy, tools=tools, thinking=use_thinking)
-                dummy_suffix = self.tokenizer.encode(
-                    self._chat_format.dummy_suffix(use_thinking),
-                    add_special_tokens=False,
-                )
-                system_tokens = full_tokens[: len(full_tokens) - len(dummy_suffix)]
-                if system_tokens:
-                    try:
-                        base_cache = make_prompt_cache(self.model)
-                        # Process system tokens directly (no generation) to avoid
-                        # polluting the base cache with an extra generated token
-                        self._prefill_cache(base_cache, system_tokens)
-                        self._register_base_cache(messages, base_cache, system_tokens, tools=tools)
-                    except Exception as e:
-                        logger.warning(f"[Base Cache] registration failed: {e}")
+        # Auto-register base cache on miss
+        if cache_mode in ("miss", "retry") and messages:
+            self._maybe_register_base_cache(
+                messages, prompt_token_ids, tools=tools, thinking=use_thinking,
+            )
 
-        # Yield final result with finish_reason
+        # Determine finish reason
         finish_reason = "stop"
-        if last_resp and hasattr(last_resp, "finish_reason"):
-            finish_reason = last_resp.finish_reason or "stop"
-
-        if has_tools and generated_tokens:
-            full_text = self.tokenizer.decode(generated_tokens)
-            _, tool_calls = parse_tool_calls(full_text, model_family=self.model_family)
+        if has_tools and accumulated_text:
+            _, tool_calls = parse_tool_calls(
+                accumulated_text, model_family=self.model_family,
+            )
             if tool_calls:
                 finish_reason = "tool_calls"
 
@@ -1513,15 +1374,63 @@ class MLXEngine:
             text="",
             finish_reason=finish_reason,
             prompt_tokens=total_prompt_tokens,
-            completion_tokens=len(generated_tokens),
-            prompt_tps=last_resp.prompt_tps if last_resp and hasattr(last_resp, "prompt_tps") else 0,
-            generation_tps=(
-                last_resp.generation_tps
-                if last_resp and hasattr(last_resp, "generation_tps")
-                else 0
-            ),
+            completion_tokens=gen_token_count,
+            prompt_tps=last_prompt_tps,
+            generation_tps=last_gen_tps,
             cache_info=response_cache_info,
         )
+
+    def _make_full_assistant_content(
+        self, accumulated_text: str, thinking_enabled: bool,
+    ) -> str:
+        """Build full assistant content for engine-internal messages.
+
+        Includes thinking markers so that suffix token computation works
+        correctly on subsequent turns.
+
+        ChatML/GLM: prompt suffix includes '<think>\\n' (or '<think>'), so
+        accumulated_text starts after it. Prepend to get the complete content.
+
+        Gemma 4: model generates thinking markers itself (e.g. '<|channel>thought\\n'),
+        so accumulated_text already includes them.
+        """
+        if self.model_family == "gemma4":
+            return accumulated_text
+        # ChatML and GLM both use <think> prefix
+        if thinking_enabled:
+            prefix = "<think>" if self.model_family == "glm" else "<think>\n"
+            return prefix + accumulated_text
+        return accumulated_text
+
+    def _maybe_register_base_cache(
+        self,
+        messages: list[dict],
+        prompt_tokens: list[int],
+        tools: list | None = None,
+        thinking: bool = True,
+    ):
+        """Register a base cache for the system prompt if not already cached."""
+        has_system_or_rotating = (
+            (messages and messages[0].get("role") in ("system", "developer"))
+            or self._has_rotating_cache
+        )
+        if not has_system_or_rotating:
+            return
+        sys_hash = self._system_hash(messages, tools=tools)
+        if not sys_hash or sys_hash in self._base_caches:
+            return
+        system_tokens = self._extract_system_tokens(
+            messages, prompt_tokens, tools=tools, thinking=thinking,
+        )
+        if system_tokens and len(system_tokens) < len(prompt_tokens):
+            try:
+                base_cache = make_prompt_cache(self._language_model)
+                self._prefill_cache(base_cache, system_tokens)
+                self._register_base_cache(
+                    messages, base_cache, system_tokens, tools=tools,
+                )
+            except Exception as e:
+                logger.warning(f"[Base Cache] registration failed: {e}")
 
     def complete(
         self,
@@ -1583,47 +1492,47 @@ class MLXEngine:
         return result
 
     def update_session_messages(self, session_id: str, messages: list[dict]):
-        """Update stored session messages after assistant response is finalized."""
+        """Touch session and mark dirty after external caller finalizes messages.
+
+        Note: The engine manages its own internal messages (with thinking) in
+        _generate_locked. This method exists for the API layer to signal that
+        generation is complete and the session should be persisted.
+        The incoming messages parameter is ignored — internal messages are
+        authoritative for cache matching.
+        """
         session = self._sessions.get(session_id)
         if session:
-            session.messages = messages
             session.touch()
             logger.info(
-                f"[Session] {session_id} | messages updated | "
-                f"{len(messages)} msgs, {session.total_cache_tokens} cached tokens"
+                f"[Session] {session_id} | messages finalized | "
+                f"{len(session.messages)} msgs, {session.total_cache_tokens} cached tokens"
             )
-
             self._mark_dirty(session_id)
 
     def compact_session(self, session_id: str, messages: list[dict]) -> dict:
         """Replace a session's messages and rebuild KV cache from scratch.
 
         Used when client compresses/summarizes conversation context.
-        Returns stats about the new cache.
         """
         with self._lock:
             self._touch_gpu()
             t0 = time.perf_counter()
 
-            prompt_tokens = self.tokenize_messages(messages)
+            prompt_tokens = self._tokenize_prompt(messages)
 
             # Try base cache first
             base = self._find_base_cache(messages)
+            base_tokens_used = 0
+            prompt_cache = None
             if base and len(prompt_tokens) >= base.token_count:
                 if prompt_tokens[:base.token_count] == base.tokens:
                     prompt_cache = self._clone_base_cache(base)
                     feed_tokens = prompt_tokens[base.token_count:]
                     base_tokens_used = base.token_count
-                else:
-                    prompt_cache = make_prompt_cache(self.model)
-                    feed_tokens = prompt_tokens
-                    base_tokens_used = 0
-            else:
-                prompt_cache = make_prompt_cache(self.model)
+            if prompt_cache is None:
+                prompt_cache = make_prompt_cache(self._language_model)
                 feed_tokens = prompt_tokens
-                base_tokens_used = 0
 
-            # Process tokens through model to build cache (no generation)
             if feed_tokens:
                 self._prefill_cache(prompt_cache, feed_tokens)
             self._eval_cache(prompt_cache)
@@ -1631,11 +1540,15 @@ class MLXEngine:
             new_offset = self._get_cache_offset(prompt_cache)
             elapsed = time.perf_counter() - t0
 
-            # Save to session
+            # Build PromptCacheState
+            cache_state = PromptCacheState()
+            cache_state.cache = prompt_cache
+            cache_state.token_ids = prompt_tokens
+
             prev = self._sessions.get(session_id)
-            prev_tokens = self._get_cache_offset(prev.cache) if prev and prev.cache else 0
+            prev_tokens = prev.total_cache_tokens if prev else 0
             self._sessions[session_id] = SessionState(
-                cache=prompt_cache,
+                cache_state=cache_state,
                 messages=messages,
                 total_cache_tokens=new_offset,
             )
@@ -1648,33 +1561,8 @@ class MLXEngine:
                 f"{elapsed:.2f}s"
             )
 
-            # Auto-register base if not present
-            if messages and messages[0].get("role") == "system":
-                sys_hash = self._system_hash(messages)
-                if sys_hash and sys_hash not in self._base_caches:
-                    # Use same tokenization approach as main auto-register
-                    system_with_dummy = [messages[0], {"role": "user", "content": "hi"}]
-                    full_tokens = self.tokenize_messages(system_with_dummy)
-                    dummy_suffix = self.tokenizer.encode(
-                        self._chat_format.dummy_suffix(True),
-                        add_special_tokens=False,
-                    )
-                    system_tokens = full_tokens[: len(full_tokens) - len(dummy_suffix)]
-                    if system_tokens:
-                        try:
-                            base_cache = make_prompt_cache(self.model)
-                            for _ in stream_generate(
-                                self.model,
-                                self.tokenizer,
-                                prompt=system_tokens,
-                                max_tokens=1,
-                                prompt_cache=base_cache,
-                            ):
-                                break
-                            self._eval_cache(base_cache)
-                            self._register_base_cache(messages, base_cache, system_tokens)
-                        except Exception as e:
-                            logger.warning(f"[Base Cache] registration failed: {e}")
+            # Auto-register base cache
+            self._maybe_register_base_cache(messages, prompt_tokens)
 
             self._mark_dirty(session_id)
 
@@ -1717,10 +1605,9 @@ class MLXEngine:
             self._dirty_sessions.discard(session_id)
         if session_id in self._sessions:
             del self._sessions[session_id]
-        # Remove disk cache + checkpoints
-        for p in [self._session_cache_path(session_id), self._session_ckpt_path(session_id)]:
-            if os.path.exists(p):
-                os.remove(p)
+        path = self._session_cache_path(session_id)
+        if os.path.exists(path):
+            os.remove(path)
         if hasattr(self, "_disk_session_ids"):
             self._disk_session_ids.discard(session_id)
         logger.info(f"[Session] DELETED | session={session_id}")
@@ -1792,7 +1679,7 @@ class MLXEngine:
             logger.debug("[Stream] Client disconnected — cancelling generation")
             raise
 
-    # --- Branching & Regeneration ---
+    # --- Truncation & Regeneration ---
 
     def branch_from_turn(
         self,
@@ -1801,22 +1688,13 @@ class MLXEngine:
         branch_turn: int,
         branch_messages: list[dict] | None = None,
     ) -> dict:
-        """Branch a new session from a specific turn of an existing session.
-
-        If a checkpoint exists at or before branch_turn, restore from it
-        (fast: DeltaNet deepcopy + KVCache slice).
-        Otherwise, build the cache from scratch by processing branch_messages
-        through the model (slower but always works).
-        """
+        """Branch a new session by building cache from scratch."""
         source = self._sessions.get(source_session_id)
-
-        # Load from disk if not in memory
         if not source and self._has_disk_cache(source_session_id):
             source = self._load_session_from_disk(source_session_id)
             if source:
                 self._sessions[source_session_id] = source
 
-        # Determine branch messages from source or caller
         if source:
             engine_messages = source.messages[:branch_turn]
         elif branch_messages:
@@ -1824,160 +1702,10 @@ class MLXEngine:
         else:
             return {"error": "source session not found and no messages provided"}
 
-        # Fast path 1: full copy (branch at end of conversation — no checkpoint needed)
-        if source and source.cache is not None and branch_turn >= len(source.messages):
-            with self._lock:
-                new_cache = copy.deepcopy(source.cache)
-                target_offset = source.total_cache_tokens
-                new_session = SessionState(
-                    cache=new_cache,
-                    messages=list(source.messages),
-                    total_cache_tokens=target_offset,
-                )
-                # Copy all existing checkpoints
-                for turn, offset in source.turn_offsets.items():
-                    new_session.turn_offsets[turn] = offset
-                    if turn in source.deltanet_snapshots:
-                        new_session.deltanet_snapshots[turn] = copy.deepcopy(
-                            source.deltanet_snapshots[turn]
-                        )
-                self._sessions[new_session_id] = new_session
-                self._mark_dirty(new_session_id)
-
-            logger.info(
-                f"[Branch] {source_session_id} -> {new_session_id} | "
-                f"COPY | cached_tokens={target_offset}, messages={len(source.messages)}"
-            )
-            return {
-                "status": "ok",
-                "method": "copy",
-                "cached_tokens": target_offset,
-                "messages": len(source.messages),
-            }
-
-        # Fast path 2: checkpoint restore (branch at earlier turn)
-        checkpoint_turn = None
-        if source:
-            for turn in sorted(source.turn_offsets.keys(), reverse=True):
-                if turn <= branch_turn:
-                    checkpoint_turn = turn
-                    break
-
-        # Guard: RotatingKVCache cannot be safely sliced (circular buffer)
-        has_rotating = self._has_rotating_cache
-
-        if (
-            checkpoint_turn is not None
-            and source
-            and not has_rotating
-            and checkpoint_turn in source.deltanet_snapshots
-        ):
-            # Restore from checkpoint
-            with self._lock:
-                deltanet_states = source.deltanet_snapshots[checkpoint_turn]
-                target_offset = source.turn_offsets[checkpoint_turn]
-
-                new_cache = []
-                dn_idx = 0
-                for c in source.cache:
-                    if type(c).__name__ == "ArraysCache":
-                        new_cache.append(copy.deepcopy(deltanet_states[dn_idx]))
-                        dn_idx += 1
-                    else:
-                        sliced = copy.deepcopy(c)
-                        if hasattr(sliced, 'keys') and sliced.keys is not None:
-                            sliced.keys = sliced.keys[..., :target_offset, :]
-                            sliced.values = sliced.values[..., :target_offset, :]
-                            sliced.offset = target_offset
-                        new_cache.append(sliced)
-
-                new_session = SessionState(
-                    cache=new_cache,
-                    messages=engine_messages,
-                    total_cache_tokens=target_offset,
-                )
-                for turn, offset in source.turn_offsets.items():
-                    if turn <= checkpoint_turn:
-                        new_session.turn_offsets[turn] = offset
-                        if turn in source.deltanet_snapshots:
-                            new_session.deltanet_snapshots[turn] = copy.deepcopy(
-                                source.deltanet_snapshots[turn]
-                            )
-                self._sessions[new_session_id] = new_session
-                self._mark_dirty(new_session_id)
-
-            logger.info(
-                f"[Branch] {source_session_id} -> {new_session_id} | "
-                f"CHECKPOINT | turn={branch_turn}, checkpoint={checkpoint_turn}, "
-                f"cached_tokens={target_offset}, messages={len(engine_messages)}"
-            )
-            return {
-                "status": "ok",
-                "method": "checkpoint",
-                "cached_tokens": target_offset,
-                "messages": len(engine_messages),
-            }
-        else:
-            # Slow path: build cache from scratch by processing messages
-            with self._lock:
-                self._touch_gpu()
-                t0 = time.perf_counter()
-                prompt_tokens = self.tokenize_messages(engine_messages)
-
-                # Try base cache first
-                prompt_cache = None
-                base = self._find_base_cache(engine_messages)
-                if base and len(prompt_tokens) >= base.token_count:
-                    if prompt_tokens[:base.token_count] == base.tokens:
-                        prompt_cache = self._clone_base_cache(base)
-                        prompt_tokens = prompt_tokens[base.token_count:]
-
-                if prompt_cache is None:
-                    prompt_cache = make_prompt_cache(self.model)
-
-                # Process tokens through model (no generation)
-                if prompt_tokens:
-                    self._prefill_cache(prompt_cache, prompt_tokens)
-
-                new_offset = self._get_cache_offset(prompt_cache)
-                elapsed = time.perf_counter() - t0
-
-                new_session = SessionState(
-                    cache=prompt_cache,
-                    messages=engine_messages,
-                    total_cache_tokens=new_offset,
-                )
-                new_session.pending_build_time = elapsed
-                # Save checkpoint so immediate regen/delete is fast
-                turn_key = len(engine_messages)
-                new_session.turn_offsets[turn_key] = new_offset
-                if self._has_deltanet:
-                    new_session.deltanet_snapshots[turn_key] = [
-                        copy.deepcopy(c) for c in prompt_cache
-                        if type(c).__name__ == "ArraysCache"
-                    ]
-                self._sessions[new_session_id] = new_session
-                self._mark_dirty(new_session_id)
-
-            logger.info(
-                f"[Branch] {source_session_id} -> {new_session_id} | "
-                f"BUILD | turn={branch_turn}, "
-                f"cached_tokens={new_offset}, messages={len(engine_messages)}, "
-                f"{elapsed:.2f}s"
-            )
-            return {
-                "status": "ok",
-                "method": "build",
-                "build_time": round(elapsed, 2),
-                "cached_tokens": new_offset,
-                "messages": len(engine_messages),
-            }
+        return self._rebuild_session(new_session_id, engine_messages)
 
     def prepare_regenerate(self, session_id: str) -> dict:
-        """Remove last assistant+user pair and restore cache to before them.
-
-        Delegates to truncate_session for cache restoration.
-        """
+        """Remove last assistant message and restore cache."""
         session = self._sessions.get(session_id)
         if not session or len(session.messages) < 2:
             return {"error": "nothing to regenerate"}
@@ -1993,13 +1721,8 @@ class MLXEngine:
         return result
 
     def truncate_session(self, session_id: str, target_msg_count: int) -> dict:
-        """Truncate session to target_msg_count messages, restoring cache.
-
-        Used by delete-last-message and regenerate.
-        Tries checkpoint first, falls back to BUILD.
-        """
+        """Truncate session to target_msg_count messages, rebuilding cache."""
         session = self._sessions.get(session_id)
-        # Load from disk if not in memory
         if not session and self._has_disk_cache(session_id):
             session = self._load_session_from_disk(session_id)
             if session:
@@ -2010,153 +1733,56 @@ class MLXEngine:
             return {"error": "nothing to truncate"}
 
         restore_messages = session.messages[:target_msg_count]
+        return self._rebuild_session(session_id, restore_messages)
 
-        # Try checkpoint restore
-        checkpoint_turn = None
-        for turn in sorted(session.turn_offsets.keys(), reverse=True):
-            if turn <= target_msg_count:
-                checkpoint_turn = turn
-                break
+    def _rebuild_session(self, session_id: str, messages: list[dict]) -> dict:
+        """Build a fresh KV cache for the given messages."""
+        with self._lock:
+            self._touch_gpu()
+            t0 = time.perf_counter()
 
-        # Guard: RotatingKVCache cannot be safely sliced (circular buffer)
-        has_rotating = self._has_rotating_cache
+            prompt_tokens = self._tokenize_prompt(messages)
 
-        if (
-            checkpoint_turn is not None
-            and not has_rotating
-            and checkpoint_turn in session.deltanet_snapshots
-        ):
-            target_offset = session.turn_offsets[checkpoint_turn]
-            deltanet_states = session.deltanet_snapshots[checkpoint_turn]
+            # Try base cache first
+            prompt_cache = None
+            base = self._find_base_cache(messages)
+            feed_tokens = prompt_tokens
+            if base and len(prompt_tokens) >= base.token_count:
+                if prompt_tokens[:base.token_count] == base.tokens:
+                    prompt_cache = self._clone_base_cache(base)
+                    feed_tokens = prompt_tokens[base.token_count:]
+            if prompt_cache is None:
+                prompt_cache = make_prompt_cache(self._language_model)
 
-            new_cache = []
-            dn_idx = 0
-            for c in session.cache:
-                if type(c).__name__ == "ArraysCache":
-                    new_cache.append(copy.deepcopy(deltanet_states[dn_idx]))
-                    dn_idx += 1
-                else:
-                    sliced = copy.deepcopy(c)
-                    if hasattr(sliced, 'keys') and sliced.keys is not None:
-                        sliced.keys = sliced.keys[..., :target_offset, :]
-                        sliced.values = sliced.values[..., :target_offset, :]
-                        sliced.offset = target_offset
-                    new_cache.append(sliced)
+            if feed_tokens:
+                self._prefill_cache(prompt_cache, feed_tokens)
 
-            session.cache = new_cache
-            session.messages = restore_messages
-            session.total_cache_tokens = target_offset
-            logger.info(
-                f"[Truncate] session={session_id} | CHECKPOINT | "
-                f"turn={checkpoint_turn}, offset={target_offset}, msgs={target_msg_count}"
+            new_offset = self._get_cache_offset(prompt_cache)
+            elapsed = time.perf_counter() - t0
+
+            cache_state = PromptCacheState()
+            cache_state.cache = prompt_cache
+            cache_state.token_ids = prompt_tokens
+
+            self._sessions[session_id] = SessionState(
+                cache_state=cache_state,
+                messages=messages,
+                total_cache_tokens=new_offset,
+                pending_build_time=elapsed,
             )
-            return {"status": "ok", "method": "checkpoint", "cached_tokens": target_offset}
-        else:
-            with self._lock:
-                self._touch_gpu()
-                t0 = time.perf_counter()
-                prompt_tokens = self.tokenize_messages(restore_messages)
-
-                prompt_cache = None
-                base = self._find_base_cache(restore_messages)
-                if base and len(prompt_tokens) >= base.token_count:
-                    if prompt_tokens[:base.token_count] == base.tokens:
-                        prompt_cache = self._clone_base_cache(base)
-                        prompt_tokens = prompt_tokens[base.token_count:]
-                if prompt_cache is None:
-                    prompt_cache = make_prompt_cache(self.model)
-
-                if prompt_tokens:
-                    self._prefill_cache(prompt_cache, prompt_tokens)
-
-                new_offset = self._get_cache_offset(prompt_cache)
-                elapsed = time.perf_counter() - t0
-
-                session.cache = prompt_cache
-                session.messages = restore_messages
-                session.total_cache_tokens = new_offset
-                session.pending_build_time = elapsed
-                # Save checkpoint
-                turn_key = len(restore_messages)
-                session.turn_offsets[turn_key] = new_offset
-                if self._has_deltanet:
-                    session.deltanet_snapshots[turn_key] = [
-                        copy.deepcopy(c) for c in prompt_cache
-                        if type(c).__name__ == "ArraysCache"
-                    ]
-
-            logger.info(
-                f"[Truncate] session={session_id} | BUILD | "
-                f"{new_offset} tokens, msgs={target_msg_count}, {elapsed:.2f}s"
-            )
-            return {"status": "ok", "method": "build", "build_time": round(elapsed, 2), "cached_tokens": new_offset}
-
-    def _check_branch_match(self, stored: list[dict], incoming: list[dict]) -> int | None:
-        """If incoming is shorter than stored and prefix matches, return branch point.
-
-        Uses the same normalization as _messages_match (list→string, thinking strip, etc.).
-        """
-        if len(incoming) >= len(stored):
-            return None
-        prefix_len = len(incoming) - 1
-        if prefix_len <= 0:
-            return None
-        for i in range(prefix_len):
-            s_msg = stored[i]
-            i_msg = incoming[i]
-            if s_msg.get("role") != i_msg.get("role"):
-                logger.debug(
-                    f"[BranchMatch] FAIL at msg[{i}]: "
-                    f"role {s_msg.get('role')!r} != {i_msg.get('role')!r}"
-                )
-                return None
-
-            s_content = s_msg.get("content", "") or ""
-            i_content = i_msg.get("content", "") or ""
-            role = s_msg.get("role", "")
-
-            # Normalize list-format content to string
-            if isinstance(s_content, list):
-                s_content = "\n".join(
-                    p["text"] if isinstance(p, dict) and "text" in p else str(p)
-                    for p in s_content
-                )
-            if isinstance(i_content, list):
-                i_content = "\n".join(
-                    p["text"] if isinstance(p, dict) and "text" in p else str(p)
-                    for p in i_content
-                )
-
-            # Assistant tool_call content tolerance (same as _messages_match)
-            if role == "assistant" and s_content != i_content:
-                import re
-                tc_pattern = r"\n*<tool_call>"
-                s_stripped = re.split(tc_pattern, s_content, maxsplit=1)[0].rstrip()
-                i_stripped = re.split(tc_pattern, i_content, maxsplit=1)[0].rstrip()
-                if s_stripped == i_stripped:
-                    continue
-
-            # Normalize and compare
-            s_norm = self._normalize_for_match(s_content, role)
-            i_norm = self._normalize_for_match(i_content, role)
-            if s_norm != i_norm:
-                # Tool content compacted/cleared (either direction)
-                if role == "tool" and self._is_compacted_tool(s_content, i_content):
-                    continue
-                # Last stored assistant tolerance
-                if role == "assistant" and i == prefix_len - 1:
-                    continue
-                logger.debug(
-                    f"[BranchMatch] FAIL at msg[{i}] role={role}: "
-                    f"content mismatch (stored_len={len(s_content)}, incoming_len={len(i_content)})"
-                )
-                return None
+            self._mark_dirty(session_id)
 
         logger.info(
-            f"[BranchMatch] OK | prefix={prefix_len} msgs match "
-            f"(stored={len(stored)}, incoming={len(incoming)})"
+            f"[Rebuild] session={session_id} | "
+            f"{new_offset} tokens, msgs={len(messages)}, {elapsed:.2f}s"
         )
-        return prefix_len
+        return {
+            "status": "ok",
+            "method": "build",
+            "build_time": round(elapsed, 2),
+            "cached_tokens": new_offset,
+            "messages": len(messages),
+        }
 
     def session_stats(self) -> dict:
         return {

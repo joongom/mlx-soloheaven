@@ -1322,10 +1322,10 @@ class MLXEngine:
 
         # Save session
         if session_id:
-            new_offset = (
-                self._get_cache_offset(cache_state.cache)
-                if cache_state.cache else total_prompt_tokens + gen_token_count
-            )
+            new_offset = self._get_cache_offset(cache_state.cache) if cache_state.cache else 0
+            # Fallback: some models (GLM MoE) don't expose offset in cache objects
+            if new_offset == 0 and cache_state.token_ids:
+                new_offset = len(cache_state.token_ids)
             prev_offset = session.total_cache_tokens if session else 0
 
             # Build full assistant content for engine-internal messages

@@ -16,6 +16,7 @@ SoloHeaven turns your Mac into a personal AI server with sub-second response tim
 - **Per-model thinking control** — Enable/disable `<think>` tags per model (e.g., `:no_think_tag` for non-reasoning models)
 - **Thinking budget control** — Configurable token limit for reasoning models, with per-request override
 - **Prompt Lookup Decoding (PLD)** — Optional speculative decoding for prompt-echo-heavy workloads (+37% on copy tasks)
+- **Structured output (`response_format`)** — OpenAI-compatible JSON mode and JSON Schema constraints via logits-level FSM masking (100% schema adherence, no prompt engineering)
 - **Prefill chunk tuning** — Configurable `prefill_step_size` for 1.3-1.5x long-prompt speedup
 - **KV cache quantization** — Optional 4/8-bit KV quant (mlx-lm path)
 - **Budget-based cache eviction** — No time-based TTL, evicts LRU only when memory/disk budget exceeded; disk files auto-pruned when exceeding `--disk-budget-gb`
@@ -421,6 +422,101 @@ the main model verifies in one forward pass.
 
 **Acceptance rate**: logged after every request as `[PLD] accepted X/Y draft tokens (Z%)`.
 Rule of thumb: Z > 30% is a net win; Z < 20% means PLD is hurting — disable for that workload.
+
+### Structured Output (`response_format`)
+
+SoloHeaven implements OpenAI's `response_format` parameter for **guaranteed JSON**
+output — not by adding "please output JSON" to the prompt, but by masking the
+model's logits at each decode step so that only tokens that maintain a valid
+JSON schema can be sampled. This is the same technique used by vLLM's
+`guided_json` / OpenAI's Structured Outputs.
+
+**No server flag required.** This is a per-request API parameter — all start
+scripts support it out of the box. When a client sends `response_format`,
+SoloHeaven builds a logits-level FSM constraint on demand; when it doesn't,
+generation runs unconstrained.
+
+**Three modes** (OpenAI-compatible):
+
+```python
+# Mode 1: no constraint (default, unchanged behavior)
+{"type": "text"}
+
+# Mode 2: any valid JSON object
+{"type": "json_object"}
+
+# Mode 3: strict JSON schema (what you want most of the time)
+{
+  "type": "json_schema",
+  "json_schema": {
+    "name": "person",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "name": {"type": "string"},
+        "age":  {"type": "integer"}
+      },
+      "required": ["name", "age"]
+    }
+  }
+}
+```
+
+**Usage with OpenAI SDK** — drop-in, works on any model:
+
+```python
+from openai import OpenAI
+from pydantic import BaseModel
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="x")
+
+class Person(BaseModel):
+    name: str
+    age: int
+
+response = client.chat.completions.create(
+    model="GLM-5.1",
+    messages=[{"role": "user", "content": "Alice, age 30"}],
+    response_format={
+        "type": "json_schema",
+        "json_schema": {"name": "person", "schema": Person.model_json_schema()},
+    },
+)
+# response.choices[0].message.content is guaranteed valid JSON matching Person
+data = Person.model_validate_json(response.choices[0].message.content)
+```
+
+**How it works**:
+
+1. The JSON schema is compiled to a regex, then to a finite-state automaton
+   (via the Rust-backed `outlines-core` library).
+2. At each decode step, the FSM reports which token IDs would keep the output
+   a valid prefix of the schema.
+3. All other tokens have their logits set to `-inf`, so sampling is forced to
+   stay on the schema.
+4. The model decides **content** (what to say); the FSM enforces **structure**.
+5. Compiled schemas are cached across requests (second request with the same
+   schema skips the 10–200 ms compile).
+
+**Compatibility**:
+
+| Context | Status |
+|---------|--------|
+| All models loaded via mlx-lm (Qwen3.5/3.6, GLM-5.1, GLM-4.7, DeepSeek, Llama, Mistral, MiniMax, …) | ✅ Works |
+| mlx-vlm models (Gemma 4, Qwen3-VL, GLM4V, …) | ✅ Works (same `logits_processors` contract) |
+| Streaming (`stream=True`) | ✅ Works — tokens stream normally, client buffers and parses |
+| `tools` present | ⚠️ `response_format` ignored with server-side warning (OpenAI behavior — tools imply `tool_calls` output, which is not JSON-schema content) |
+| `--pld` enabled | ⚠️ `response_format` disabled with warning (PLD's speculative multi-token steps are incompatible with FSM state). Either: drop `--pld` for that server, or keep `--pld` and skip `response_format` requests. |
+
+**Validation**: SoloHeaven validates the schema at request time via
+`outlines_core.json_schema.build_regex_from_schema()`. Malformed schemas
+return HTTP 400 (matches OpenAI behavior) rather than silently falling
+through to unconstrained generation.
+
+**Performance cost**: ~1 ms per decode step for the mask build on a ~250K
+vocab (benchmarked on M3 Ultra). Typical overhead on a 27 TPS generation is
+under 3%. Content quality depends on the model — smaller models may pick
+strange string values but the structure is guaranteed.
 
 ### Multi-Model Setup
 

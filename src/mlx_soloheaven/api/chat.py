@@ -337,6 +337,12 @@ async def _stream_chat(
                     engine_cache_info = result.cache_info
                 break
 
+            if not (result.text or result.token):
+                # Empty heartbeat from engine during long prefill — forward as
+                # SSE comment to keep client connection alive
+                yield ": keepalive\n\n"
+                continue
+
             if result.text or result.token:
                 token_count += 1
                 if t_first_token is None:

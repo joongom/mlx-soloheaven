@@ -172,7 +172,8 @@ async def cache_overview():
     for model_id, engine in _engines.items():
         sessions = []
         for sid, s in engine._sessions.items():
-            cache_size = engine.cache_manager._estimate_cache_size(s.cache) if s.cache else 0
+            cache = s.cache_state.cache if s.cache_state else None
+            cache_size = engine.cache_manager._estimate_cache_size(cache) if cache else 0
             sessions.append({
                 "session_id": sid,
                 "messages": len(s.messages),
@@ -219,8 +220,9 @@ async def cache_overview():
     # Total memory
     for model_id, engine in _engines.items():
         for sid, s in engine._sessions.items():
-            if s.cache:
-                result["total_memory_gb"] += engine.cache_manager._estimate_cache_size(s.cache) / 1e9
+            cache = s.cache_state.cache if s.cache_state else None
+            if cache:
+                result["total_memory_gb"] += engine.cache_manager._estimate_cache_size(cache) / 1e9
     result["total_memory_gb"] = round(result["total_memory_gb"], 2)
     result["total_disk_gb"] = round(result["total_disk_gb"], 2)
 

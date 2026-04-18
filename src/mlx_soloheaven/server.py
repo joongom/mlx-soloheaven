@@ -88,6 +88,14 @@ def create_app(cfg: Config) -> FastAPI:
                 data_dir=cfg.data_dir,
                 verbose=cfg.verbose,
                 gpu_keepalive=cfg.gpu_keepalive,
+                # Carry over tuning flags from top-level cfg
+                kv_bits=cfg.kv_bits,
+                kv_group_size=cfg.kv_group_size,
+                quantized_kv_start=cfg.quantized_kv_start,
+                prefill_step_size=cfg.prefill_step_size,
+                pld_enabled=cfg.pld_enabled,
+                pld_num_draft_tokens=cfg.pld_num_draft_tokens,
+                pld_ngram_k=cfg.pld_ngram_k,
             )
             engine = MLXEngine(model_cfg)
             engines[mcfg.model_id] = engine

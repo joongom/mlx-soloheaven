@@ -122,6 +122,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=_env("GPU_KEEPALIVE", "").lower() in ("1", "true", "yes"),
         help="Keep Metal GPU warm to avoid idle penalty (env: SOLOHEAVEN_GPU_KEEPALIVE)",
     )
+    p.add_argument(
+        "--kv-bits",
+        type=int,
+        default=int(_env("KV_BITS", "0")),
+        choices=[0, 4, 8],
+        help="KV cache quantization bits (0=disabled, 4 or 8). mlx-lm path only. (env: SOLOHEAVEN_KV_BITS)",
+    )
+    p.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=int(_env("KV_GROUP_SIZE", "64")),
+        help="KV quantization group size (default: 64)",
+    )
+    p.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        default=int(_env("QUANTIZED_KV_START", "0")),
+        help="Token offset at which KV quantization starts (0=from beginning)",
+    )
+    p.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=int(_env("PREFILL_STEP_SIZE", "2048")),
+        help="Prefill chunk size (default: 2048). Try 4096/8192 for long-prompt speedup (env: SOLOHEAVEN_PREFILL_STEP_SIZE)",
+    )
+    p.add_argument("--pld", dest="pld_enabled", action="store_true",
+                   default=_env("PLD", "").lower() in ("1", "true", "yes"),
+                   help="Enable Prompt Lookup Decoding for speculative generation (env: SOLOHEAVEN_PLD)")
+    p.add_argument("--pld-num-draft", type=int, default=int(_env("PLD_NUM_DRAFT", "10")),
+                   help="Max draft tokens per step in PLD (default: 10)")
+    p.add_argument("--pld-ngram-k", type=int, default=int(_env("PLD_NGRAM_K", "3")),
+                   help="N-gram size for PLD matching (default: 3)")
 
     args = p.parse_args(argv)
 

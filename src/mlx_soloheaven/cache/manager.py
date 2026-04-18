@@ -117,20 +117,36 @@ class CacheManager:
         return max_len
 
     def _estimate_cache_size(self, cache: list) -> int:
+        """Sum bytes across all arrays in cache, handling nested structures.
+
+        Cache can contain various types: KVCache, RotatingKVCache, ArraysCache,
+        CacheList (nests more caches), QuantizedKVCache (tuple-based storage).
+        We recursively walk each cache's state to find all mx.array bytes.
+        """
+        def _walk_bytes(obj) -> int:
+            if obj is None:
+                return 0
+            if hasattr(obj, "nbytes") and isinstance(obj.nbytes, int):
+                return obj.nbytes
+            if isinstance(obj, (list, tuple)):
+                return sum(_walk_bytes(x) for x in obj)
+            return 0
+
         total = 0
         for c in cache:
-            if hasattr(c, "keys") and c.keys is not None:
-                for k in c.keys if isinstance(c.keys, list) else [c.keys]:
-                    if hasattr(k, "nbytes"):
-                        total += k.nbytes
-            if hasattr(c, "values") and c.values is not None:
-                for v in c.values if isinstance(c.values, list) else [c.values]:
-                    if hasattr(v, "nbytes"):
-                        total += v.nbytes
+            # Recurse into nested caches (CacheList.caches)
+            if hasattr(c, "caches"):
+                total += self._estimate_cache_size(c.caches)
+                continue
+            # Primary path: walk .state (works for KVCache, ArraysCache, QuantizedKVCache)
             if hasattr(c, "state") and c.state is not None:
-                for s in c.state if isinstance(c.state, list) else [c.state]:
-                    if hasattr(s, "nbytes"):
-                        total += s.nbytes
+                total += _walk_bytes(c.state)
+                continue
+            # Fallback: legacy attribute scan
+            if hasattr(c, "keys") and c.keys is not None:
+                total += _walk_bytes(c.keys)
+            if hasattr(c, "values") and c.values is not None:
+                total += _walk_bytes(c.values)
         return total
 
     def _memory_usage_gb(self) -> float:

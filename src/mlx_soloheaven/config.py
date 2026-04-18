@@ -26,6 +26,20 @@ class ModelConfig:
     think_start_token: int = -1
     im_end_token: int = -1
 
+    # KV cache quantization (mlx-lm path only; 0=disabled, 4 or 8 recommended)
+    kv_bits: int = 0
+    kv_group_size: int = 64
+    quantized_kv_start: int = 0  # token offset at which quantization kicks in
+
+    # Prefill chunk size (larger = faster prefill at cost of peak memory)
+    # mlx-lm default is 2048; try 4096/8192 for long-prompt speedup
+    prefill_step_size: int = 2048
+
+    # PLD (Prompt Lookup Decoding): speculative decoding via n-gram prompt lookup
+    pld_enabled: bool = False              # Off by default
+    pld_num_draft_tokens: int = 10         # Max draft tokens per step
+    pld_ngram_k: int = 3                   # N-gram size for matching
+
     @property
     def model_id(self) -> str:
         """Model ID derived from directory name."""
@@ -58,6 +72,19 @@ class Config:
     think_end_token: int = -1
     think_start_token: int = -1
     im_end_token: int = -1
+
+    # KV cache quantization (mlx-lm path only; 0=disabled, 4 or 8 recommended)
+    kv_bits: int = 0
+    kv_group_size: int = 64
+    quantized_kv_start: int = 0
+
+    # Prefill chunk size (mlx-lm default 2048; 4096/8192 can speed up long prompts)
+    prefill_step_size: int = 2048
+
+    # PLD (Prompt Lookup Decoding): speculative decoding via n-gram prompt lookup
+    pld_enabled: bool = False              # Off by default
+    pld_num_draft_tokens: int = 10         # Max draft tokens per step
+    pld_ngram_k: int = 3                   # N-gram size for matching
 
     # Cache budgets (no time-based TTL — evict LRU when over budget)
     memory_budget_gb: float = 200.0
@@ -114,6 +141,9 @@ class Config:
                     default_max_tokens=args.max_tokens,
                     thinking_budget=args.thinking_budget,
                     enable_thinking=enable_thinking,
+                    pld_enabled=args.pld_enabled,
+                    pld_num_draft_tokens=args.pld_num_draft,
+                    pld_ngram_k=args.pld_ngram_k,
                 ))
         elif args.model:
             models.append(ModelConfig(
@@ -126,6 +156,9 @@ class Config:
                 default_max_tokens=args.max_tokens,
                 thinking_budget=args.thinking_budget,
                 enable_thinking=not args.no_thinking,
+                pld_enabled=args.pld_enabled,
+                pld_num_draft_tokens=args.pld_num_draft,
+                pld_ngram_k=args.pld_ngram_k,
             ))
 
         return cls(
@@ -147,4 +180,11 @@ class Config:
             data_dir=args.data_dir,
             verbose=args.verbose,
             gpu_keepalive=args.gpu_keepalive,
+            kv_bits=args.kv_bits,
+            kv_group_size=args.kv_group_size,
+            quantized_kv_start=args.quantized_kv_start,
+            prefill_step_size=args.prefill_step_size,
+            pld_enabled=args.pld_enabled,
+            pld_num_draft_tokens=args.pld_num_draft,
+            pld_ngram_k=args.pld_ngram_k,
         )

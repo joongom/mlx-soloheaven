@@ -47,6 +47,59 @@ from mlx_soloheaven.cache.manager import CacheManager
 logger = logging.getLogger(__name__)
 
 
+def _pld_response_adapter(pld_iter, tokenizer):
+    """Adapt pld_generate_step's (token, logprobs, from_draft) tuples to
+    mimic lm_stream_generate's GenerationResponse objects.
+
+    Also performs EOS detection — pld_generate_step is a low-level generator
+    that doesn't stop on EOS (mlx-lm's stream_generate normally handles that).
+    """
+    import time as _time
+    from types import SimpleNamespace
+
+    # Collect EOS token IDs from the tokenizer
+    eos_ids = set()
+    if hasattr(tokenizer, "eos_token_ids") and tokenizer.eos_token_ids:
+        eos_ids.update(tokenizer.eos_token_ids)
+    if hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:
+        eid = tokenizer.eos_token_id
+        if isinstance(eid, (list, tuple, set)):
+            eos_ids.update(eid)
+        else:
+            eos_ids.add(eid)
+
+    t_first = None
+    count = 0
+    from_draft_count = 0
+    for token, _logprobs, from_draft in pld_iter:
+        count += 1
+        if from_draft:
+            from_draft_count += 1
+        if t_first is None:
+            t_first = _time.perf_counter()
+        now = _time.perf_counter()
+        tps = count / (now - t_first) if t_first and now > t_first else 0.0
+        try:
+            text = tokenizer.decode([token])
+        except Exception:
+            text = tokenizer.decode([token], skip_special_tokens=False)
+        yield SimpleNamespace(
+            text=text,
+            token=token,
+            prompt_tps=0.0,
+            generation_tps=tps,
+            from_draft=from_draft,
+        )
+        if token in eos_ids:
+            break
+
+    if count > 0:
+        logger.info(
+            f"[PLD] accepted {from_draft_count}/{count} draft tokens "
+            f"({100*from_draft_count/count:.1f}% acceptance rate)"
+        )
+
+
 @dataclass
 class GenerationResult:
     """A single token/chunk from generation."""
@@ -169,11 +222,12 @@ class MLXEngine:
                 model_config = json.load(f)
         self._model_type = model_config.get("model_type", "")
 
-        # VLM-capable model types (skip mlx-vlm for known text-only types)
-        _vlm_types = {"gemma4", "gemma3", "gemma3n"}
+        # Check if mlx-vlm supports this model type BEFORE loading weights.
+        # (mlx-vlm's load loads the entire safetensors before checking model type,
+        #  which wastes memory for huge models like GLM-5.1 at 378GB.)
         self._use_vlm = False
-
-        if self._model_type in _vlm_types:
+        vlm_supported = self._vlm_supports(self._model_type)
+        if vlm_supported:
             try:
                 self._vlm_model, self._processor = vlm_load(self.cfg.model_path)
                 self._language_model = getattr(
@@ -234,6 +288,35 @@ class MLXEngine:
             f"[{self.model_id}] enable_thinking={self.cfg.enable_thinking}"
         )
 
+        if self.cfg.prefill_step_size != 2048:
+            logger.info(
+                f"[{self.model_id}] Prefill step size: {self.cfg.prefill_step_size} "
+                f"(default 2048)"
+            )
+        if self.cfg.kv_bits and not self._use_vlm:
+            logger.info(
+                f"[{self.model_id}] KV cache quantization: "
+                f"bits={self.cfg.kv_bits}, group_size={self.cfg.kv_group_size}, "
+                f"start={self.cfg.quantized_kv_start}"
+            )
+        elif self.cfg.kv_bits and self._use_vlm:
+            logger.warning(
+                f"[{self.model_id}] --kv-bits ignored (mlx-vlm path — quantization "
+                f"not supported; only mlx-lm fallback models support this)"
+            )
+
+        if self.cfg.pld_enabled:
+            if self._use_vlm:
+                logger.warning(
+                    f"[{self.model_id}] --pld ignored (mlx-vlm path — PLD "
+                    f"not supported; falling back to standard VLM generation)"
+                )
+            else:
+                logger.info(
+                    f"[{self.model_id}] PLD enabled: "
+                    f"num_draft={self.cfg.pld_num_draft_tokens}, k={self.cfg.pld_ngram_k}"
+                )
+
         # Set wired limit once at startup
         if mx.metal.is_available():
             max_rec = mx.device_info()["max_recommended_working_set_size"]
@@ -265,6 +348,23 @@ class MLXEngine:
             logger.info(f"[{self.model_id}] GPU keepalive enabled (interval={self.GPU_KEEPALIVE_INTERVAL}s)")
 
     # --- Model detection helpers ---
+
+    @staticmethod
+    def _vlm_supports(model_type: str) -> bool:
+        """Check if mlx-vlm has a model module for this model_type.
+
+        Done BEFORE calling vlm_load to avoid loading huge weights
+        just to fail on the model-type check (mlx-vlm currently loads
+        all safetensors before checking model support).
+        """
+        if not model_type:
+            return False
+        try:
+            import importlib
+            importlib.import_module(f"mlx_vlm.models.{model_type}")
+            return True
+        except ImportError:
+            return False
 
     def _detect_model_family(self) -> str:
         """Detect model family from model_type in config.json."""
@@ -408,7 +508,70 @@ class MLXEngine:
             f"{session.total_cache_tokens} tokens, {len(session.messages)} msgs, "
             f"{fsize:.1f}MB, {elapsed:.2f}s"
         )
+        # LRU eviction: keep total disk usage under budget
+        self._evict_disk_sessions_if_needed(protect_session_id=session_id)
         return True
+
+    def _evict_disk_sessions_if_needed(self, protect_session_id: str | None = None):
+        """Scan cache_dir and delete oldest session files if disk usage exceeds budget.
+
+        Protects:
+        - The session we just saved (protect_session_id)
+        - Any session currently in self._sessions (in-memory, active)
+        """
+        budget_bytes = int(self.cfg.disk_budget_gb * 1e9)
+        cache_dir = self.cfg.cache_dir
+        if not os.path.isdir(cache_dir):
+            return
+
+        # Gather session file info: path, size, mtime, session_id
+        entries = []
+        total_size = 0
+        for fname in os.listdir(cache_dir):
+            if not fname.startswith("session_") or not fname.endswith(".safetensors"):
+                continue
+            fpath = os.path.join(cache_dir, fname)
+            try:
+                st = os.stat(fpath)
+            except OSError:
+                continue
+            total_size += st.st_size
+            # Extract session_id: session_<id>.safetensors or session_<id>_ckpt.safetensors
+            sid_part = fname[len("session_"):-len(".safetensors")]
+            sid = sid_part[:-len("_ckpt")] if sid_part.endswith("_ckpt") else sid_part
+            entries.append((st.st_mtime, st.st_size, fpath, sid))
+
+        if total_size <= budget_bytes:
+            return
+
+        # Sort oldest first
+        entries.sort(key=lambda e: e[0])
+        protected = set(self._sessions.keys())
+        if protect_session_id:
+            protected.add(protect_session_id)
+
+        deleted = 0
+        freed = 0
+        for mtime, size, fpath, sid in entries:
+            if total_size <= budget_bytes:
+                break
+            if sid in protected:
+                continue
+            try:
+                os.remove(fpath)
+                total_size -= size
+                freed += size
+                deleted += 1
+                if hasattr(self, "_disk_session_ids"):
+                    self._disk_session_ids.discard(sid)
+            except OSError as e:
+                logger.debug(f"[Disk LRU] failed to delete {fpath}: {e}")
+
+        if deleted:
+            logger.info(
+                f"[Disk LRU] evicted {deleted} files, freed {freed/1e9:.2f} GB "
+                f"(total now {total_size/1e9:.2f}/{budget_bytes/1e9:.2f} GB)"
+            )
 
     def _mark_dirty(self, session_id: str):
         """Mark a session for disk save on next idle cycle."""
@@ -1210,6 +1373,7 @@ class MLXEngine:
                 top_p=top_p,
                 min_p=min_p,
                 top_k=top_k,
+                prefill_step_size=self.cfg.prefill_step_size,
                 logits_processors=logits_processors if logits_processors else None,
             )
         else:
@@ -1239,15 +1403,59 @@ class MLXEngine:
                 prompt_token_ids = prompt_token_ids[prefix_len:]
 
             sampler = make_sampler(temp=temperature, top_p=top_p, min_p=min_p, top_k=top_k)
-            gen_iter = lm_stream_generate(
-                self._language_model,
-                self.tokenizer,
-                prompt=prompt_token_ids,
-                max_tokens=max_tokens,
-                sampler=sampler,
-                prompt_cache=prompt_cache,
-                logits_processors=logits_processors if logits_processors else None,
-            )
+            lm_kwargs = {
+                "max_tokens": max_tokens,
+                "sampler": sampler,
+                "prompt_cache": prompt_cache,
+                "prefill_step_size": self.cfg.prefill_step_size,
+                "logits_processors": logits_processors if logits_processors else None,
+            }
+            if self.cfg.kv_bits:
+                lm_kwargs["kv_bits"] = self.cfg.kv_bits
+                lm_kwargs["kv_group_size"] = self.cfg.kv_group_size
+                lm_kwargs["quantized_kv_start"] = self.cfg.quantized_kv_start
+            # PLD requires trimmable cache (for rollback on rejection).
+            # Models with ArraysCache layers (Qwen3.5 DeltaNet, etc.) are NOT
+            # trimmable — fall back to regular lm_stream_generate.
+            use_pld = self.cfg.pld_enabled
+            if use_pld:
+                from mlx_lm.models.cache import can_trim_prompt_cache
+                if not can_trim_prompt_cache(prompt_cache):
+                    if not getattr(self, "_pld_incompat_warned", False):
+                        logger.warning(
+                            f"[{self.model_id}] PLD disabled: model uses "
+                            f"non-trimmable cache (e.g. ArraysCache/DeltaNet). "
+                            f"Falling back to standard generation."
+                        )
+                        self._pld_incompat_warned = True
+                    use_pld = False
+
+            if use_pld:
+                from mlx_soloheaven.engine.pld import pld_generate_step
+                gen_iter = _pld_response_adapter(
+                    pld_generate_step(
+                        prompt=mx.array(prompt_token_ids),
+                        model=self._language_model,
+                        num_draft_tokens=self.cfg.pld_num_draft_tokens,
+                        max_tokens=max_tokens,
+                        sampler=sampler,
+                        logits_processors=logits_processors if logits_processors else None,
+                        prompt_cache=prompt_cache,
+                        prefill_step_size=self.cfg.prefill_step_size,
+                        kv_bits=self.cfg.kv_bits if self.cfg.kv_bits else None,
+                        kv_group_size=self.cfg.kv_group_size,
+                        quantized_kv_start=self.cfg.quantized_kv_start,
+                        ngram_k=self.cfg.pld_ngram_k,
+                    ),
+                    tokenizer=self.tokenizer,
+                )
+            else:
+                gen_iter = lm_stream_generate(
+                    self._language_model,
+                    self.tokenizer,
+                    prompt=prompt_token_ids,
+                    **lm_kwargs,
+                )
 
         for resp in gen_iter:
             if cancel_event and cancel_event.is_set():

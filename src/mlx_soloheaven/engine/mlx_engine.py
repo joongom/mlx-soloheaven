@@ -41,7 +41,11 @@ from mlx_vlm.generate import (
 
 from mlx_soloheaven.config import Config
 from mlx_soloheaven.engine.thinking import ThinkingBudgetProcessor, RepetitionPenaltyProcessor
-from mlx_soloheaven.engine.tool_parser import parse_tool_calls, split_thinking_and_content
+from mlx_soloheaven.engine.tool_parser import (
+    get_tool_markers,
+    parse_tool_calls,
+    split_thinking_and_content,
+)
 from mlx_soloheaven.cache.manager import CacheManager
 
 logger = logging.getLogger(__name__)
@@ -51,26 +55,54 @@ def _pld_response_adapter(pld_iter, tokenizer):
     """Adapt pld_generate_step's (token, logprobs, from_draft) tuples to
     mimic lm_stream_generate's GenerationResponse objects.
 
-    Also performs EOS detection — pld_generate_step is a low-level generator
-    that doesn't stop on EOS (mlx-lm's stream_generate normally handles that).
+    - Uses mlx-lm's StreamingDetokenizer (buffers partial UTF-8 byte
+      sequences so multi-byte characters like CJK aren't emitted as
+      replacement chars \ufffd between tokens).
+    - Performs EOS detection — pld_generate_step doesn't stop on its own
+      (mlx-lm's stream_generate normally handles that). EOS ids include
+      the wrapper's list + HF tokenizer's (list or single).
     """
     import time as _time
     from types import SimpleNamespace
 
-    # Collect EOS token IDs from the tokenizer
-    eos_ids = set()
+    # Collect EOS token IDs from both mlx-lm wrapper and HF tokenizer
+    eos_ids: set[int] = set()
     if hasattr(tokenizer, "eos_token_ids") and tokenizer.eos_token_ids:
         eos_ids.update(tokenizer.eos_token_ids)
-    if hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:
-        eid = tokenizer.eos_token_id
+    inner = getattr(tokenizer, "_tokenizer", tokenizer)
+    eid = getattr(inner, "eos_token_id", None)
+    if eid is not None:
         if isinstance(eid, (list, tuple, set)):
             eos_ids.update(eid)
         else:
             eos_ids.add(eid)
+    # GLM-family and other models expose multi-EOS via generation_config
+    gc = getattr(inner, "generation_config", None)
+    if gc is not None:
+        gc_eos = getattr(gc, "eos_token_id", None)
+        if gc_eos is not None:
+            if isinstance(gc_eos, (list, tuple, set)):
+                eos_ids.update(gc_eos)
+            else:
+                eos_ids.add(gc_eos)
+
+    # Use mlx-lm's StreamingDetokenizer to buffer partial UTF-8 bytes
+    # across tokens (mirrors stream_generate's behavior).
+    detok = None
+    make_detok = getattr(tokenizer, "detokenizer", None)
+    if make_detok is not None:
+        # TokenizerWrapper.detokenizer is a property that returns a fresh
+        # detokenizer every access. Call .reset() and use it directly.
+        try:
+            detok = tokenizer.detokenizer
+            detok.reset()
+        except Exception:
+            detok = None
 
     t_first = None
     count = 0
     from_draft_count = 0
+    last_segment = ""
     for token, _logprobs, from_draft in pld_iter:
         count += 1
         if from_draft:
@@ -79,19 +111,43 @@ def _pld_response_adapter(pld_iter, tokenizer):
             t_first = _time.perf_counter()
         now = _time.perf_counter()
         tps = count / (now - t_first) if t_first and now > t_first else 0.0
-        try:
+
+        # Stop on EOS BEFORE emitting the EOS token's (often empty) text
+        if token in eos_ids:
+            # Flush any remaining buffered segment first
+            if detok is not None:
+                try:
+                    detok.finalize()
+                    remaining = detok.last_segment
+                    if remaining:
+                        yield SimpleNamespace(
+                            text=remaining, token=token,
+                            prompt_tps=0.0, generation_tps=tps,
+                            from_draft=from_draft,
+                        )
+                except Exception:
+                    pass
+            break
+
+        if detok is not None:
+            try:
+                detok.add_token(token)
+                text = detok.last_segment
+            except Exception:
+                # Fallback: decode single token (may yield replacement chars)
+                text = tokenizer.decode([token])
+        else:
             text = tokenizer.decode([token])
-        except Exception:
-            text = tokenizer.decode([token], skip_special_tokens=False)
+
+        if not text:
+            # Partial UTF-8 — buffered, wait for next token
+            continue
+
         yield SimpleNamespace(
-            text=text,
-            token=token,
-            prompt_tps=0.0,
-            generation_tps=tps,
+            text=text, token=token,
+            prompt_tps=0.0, generation_tps=tps,
             from_draft=from_draft,
         )
-        if token in eos_ids:
-            break
 
     if count > 0:
         logger.info(
@@ -1495,9 +1551,17 @@ class MLXEngine:
                     **lm_kwargs,
                 )
 
+        # Configurable progress log interval (tokens between INFO snapshots)
+        progress_interval = 50  # tokens — every ~2s at 25 TPS
         for resp in gen_iter:
             if cancel_event and cancel_event.is_set():
-                logger.debug(f"[Generate] session={session_id} | CANCELLED")
+                # Report last token state when cancelled so we can see
+                # where generation was when the client disconnected.
+                tail = accumulated_text[-200:].replace('\n', '\\n')
+                logger.info(
+                    f"[Generate] session={session_id} | CANCELLED at token {gen_token_count} | "
+                    f"last_tps={last_gen_tps:.1f} | tail={tail!r}"
+                )
                 cancelled = True
                 break
 
@@ -1515,6 +1579,21 @@ class MLXEngine:
                 last_prompt_tps = prompt_tps
                 logger.info(
                     f"[Generate] TTFT={round((t_first_token - t_gen_start)*1000)}ms"
+                )
+
+            # Per-token DEBUG log (very verbose — only when --verbose)
+            logger.debug(
+                f"[Token] session={session_id} | n={gen_token_count} id={token} text={text!r}"
+            )
+
+            # Periodic INFO snapshot (every 50 tokens) so we can see progress
+            # when verbose is off
+            if gen_token_count % progress_interval == 0:
+                tail = accumulated_text[-120:].replace('\n', '\\n')
+                logger.info(
+                    f"[Generate] session={session_id} | "
+                    f"tokens={gen_token_count} | tps={gen_tps:.1f} | "
+                    f"tail={tail!r}"
                 )
 
             last_gen_tps = gen_tps
@@ -1566,6 +1645,14 @@ class MLXEngine:
             cache_state.cache = prompt_cache
             cache_state.token_ids = full_prompt_token_ids  # full IDs before trim
 
+        # Parse tool_calls once — used both for session persistence and
+        # for the terminal GenerationResult's finish_reason.
+        parsed_tool_calls: list[dict] = []
+        if has_tools and accumulated_text:
+            _, parsed_tool_calls = parse_tool_calls(
+                accumulated_text, model_family=self.model_family,
+            )
+
         # Save session
         if session_id:
             new_offset = self._get_cache_offset(cache_state.cache) if cache_state.cache else 0
@@ -1579,15 +1666,31 @@ class MLXEngine:
             full_assistant_content = self._make_full_assistant_content(
                 accumulated_text, use_thinking,
             )
+
+            if parsed_tool_calls:
+                # Strip the tool_call XML from stored content so the template
+                # doesn't double-render (content + tool_calls both emit XML).
+                start_tag, _ = get_tool_markers(self.model_family)
+                tc_idx = full_assistant_content.find(start_tag)
+                if tc_idx >= 0:
+                    full_assistant_content = full_assistant_content[:tc_idx].rstrip()
+
             # On HIT: extend session.messages with new incoming + assistant
             # On MISS: use incoming messages + assistant
             if cache_mode == "hit" and session:
                 base_messages = list(session.messages) + new_messages
             else:
                 base_messages = list(messages)
-            updated_messages = base_messages + [
-                {"role": "assistant", "content": full_assistant_content}
-            ]
+            assistant_msg: dict = {
+                "role": "assistant",
+                "content": full_assistant_content,
+            }
+            if parsed_tool_calls:
+                assistant_msg["tool_calls"] = [
+                    {"id": tc["id"], "type": "function", "function": tc["function"]}
+                    for tc in parsed_tool_calls
+                ]
+            updated_messages = base_messages + [assistant_msg]
 
             self._sessions[session_id] = SessionState(
                 cache_state=cache_state,
@@ -1607,14 +1710,8 @@ class MLXEngine:
                 messages, prompt_token_ids, tools=tools, thinking=use_thinking,
             )
 
-        # Determine finish reason
-        finish_reason = "stop"
-        if has_tools and accumulated_text:
-            _, tool_calls = parse_tool_calls(
-                accumulated_text, model_family=self.model_family,
-            )
-            if tool_calls:
-                finish_reason = "tool_calls"
+        # Determine finish reason (parsed_tool_calls computed above)
+        finish_reason = "tool_calls" if parsed_tool_calls else "stop"
 
         yield GenerationResult(
             text="",
@@ -1924,9 +2021,13 @@ class MLXEngine:
                 if isinstance(item, Exception):
                     raise item
                 yield item
-        except (asyncio.CancelledError, GeneratorExit):
+        except (asyncio.CancelledError, GeneratorExit) as exc:
             cancel_event.set()
-            logger.debug("[Stream] Client disconnected — cancelling generation")
+            # INFO-level so we always see disconnects (debugging client timeouts etc.)
+            logger.info(
+                f"[Stream] session={session_id} | client disconnected "
+                f"({type(exc).__name__}) — cancelling generation"
+            )
             raise
 
     # --- Truncation & Regeneration ---

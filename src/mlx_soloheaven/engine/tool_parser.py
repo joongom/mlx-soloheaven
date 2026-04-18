@@ -1,7 +1,6 @@
 """Parse model XML tool calls to/from OpenAI JSON format.
 
-Supports Qwen-style XML tool call format:
-    <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
+Supports Qwen/ChatML, GLM, and Gemma 4 tool call formats.
 """
 
 import json
@@ -14,12 +13,56 @@ def generate_call_id() -> str:
     return f"call_{uuid.uuid4().hex[:24]}"
 
 
+# Per-family tool_call block markers. The streaming emitter uses these to
+# detect block boundaries and extract the function name as soon as it's
+# determinable, so the first OpenAI-format chunk can be emitted early
+# instead of waiting for the whole block to close.
+_TOOL_MARKERS = {
+    "chatml": ("<tool_call>", "</tool_call>"),
+    "qwen":   ("<tool_call>", "</tool_call>"),
+    "glm":    ("<tool_call>", "</tool_call>"),
+    "gemma4": ("<|tool_call>", "<tool_call|>"),
+}
+
+
+def get_tool_markers(model_family: str) -> tuple[str, str]:
+    return _TOOL_MARKERS.get(model_family, _TOOL_MARKERS["chatml"])
+
+
+def try_extract_tool_name(buf_after_start: str, model_family: str) -> Optional[str]:
+    """Extract function name from text buffered *after* the start marker.
+
+    Returns the name if determinable, else None (need more text).
+    """
+    if model_family == "gemma4":
+        m = re.match(r"\s*call:(\w+)\s*\{", buf_after_start)
+        return m.group(1) if m else None
+    if model_family == "glm":
+        # GLM: name is bare text between <tool_call> and first <arg_key>
+        # (or </tool_call> for no-args calls). Some GLM variants follow Qwen.
+        first_ak = buf_after_start.find("<arg_key>")
+        first_fn = buf_after_start.find("<function=")
+        first_end = buf_after_start.find("</tool_call>")
+        if first_fn >= 0 and (first_ak < 0 or first_fn < first_ak):
+            m = re.match(r"\s*<function=(\w+)>", buf_after_start)
+            return m.group(1) if m else None
+        cutoffs = [p for p in (first_ak, first_end) if p >= 0]
+        if not cutoffs:
+            return None
+        name = buf_after_start[:min(cutoffs)].strip().lstrip("\n").strip()
+        return name or None
+    # Qwen / chatml default
+    m = re.match(r"\s*<function=(\w+)>", buf_after_start)
+    return m.group(1) if m else None
+
+
 def parse_tool_calls(text: str, model_family: str = "chatml") -> tuple[str, list[dict]]:
     """
     Parse tool_call blocks from model output.
 
     Supports:
     - ChatML/Qwen: <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
+    - GLM: <tool_call>function_name<arg_key>key</arg_key><arg_value>value</arg_value>...</tool_call>
     - Gemma 4: <|tool_call>call:name{key:<|"|>val<|"|>}<tool_call|>
 
     Returns:
@@ -29,6 +72,11 @@ def parse_tool_calls(text: str, model_family: str = "chatml") -> tuple[str, list
     """
     if model_family == "gemma4":
         return _parse_gemma4_tool_calls(text)
+    if model_family == "glm":
+        # GLM format has <arg_key>/<arg_value> pairs; if not found, fall through
+        # to Qwen-style parsing (some GLM variants follow Qwen format).
+        if "<arg_key>" in text or "<arg_value>" in text:
+            return _parse_glm_tool_calls(text)
     return _parse_chatml_tool_calls(text)
 
 
@@ -57,6 +105,76 @@ def _parse_chatml_tool_calls(text: str) -> tuple[str, list[dict]]:
         for pm in param_pattern.finditer(params_block):
             key = pm.group(1)
             value = pm.group(2).strip()
+            try:
+                arguments[key] = json.loads(value)
+            except (json.JSONDecodeError, ValueError):
+                arguments[key] = value
+
+        tool_calls.append({
+            "id": generate_call_id(),
+            "type": "function",
+            "function": {
+                "name": func_name,
+                "arguments": json.dumps(arguments, ensure_ascii=False),
+            },
+        })
+
+    return content_text, tool_calls
+
+
+def _parse_glm_tool_calls(text: str) -> tuple[str, list[dict]]:
+    """Parse GLM-family tool call format.
+
+    Format (from GLM chat_template.jinja):
+        <tool_call>{function_name}
+        <arg_key>{key1}</arg_key><arg_value>{val1}</arg_value>
+        <arg_key>{key2}</arg_key><arg_value>{val2}</arg_value>
+        ...
+        </tool_call>
+
+    The function name is the bare text immediately following <tool_call>
+    and preceding the first <arg_key>. Key/value pairs alternate.
+    Values may be JSON strings, numbers, booleans, or nested JSON; we
+    attempt json.loads per value and fall back to raw string.
+    """
+    first_tc = text.find("<tool_call>")
+    if first_tc == -1:
+        return text, []
+
+    content_text = text[:first_tc].rstrip()
+    tool_calls = []
+
+    # Full tool_call block pattern (non-greedy, tolerate missing </tool_call>)
+    tc_pattern = re.compile(
+        r"<tool_call>(.*?)(?:</tool_call>|\Z)",
+        re.DOTALL,
+    )
+    kv_pattern = re.compile(
+        r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
+        re.DOTALL,
+    )
+
+    for tc_match in tc_pattern.finditer(text):
+        inner = tc_match.group(1)
+        # Function name: text before the first <arg_key> (or the whole inner
+        # text if there are no args)
+        first_arg = inner.find("<arg_key>")
+        if first_arg >= 0:
+            func_name = inner[:first_arg].strip()
+            args_text = inner[first_arg:]
+        else:
+            func_name = inner.strip()
+            args_text = ""
+        # Some models prepend a newline or whitespace inside <tool_call>
+        func_name = func_name.strip().lstrip("\n").strip()
+        if not func_name:
+            continue
+
+        arguments = {}
+        for kv in kv_pattern.finditer(args_text):
+            key = kv.group(1).strip()
+            value = kv.group(2).strip()
+            # Try to parse as JSON (handles numbers, booleans, objects, arrays)
             try:
                 arguments[key] = json.loads(value)
             except (json.JSONDecodeError, ValueError):

@@ -4,11 +4,12 @@ POST /v1/chat/completions — with streaming SSE and tool calling
 GET  /v1/models
 """
 
+import asyncio
 import json
 import time
 import uuid
 import logging
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -32,9 +33,12 @@ from mlx_soloheaven.api.schemas import (
 )
 from mlx_soloheaven.engine.mlx_engine import MLXEngine
 from mlx_soloheaven.engine.tool_parser import (
+    generate_call_id,
+    get_tool_markers,
     parse_tool_calls,
     split_thinking_and_content,
     strip_thinking_tags,
+    try_extract_tool_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -182,7 +186,16 @@ def _sync_completion(request: ChatCompletionRequest, engine: MLXEngine) -> ChatC
         msg.content = result.content
 
     if request.user:
-        assistant_msg = {"role": "assistant", "content": result.content or ""}
+        assistant_msg: dict = {"role": "assistant", "content": result.content or ""}
+        if result.tool_calls:
+            assistant_msg["tool_calls"] = [
+                {
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": tc["function"],
+                }
+                for tc in result.tool_calls
+            ]
         engine.update_session_messages(request.user, messages + [assistant_msg])
 
     return ChatCompletionResponse(
@@ -242,13 +255,24 @@ async def _stream_completion(
 
     # Generate and stream
     accumulated_text = ""
-    tool_call_buffer = ""
-    in_tool_call = False
     final_prompt_tokens = 0
     final_completion_tokens = 0
     final_cache_info = None
-    TOOL_CALL_TAG = "<|tool_call>" if model_family == "gemma4" else "<tool_call>"
+    token_count = 0  # tracked for disconnect diagnostics
+    TOOL_START, TOOL_END = get_tool_markers(model_family)
     holdback = ""
+
+    # === Incremental tool_call emission state ===
+    # When a <tool_call> block starts, we buffer per-block text (tc_block) and
+    # try to emit the OpenAI first chunk (id + name) as soon as the function
+    # name is determinable. The args chunk is emitted when the block closes.
+    # Parallel calls are tracked by monotonically increasing tc_index.
+    tc_active = False           # inside a tool_call block
+    tc_block = ""               # buffered text after TOOL_START (excl. start tag itself)
+    tc_name_sent = False        # whether first chunk (name) was emitted
+    tc_id: Optional[str] = None
+    tc_index = -1
+    parsed_tool_calls: list[dict] = []   # completed calls (for session persistence)
 
     # Structured output (response_format): build constraint but skip if
     # tools are present (tools take priority per OpenAI semantics).
@@ -260,125 +284,207 @@ async def _stream_completion(
         )
         response_format = None
 
-    async for result in engine.generate_stream_async(
-        messages,
-        max_tokens=request.max_tokens or request.max_completion_tokens,
-        temperature=request.temperature,
-        top_p=request.top_p,
-        min_p=request.min_p,
-        top_k=request.top_k,
-        repetition_penalty=rep_penalty,
-        session_id=request.user,
-        tools=tools,
-        thinking=enable_thinking,
-        thinking_budget=thinking_budget,
-        response_format=response_format,
-    ):
-        if result.finish_reason is not None:
-            final_prompt_tokens = result.prompt_tokens
-            final_completion_tokens = result.completion_tokens
-            final_cache_info = result.cache_info
-            break
+    try:
+        async for result in engine.generate_stream_async(
+            messages,
+            max_tokens=request.max_tokens or request.max_completion_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            min_p=request.min_p,
+            top_k=request.top_k,
+            repetition_penalty=rep_penalty,
+            session_id=request.user,
+            tools=tools,
+            thinking=enable_thinking,
+            thinking_budget=thinking_budget,
+            response_format=response_format,
+        ):
+            if result.finish_reason is not None:
+                final_prompt_tokens = result.prompt_tokens
+                final_completion_tokens = result.completion_tokens
+                final_cache_info = result.cache_info
+                break
 
-        text = result.text
-        if not text:
-            # Send SSE comment as keepalive during prompt processing
-            yield ": keepalive\n\n"
-            continue
+            text = result.text
+            if not text:
+                # Send SSE comment as keepalive during prompt processing
+                yield ": keepalive\n\n"
+                continue
 
-        accumulated_text += text
+            accumulated_text += text
+            token_count += 1
 
-        if in_tool_call:
-            tool_call_buffer += text
-            continue
+            if tc_active:
+                tc_block += text
 
-        holdback += text
+                # Try to emit first chunk (id + name) as soon as name is known.
+                if not tc_name_sent:
+                    name = try_extract_tool_name(tc_block, model_family)
+                    if name:
+                        first = ChatCompletionChunk(
+                            id=chunk_id, created=created, model=model,
+                            choices=[ChunkChoice(delta=DeltaMessage(tool_calls=[{
+                                "index": tc_index,
+                                "id": tc_id,
+                                "type": "function",
+                                "function": {"name": name, "arguments": ""},
+                            }]))],
+                        )
+                        yield f"data: {first.model_dump_json(exclude_none=True)}\n\n"
+                        tc_name_sent = True
 
-        if has_tools and TOOL_CALL_TAG.startswith(holdback.lstrip()):
-            continue
+                # Check for block close.
+                if TOOL_END in tc_block:
+                    end_idx = tc_block.index(TOOL_END)
+                    block_text = TOOL_START + tc_block[:end_idx] + TOOL_END
+                    _, calls = parse_tool_calls(block_text, model_family=model_family)
+                    if calls:
+                        tc = calls[0]
+                        # If name chunk wasn't emitted yet (rare: whole block
+                        # arrived in one token), emit it now.
+                        if not tc_name_sent:
+                            first = ChatCompletionChunk(
+                                id=chunk_id, created=created, model=model,
+                                choices=[ChunkChoice(delta=DeltaMessage(tool_calls=[{
+                                    "index": tc_index,
+                                    "id": tc_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc["function"]["name"],
+                                        "arguments": "",
+                                    },
+                                }]))],
+                            )
+                            yield f"data: {first.model_dump_json(exclude_none=True)}\n\n"
+                        args_chunk = ChatCompletionChunk(
+                            id=chunk_id, created=created, model=model,
+                            choices=[ChunkChoice(delta=DeltaMessage(tool_calls=[{
+                                "index": tc_index,
+                                "function": {"arguments": tc["function"]["arguments"]},
+                            }]))],
+                        )
+                        yield f"data: {args_chunk.model_dump_json(exclude_none=True)}\n\n"
+                        # Use the id we generated at block-start so session
+                        # + SSE agree.
+                        tc["id"] = tc_id
+                        parsed_tool_calls.append(tc)
 
-        if has_tools and TOOL_CALL_TAG in holdback:
-            idx = holdback.index(TOOL_CALL_TAG)
-            before = holdback[:idx]
-            if before:
-                chunk = _make_content_chunk(chunk_id, created, model, before)
+                    # Reset for next block; any trailing text after TOOL_END
+                    # goes back into the holdback/content path.
+                    trailing = tc_block[end_idx + len(TOOL_END):]
+                    tc_active = False
+                    tc_block = ""
+                    tc_name_sent = False
+                    tc_id = None
+                    if trailing:
+                        holdback += trailing
+                continue
+
+            holdback += text
+
+            if has_tools and TOOL_START.startswith(holdback.lstrip()):
+                continue
+
+            if has_tools and TOOL_START in holdback:
+                idx = holdback.index(TOOL_START)
+                before = holdback[:idx]
+                if before:
+                    chunk = _make_content_chunk(chunk_id, created, model, before)
+                    yield f"data: {chunk}\n\n"
+                tc_active = True
+                tc_index += 1
+                tc_id = generate_call_id()
+                tc_name_sent = False
+                tc_block = holdback[idx + len(TOOL_START):]
+                holdback = ""
+                # The just-received text may already contain the full block;
+                # fall through by re-triggering on next iteration is fine,
+                # but we can also short-circuit by running detection now.
+                if tc_block:
+                    name = try_extract_tool_name(tc_block, model_family)
+                    if name and not tc_name_sent:
+                        first = ChatCompletionChunk(
+                            id=chunk_id, created=created, model=model,
+                            choices=[ChunkChoice(delta=DeltaMessage(tool_calls=[{
+                                "index": tc_index,
+                                "id": tc_id,
+                                "type": "function",
+                                "function": {"name": name, "arguments": ""},
+                            }]))],
+                        )
+                        yield f"data: {first.model_dump_json(exclude_none=True)}\n\n"
+                        tc_name_sent = True
+                continue
+
+            if holdback:
+                chunk = _make_content_chunk(chunk_id, created, model, holdback)
                 yield f"data: {chunk}\n\n"
-            in_tool_call = True
-            tool_call_buffer = holdback[idx:]
-            holdback = ""
-            continue
+                holdback = ""
+    except (asyncio.CancelledError, GeneratorExit) as exc:
+        tail = accumulated_text[-200:].replace('\n', '\\n')
+        logger.info(
+            f"[Stream] user={request.user!r} | client disconnected "
+            f"({type(exc).__name__}) after {token_count} tokens | "
+            f"tail={tail!r}"
+        )
+        raise
 
-        if holdback:
-            chunk = _make_content_chunk(chunk_id, created, model, holdback)
-            yield f"data: {chunk}\n\n"
-            holdback = ""
-
-    # Flush remaining holdback
-    if holdback and not in_tool_call:
+    # Flush remaining holdback (only content path; tool_call active is handled below)
+    if holdback and not tc_active:
         chunk = _make_content_chunk(chunk_id, created, model, holdback)
         yield f"data: {chunk}\n\n"
 
-    # Handle tool calls
-    finish_reason = "stop"
-    if tool_call_buffer:
-        _, tool_calls = parse_tool_calls(
-            tool_call_buffer,
-            model_family=model_family,
-        )
-        if tool_calls:
-            finish_reason = "tool_calls"
-            for i, tc in enumerate(tool_calls):
-                tc_chunk = ChatCompletionChunk(
-                    id=chunk_id,
-                    created=created,
-                    model=model,
-                    choices=[
-                        ChunkChoice(
-                            delta=DeltaMessage(
-                                tool_calls=[
-                                    {
-                                        "index": i,
-                                        "id": tc["id"],
-                                        "type": "function",
-                                        "function": {
-                                            "name": tc["function"]["name"],
-                                            "arguments": "",
-                                        },
-                                    }
-                                ]
-                            )
-                        )
-                    ],
+    # If generation ended mid-block (no TOOL_END seen), try best-effort parse
+    # so we don't silently drop a tool_call the model truncated.
+    if tc_active and tc_block:
+        block_text = TOOL_START + tc_block
+        _, calls = parse_tool_calls(block_text, model_family=model_family)
+        if calls:
+            tc = calls[0]
+            if not tc_name_sent:
+                first = ChatCompletionChunk(
+                    id=chunk_id, created=created, model=model,
+                    choices=[ChunkChoice(delta=DeltaMessage(tool_calls=[{
+                        "index": tc_index,
+                        "id": tc_id,
+                        "type": "function",
+                        "function": {
+                            "name": tc["function"]["name"],
+                            "arguments": "",
+                        },
+                    }]))],
                 )
-                yield f"data: {tc_chunk.model_dump_json(exclude_none=True)}\n\n"
+                yield f"data: {first.model_dump_json(exclude_none=True)}\n\n"
+            args_chunk = ChatCompletionChunk(
+                id=chunk_id, created=created, model=model,
+                choices=[ChunkChoice(delta=DeltaMessage(tool_calls=[{
+                    "index": tc_index,
+                    "function": {"arguments": tc["function"]["arguments"]},
+                }]))],
+            )
+            yield f"data: {args_chunk.model_dump_json(exclude_none=True)}\n\n"
+            tc["id"] = tc_id
+            parsed_tool_calls.append(tc)
 
-                args_chunk = ChatCompletionChunk(
-                    id=chunk_id,
-                    created=created,
-                    model=model,
-                    choices=[
-                        ChunkChoice(
-                            delta=DeltaMessage(
-                                tool_calls=[
-                                    {
-                                        "index": i,
-                                        "function": {
-                                            "arguments": tc["function"]["arguments"],
-                                        },
-                                    }
-                                ]
-                            )
-                        )
-                    ],
-                )
-                yield f"data: {args_chunk.model_dump_json(exclude_none=True)}\n\n"
+    finish_reason = "tool_calls" if parsed_tool_calls else "stop"
 
-    # Update session
+    # Update session — persist tool_calls in assistant message so next turn's
+    # chat template can render {% if m.tool_calls %} block (required for
+    # multi-turn tool use with stateful clients like OpenClaw).
     if request.user:
         thinking, content = split_thinking_and_content(
             accumulated_text, model_family=model_family
         )
-        assistant_msg = {"role": "assistant", "content": content or ""}
+        assistant_msg: dict = {"role": "assistant", "content": content or ""}
+        if parsed_tool_calls:
+            assistant_msg["tool_calls"] = [
+                {
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": tc["function"],
+                }
+                for tc in parsed_tool_calls
+            ]
         engine.update_session_messages(request.user, messages + [assistant_msg])
 
     # Final chunk

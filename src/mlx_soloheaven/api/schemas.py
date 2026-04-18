@@ -34,6 +34,29 @@ class ChatMessage(BaseModel):
     tool_call_id: Optional[str] = None
 
 
+# --- Structured output (response_format) ---
+
+class JsonSchemaSpec(BaseModel):
+    """OpenAI response_format.json_schema content."""
+    name: Optional[str] = None
+    description: Optional[str] = None
+    schema_: Optional[dict[str, Any]] = Field(default=None, alias="schema")
+    strict: Optional[bool] = None
+    model_config = {"populate_by_name": True}
+
+
+class ResponseFormat(BaseModel):
+    """OpenAI response_format parameter.
+
+    Values:
+    - {"type": "text"}: no constraint (default)
+    - {"type": "json_object"}: loose JSON mode (any valid JSON object)
+    - {"type": "json_schema", "json_schema": {name, schema, strict}}: strict schema
+    """
+    type: Literal["text", "json_object", "json_schema"] = "text"
+    json_schema: Optional[JsonSchemaSpec] = None
+
+
 class ChatCompletionRequest(BaseModel):
     model: str = "default"
     messages: list[ChatMessage]
@@ -45,6 +68,7 @@ class ChatCompletionRequest(BaseModel):
     stop: Optional[str | list[str]] = None
     tools: Optional[list[ToolDef]] = None
     tool_choice: Optional[str | dict] = None
+    response_format: Optional[ResponseFormat] = None
     seed: Optional[int] = None
     user: Optional[str] = None
     thinking: Optional[bool] = None  # Enable/disable thinking (default: server config)

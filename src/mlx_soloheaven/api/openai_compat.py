@@ -69,6 +69,32 @@ def _get_engine(model: str) -> MLXEngine:
 async def chat_completions(request: ChatCompletionRequest):
     engine = _get_engine(request.model)
 
+    # Validate response_format.json_schema early — return 400 on malformed
+    # schemas (matches OpenAI's behavior; avoids silent fallback to
+    # unconstrained generation).
+    if request.response_format and request.response_format.type == "json_schema":
+        js = request.response_format.json_schema
+        if not js or not js.schema_:
+            return JSONResponse(
+                status_code=400,
+                content={"error": {
+                    "message": "response_format.json_schema.schema is required when type=json_schema",
+                    "type": "invalid_request_error",
+                }},
+            )
+        try:
+            from outlines_core.json_schema import build_regex_from_schema
+            import json as _json
+            build_regex_from_schema(_json.dumps(js.schema_))
+        except Exception as e:
+            return JSONResponse(
+                status_code=400,
+                content={"error": {
+                    "message": f"Invalid JSON schema in response_format: {e}",
+                    "type": "invalid_request_error",
+                }},
+            )
+
     # Build message preview for logging
     msg_preview = []
     for m in request.messages[:3]:
@@ -118,6 +144,14 @@ def _sync_completion(request: ChatCompletionRequest, engine: MLXEngine) -> ChatC
         pp = request.presence_penalty or 0.0
         rep_penalty = 1.0 + (fp + pp) * 0.25  # rough mapping
 
+    response_format = request.response_format
+    if response_format and tools:
+        logger.warning(
+            f"[Structured] response_format={response_format.type} ignored: "
+            f"tools are present (OpenAI behavior)."
+        )
+        response_format = None
+
     result = engine.complete(
         messages,
         max_tokens=request.max_tokens or request.max_completion_tokens,
@@ -130,6 +164,7 @@ def _sync_completion(request: ChatCompletionRequest, engine: MLXEngine) -> ChatC
         session_id=request.user,
         thinking=enable_thinking,
         thinking_budget=request.thinking_budget,
+        response_format=response_format,
     )
 
     msg = ResponseMessage(content=result.content)
@@ -215,6 +250,16 @@ async def _stream_completion(
     TOOL_CALL_TAG = "<|tool_call>" if model_family == "gemma4" else "<tool_call>"
     holdback = ""
 
+    # Structured output (response_format): build constraint but skip if
+    # tools are present (tools take priority per OpenAI semantics).
+    response_format = request.response_format
+    if response_format and has_tools:
+        logger.warning(
+            f"[Structured] response_format={response_format.type} ignored: "
+            f"tools are present (OpenAI behavior)."
+        )
+        response_format = None
+
     async for result in engine.generate_stream_async(
         messages,
         max_tokens=request.max_tokens or request.max_completion_tokens,
@@ -227,6 +272,7 @@ async def _stream_completion(
         tools=tools,
         thinking=enable_thinking,
         thinking_budget=thinking_budget,
+        response_format=response_format,
     ):
         if result.finish_reason is not None:
             final_prompt_tokens = result.prompt_tokens

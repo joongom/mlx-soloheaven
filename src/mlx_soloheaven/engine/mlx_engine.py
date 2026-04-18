@@ -1170,6 +1170,7 @@ class MLXEngine:
         cancel_event: threading.Event | None = None,
         thinking: bool | None = None,
         thinking_budget: int | None = None,
+        response_format=None,
     ) -> Generator[GenerationResult, None, None]:
         """Generate with session-based KV cache reuse (holds lock)."""
         sid = session_id or "anon"
@@ -1192,6 +1193,7 @@ class MLXEngine:
                 cancel_event=cancel_event,
                 thinking=thinking,
                 thinking_budget=thinking_budget,
+                response_format=response_format,
             )
 
     def _generate_locked(
@@ -1208,6 +1210,7 @@ class MLXEngine:
         min_p: float = 0.0,
         top_k: int = 0,
         repetition_penalty: float = 1.0,
+        response_format=None,
     ) -> Generator[GenerationResult, None, None]:
         """Core generation logic using mlx-vlm (must hold lock).
 
@@ -1324,6 +1327,41 @@ class MLXEngine:
                 think_start_token=think_start,
                 model_family=self.model_family,
             ))
+        # Structured output (response_format) via FSM-based logits masking.
+        # Works on both mlx-vlm and mlx-lm paths (same logits_processors contract).
+        # PLD is incompatible: speculative decoding advances multiple tokens
+        # per step, breaking the FSM's single-step advance assumption.
+        structured_proc = None
+        rf_type = getattr(response_format, "type", None) if response_format else None
+        if rf_type in ("json_schema", "json_object") and self.cfg.pld_enabled and not self._use_vlm:
+            logger.warning(
+                f"[Structured] response_format={rf_type} disabled: PLD is active "
+                f"(speculative decoding is incompatible with FSM-based constraints). "
+                f"Disable PLD to use structured output."
+            )
+        elif rf_type in ("json_schema", "json_object"):
+            try:
+                from mlx_soloheaven.engine.structured import (
+                    build_json_schema_processor,
+                    build_json_object_processor,
+                )
+                if rf_type == "json_schema":
+                    js = response_format.json_schema
+                    if js is None or js.schema_ is None:
+                        raise ValueError("response_format.json_schema.schema is required")
+                    structured_proc = build_json_schema_processor(
+                        js.schema_, self.tokenizer,
+                        cache_key=f"{js.name or 'anon'}:{hash(json.dumps(js.schema_, sort_keys=True))}",
+                    )
+                    logger.info(f"[Structured] json_schema active (name={js.name})")
+                else:  # json_object
+                    structured_proc = build_json_object_processor(self.tokenizer)
+                    logger.info(f"[Structured] json_object active")
+            except Exception as e:
+                logger.warning(f"[Structured] failed to build processor: {e} — ignoring")
+                structured_proc = None
+        if structured_proc is not None:
+            logits_processors.append(structured_proc)
 
         # Build response cache info
         response_cache_info = {
@@ -1654,6 +1692,7 @@ class MLXEngine:
         session_id: str | None = None,
         thinking: bool | None = None,
         thinking_budget: int | None = None,
+        response_format=None,
     ) -> CompletionResult:
         """Non-streaming completion."""
         all_text = []
@@ -1671,6 +1710,7 @@ class MLXEngine:
             tools=tools,
             thinking=thinking,
             thinking_budget=thinking_budget,
+            response_format=response_format,
         ):
             if chunk.text:
                 all_text.append(chunk.text)
@@ -1835,6 +1875,7 @@ class MLXEngine:
         tools: list | None = None,
         thinking: bool | None = None,
         thinking_budget: int | None = None,
+        response_format=None,
     ) -> AsyncGenerator[GenerationResult, None]:
         """Async wrapper for generate_stream. Supports client disconnect cancellation."""
         loop = asyncio.get_event_loop()
@@ -1856,6 +1897,7 @@ class MLXEngine:
                     cancel_event=cancel_event,
                     thinking=thinking,
                     thinking_budget=thinking_budget,
+                    response_format=response_format,
                 ):
                     if cancel_event.is_set():
                         break

@@ -377,9 +377,14 @@ async def _stream_chat(
                     ensure_ascii=False,
                 )
                 yield f"data: {event}\n\n"
-    except (asyncio.CancelledError, GeneratorExit):
+    except (asyncio.CancelledError, GeneratorExit) as exc:
         client_disconnected = True
-        logger.info(f"[Stream] session={session_id} | client disconnected")
+        tail = accumulated_text[-200:].replace('\n', '\\n')
+        logger.info(
+            f"[Stream] session={session_id} | client disconnected "
+            f"({type(exc).__name__}) after {token_count} tokens | "
+            f"tail={tail!r}"
+        )
 
     t_end = time.perf_counter()
     engine_ttft = (t_first_token - (t_gen_actual or t_gen_start)) if t_first_token else 0

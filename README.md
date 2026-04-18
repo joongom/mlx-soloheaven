@@ -12,9 +12,13 @@ SoloHeaven turns your Mac into a personal AI server with sub-second response tim
 - **250x TTFT improvement** — From 126s to 0.5s at 131K context tokens
 - **99.9% token savings** — Cache hit reuses all previously computed KV states
 - **Multi-model support** — Load multiple models simultaneously, route requests by model name
+- **Multimodal (VLM) support** — Gemma 4, Qwen3-VL, GLM4V, and other vision/omni models via mlx-vlm, with automatic mlx-lm fallback for text-only models
 - **Per-model thinking control** — Enable/disable `<think>` tags per model (e.g., `:no_think_tag` for non-reasoning models)
 - **Thinking budget control** — Configurable token limit for reasoning models, with per-request override
-- **Budget-based cache eviction** — No time-based TTL, evicts LRU only when memory/disk budget exceeded
+- **Prompt Lookup Decoding (PLD)** — Optional speculative decoding for prompt-echo-heavy workloads (+37% on copy tasks)
+- **Prefill chunk tuning** — Configurable `prefill_step_size` for 1.3-1.5x long-prompt speedup
+- **KV cache quantization** — Optional 4/8-bit KV quant (mlx-lm path)
+- **Budget-based cache eviction** — No time-based TTL, evicts LRU only when memory/disk budget exceeded; disk files auto-pruned when exceeding `--disk-budget-gb`
 - **GPU keepalive** — Optional Metal idle prevention with periodic micro-computations (`--gpu-keepalive`)
 - **Full OpenAI API compatibility** — Streaming SSE, tool calling, `developer` role, `/v1/chat/completions`, `/v1/models`
 - **Built-in web UI** — Chat interface with model selector, live thinking display, TPS stats, cache hit indicators, branch/regenerate/delete controls
@@ -25,6 +29,27 @@ SoloHeaven turns your Mac into a personal AI server with sub-second response tim
 - **Disk persistence** — KV caches survive server restarts via safetensors serialization
 - **Client disconnect handling** — Frees the generation lock immediately, tolerates content mismatches on reconnect
 - **Base cache pool** — System prompt KV caches shared across sessions for fast cold starts
+
+## Supported Model Families
+
+SoloHeaven tries `mlx-vlm` first for any model whose `model_type` has a module in
+mlx-vlm, then falls back to `mlx-lm` for text-only architectures. This gives
+multimodal + text coverage from a single code path.
+
+| Model family | Backend | Cache structure | Notes |
+|--------------|---------|-----------------|-------|
+| **Gemma 4** (`gemma4`, e.g. 31B/26B-A4B/E4B) | mlx-vlm | `KVCache` + `RotatingKVCache` (sliding window) | Multimodal (text/vision/audio). Uses `<\|channel>thought\|...\|<channel\|>` for reasoning. VLM models automatically enable `mlx-vlm` native stream_generate. |
+| **Qwen3.5 / Qwen3.6 MoE** (`qwen3_5_moe`, e.g. 122B/397B/35B-A3B) | mlx-vlm → falls through | `ArraysCache` (DeltaNet linear) + `KVCache` (full attn every 4th) | Uses ChatML. **PLD not applicable** — DeltaNet state is not trimmable. Use `--kv-bits 0` (quantization won't help; only 2 KV heads per layer). |
+| **Qwen3-VL / Qwen3-Omni** | mlx-vlm | Varies per model | Vision/omni variants. |
+| **GLM-5.1 / DeepSeek-V3.2** (`glm_moe_dsa`, `deepseek_v32`) | mlx-lm | `CacheList(KVCache, KVCache)` per layer (MLA + DSA indexer) | **Multi-head Latent Attention (MLA)**: KV is pre-compressed to `kv_lora_rank=512` — cache is ~1/3 of typical. **PLD compatible.** Use `--no-thinking --prefill-step-size 8192 --pld` for best performance. |
+| **GLM-4.5 / 4.7** (`glm4_moe`, `glm4_moe_lite`) | mlx-lm | `KVCache` or `RotatingKVCache` mix | ChatML-ish format with `<\|user\|>`/`<\|assistant\|>`. PLD compatible on pure-KVCache variants. |
+| **GLM4V / GLM-OCR** | mlx-vlm | Per-model | Vision variants. |
+| **MiniMax, GPT-OSS** | mlx-lm | Standard `KVCache` | ChatML. |
+
+**Note on mxfp4/mxfp8 quantization**: MLX currently has kernel inefficiencies for
+MoE matmul under mxfp4/mxfp8 modes (see [mlx issue #3402](https://github.com/ml-explore/mlx/issues/3402)).
+If a `mxfp8` quant produces garbage output (`!!!!` repeated tokens), switch to
+the plain `8bit` quant of the same model.
 
 ## Research Background
 
@@ -129,6 +154,67 @@ Live data from a coding agent session (OpenClaw, 266 messages, 131K context):
 - Large tool results (8K+ tokens) in suffix cause TTFT spikes to ~55s — tool result size optimization or caching strategies are needed
 - KV cache is 4.1 GB/session, but 512GB memory can hold 7 sessions simultaneously (model weight ~160GB + KV cache ~10GB)
 - Disk save runs in background without lock, no blocking on generation requests
+
+### GLM-5.1 (MLA + DSA + MoE 256 experts, M3 Ultra 512GB)
+
+GLM-5.1 (`mlx-community/GLM-5.1-MXFP4-Q8`) inherits DeepSeek-V3.2's
+architecture: **Multi-head Latent Attention** (kv_lora_rank=512) +
+**DeepSeek Sparse Attention** (32-head indexer, top-k=2048) + **MoE**
+(256 routed experts, 8 active). 78 layers, ~378 GB on disk.
+
+**Baseline performance**: **12–13 TPS** at short context (no thinking).
+
+| Metric | Value |
+|--------|-------|
+| Model size (mxfp4 + Q8) | 378 GB on disk, ~450 GB resident |
+| KV cache per token (MLA compressed) | ~90 KB (78 × 1152 bytes) |
+| TTFT (cache miss, 13K tokens prefill) | ~100s |
+| TTFT (cache hit, small suffix) | 400–600 ms |
+| Decode TPS (short context) | 15 TPS |
+| Decode TPS (30K+ context) | 12 TPS |
+
+**Why 12–13 TPS is near the ceiling**: At M3 Ultra's 800 GB/s bandwidth
+with ~30 GB of active weights read per step (MLA + MoE + DSA indexer),
+the memory-bandwidth ceiling is ~26 TPS at 100% efficiency. mlx-lm
+reaches about 50% of peak, matching measurements. MLA already keeps
+the KV read volume very small (see table) — there's limited room for
+further KV-side gains.
+
+**Recommended launch config for GLM-5.1**:
+
+```bash
+./start_glm5.1.sh
+# or:
+mlx-soloheaven --model ~/models/GLM-5.1-MXFP4-Q8 \
+  --memory-budget-gb 50 \
+  --no-thinking \
+  --prefill-step-size 8192 \
+  --pld \
+  --gpu-keepalive --verbose
+```
+
+**What each flag buys**:
+
+| Flag | Effect on GLM-5.1 |
+|------|-------------------|
+| `--no-thinking` | Skips `<think>` generation — in OpenClaw agent workloads, thinking turns often eat 80% of generation tokens; disabling it is a large effective speedup. |
+| `--prefill-step-size 8192` | 1.3–1.5x faster prefill on long prompts (reduces TTFT on large tool-result turns). |
+| `--pld` | Prompt Lookup Decoding: up to +37% TPS on tool-heavy / file-editing turns where the model echoes parts of the prompt. Automatic — uses the trimmable CacheList KV cache GLM-5.1 ships with. Logs `[PLD] accepted X/Y (Z%)` per request — track Z to verify it helps. |
+| `--memory-budget-gb 50` | Leaves ~60 GB headroom on top of the ~450 GB model for KV growth before session LRU eviction kicks in. |
+| `--disk-budget-gb 100` (default) | Disk session cache now enforces this budget via LRU eviction — previously it just grew unbounded. |
+
+**Known limitations**:
+
+- **PLD is workload-dependent**. Pure creative writing shows a ~15%
+  slowdown. The acceptance-rate log lets you confirm per-workload
+  whether to keep it enabled.
+- **Disk save skipped for GLM MoE**: mlx-lm's save_prompt_cache can't
+  serialize some empty arrays in GLM MoE state. Session cache is
+  in-memory only for this model; restart loses the KV. (Other models
+  with standard cache shapes still persist.)
+- **mxfp4 MoE kernels are slower than Q8** on M3 (see [mlx #3402](https://github.com/ml-explore/mlx/issues/3402)).
+  If a quant feels pathologically slow, swap to the Q8 variant of the
+  same model.
 
 ## Quick Start
 
@@ -244,11 +330,20 @@ Options:
   --max-tokens          Default max generation tokens (default: 32768)
   --thinking-budget     Max thinking tokens before forcing </think> (default: 8192, 0=unlimited)
   --memory-budget-gb    In-memory KV cache budget in GB (default: 200)
-  --disk-budget-gb      On-disk KV cache budget in GB (default: 100)
+  --disk-budget-gb      On-disk KV cache budget in GB, auto-evicts oldest (default: 100)
   --data-dir            Directory for SQLite DB and cache files (default: ./data)
   --no-thinking         Disable thinking mode globally
   --gpu-keepalive       Keep Metal GPU warm to avoid idle penalty (env: SOLOHEAVEN_GPU_KEEPALIVE)
   --verbose, -v         Enable verbose logging (env: SOLOHEAVEN_VERBOSE)
+
+Performance tuning (see Performance Tuning Flags section below):
+  --prefill-step-size   Prefill chunk size (default: 2048; try 8192)
+  --pld                 Enable Prompt Lookup Decoding (speculative decoding via prompt n-grams)
+  --pld-num-draft       Max draft tokens per step (default: 10)
+  --pld-ngram-k         N-gram size for PLD matching (default: 3)
+  --kv-bits             KV cache quantization bits (0=off, 4, 8; mlx-lm path only)
+  --kv-group-size       KV quant group size (default: 64)
+  --quantized-kv-start  Token offset at which KV quantization kicks in
 ```
 
 ### Sampling Parameters
@@ -282,6 +377,50 @@ Per-request override via the OpenAI API:
 ```
 
 > `frequency_penalty` and `presence_penalty` (OpenAI standard) are mapped to `repetition_penalty` when `repetition_penalty` is not explicitly set.
+
+### Performance Tuning Flags
+
+Optional speed knobs. All are server-level (set at launch); SoloHeaven's
+session/KV/compaction logic is unaware of them and keeps working identically
+whether they're on or off.
+
+| Flag | Default | Applies to | Effect |
+|------|---------|-----------|--------|
+| `--prefill-step-size N` | 2048 | both mlx-vlm & mlx-lm | Chunk size for prompt prefill. Larger = fewer kernel launches = faster prefill on long prompts. Recommended: **8192** on Mac M3 Ultra for 1.3–1.5x prefill speedup. |
+| `--pld` | off | mlx-lm only; auto-disabled on DeltaNet/ArraysCache | Prompt Lookup Decoding: speculative decoding using n-gram matching from the prompt instead of a separate draft model. **+37% TPS on copy-heavy workloads (code editing, RAG), -15% on novel/creative**. See [PLD section](#prompt-lookup-decoding-pld) below. |
+| `--pld-num-draft N` | 10 | PLD only | Max draft tokens proposed per step. |
+| `--pld-ngram-k K` | 3 | PLD only | N-gram size for the prompt-lookup match. Shorter = more matches but noisier. |
+| `--kv-bits 0\|4\|8` | 0 (off) | mlx-lm path only | Quantize KV cache to reduce memory. **Skip for MLA models** (GLM-5.1, DeepSeek): KV is already compressed via `kv_lora_rank`. Skip for small-KV-head models (Qwen3.5 MoE has only 2 KV heads per layer — overhead dominates). Useful for standard dense/MoE models with large KV heads at long context. |
+| `--kv-group-size N` | 64 | with `--kv-bits` | Quantization group size. |
+| `--quantized-kv-start N` | 0 | with `--kv-bits` | Skip quant for first N tokens. |
+| `--memory-budget-gb N` | 200 | always | In-memory KV cache budget before LRU eviction to disk. |
+| `--disk-budget-gb N` | 100 | always | On-disk cache budget. **Now actually enforced**: when `_save_session_to_disk` exceeds this, oldest session files are deleted (protecting active sessions). |
+
+#### Prompt Lookup Decoding (PLD)
+
+PLD is a draft-model-free form of speculative decoding. On each decode step
+it searches the prompt (and accumulated output) for a match to the last K
+generated tokens; if found, it proposes the next N tokens as drafts, which
+the main model verifies in one forward pass.
+
+**When PLD is a win** (+30% to +40% TPS):
+- Code edits (the model echoes parts of the source it's modifying)
+- RAG / summarization (the model quotes the retrieved text)
+- Tool-calling agents where tool arguments mirror prompt content
+- Long-context Q&A that cites the document
+
+**When PLD is a loss** (−10% to −15% TPS):
+- Free-form creative writing (no prompt-to-output overlap)
+- Pure reasoning / chain-of-thought
+- First-turn greetings
+
+**Compatibility**: Requires a trimmable KV cache. Automatic detection:
+- ✅ GLM-5.1 (CacheList/KVCache), GLM-4.7, DeepSeek-V3/V3.2, Llama, Mistral
+- ❌ Qwen3.5/3.6 MoE (DeltaNet ArraysCache is not trimmable — auto-falls back, zero overhead)
+- ❌ mlx-vlm path (use the VLM's own speculation path if available)
+
+**Acceptance rate**: logged after every request as `[PLD] accepted X/Y draft tokens (Z%)`.
+Rule of thumb: Z > 30% is a net win; Z < 20% means PLD is hurting — disable for that workload.
 
 ### Multi-Model Setup
 

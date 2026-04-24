@@ -940,9 +940,42 @@ class MLXEngine:
         return False
 
     @staticmethod
-    def _normalize_for_match(content: str, role: str) -> str:
+    def _flatten_multipart(content) -> str:
+        """Flatten OpenAI multi-part content to a plain string.
+
+        Drops image/video parts and client-inserted
+        "[image data removed ...]" placeholders so that a turn with an
+        image blob and a subsequent turn where the client replaced the
+        blob with a placeholder normalize to the same text.
+        """
+        import re
+        if isinstance(content, str):
+            return content
+        if content is None:
+            return ""
+        if not isinstance(content, list):
+            return str(content)
+        parts: list[str] = []
+        for p in content:
+            if isinstance(p, str):
+                parts.append(p)
+                continue
+            if not isinstance(p, dict):
+                continue
+            ptype = p.get("type")
+            if ptype and ptype != "text":
+                continue  # image, image_url, video, etc.
+            txt = p.get("text", "") or ""
+            if re.match(r"\s*\[image data removed", txt, flags=re.IGNORECASE):
+                continue
+            parts.append(txt)
+        return "\n".join(parts)
+
+    @staticmethod
+    def _normalize_for_match(content, role: str) -> str:
         """Normalize message content for comparison."""
         import re
+        content = MLXEngine._flatten_multipart(content)
         if role == "system":
             # Normalize dynamic date (e.g. "Today's date: Tue Mar 10 2026" → placeholder)
             content = re.sub(
@@ -988,8 +1021,8 @@ class MLXEngine:
                     f"[Match] FAIL at msg[{i}]: role {s_msg.get('role')!r} != {i_msg.get('role')!r}"
                 )
                 return False
-            s_content = s_msg.get("content", "") or ""
-            i_content = i_msg.get("content", "") or ""
+            s_content = self._flatten_multipart(s_msg.get("content"))
+            i_content = self._flatten_multipart(i_msg.get("content"))
             role = s_msg.get("role", "")
 
             # Assistant tool_call messages: OpenCode strips <tool_call> from content
@@ -1029,6 +1062,39 @@ class MLXEngine:
                     logger.debug(
                         f"[Match] msg[{i}] assistant content mismatch at last stored msg — "
                         f"accepting (stored={len(s_content)}, incoming={len(i_content)})"
+                    )
+                    continue
+
+                # Client may reconstruct assistant content as "{thinking}\n\n{final}"
+                # without <think> tags. Stored normalized is just "{final}"; incoming
+                # normalized is "{thinking}\n\n{final}". KV cache reflects what the
+                # model actually processed (stored), so if the final answer matches
+                # as a suffix of the incoming, the cache is still valid.
+                if role == "assistant" and s_norm and len(s_norm) >= 8 and (
+                    i_norm.endswith(s_norm) or s_norm.endswith(i_norm)
+                ):
+                    logger.debug(
+                        f"[Match] msg[{i}] assistant content suffix match — "
+                        f"accepting (stored={len(s_content)}, incoming={len(i_content)})"
+                    )
+                    continue
+
+                # Assistant tool_call turn: stored was (optional <think>...</think>
+                # + <tool_call>...</tool_call>), which normalizes to empty because
+                # both blocks are stripped. OpenAI-format clients move the tool
+                # call to tool_calls[] and may reconstruct the thinking as plain
+                # text in content (no <think> tags). KV cache is still valid —
+                # it reflects the tokens the model actually emitted.
+                if (
+                    role == "assistant"
+                    and not s_norm
+                    and i_msg.get("tool_calls")
+                    and ("<tool_call>" in s_content or s_msg.get("tool_calls"))
+                ):
+                    logger.debug(
+                        f"[Match] msg[{i}] assistant tool_call turn — "
+                        f"accepting reconstructed content "
+                        f"(stored_len={len(s_content)}, incoming_len={len(i_content)})"
                     )
                     continue
 

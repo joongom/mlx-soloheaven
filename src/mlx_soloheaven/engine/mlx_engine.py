@@ -1,11 +1,14 @@
 """
 MLX Engine — model loading and generation with KV cache reuse.
 
-Uses mlx-vlm as the unified generation backend for both text-only and
-vision-language models.  Session-based KV cache management is built on
-mlx-vlm's PromptCacheState which does prefix-matching on token IDs.
+mlx-vlm-first; mlx-lm legacy fallback for text-only model_types not in
+mlx-vlm's registry. The mlx-vlm path is the canonical (and drafter-ready)
+generation surface; the mlx-lm branch remains load-bearing for text-only
+model_types such as Qwen3.5/3.6 dense, MiniMax-M2.5, GLM-4.7, and GLM-5.1
+that mlx-vlm does not currently register under `mlx_vlm.models.<type>`.
 
-Cache reuse across turns:
+Session-based KV cache management is built on mlx-vlm's PromptCacheState
+which does prefix-matching on token IDs:
 - Engine-internal messages store full assistant content (including thinking)
 - apply_chat_template(tokenize=True) produces tokens matching stored IDs
 - PromptCacheState.find_prefix_length() reuses the common prefix
@@ -214,6 +217,16 @@ def _detect_token_id(tokenizer, text: str) -> int:
     if len(ids) == 1:
         return ids[0]
     return -1
+
+
+def _maybe_load_drafter(draft_model_path: str | None = None):
+    """Phase 2: returns (model, kind). Phase 1: returns None."""
+    # Lazy import keeps `from mlx_soloheaven.engine.mlx_engine import MLXEngine`
+    # working on machines where mlx_vlm.speculative is unavailable.
+    if not draft_model_path:
+        return None
+    from mlx_vlm.speculative import load_drafter  # noqa: F401  (Phase 2 wiring)
+    return None
 
 
 @dataclass
@@ -888,6 +901,37 @@ class MLXEngine:
         ]
 
     @staticmethod
+    def _safe_to_reuse_cache(cache_state) -> bool:
+        """Return False if any cache entry is a RotatingKVCache whose
+        internal ring buffer has wrapped (offset > max_size). In that case
+        the buffer no longer corresponds to a contiguous token prefix, and
+        prefix-trim based reuse (mlx-vlm's `c.keys.shape[2]` slicing path)
+        would silently mis-align KV entries with the new prompt's tokens.
+
+        Reference: `mlx_lm/models/cache.py::RotatingKVCache` exposes
+        `.offset` (cumulative tokens seen) and `.max_size` (ring capacity).
+        Non-rotating caches (KVCache, ArraysCache, ...) are always safe.
+
+        Empty / None cache lists return True (nothing to gate).
+        """
+        if cache_state is None:
+            return True
+        cache = getattr(cache_state, "cache", None)
+        if not cache:
+            return True
+        for c in cache:
+            if type(c).__name__ != "RotatingKVCache":
+                continue
+            max_size = getattr(c, "max_size", None)
+            offset = getattr(c, "offset", None)
+            if max_size is None or offset is None:
+                # Unknown layout — be conservative and force cold-fill.
+                return False
+            if offset > max_size:
+                return False
+        return True
+
+    @staticmethod
     def _get_cache_offset(cache: list) -> int:
         """Get the total number of tokens processed by this cache.
 
@@ -1519,103 +1563,38 @@ class MLXEngine:
         last_gen_tps = 0.0
         gen_token_count = 0
         cancelled = False
+        # Capture every yielded token so post-loop can extend
+        # cache_state.token_ids = prompt_token_ids + generated_token_ids on BOTH
+        # paths. mlx-vlm's stream_generate mutates cache_state.cache in place but
+        # does not append generated IDs to cache_state.token_ids — without this
+        # capture, subsequent turns silently miss the generated-token prefix.
+        generated_token_ids: list[int] = []
+        # Snapshot of the full prompt IDs (pre any in-branch slicing) used by
+        # the unified post-generation cache_state.token_ids update for both paths.
+        full_prompt_token_ids = list(prompt_token_ids)
 
-        if self._use_vlm:
-            input_ids = mx.array([prompt_token_ids])
-            gen_iter = vlm_stream_generate(
-                self._vlm_model,
-                self._processor,
-                "",  # prompt text ignored when input_ids is provided
-                input_ids=input_ids,
-                prompt_cache_state=cache_state,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                min_p=min_p,
-                top_k=top_k,
-                prefill_step_size=self.cfg.prefill_step_size,
-                logits_processors=logits_processors if logits_processors else None,
-            )
-        else:
-            # mlx-lm path: manage cache manually via prompt_cache
-            full_prompt_token_ids = list(prompt_token_ids)  # save before trimming
-            prompt_cache = cache_state.cache
-            if prompt_cache is None:
-                prompt_cache = make_prompt_cache(self._language_model)
-            else:
-                # Trim cache to match prefix
-                stored_ids = cache_state.token_ids or []
-                prefix_len = 0
-                for j in range(min(len(stored_ids), len(prompt_token_ids))):
-                    if stored_ids[j] != prompt_token_ids[j]:
-                        break
-                    prefix_len = j + 1
-                # Trim KV cache to prefix length
-                for c in prompt_cache:
-                    if hasattr(c, "keys") and c.keys is not None:
-                        cached_len = c.keys.shape[2] if len(c.keys.shape) > 2 else 0
-                        if cached_len > prefix_len:
-                            c.keys = c.keys[..., :prefix_len, :]
-                            c.values = c.values[..., :prefix_len, :]
-                            if hasattr(c, "offset"):
-                                c.offset = prefix_len
-                # Only feed tokens after prefix
-                prompt_token_ids = prompt_token_ids[prefix_len:]
+        # Shared sampler — used by the mlx-lm legacy path; the mlx-vlm path
+        # consumes top_p/min_p/top_k/temp directly so it ignores `sampler`.
+        # Constructing it unconditionally costs ~one closure allocation and
+        # keeps the dispatcher signature uniform across paths.
+        sampler = make_sampler(temp=temperature, top_p=top_p, min_p=min_p, top_k=top_k)
 
-            sampler = make_sampler(temp=temperature, top_p=top_p, min_p=min_p, top_k=top_k)
-            lm_kwargs = {
-                "max_tokens": max_tokens,
-                "sampler": sampler,
-                "prompt_cache": prompt_cache,
-                "prefill_step_size": self.cfg.prefill_step_size,
-                "logits_processors": logits_processors if logits_processors else None,
-            }
-            if self.cfg.kv_bits:
-                lm_kwargs["kv_bits"] = self.cfg.kv_bits
-                lm_kwargs["kv_group_size"] = self.cfg.kv_group_size
-                lm_kwargs["quantized_kv_start"] = self.cfg.quantized_kv_start
-            # PLD requires trimmable cache (for rollback on rejection).
-            # Models with ArraysCache layers (Qwen3.5 DeltaNet, etc.) are NOT
-            # trimmable — fall back to regular lm_stream_generate.
-            use_pld = self.cfg.pld_enabled
-            if use_pld:
-                from mlx_lm.models.cache import can_trim_prompt_cache
-                if not can_trim_prompt_cache(prompt_cache):
-                    if not getattr(self, "_pld_incompat_warned", False):
-                        logger.warning(
-                            f"[{self.model_id}] PLD disabled: model uses "
-                            f"non-trimmable cache (e.g. ArraysCache/DeltaNet). "
-                            f"Falling back to standard generation."
-                        )
-                        self._pld_incompat_warned = True
-                    use_pld = False
-
-            if use_pld:
-                from mlx_soloheaven.engine.pld import pld_generate_step
-                gen_iter = _pld_response_adapter(
-                    pld_generate_step(
-                        prompt=mx.array(prompt_token_ids),
-                        model=self._language_model,
-                        num_draft_tokens=self.cfg.pld_num_draft_tokens,
-                        max_tokens=max_tokens,
-                        sampler=sampler,
-                        logits_processors=logits_processors if logits_processors else None,
-                        prompt_cache=prompt_cache,
-                        prefill_step_size=self.cfg.prefill_step_size,
-                        kv_bits=self.cfg.kv_bits if self.cfg.kv_bits else None,
-                        kv_group_size=self.cfg.kv_group_size,
-                        quantized_kv_start=self.cfg.quantized_kv_start,
-                        ngram_k=self.cfg.pld_ngram_k,
-                    ),
-                    tokenizer=self.tokenizer,
-                )
-            else:
-                gen_iter = lm_stream_generate(
-                    self._language_model,
-                    self.tokenizer,
-                    prompt=prompt_token_ids,
-                    **lm_kwargs,
-                )
+        # Dispatch to the per-backend runner. The runner returns the
+        # streaming generator AND (legacy path only) the local
+        # `prompt_cache` reference needed for the post-loop write-back.
+        gen_iter, prompt_cache = self._run_generate(
+            cache_state=cache_state,
+            prompt_token_ids=prompt_token_ids,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            min_p=min_p,
+            top_k=top_k,
+            sampler=sampler,
+            logits_processors=logits_processors,
+            session_id=session_id,
+            total_prompt_tokens=total_prompt_tokens,
+        )
 
         # Configurable progress log interval (tokens between INFO snapshots)
         progress_interval = 50  # tokens — every ~2s at 25 TPS
@@ -1639,6 +1618,12 @@ class MLXEngine:
             gen_tps = getattr(resp, "generation_tps", 0.0) or 0.0
 
             accumulated_text += text
+            # Track yielded token IDs so the post-loop update keeps
+            # cache_state.token_ids == full_prompt_token_ids + generated_token_ids
+            # on both paths. resp.token may be None on the synthetic terminal
+            # frame; in that case the token has already been counted earlier.
+            if hasattr(resp, "token") and resp.token is not None:
+                generated_token_ids.append(int(resp.token))
 
             if t_first_token is None:
                 t_first_token = time.perf_counter()
@@ -1675,6 +1660,26 @@ class MLXEngine:
 
         self._touch_gpu()
 
+        # Unified post-generation cache_state update (both VLM and legacy
+        # mlx-lm paths). mlx-vlm's stream_generate mutates cache_state.cache
+        # in place but never appends generated IDs to cache_state.token_ids;
+        # the legacy branch needs an explicit write-back of `prompt_cache` too.
+        # Both paths converge on:
+        #     cache_state.cache     = <post-generation cache>
+        #     cache_state.token_ids = full_prompt_token_ids + generated_token_ids
+        # Doing this even on cancellation keeps cache_state.token_ids consistent
+        # with the in-place mutated cache_state.cache (the VLM path may have
+        # already prefilled / advanced the cache before the cancel was observed).
+        # Legacy mlx-lm path returns a local `prompt_cache` reference that
+        # must be written back; VLM path mutates cache_state.cache in place
+        # and `prompt_cache` is None — the conditional below is the single
+        # remaining `self._use_vlm` branch in this method's post-loop and
+        # is kept because the two paths legitimately diverge in WHERE the
+        # post-generation KV cache lives.
+        if prompt_cache is not None:
+            cache_state.cache = prompt_cache
+        cache_state.token_ids = full_prompt_token_ids + list(generated_token_ids)
+
         # Log generated text for debugging
         if accumulated_text:
             preview = accumulated_text[:200].replace('\n', '\\n')
@@ -1704,12 +1709,6 @@ class MLXEngine:
                     completion_tokens=gen_token_count,
                 )
                 return
-
-        # For mlx-lm path: manually update PromptCacheState
-        # (mlx-vlm does this automatically in stream_generate)
-        if not self._use_vlm and not cancelled:
-            cache_state.cache = prompt_cache
-            cache_state.token_ids = full_prompt_token_ids  # full IDs before trim
 
         # Parse tool_calls once — used both for session persistence and
         # for the terminal GenerationResult's finish_reason.
@@ -1788,6 +1787,209 @@ class MLXEngine:
             generation_tps=last_gen_tps,
             cache_info=response_cache_info,
         )
+
+    def _run_generate(
+        self,
+        *,
+        cache_state,
+        prompt_token_ids,
+        max_tokens,
+        temperature,
+        top_p,
+        min_p,
+        top_k,
+        sampler,
+        logits_processors,
+        session_id,
+        total_prompt_tokens,
+    ):
+        """Backend dispatcher. Returns `(gen_iter, prompt_cache_or_none)`.
+
+        - mlx-vlm path → `(iter, None)` — KV cache is mutated in place on
+          `cache_state.cache` by mlx-vlm's stream_generate; no write-back
+          required by the caller.
+        - mlx-lm legacy path → `(iter, prompt_cache)` — caller must write
+          `prompt_cache` back to `cache_state.cache` after the stream loop
+          finishes (mlx-lm doesn't know about cache_state).
+
+        This method is the SINGLE `self._use_vlm` branch point for stream
+        construction (P1.6). Other `self._use_vlm` references in this file
+        gate orthogonal concerns (load path, kv_bits warning, structured-
+        output incompat warning) and remain in place.
+        """
+        if self._use_vlm:
+            return (
+                self._run_vlm(
+                    cache_state=cache_state,
+                    prompt_token_ids=prompt_token_ids,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    min_p=min_p,
+                    top_k=top_k,
+                    logits_processors=logits_processors,
+                    session_id=session_id,
+                    total_prompt_tokens=total_prompt_tokens,
+                ),
+                None,
+            )
+        return self._run_lm_legacy(
+            cache_state=cache_state,
+            prompt_token_ids=prompt_token_ids,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            logits_processors=logits_processors,
+        )
+
+    def _run_vlm(
+        self,
+        *,
+        cache_state,
+        prompt_token_ids,
+        max_tokens,
+        temperature,
+        top_p,
+        min_p,
+        top_k,
+        logits_processors,
+        session_id,
+        total_prompt_tokens,
+    ):
+        """mlx-vlm streaming path. Mutates `cache_state` in place.
+
+        Applies the RotatingKVCache wrap-around safety gate (P1.4) before
+        delegating to `vlm_stream_generate`.
+        """
+        # P1.7: PLD is mlx-lm legacy only. The VLM path has no PLD
+        # implementation; observing it here means CLI / config wiring is
+        # wrong and we'd silently fall back to non-PLD generation —
+        # better to fail loud.
+        if self.cfg.pld_enabled:
+            raise RuntimeError(
+                "PLD is mlx-lm legacy only; cannot enable on a "
+                "VLM-supported model_type"
+            )
+
+        # P1.4 safety gate: drop wrapped RotatingKVCache before reuse.
+        if not self._safe_to_reuse_cache(cache_state):
+            logger.warning(
+                f"[KV Cache] session={session_id} | "
+                f"COLD-FILL (RotatingKVCache wrapped) — dropping cache and "
+                f"re-prefilling full prompt ({total_prompt_tokens} tokens)"
+            )
+            cache_state.cache = None
+            cache_state.token_ids = None
+
+        input_ids = mx.array([prompt_token_ids])
+        return vlm_stream_generate(
+            self._vlm_model,
+            self._processor,
+            "",  # prompt text ignored when input_ids is provided
+            input_ids=input_ids,
+            prompt_cache_state=cache_state,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            min_p=min_p,
+            top_k=top_k,
+            prefill_step_size=self.cfg.prefill_step_size,
+            logits_processors=logits_processors if logits_processors else None,
+        )
+
+    def _run_lm_legacy(
+        self,
+        *,
+        cache_state,
+        prompt_token_ids,
+        max_tokens,
+        sampler,
+        logits_processors,
+    ):
+        """mlx-lm legacy path. Manages a local `prompt_cache` because
+        mlx-lm mutates the cache list in place during prefix-trim +
+        stream_generate; the caller writes it back to `cache_state.cache`
+        after the stream loop completes.
+
+        Returns `(gen_iter, prompt_cache)`.
+        """
+        prompt_cache = cache_state.cache
+        if prompt_cache is None:
+            prompt_cache = make_prompt_cache(self._language_model)
+        else:
+            # Trim cache to match prefix
+            stored_ids = cache_state.token_ids or []
+            prefix_len = 0
+            for j in range(min(len(stored_ids), len(prompt_token_ids))):
+                if stored_ids[j] != prompt_token_ids[j]:
+                    break
+                prefix_len = j + 1
+            # Trim KV cache to prefix length
+            for c in prompt_cache:
+                if hasattr(c, "keys") and c.keys is not None:
+                    cached_len = c.keys.shape[2] if len(c.keys.shape) > 2 else 0
+                    if cached_len > prefix_len:
+                        c.keys = c.keys[..., :prefix_len, :]
+                        c.values = c.values[..., :prefix_len, :]
+                        if hasattr(c, "offset"):
+                            c.offset = prefix_len
+            # Only feed tokens after prefix
+            prompt_token_ids = prompt_token_ids[prefix_len:]
+
+        lm_kwargs = {
+            "max_tokens": max_tokens,
+            "sampler": sampler,
+            "prompt_cache": prompt_cache,
+            "prefill_step_size": self.cfg.prefill_step_size,
+            "logits_processors": logits_processors if logits_processors else None,
+        }
+        if self.cfg.kv_bits:
+            lm_kwargs["kv_bits"] = self.cfg.kv_bits
+            lm_kwargs["kv_group_size"] = self.cfg.kv_group_size
+            lm_kwargs["quantized_kv_start"] = self.cfg.quantized_kv_start
+
+        # PLD requires trimmable cache (for rollback on rejection).
+        # Models with ArraysCache layers (Qwen3.5 DeltaNet, etc.) are NOT
+        # trimmable — fall back to regular lm_stream_generate.
+        use_pld = self.cfg.pld_enabled
+        if use_pld:
+            from mlx_lm.models.cache import can_trim_prompt_cache
+            if not can_trim_prompt_cache(prompt_cache):
+                if not getattr(self, "_pld_incompat_warned", False):
+                    logger.warning(
+                        f"[{self.model_id}] PLD disabled: model uses "
+                        f"non-trimmable cache (e.g. ArraysCache/DeltaNet). "
+                        f"Falling back to standard generation."
+                    )
+                    self._pld_incompat_warned = True
+                use_pld = False
+
+        if use_pld:
+            from mlx_soloheaven.engine.pld import pld_generate_step
+            gen_iter = _pld_response_adapter(
+                pld_generate_step(
+                    prompt=mx.array(prompt_token_ids),
+                    model=self._language_model,
+                    num_draft_tokens=self.cfg.pld_num_draft_tokens,
+                    max_tokens=max_tokens,
+                    sampler=sampler,
+                    logits_processors=logits_processors if logits_processors else None,
+                    prompt_cache=prompt_cache,
+                    prefill_step_size=self.cfg.prefill_step_size,
+                    kv_bits=self.cfg.kv_bits if self.cfg.kv_bits else None,
+                    kv_group_size=self.cfg.kv_group_size,
+                    quantized_kv_start=self.cfg.quantized_kv_start,
+                    ngram_k=self.cfg.pld_ngram_k,
+                ),
+                tokenizer=self.tokenizer,
+            )
+        else:
+            gen_iter = lm_stream_generate(
+                self._language_model,
+                self.tokenizer,
+                prompt=prompt_token_ids,
+                **lm_kwargs,
+            )
+        return gen_iter, prompt_cache
 
     def _make_full_assistant_content(
         self, accumulated_text: str, thinking_enabled: bool,

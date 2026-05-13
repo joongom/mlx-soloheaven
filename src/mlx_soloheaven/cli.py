@@ -147,6 +147,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=int(_env("PREFILL_STEP_SIZE", "2048")),
         help="Prefill chunk size (default: 2048). Try 4096/8192 for long-prompt speedup (env: SOLOHEAVEN_PREFILL_STEP_SIZE)",
     )
+    # Speculative decoding via mlx-vlm drafter (MTP / DFlash).
+    p.add_argument(
+        "--draft-model",
+        default=_env("DRAFT_MODEL"),
+        help="Path to drafter MLX model directory (enables speculative decoding; "
+             "env: SOLOHEAVEN_DRAFT_MODEL)",
+    )
+    p.add_argument(
+        "--draft-kind",
+        choices=["mtp", "dflash"],
+        default=_env("DRAFT_KIND"),
+        help="Drafter kind: 'mtp' (Gemma 4) or 'dflash' (Qwen3). "
+             "Default: auto-detect from drafter's model_type.",
+    )
+    p.add_argument(
+        "--draft-block-size",
+        type=int,
+        default=int(_env("DRAFT_BLOCK_SIZE", "0")) or None,
+        help="Drafter block size (default: use drafter config).",
+    )
+
     p.add_argument("--pld", dest="pld_enabled", action="store_true",
                    default=_env("PLD", "").lower() in ("1", "true", "yes"),
                    help="Enable Prompt Lookup Decoding for speculative generation (env: SOLOHEAVEN_PLD)")
@@ -160,6 +181,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if not args.model and not args.models:
         p.error(
             "Model path is required. Set --model or --models, or SOLOHEAVEN_MODEL environment variable."
+        )
+
+    # Drafter (MTP/DFlash) requires single-model path; reject multi-model + drafter combos.
+    if (args.models or []) and (
+        getattr(args, "draft_model", None)
+        or getattr(args, "draft_kind", None)
+        or getattr(args, "draft_block_size", None)
+    ):
+        p.error(
+            "--draft-model is not supported with --models (multi-model); use --model for single-model + drafter"
         )
 
     return args

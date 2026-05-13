@@ -26,8 +26,10 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import AsyncGenerator, Generator, Optional
 
@@ -219,14 +221,32 @@ def _detect_token_id(tokenizer, text: str) -> int:
     return -1
 
 
-def _maybe_load_drafter(draft_model_path: str | None = None):
-    """Phase 2: returns (model, kind). Phase 1: returns None."""
-    # Lazy import keeps `from mlx_soloheaven.engine.mlx_engine import MLXEngine`
-    # working on machines where mlx_vlm.speculative is unavailable.
+def _maybe_load_drafter(
+    draft_model_path: str | None = None,
+    kind: str | None = None,
+):
+    """Load a speculative drafter; returns (model, kind) or (None, None)."""
     if not draft_model_path:
-        return None
-    from mlx_vlm.speculative import load_drafter  # noqa: F401  (Phase 2 wiring)
-    return None
+        return (None, None)
+    try:
+        from mlx_vlm.speculative import load_drafter
+    except ImportError as e:
+        raise RuntimeError(
+            "mlx_vlm.speculative is unavailable; --draft-model requires "
+            "mlx-vlm >= 0.5.0"
+        ) from e
+    t0 = time.perf_counter()
+    model, resolved_kind = load_drafter(draft_model_path, kind=kind)
+    elapsed = time.perf_counter() - t0
+    block_size = None
+    cfg_obj = getattr(model, "config", None)
+    if cfg_obj is not None:
+        block_size = getattr(cfg_obj, "block_size", None)
+    logger.info(
+        f"[Drafter] loaded {draft_model_path} kind={resolved_kind} "
+        f"block_size={block_size} in {elapsed:.1f}s"
+    )
+    return (model, resolved_kind)
 
 
 @dataclass
@@ -277,7 +297,70 @@ class MLXEngine:
         # Dirty session tracking for idle-time disk save
         self._dirty_sessions: set[str] = set()
         self._dirty_lock = threading.Lock()
+
+        # F3 architecture: pin ALL mlx-vlm calls to a single persistent worker
+        # thread. mlx-vlm 0.5.0's module-global `generation_stream` is a
+        # ThreadLocalStream created on the importing thread; if generation
+        # runs on a different (or short-lived) thread, MLX raises
+        # `RuntimeError: There is no Stream(gpu, N) in current thread.`
+        # By dedicating one long-lived worker we register the stream ONCE
+        # and every subsequent call inherits a consistent slot.
+        self._vlm_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mlx-vlm-worker"
+        )
+        self._vlm_worker_ready_event = threading.Event()
+
+        def _vlm_worker_init():
+            # Runs on the dedicated worker thread.
+            #
+            # Install a worker-thread-local `generation_stream` on
+            # `mlx_vlm.generate` and warm the per-thread slot. mlx-vlm
+            # 0.5.0's module-global `generation_stream` is a
+            # ThreadLocalStream created on the importing thread; if
+            # generation runs on a different thread, MLX raises
+            # `RuntimeError: There is no Stream(gpu, N) in current thread.`
+            # Pinning load + inference to this worker (see F3-LOAD in
+            # `load_model`) eliminates the hand-off; replacing the stream
+            # here ensures every mlx-vlm call inside this worker uses a
+            # slot we registered.
+            try:
+                import mlx_vlm.generate  # noqa: F401 — populate sys.modules
+                _mvg = sys.modules["mlx_vlm.generate"]
+                _old = getattr(_mvg, "generation_stream", None)
+                _new = mx.new_thread_local_stream(mx.default_device())
+                _mvg.generation_stream = _new
+
+                # Pin a per-thread slot for `_new` on THIS thread.
+                with mx.stream(_new):
+                    _probe = mx.array([1.0]) * 1.0
+                    mx.eval(_probe)
+
+                logger.debug(
+                    f"[F3-INIT] thread={threading.current_thread().name} "
+                    f"old_stream={_old!r} new_stream={_new!r}"
+                )
+            finally:
+                self._vlm_worker_ready_event.set()
+
+        self._vlm_executor.submit(_vlm_worker_init)
+        # Block until the worker has installed its stream — keeps the
+        # one-time init synchronous from the engine's perspective.
+        self._vlm_worker_ready_event.wait(timeout=10)
+
         MLXEngine._all_engines.append(self)
+
+    def close(self):
+        """Shut down the dedicated mlx-vlm worker. Idempotent."""
+        ex = getattr(self, "_vlm_executor", None)
+        if ex is not None:
+            ex.shutdown(wait=True)
+            self._vlm_executor = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001 — destructor must not raise
+            pass
 
     def load_model(self):
         logger.info(f"Loading model: {self.cfg.model_path}")
@@ -294,17 +377,34 @@ class MLXEngine:
         # Check if mlx-vlm supports this model type BEFORE loading weights.
         # (mlx-vlm's load loads the entire safetensors before checking model type,
         #  which wastes memory for huge models like GLM-5.1 at 378GB.)
+        #
+        # F3-LOAD: load the VLM model on the dedicated worker thread, NOT
+        # on whatever thread happens to call `load_model()`. mlx-vlm's
+        # `load_model` calls `mx.eval(model.parameters())` to force the
+        # weights off the lazy-load path; that eval runs on the thread
+        # that invokes `vlm_load`, binding the weights' computation
+        # graph to that thread's stream slots. If inference later runs
+        # on a DIFFERENT thread (our worker), some lazy state — most
+        # notably KV-cache buffers and any post-load model state — ends
+        # up referencing stream slots the inference thread cannot
+        # resolve, raising `Stream(gpu, N) in current thread`. Pinning
+        # load + inference to the same worker eliminates the hand-off.
         self._use_vlm = False
         vlm_supported = self._vlm_supports(self._model_type)
         if vlm_supported:
             try:
-                self._vlm_model, self._processor = vlm_load(self.cfg.model_path)
+                def _vlm_load_on_worker():
+                    return vlm_load(self.cfg.model_path)
+
+                self._vlm_model, self._processor = self._vlm_executor.submit(
+                    _vlm_load_on_worker
+                ).result()
                 self._language_model = getattr(
                     self._vlm_model, "language_model", self._vlm_model
                 )
                 self.tokenizer = getattr(self._processor, "tokenizer", self._processor)
                 self._use_vlm = True
-                logger.info("Loaded via mlx-vlm")
+                logger.info("Loaded via mlx-vlm (on worker thread)")
             except Exception as e:
                 logger.info(f"mlx-vlm load failed ({e}), falling back to mlx-lm")
 
@@ -385,6 +485,44 @@ class MLXEngine:
                     f"[{self.model_id}] PLD enabled: "
                     f"num_draft={self.cfg.pld_num_draft_tokens}, k={self.cfg.pld_ngram_k}"
                 )
+
+        # Drafter weight is cached on ``self._drafter`` for per-request reuse;
+        # mlx-lm legacy path has no drafter integration so we refuse loudly.
+        #
+        # F3-LOAD: the drafter is loaded **on the dedicated VLM worker
+        # thread**. mlx-vlm 0.5.0 schedules drafter ops via the same
+        # `mx.async_eval(...)` outside-of-with-block calls in
+        # `generate_step` that previously raised the user's:
+        #     RuntimeError: There is no Stream(gpu, N) in current thread.
+        # When `--draft-model` is OFF, mlx-vlm's chunked-prefill block
+        # does `mx.eval([c.state for c in prompt_cache])` *inside* the
+        # `with mx.stream(generation_stream):` context — that incidental
+        # eval keeps any lazy drafter state thread-portable. Drafter ON
+        # disables chunked-prefill (`prefill_step_size = None` at
+        # generate.py:1223), so any drafter weight evaluated on a
+        # different thread from the inference loop's worker fails.
+        # Loading on the worker eliminates the cross-thread hand-off.
+        self._drafter = None
+        self._draft_kind = None
+        if self.cfg.draft_model:
+            if not self._use_vlm:
+                raise RuntimeError(
+                    f"--draft-model is not supported on the mlx-lm legacy "
+                    f"path (model_type={self._model_type!r}). Speculative "
+                    f"decoding (MTP / DFlash) requires the mlx-vlm backend; "
+                    f"this model_type is not in mlx-vlm's registry. Drop "
+                    f"--draft-model or pick an mlx-vlm-supported target."
+                )
+
+            def _load_drafter_on_worker():
+                return _maybe_load_drafter(
+                    self.cfg.draft_model,
+                    kind=self.cfg.draft_kind,
+                )
+
+            self._drafter, self._draft_kind = self._vlm_executor.submit(
+                _load_drafter_on_worker
+            ).result()
 
         # Set wired limit once at startup
         if mx.metal.is_available():
@@ -1680,6 +1818,26 @@ class MLXEngine:
             cache_state.cache = prompt_cache
         cache_state.token_ids = full_prompt_token_ids + list(generated_token_ids)
 
+        # Force-materialize all lazy mx.array objects in the KV cache BEFORE
+        # this worker thread exits. mlx-vlm's _step uses
+        # `with mx.stream(generation_stream): ...` which schedules ops on a
+        # ThreadLocalStream owned by THIS worker thread. Any lazy array left
+        # in cache_state.cache carries an internal reference to that
+        # thread-local stream slot — when the NEXT request's worker thread
+        # picks up the cache and tries to evaluate, MLX raises
+        # `RuntimeError: There is no Stream(gpu, N) in current thread.`
+        # Fully evaluating here makes the cached arrays thread-portable.
+        # Only required on the VLM path; mlx-lm legacy runs on the request
+        # thread and has no thread-local stream to evict from.
+        if self._use_vlm and cache_state.cache is not None:
+            try:
+                self._eval_cache(cache_state.cache)
+            except Exception as _eval_err:  # noqa: BLE001 — best-effort
+                logger.warning(
+                    f"[KV Cache] session={session_id} | "
+                    f"post-gen _eval_cache failed: {_eval_err!r}"
+                )
+
         # Log generated text for debugging
         if accumulated_text:
             preview = accumulated_text[:200].replace('\n', '\\n')
@@ -1813,9 +1971,9 @@ class MLXEngine:
           finishes (mlx-lm doesn't know about cache_state).
 
         This method is the SINGLE `self._use_vlm` branch point for stream
-        construction (P1.6). Other `self._use_vlm` references in this file
-        gate orthogonal concerns (load path, kv_bits warning, structured-
-        output incompat warning) and remain in place.
+        construction. Other `self._use_vlm` references gate orthogonal
+        concerns (load path, kv_bits warning, structured-output incompat
+        warning) and remain in place.
         """
         if self._use_vlm:
             return (
@@ -1857,20 +2015,17 @@ class MLXEngine:
     ):
         """mlx-vlm streaming path. Mutates `cache_state` in place.
 
-        Applies the RotatingKVCache wrap-around safety gate (P1.4) before
+        Applies the RotatingKVCache wrap-around safety gate before
         delegating to `vlm_stream_generate`.
         """
-        # P1.7: PLD is mlx-lm legacy only. The VLM path has no PLD
-        # implementation; observing it here means CLI / config wiring is
-        # wrong and we'd silently fall back to non-PLD generation —
-        # better to fail loud.
+        # PLD is mlx-lm legacy only; fail loud rather than silently fall back.
         if self.cfg.pld_enabled:
             raise RuntimeError(
                 "PLD is mlx-lm legacy only; cannot enable on a "
                 "VLM-supported model_type"
             )
 
-        # P1.4 safety gate: drop wrapped RotatingKVCache before reuse.
+        # Safety gate: drop wrapped RotatingKVCache before reuse.
         if not self._safe_to_reuse_cache(cache_state):
             logger.warning(
                 f"[KV Cache] session={session_id} | "
@@ -1881,10 +2036,10 @@ class MLXEngine:
             cache_state.token_ids = None
 
         input_ids = mx.array([prompt_token_ids])
-        return vlm_stream_generate(
-            self._vlm_model,
-            self._processor,
-            "",  # prompt text ignored when input_ids is provided
+
+        # Only inject drafter kwargs when a drafter is loaded — keeps the
+        # non-drafter call shape byte-equal to baseline.
+        gen_kwargs = dict(
             input_ids=input_ids,
             prompt_cache_state=cache_state,
             max_tokens=max_tokens,
@@ -1895,6 +2050,58 @@ class MLXEngine:
             prefill_step_size=self.cfg.prefill_step_size,
             logits_processors=logits_processors if logits_processors else None,
         )
+        drafter = getattr(self, "_drafter", None)
+        if drafter is not None:
+            gen_kwargs["draft_model"] = drafter
+            gen_kwargs["draft_kind"] = getattr(self, "_draft_kind", None)
+            if self.cfg.draft_block_size:
+                gen_kwargs["draft_block_size"] = self.cfg.draft_block_size
+            # Reset acceptance bookkeeping per request so the post-stream
+            # log line below reports this request's stats only.
+            if hasattr(drafter, "accept_lens"):
+                drafter.accept_lens = []
+
+        # F3: generation_stream is installed ONCE on the dedicated
+        # _vlm_executor worker thread during engine __init__. Per-call
+        # log stays at DEBUG so verbose logs don't drown in stream-id
+        # lines; raise to INFO if a future cross-thread bug recurs.
+        logger.debug(
+            f"[VLM] thread={threading.current_thread().name} "
+            f"gen_stream_id={id(sys.modules['mlx_vlm.generate'].generation_stream)}"
+        )
+
+        stream_iter = vlm_stream_generate(
+            self._vlm_model,
+            self._processor,
+            "",  # prompt text ignored when input_ids is provided
+            **gen_kwargs,
+        )
+
+        # Drafter-stats wrapper: forward stream items unchanged and log
+        # acceptance bookkeeping on exit. Stream-context defense lives
+        # in F3-LOAD (model + drafter loaded on the worker thread), so
+        # no `with mx.stream(...)` is needed here.
+        def _stream_ctx_wrapper():
+            try:
+                for item in stream_iter:
+                    yield item
+            finally:
+                if drafter is not None:
+                    lens = list(getattr(drafter, "accept_lens", []) or [])
+                    if lens:
+                        mean_a = sum(lens) / len(lens)
+                        max_a = max(lens)
+                        logger.debug(
+                            f"[Drafter] session={session_id} rounds={len(lens)} "
+                            f"mean_accepted={mean_a:.2f} max_accepted={max_a}"
+                        )
+                    else:
+                        logger.debug(
+                            f"[Drafter] session={session_id} no rounds recorded "
+                            f"(drafter present but accept_lens empty)"
+                        )
+
+        return _stream_ctx_wrapper()
 
     def _run_lm_legacy(
         self,
@@ -1912,6 +2119,12 @@ class MLXEngine:
 
         Returns `(gen_iter, prompt_cache)`.
         """
+        # Drafter is only wired on the mlx-vlm path; fail loud if reached here.
+        if getattr(self, "_drafter", None) is not None:
+            raise RuntimeError(
+                "--draft-model not supported on mlx-lm legacy path; "
+                "this model_type has no mlx-vlm support yet"
+            )
         prompt_cache = cache_state.cache
         if prompt_cache is None:
             prompt_cache = make_prompt_cache(self._language_model)
@@ -2059,33 +2272,56 @@ class MLXEngine:
         thinking_budget: int | None = None,
         response_format=None,
     ) -> CompletionResult:
-        """Non-streaming completion."""
-        all_text = []
+        """Non-streaming completion.
+
+        VLM path is routed through the dedicated `_vlm_executor` worker so
+        the module-global `mlx_vlm.generate.generation_stream` (a
+        ThreadLocalStream installed once during engine init) stays on the
+        same thread for both streaming and non-streaming requests. On the
+        user's M3 Ultra-class hardware, calling `vlm_stream_generate` from
+        the FastAPI event-loop thread surfaced `RuntimeError: There is no
+        Stream(gpu, N) in current thread.` whenever lazy KV-cache arrays
+        produced by an earlier worker-thread call were touched on the loop
+        thread. Pinning both paths to the same worker eliminates the
+        cross-thread evaluation entirely.
+        """
         result = CompletionResult()
 
-        for chunk in self.generate_stream(
-            messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            min_p=min_p,
-            top_k=top_k,
-            repetition_penalty=repetition_penalty,
-            session_id=session_id,
-            tools=tools,
-            thinking=thinking,
-            thinking_budget=thinking_budget,
-            response_format=response_format,
-        ):
-            if chunk.text:
-                all_text.append(chunk.text)
-            if chunk.finish_reason:
-                result.finish_reason = chunk.finish_reason
-                result.prompt_tokens = chunk.prompt_tokens
-                result.completion_tokens = chunk.completion_tokens
-                result.prompt_tps = chunk.prompt_tps
-                result.generation_tps = chunk.generation_tps
-                result.cache_info = chunk.cache_info
+        def _drive() -> list[str]:
+            # TODO(P3): _drive here and _run in generate_stream_async share
+            # the same generate_stream-driving shape; consolidate into a
+            # single helper once the API surface stabilises (>20 lines refactor).
+            chunks: list[str] = []
+            for chunk in self.generate_stream(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                min_p=min_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                session_id=session_id,
+                tools=tools,
+                thinking=thinking,
+                thinking_budget=thinking_budget,
+                response_format=response_format,
+            ):
+                if chunk.text:
+                    chunks.append(chunk.text)
+                if chunk.finish_reason:
+                    result.finish_reason = chunk.finish_reason
+                    result.prompt_tokens = chunk.prompt_tokens
+                    result.completion_tokens = chunk.completion_tokens
+                    result.prompt_tps = chunk.prompt_tps
+                    result.generation_tps = chunk.generation_tps
+                    result.cache_info = chunk.cache_info
+            return chunks
+
+        if self._use_vlm and getattr(self, "_vlm_executor", None) is not None:
+            fut = self._vlm_executor.submit(_drive)
+            all_text = fut.result()
+        else:
+            all_text = _drive()
 
         full_text = "".join(all_text)
         thinking, content = split_thinking_and_content(full_text, model_family=self.model_family)
@@ -2273,8 +2509,16 @@ class MLXEngine:
             finally:
                 loop.call_soon_threadsafe(q.put_nowait, None)
 
-        thread = threading.Thread(target=_run, daemon=True)
-        thread.start()
+        # F3: pin to the dedicated mlx-vlm worker thread so mlx-vlm's
+        # module-global generation_stream (a ThreadLocalStream) stays
+        # consistent across all turns. The future is discarded — results
+        # flow via the existing asyncio.Queue plumbing. mlx-lm legacy
+        # has no thread-local stream constraint and uses a one-shot
+        # daemon thread to avoid contention with the VLM worker.
+        if self._use_vlm:
+            self._vlm_executor.submit(_run)
+        else:
+            threading.Thread(target=_run, daemon=True).start()
 
         try:
             while True:

@@ -50,6 +50,7 @@ To adopt MTP we must drive `mlx_vlm.stream_generate` / `generate_step`; mlx-lm d
 - **Full removal of mlx-lm legacy branch** — not possible until mlx-vlm registers `models/<type>` modules for Qwen3.5/3.6 dense, MiniMax-M2.5, GLM-4.7, GLM-5.1. Tracked but out of scope.
 - **DFlash drafter activation for Qwen** — wired so a `--draft-model <qwen-dflash>` invocation does the right thing, but **not validated** in this spec (no public Qwen3.5/3.6 DFlash weight verified at time of writing). Validation deferred.
 - **DeepSeek V4 support** — blocked on upstream mlx-lm PR #1189.
+- **Drafter with multi-model (`--models`)** — drafter (`--draft-model` / `--draft-kind` / `--draft-block-size`) is rejected when `--models` is set; use `--model` for single-model + drafter. `ModelConfig` deliberately omits per-model `draft_*` fields.
 
 ## Constraints
 
@@ -159,7 +160,44 @@ Add drafter loading and pass through to `stream_generate`.
     - `grep -rn "RotatingKVCache\|_has_rotating_cache" src/` — make sure task 4's `_safe_to_reuse_cache` is consulted at every reuse site (`_generate_locked`, `_load_session_from_disk`, `_clone_base_cache`).
     Acceptance: a short audit log appended to the QA section of this spec listing each grep + hit count + disposition.
 
-## Tasks (Phase 2) — to be filled by Tech Lead after Phase 1 ships
+## Tasks (Phase 2) — written 2026-05-11 (post Phase-1 commit 327927e)
+
+**Pre-flight (orchestrator confirmed 2026-05-11)**
+- Drafter slug verified: `mlx-community/gemma-4-31B-it-assistant-bf16` (HTTP 200, `model_type=gemma4_assistant` → auto-detected `kind="mtp"`).
+- Local drafter path: `/Users/joongom/.lmstudio/models/mlx-community/gemma-4-31B-it-assistant-bf16` (928 MB, present).
+- Target candidates on user disk: `lmstudio-community/gemma-4-31B-it-MLX-8bit` (used by existing `start_gemma4_31b.sh`) and `mlx-community/gemma-4-31b-8bit`.
+- Caveat (A1 risk): mlx-vlm MTP path has only been validated with bf16+bf16 upstream. The 8bit target × bf16 drafter combination is exploratory. Phase 2 wires both paths; the user-validation step will reveal whether 8bit target works. If it fails, fallback is documented in start-script comments.
+
+### Numbered tasks
+
+1. **CLI options.** In `cli.py`, add three flags before the existing options block:
+   - `--draft-model PATH` (default `None`)
+   - `--draft-kind {mtp,dflash}` (default `None`, auto-detect)
+   - `--draft-block-size INT` (default `None`, use drafter config)
+   Touch: `src/mlx_soloheaven/cli.py`. Acceptance: `mlx-soloheaven --help | grep -E 'draft-(model|kind|block)'` returns three lines.
+
+2. **EngineConfig fields.** Add `draft_model: Optional[str] = None`, `draft_kind: Optional[str] = None`, `draft_block_size: Optional[int] = None` to `EngineConfig` (and matching parsing in `from_args`). Touch: `src/mlx_soloheaven/config.py`. Acceptance: `EngineConfig.from_args(args).draft_model` echoes the CLI value.
+
+3. **`_maybe_load_drafter` real implementation.** Replace the Phase-1 stub. When `cfg.draft_model` is set, call `mlx_vlm.speculative.load_drafter(cfg.draft_model, kind=cfg.draft_kind)` and return `(drafter_model, resolved_kind)`. Log `[Drafter] loaded {path} kind={kind} block_size={N}`. On `cfg.draft_model is None`, return `(None, None)`. Touch: `src/mlx_soloheaven/engine/mlx_engine.py::_maybe_load_drafter`. Acceptance: a stub-target test instantiates a fake drafter dir and verifies the returned `kind == "mtp"` when `model_type=gemma4_assistant`.
+
+4. **Wire drafter through `_run_vlm`.** Pull `self._drafter`, `self._draft_kind`, `cfg.draft_block_size` from engine state and pass them to `vlm_stream_generate(...)` as `draft_model=`, `draft_kind=`, `draft_block_size=`. Only when `self._drafter is not None`. Touch: `src/mlx_soloheaven/engine/mlx_engine.py::_run_vlm` (~line 1884). Acceptance: an instrumented test asserts that with drafter set, `stream_generate` is called with `draft_model` kwarg non-None.
+
+5. **Legacy-path drafter rejection.** In `_run_lm_legacy`, if `self._drafter is not None`, raise `RuntimeError("--draft-model not supported on mlx-lm legacy path; this model_type has no mlx-vlm support yet")`. Touch: `src/mlx_soloheaven/engine/mlx_engine.py::_run_lm_legacy`. Acceptance: unit test exercises the assertion path.
+
+6. **Engine init drafter load.** In `MLXEngine.__init__`, after the language model is loaded and `self._use_vlm` is decided, call `_maybe_load_drafter(self.cfg.draft_model, kind=self.cfg.draft_kind)` and stash on `self._drafter`, `self._draft_kind`. If `_use_vlm is False` and `cfg.draft_model is not None`, log a warning and refuse to start (raise). This catches user error early. Touch: `src/mlx_soloheaven/engine/mlx_engine.py::__init__`. Acceptance: start with drafter on mlx-lm-only model_type → engine refuses with clear message.
+
+7. **Acceptance-rate logging.** Inside `_run_vlm` generator drain, count drafter rounds (`len(drafter.accept_lens)` after stream end) and emit one INFO log line: `[Drafter] {N} rounds, mean accepted={A:.2f}, max accepted={M}`. Touch: same file. Acceptance: log line appears in pytest capture once during the drafter-on test.
+
+8. **Unit test: drafter loading auto-detect.** New file `tests/test_drafter_loading.py`. Two cases: (a) mock `config.json` with `model_type=gemma4_assistant` → `_maybe_load_drafter` returns `(model, "mtp")`; (b) mock with unknown `model_type` → `(model, "dflash")` (DEFAULT_DRAFTER_KIND). Use monkeypatch on `mlx_vlm.speculative.load_drafter` to avoid downloading anything. Acceptance: 2+ tests pass.
+
+9. **Start scripts.** New files `start_gemma4_31b_mtp.sh` and `start_gemma4_26b_a4b_mtp.sh`. Each:
+   - Sets `MODEL_PATH` from the existing `start_gemma4_*` script.
+   - Sets `DRAFT_PATH=$HOME/.lmstudio/models/mlx-community/gemma-4-31B-it-assistant-bf16` (uncomment to enable).
+   - **Drafter line commented out by default** with a header explaining the opt-in and the 8bit-target caveat.
+   - Sets `--prefill-step-size 1024` (consistent with existing dense scripts).
+   - Calls `mlx-soloheaven --model "$MODEL_PATH" --draft-model "$DRAFT_PATH" --memory-budget-gb 20 --gpu-keepalive --prefill-step-size 1024 --verbose "$@"`.
+
+10. **Audit grep + final regression.** After all touches: `pytest`, then `grep -rn "draft_model\|draft_kind\|draft_block_size\|_drafter" src/ tests/` and confirm every hit is intentional. Append result + count to spec QA section under "Phase 2 audit".
 
 ## Tasks (Phase 3) — to be filled by Tech Lead after Phase 2 ships
 
@@ -190,7 +228,41 @@ Future consolidation of the three `_suffix_tokens_*` helpers into one dispatched
 - Post-Phase-1: **64 passed, 1 skipped** (the skip is the placeholder integration scenario in `test_rotating_cache_prefix.py`).
 - Five new test files: `test_cache_state_token_ids.py`, `test_rotating_cache_prefix.py`, `test_session_cache_roundtrip.py`, `test_chat_template_parity.py`, `test_pld_path_guard.py`.
 
+### Phase 2 — audit log (P2.10, 2026-05-13)
+
+Audit grep command run from repo root:
+
+```
+grep -rn "draft_model\|draft_kind\|draft_block_size\|_drafter" src/ tests/
+```
+
+| File | Hits | Disposition |
+|------|------|-------------|
+| `src/mlx_soloheaven/config.py` | 7 | Intentional: `EngineConfig` fields (`draft_model`, `draft_kind`, `draft_block_size`) + matching `from_args` parsing per P2.2. |
+| `src/mlx_soloheaven/engine/mlx_engine.py` | 23 | Intentional: `_maybe_load_drafter` definition + `__init__` drafter load (`self._drafter`, `self._draft_kind`) per P2.3/P2.6, `_run_vlm` kwarg pass-through per P2.4, legacy-path rejection guard per P2.5, acceptance-rate logging wrapper per P2.7. |
+| `tests/test_drafter_loading.py` | 55 | Intentional: dedicated unit tests covering `_maybe_load_drafter` auto-detect (mtp / dflash / explicit kind), `_run_lm_legacy` drafter rejection, `_run_vlm` kwarg pass-through with/without drafter per P2.8. |
+
+No stray references in unrelated files. `cli.py` registers `--draft-model` / `--draft-kind` / `--draft-block-size` via argparse hyphen form (auto-mapped to underscore by argparse), so it does not appear in the grep output by design.
+
+**Test count: 68 passed, 5 skipped** (unchanged from Phase 1 close).
+
+**8bit-target caveat**: User-validation may reveal 8bit×bf16 incompatibility; fallback path is documented in start script header (comment the `DRAFT_ARGS` line in `start_gemma4_31b_mtp.sh` or set `DRAFT_PATH=""`).
+
+**26B-A4B slug audit**: 26B-A4B drafter slug `mlx-community/gemma-4-26B-A4B-it-assistant-bf16` HTTP check deferred — neither target nor drafter present on user disk at audit time; user-validation will surface the actual slug if/when downloaded.
+
 ### Phase 2 — QA pending
+
+### Phase 2 — bug-fix v2 (worker-thread generation_stream monkey-patch, 2026-05-13)
+
+User-validation surfaced `RuntimeError: There is no Stream(gpu, 1) in
+current thread` on first VLM-path request. First fix (outer
+`with mx.stream(worker_stream)`) was ineffective: mlx-vlm's internal
+`with mx.stream(generation_stream)` binds the lazy array to slot 1 at
+compute time; the subsequent `mx.async_eval(y)` then queries slot 1 in
+the worker thread which has no such registration. Real fix: at
+`_run_vlm` entry, monkey-patch `mlx_vlm.generate.generation_stream` to
+a fresh `mx.new_thread_local_stream(...)` so the inner with activates
+the worker's own slot. engine._lock serializes generation; no race.
 
 ### Phase 3 — QA pending
 

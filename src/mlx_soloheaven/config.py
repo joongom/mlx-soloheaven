@@ -86,6 +86,11 @@ class Config:
     pld_num_draft_tokens: int = 10         # Max draft tokens per step
     pld_ngram_k: int = 3                   # N-gram size for matching
 
+    # Speculative decoding via mlx-vlm drafter (MTP / DFlash); mlx-vlm path only.
+    draft_model: str | None = None
+    draft_kind: str | None = None
+    draft_block_size: int | None = None
+
     # Cache budgets (no time-based TTL — evict LRU when over budget)
     memory_budget_gb: float = 200.0
     disk_budget_gb: float = 100.0
@@ -187,4 +192,7 @@ class Config:
             pld_enabled=args.pld_enabled,
             pld_num_draft_tokens=args.pld_num_draft,
             pld_ngram_k=args.pld_ngram_k,
+            draft_model=getattr(args, "draft_model", None),
+            draft_kind=getattr(args, "draft_kind", None),
+            draft_block_size=getattr(args, "draft_block_size", None),
         )

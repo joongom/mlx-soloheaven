@@ -96,6 +96,13 @@ def create_app(cfg: Config) -> FastAPI:
                 pld_enabled=cfg.pld_enabled,
                 pld_num_draft_tokens=cfg.pld_num_draft_tokens,
                 pld_ngram_k=cfg.pld_ngram_k,
+                # Speculative-decoding drafter (MTP / DFlash) — must be
+                # propagated to the per-model Config or `MLXEngine.load_model`
+                # silently skips drafter wiring. Without this, `--draft-model`
+                # at the CLI never reaches the engine and MTP is a no-op.
+                draft_model=cfg.draft_model,
+                draft_kind=cfg.draft_kind,
+                draft_block_size=cfg.draft_block_size,
             )
             engine = MLXEngine(model_cfg)
             engines[mcfg.model_id] = engine

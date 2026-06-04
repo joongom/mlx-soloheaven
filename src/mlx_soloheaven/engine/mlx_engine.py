@@ -620,20 +620,35 @@ def _install_mtp_wrap_patches() -> bool:
                 )
                 draft_model.accept_lens.append(accepted)
 
-                for tok in new_tokens:
-                    yield tok, None
-                    emitted += 1
-                    if emitted >= max_tokens:
-                        return
+                try:
+                    for tok in new_tokens:
+                        yield tok, None
+                        emitted += 1
+                        if emitted >= max_tokens:
+                            return
+                finally:
+                    # Roll back rejected speculative drafts even when the
+                    # generator is CLOSED mid-block — stream_generate breaks
+                    # on EOS while _mtp_rounds is suspended at the last
+                    # `yield`, so the post-loop rollback never runs and this
+                    # block's rejected draft K/V is stranded in the cache
+                    # (cache.offset runs +rejected ahead of the recorded
+                    # tokens → offset > len(token_ids) → next turn's
+                    # wrapped-cache reuse COLD-FILLs, multi-second TTFT). The
+                    # finally guarantees the trim runs on normal completion,
+                    # `return` at max_tokens, AND GeneratorExit. (mlx-lm and
+                    # PLD already rewind in a finally; the MTP clone didn't.)
+                    if accepted < bs - 1:
+                        try:
+                            with mx.stream(_generation_stream):
+                                lm.rollback_speculative_cache(
+                                    prompt_cache, None, accepted, bs
+                                )
+                        except Exception:  # noqa: BLE001
+                            logger.exception("[MTP] finally rollback failed")
 
                 hidden = hidden_full[:, accepted : accepted + 1, :]
                 b = new_tokens[-1] if new_tokens else b
-
-                if accepted < bs - 1:
-                    with mx.stream(_generation_stream):
-                        lm.rollback_speculative_cache(
-                            prompt_cache, None, accepted, bs
-                        )
 
                 rejected = bs - (accepted + 1)
                 next_shared_kv = {}
@@ -2509,10 +2524,30 @@ class MLXEngine:
         _cache_off = (
             self._get_cache_offset(cache_state.cache) if cache_state.cache else None
         )
-        if _cache_off is not None and 0 < _cache_off < len(_actual_token_ids):
-            cache_state.token_ids = _actual_token_ids[:_cache_off]
-        else:
-            cache_state.token_ids = _actual_token_ids
+        cache_state.token_ids = _actual_token_ids
+        if _cache_off is not None and _cache_off > 0:
+            if _cache_off < len(_actual_token_ids):
+                # Cache BEHIND recorded (a yielded token not yet forwarded —
+                # bonus lag / final token). Drop the un-forwarded tail so
+                # token_ids matches the cache content exactly.
+                cache_state.token_ids = _actual_token_ids[:_cache_off]
+            elif _cache_off > len(_actual_token_ids) and cache_state.cache:
+                # Cache AHEAD of recorded (speculative tail forwarded past
+                # the last RECORDED token — e.g. the terminating block
+                # forwards b but its only output is the stop token, which
+                # stream_generate drops before the engine records it). Trim
+                # the cache back so cache.offset == len(token_ids); the few
+                # trimmed positions are reprocessed in next turn's suffix.
+                # Without this, offset>prefix_len → wrapped reuse COLD-FILLs.
+                _over = _cache_off - len(_actual_token_ids)
+                for _c in cache_state.cache:
+                    if hasattr(_c, "trim"):
+                        try:
+                            _c.trim(_over)
+                        except Exception:  # noqa: BLE001
+                            logger.exception(
+                                "[KV Cache] offset>len cache trim failed"
+                            )
 
         # WHY: F3 pins every mlx-vlm call to one persistent _vlm_executor
         # worker thread (model + drafter + generation_stream all bound to

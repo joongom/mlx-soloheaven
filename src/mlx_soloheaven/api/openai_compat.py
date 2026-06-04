@@ -254,7 +254,9 @@ async def _stream_completion(
         yield f"data: {think_chunk}\n\n"
 
     # Generate and stream
-    accumulated_text = ""
+    # PERF: append-to-list + join at consumption points avoids the O(N^2)
+    # cost of repeated ``str += text`` across the streaming loop.
+    acc_parts: list[str] = []
     final_prompt_tokens = 0
     final_completion_tokens = 0
     final_cache_info = None
@@ -311,7 +313,7 @@ async def _stream_completion(
                 yield ": keepalive\n\n"
                 continue
 
-            accumulated_text += text
+            acc_parts.append(text)
             token_count += 1
 
             if tc_active:
@@ -421,7 +423,7 @@ async def _stream_completion(
                 yield f"data: {chunk}\n\n"
                 holdback = ""
     except (asyncio.CancelledError, GeneratorExit) as exc:
-        tail = accumulated_text[-200:].replace('\n', '\\n')
+        tail = ("".join(acc_parts))[-200:].replace('\n', '\\n')
         logger.info(
             f"[Stream] user={request.user!r} | client disconnected "
             f"({type(exc).__name__}) after {token_count} tokens | "
@@ -473,7 +475,7 @@ async def _stream_completion(
     # multi-turn tool use with stateful clients like OpenClaw).
     if request.user:
         thinking, content = split_thinking_and_content(
-            accumulated_text, model_family=model_family
+            "".join(acc_parts), model_family=model_family
         )
         assistant_msg: dict = {"role": "assistant", "content": content or ""}
         if parsed_tool_calls:

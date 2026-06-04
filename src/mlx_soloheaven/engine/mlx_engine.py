@@ -26,6 +26,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -54,6 +55,12 @@ from mlx_soloheaven.engine.tool_parser import (
 from mlx_soloheaven.cache.manager import CacheManager
 
 logger = logging.getLogger(__name__)
+
+# Heuristic threshold for the per-request drafter low-acceptance WARNING.
+# At block_size=3 the max possible mean_accepted is 2.0 (every block fully
+# accepted). A mean below 0.5 means more than 75% of drafted tokens are
+# being rejected — at that rate the drafter is typically net negative.
+_DRAFTER_LOW_ACCEPT_THRESHOLD = 0.5
 
 
 def _pld_response_adapter(pld_iter, tokenizer):
@@ -205,6 +212,11 @@ class SessionState:
     # Cache build time from last truncate/rebuild (seconds, consumed once)
     pending_build_time: float = 0.0
 
+    # Cumulative drafter acceptance stats across all requests in this session.
+    # None until the first drafter-enabled request completes. Shape:
+    # {"requests": N, "total_rounds": R, "total_accepted": A}
+    drafter_stats: dict | None = None
+
     def touch(self):
         self.last_used = time.time()
 
@@ -219,6 +231,344 @@ def _detect_token_id(tokenizer, text: str) -> int:
     if len(ids) == 1:
         return ids[0]
     return -1
+
+
+# --- mlx-vlm 0.5.0 Gemma 4 MTP wrap-around patches ---
+#
+# Two coordinated bugs surface once a ``RotatingKVCache`` ring buffer
+# wraps (offset > max_size) while the Gemma 4 MTP drafter is running:
+#
+#   B1. ``Gemma4TextModel.__call__`` writes the sliding-attention layer's
+#       rotated (non-temporal) keys/values directly into ``shared_kv_sink``.
+#       The drafter's SWA mask (mlx_vlm/speculative/drafters/gemma4_assistant/
+#       masks.py) assumes ``k_idx = arange(kv_len)`` is temporal — after wrap
+#       that assumption is violated and the drafter attends to the wrong
+#       keys. Symptom: drafter mean_accepted collapses (~1.17 → ~0.26).
+#
+#   B2. ``mlx_vlm.generate._mtp_rounds`` reads ``kv_offset = int(prompt_cache[0]
+#       .offset)`` which is the *logical-cumulative* token count. After wrap
+#       this exceeds ``max_size`` and the drafter computes a wrong query
+#       offset for its SWA mask. The offset is read at TWO sites (entry,
+#       and inside the verify/rollback loop). The earlier save/restore
+#       patch only covered the entry read — the second read inside the
+#       loop ran with the un-clamped offset and silently masked-out the
+#       entire in-window key range (q_idx - k_idx >= window), leaving the
+#       drafter blind → garbage tokens → no EOS → infinite max_tokens loop.
+#       Current fix: replace ``_mtp_rounds`` with a corrected clone that
+#       applies ``min(offset, max_size)`` at BOTH read sites for
+#       RotatingKVCache (clone-replace, not save/restore).
+#
+# NOTE: B3 was previously installed to skip ``c.trim`` on a wrapped
+# RotatingKVCache (``is_trimmable() == False``), but RCA-2 (2026-05-13)
+# determined that ``c.trim(n)`` is unconditionally safe (``offset -= n;
+# _idx -= n``); skipping it leaves rejected speculative K/V slots in the
+# ring buffer and contaminates target attention, causing post-wrap MTP
+# output to degrade into an infinite repetition loop. Upstream
+# ``rollback_speculative_cache`` is now used unchanged.
+#
+# Idempotency: ``_MTP_PATCHES_INSTALLED`` guards re-application. Each
+# patch records the original on the module so re-running the helper
+# (e.g. across worker restarts in tests) does not double-wrap.
+_MTP_PATCHES_INSTALLED = False
+
+# PERF: when ``_run_vlm`` knows wrap is NOT imminent for the current
+# request (via ``_will_wrap_during_generate``), it flips this flag so
+# the B1/B2-v2 monkey-patches become near-noop pass-throughs and avoid
+# their per-call guard work on the hot speculative-decoding verify path.
+# Flag is single-worker safe — VLM executor pins all calls to one thread.
+_HOT_PATH_FAST = False
+
+
+def _clamped_kv_offset(prompt_cache):
+    """Return ``prompt_cache[0].offset`` clamped to ``max_size`` for a
+    wrapped ``RotatingKVCache``.
+
+    This is the B2 fix: after the ring buffer wraps, the raw
+    ``offset`` is the logical cumulative token count and exceeds the
+    physical ``max_size``. The Gemma 4 drafter's SWA mask derives the
+    query-row index from this value and masks out keys whose
+    ``q_idx - k_idx >= window`` — with an un-clamped ``q_idx`` (e.g.
+    1100 when ``max_size`` is 1024) every in-window key is rejected.
+    Clamping to ``max_size`` keeps ``q_idx`` inside the window so the
+    distance check admits the correct K range.
+
+    Non-RotatingKVCache entries (KVCache, etc.) return their raw
+    offset unchanged — only the ring-buffer cache exhibits this
+    ``offset > max_size`` divergence.
+    """
+    c = prompt_cache[0]
+    off = int(getattr(c, "offset", 0) or 0)
+    if type(c).__name__ == "RotatingKVCache":
+        max_size = int(getattr(c, "max_size", 0) or 0)
+        if max_size > 0 and off > max_size:
+            return max_size
+    return off
+
+
+def _install_mtp_wrap_patches() -> bool:
+    """Patch the three mlx-vlm 0.5.0 Gemma 4 MTP wrap-around bugs.
+
+    Returns True if patches were applied this call, False if already
+    installed.  Safe to call multiple times.
+    """
+    global _MTP_PATCHES_INSTALLED
+    if _MTP_PATCHES_INSTALLED:
+        return False
+
+    try:
+        import mlx_vlm.models.gemma4.language as _g4lang
+        import mlx_vlm.generate as _mvgen_attr  # noqa: F401 — populate sys.modules
+        _mvgen = sys.modules["mlx_vlm.generate"]
+    except ImportError:
+        # mlx-vlm not installed / Gemma 4 module unavailable — nothing to
+        # patch. Mark installed so we don't retry on every worker init.
+        _MTP_PATCHES_INSTALLED = True
+        return False
+
+    # ----- B1: temporal-order shared_kv writes -----
+    # Wrap ``Gemma4TextModel.__call__`` so any (keys, values) that land in
+    # ``shared_kv_sink`` are converted to temporal order when the
+    # corresponding cache layer is a RotatingKVCache that has wrapped.
+    _orig_textmodel_call = _g4lang.Gemma4TextModel.__call__
+
+    # PERF: per-cache-list memoization of (rotating_layer_indices,
+    # layer_types). Hot non-MTP forwards early-return BEFORE this map
+    # is ever touched. MTP forwards (shared_kv_sink != None) iterate
+    # only the rotating layer indices instead of all 60.
+    # Keyed by id(cache); bounded to 32 entries.
+    _rot_idx_cache: dict[int, tuple[tuple[int, ...], tuple[str | None, ...]]] = {}
+
+    def _patched_textmodel_call(self, *args, **kwargs):  # noqa: D401
+        # PERF: fast-path bypass — when ``_run_vlm`` has determined wrap
+        # is not imminent for the in-flight request, the entire
+        # temporal-order rewrite is irrelevant. Skip all guard work and
+        # just delegate to the original method.
+        if _HOT_PATH_FAST:
+            return _orig_textmodel_call(self, *args, **kwargs)
+        shared_kv_sink = kwargs.get("shared_kv_sink")
+        cache = kwargs.get("cache")
+        out = _orig_textmodel_call(self, *args, **kwargs)
+        # PERF: non-MTP path (shared_kv_sink is None) early-returns
+        # BEFORE any per-layer work. This is the common (baseline) case.
+        if shared_kv_sink is None or not cache:
+            return out
+        try:
+            cache_key = id(cache)
+            entry = _rot_idx_cache.get(cache_key)
+            if entry is None:
+                layers = getattr(self, "layers", [])
+                indices: list[int] = []
+                ltypes: list[str | None] = []
+                for idx, c in enumerate(cache):
+                    if (
+                        c is not None
+                        and idx < len(layers)
+                        and type(c).__name__ == "RotatingKVCache"
+                        and hasattr(c, "_temporal_order")
+                    ):
+                        indices.append(idx)
+                        ltypes.append(getattr(layers[idx], "layer_type", None))
+                entry = (tuple(indices), tuple(ltypes))
+                if len(_rot_idx_cache) >= 32:
+                    _rot_idx_cache.pop(next(iter(_rot_idx_cache)))
+                _rot_idx_cache[cache_key] = entry
+            indices, ltypes = entry
+            for pos, idx in enumerate(indices):
+                c = cache[idx]
+                if c is None:
+                    continue
+                max_size = getattr(c, "max_size", 0)
+                offset = getattr(c, "offset", 0)
+                if offset <= max_size:
+                    continue
+                lt = ltypes[pos]
+                if lt is None or lt not in shared_kv_sink:
+                    continue
+                kv = shared_kv_sink[lt]
+                if not (isinstance(kv, tuple) and len(kv) == 2):
+                    continue
+                K, V = kv
+                shared_kv_sink[lt] = (c._temporal_order(K), c._temporal_order(V))
+        except Exception:  # noqa: BLE001 — patch must never break inference
+            logger.exception("[MTP-Patch B1] temporal-order rewrite failed")
+        return out
+
+    _patched_textmodel_call._mtp_wrap_patch = True  # marker for tests
+    _g4lang.Gemma4TextModel.__call__ = _patched_textmodel_call
+
+    # ----- B2: clamp kv_offset on wrapped RotatingKVCache -----
+    # Clone-replace: re-implement _mtp_rounds with the offset clamp
+    # applied at BOTH read sites. The old save/restore patch only
+    # covered the entry read; the second read inside the while-loop
+    # (after verify+rollback, before the next set_shared_kv) still
+    # received the un-clamped offset and silently broke the drafter's
+    # SWA mask → infinite-loop until max_tokens.
+    _orig_mtp_rounds = getattr(_mvgen, "_mtp_rounds", None)
+    _speculative_walk = getattr(_mvgen, "_speculative_walk", None)
+    _generation_stream = getattr(_mvgen, "generation_stream", None)
+    if (
+        _orig_mtp_rounds is not None
+        and _speculative_walk is not None
+        and _generation_stream is not None
+    ):
+        def _patched_mtp_rounds_v2(
+            model,
+            draft_model,
+            prompt_cache,
+            hidden,
+            shared_kv_states,
+            *,
+            first_bonus,
+            max_tokens,
+            sampler,
+            draft_block_size=None,
+            token_dtype=mx.int32,
+        ):
+            # PERF: fast-path bypass when wrap is not imminent — delegate
+            # straight to the upstream _mtp_rounds. The clamp is only
+            # needed when a wrap has occurred (offset > max_size).
+            if _HOT_PATH_FAST:
+                return _orig_mtp_rounds(
+                    model,
+                    draft_model,
+                    prompt_cache,
+                    hidden,
+                    shared_kv_states,
+                    first_bonus=first_bonus,
+                    max_tokens=max_tokens,
+                    sampler=sampler,
+                    draft_block_size=draft_block_size,
+                    token_dtype=token_dtype,
+                )
+
+            # --- Clone of mlx_vlm.generate._mtp_rounds with B2 clamp. ---
+            lm = (
+                model.language_model
+                if hasattr(model, "language_model")
+                else model
+            )
+            if not hasattr(lm, "rollback_speculative_cache"):
+                raise RuntimeError(
+                    f"{type(lm).__name__} does not implement "
+                    "rollback_speculative_cache. MTP speculative decoding "
+                    "currently only supports gemma4."
+                )
+
+            block_total = (
+                draft_block_size
+                if draft_block_size is not None
+                else int(draft_model.config.block_size)
+            )
+            draft_model.reset(model)
+
+            if hidden.shape[1] > 1:
+                hidden = hidden[:, -1:, :]
+
+            # B2 fix (read #1): entry-time clamped offset.
+            kv_offset = _clamped_kv_offset(prompt_cache)
+            draft_model.set_shared_kv(shared_kv_states, kv_offset)
+
+            b = first_bonus
+            emitted = 1  # caller already yielded the first bonus
+
+            while emitted < max_tokens:
+                bs = min(block_total, max_tokens - emitted + 1)
+                if bs <= 1:
+                    break
+
+                draft_tokens = draft_model.draft_block(
+                    b, hidden, None, bs, sampler, token_dtype
+                )
+                mx.async_eval(draft_tokens)
+
+                with mx.stream(_generation_stream):
+                    verify_input = mx.concatenate(
+                        [mx.array([[b]], dtype=token_dtype), draft_tokens],
+                        axis=1,
+                    )
+                    verify_out = lm(
+                        verify_input,
+                        cache=prompt_cache,
+                        return_hidden=True,
+                        return_shared_kv=True,
+                    )
+                    hidden_full = verify_out.hidden_states[-1]
+                    target_tokens = sampler(verify_out.logits)
+                mx.async_eval(target_tokens, hidden_full)
+
+                accepted, new_tokens = _speculative_walk(
+                    draft_tokens, target_tokens, max_tokens - emitted
+                )
+                draft_model.accept_lens.append(accepted)
+
+                for tok in new_tokens:
+                    yield tok, None
+                    emitted += 1
+                    if emitted >= max_tokens:
+                        return
+
+                hidden = hidden_full[:, accepted : accepted + 1, :]
+                b = new_tokens[-1] if new_tokens else b
+
+                if accepted < bs - 1:
+                    with mx.stream(_generation_stream):
+                        lm.rollback_speculative_cache(
+                            prompt_cache, None, accepted, bs
+                        )
+
+                rejected = bs - (accepted + 1)
+                next_shared_kv = {}
+                for k, kv in verify_out.shared_kv_states.items():
+                    K, V = kv
+                    valid = K.shape[-2] - rejected
+                    if valid <= 0 or valid >= K.shape[-2]:
+                        next_shared_kv[k] = (
+                            (K, V)
+                            if valid >= K.shape[-2]
+                            else (K[..., :1, :], V[..., :1, :])
+                        )
+                    else:
+                        next_shared_kv[k] = (
+                            K[..., :valid, :],
+                            V[..., :valid, :],
+                        )
+                # B2 fix (read #2): inner-loop clamped offset. Without
+                # this, after wrap the drafter's SWA mask receives
+                # q_idx > max_size and rejects every in-window key.
+                kv_offset = _clamped_kv_offset(prompt_cache)
+                draft_model.set_shared_kv(next_shared_kv, kv_offset)
+
+                if emitted % 256 == 0:
+                    mx.clear_cache()
+
+        _patched_mtp_rounds_v2._mtp_wrap_patch = True
+        _mvgen._mtp_rounds = _patched_mtp_rounds_v2
+        logger.debug("[MTP-Patch B2-v2] applied clone-replace path")
+    elif _orig_mtp_rounds is not None:
+        # Required symbol missing in this mlx-vlm version — skip rather
+        # than crash. The original (unclamped-second-read) function
+        # stays in place; tests covering B2 will reflect this regime.
+        logger.warning(
+            "[MTP-Patch B2] required symbols missing "
+            "(_speculative_walk/generation_stream); B2 clone-replace skipped"
+        )
+
+    # ----- B3 REMOVED (RCA-2, 2026-05-13) -----
+    # Previously we monkey-patched ``LanguageModel.rollback_speculative_cache``
+    # to skip ``c.trim`` when ``c.is_trimmable()`` was False (i.e. after
+    # a RotatingKVCache wrap). Upstream's ``RotatingKVCache.trim(n)`` is
+    # unconditionally safe — it just does ``offset -= n; _idx -= n`` —
+    # so skipping it leaves rejected speculative K/V slots resident in
+    # the ring buffer, contaminating target attention and degrading
+    # post-wrap output into an infinite repetition loop. Upstream
+    # ``rollback_speculative_cache`` is now used unchanged.
+
+    _MTP_PATCHES_INSTALLED = True
+    logger.info(
+        "[MTP-Patch] installed wrap-around patches for "
+        "mlx_vlm.models.gemma4 (B1+B2-v2)"
+    )
+    return True
 
 
 def _maybe_load_drafter(
@@ -260,6 +610,25 @@ class BaseCacheEntry:
     hit_count: int = 0
 
 
+# Precompiled regexes used by message-normalization / cache-match hot path.
+# Patterns + flags are byte-identical to the original inline re.* calls.
+_NORMALIZE_RE_IMAGE_REMOVED = re.compile(r"\s*\[image data removed", re.IGNORECASE)
+_NORMALIZE_RE_TODAYS_DATE = re.compile(
+    r"Today's date:\s*\w{3}\s+\w{3}\s+\d{1,2}\s+\d{4}"
+)
+_NORMALIZE_RE_SYSTEM_REMINDER = re.compile(
+    r"\n?<system-reminder>.*?</system-reminder>", re.DOTALL
+)
+_NORMALIZE_RE_THINK_PREFIX = re.compile(r"^<think>\n?")
+_NORMALIZE_RE_CHANNEL_THOUGHT_PREFIX = re.compile(r"^<\|channel>thought\n?")
+_NORMALIZE_RE_THOUGHT_PREFIX = re.compile(r"^thought\n")
+_NORMALIZE_RE_TOOL_CALL_CHANNEL = re.compile(
+    r"<\|?tool_call>.*?<\|?tool_call\|?>", re.DOTALL
+)
+_NORMALIZE_RE_TOOL_CALL_XML = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
+_NORMALIZE_RE_TOOL_CALL_SPLIT = re.compile(r"\n*<tool_call>")
+
+
 class MLXEngine:
     """MLX model engine with session-based KV cache reuse."""
 
@@ -298,6 +667,13 @@ class MLXEngine:
         self._dirty_sessions: set[str] = set()
         self._dirty_lock = threading.Lock()
 
+        # PERF: deferred drafter-stats finalize. Set by ``_run_vlm`` when a
+        # drafter is active so the per-token generator wrapper can be
+        # removed from the hot path. ``_run``'s post-loop block invokes
+        # this exactly once and resets it. VLM executor is single-worker,
+        # so a per-engine stash is safe.
+        self._pending_drafter_finalize = None
+
         # F3 architecture: pin ALL mlx-vlm calls to a single persistent worker
         # thread. mlx-vlm 0.5.0's module-global `generation_stream` is a
         # ThreadLocalStream created on the importing thread; if generation
@@ -334,6 +710,11 @@ class MLXEngine:
                 with mx.stream(_new):
                     _probe = mx.array([1.0]) * 1.0
                     mx.eval(_probe)
+
+                # Install the Gemma 4 MTP wrap-around patches once mlx-vlm
+                # is loaded. Idempotency-guarded so multiple engines / re-
+                # inits don't double-wrap.
+                _install_mtp_wrap_patches()
 
                 logger.debug(
                     f"[F3-INIT] thread={threading.current_thread().name} "
@@ -1038,6 +1419,33 @@ class MLXEngine:
             for e in self._base_caches.values()
         ]
 
+    def _will_wrap_during_generate(self, prompt_token_ids, cache_state) -> bool:
+        """True iff serving this request would cross the RotatingKVCache
+        sliding-window boundary (ring-buffer wrap).
+
+        Used as a Layer-A safety net in ``_run_vlm`` to bypass the
+        speculative drafter on requests where the mlx-vlm Gemma 4 MTP
+        wrap-around bugs (B1/B2-v2) would otherwise tank acceptance.
+
+        ``cache_state.cache[0].offset`` is the logical-cumulative token
+        count; ``len(prompt_token_ids)`` is the bytes-to-process
+        post-prefix-trim. Their sum compared against
+        ``self._sliding_window_size`` predicts whether the next
+        ``update_and_fetch`` calls will exceed the ring capacity.
+        """
+        if not getattr(self, "_has_rotating_cache", False):
+            return False
+        win = getattr(self, "_sliding_window_size", 0) or 0
+        if win <= 0:
+            return False
+        cur_offset = 0
+        if cache_state is not None:
+            cache = getattr(cache_state, "cache", None)
+            if cache:
+                first = cache[0]
+                cur_offset = int(getattr(first, "offset", 0) or 0)
+        return (cur_offset + len(prompt_token_ids or [])) >= win
+
     @staticmethod
     def _safe_to_reuse_cache(cache_state) -> bool:
         """Return False if any cache entry is a RotatingKVCache whose
@@ -1130,7 +1538,6 @@ class MLXEngine:
         image blob and a subsequent turn where the client replaced the
         blob with a placeholder normalize to the same text.
         """
-        import re
         if isinstance(content, str):
             return content
         if content is None:
@@ -1148,7 +1555,7 @@ class MLXEngine:
             if ptype and ptype != "text":
                 continue  # image, image_url, video, etc.
             txt = p.get("text", "") or ""
-            if re.match(r"\s*\[image data removed", txt, flags=re.IGNORECASE):
+            if _NORMALIZE_RE_IMAGE_REMOVED.match(txt):
                 continue
             parts.append(txt)
         return "\n".join(parts)
@@ -1156,21 +1563,17 @@ class MLXEngine:
     @staticmethod
     def _normalize_for_match(content, role: str) -> str:
         """Normalize message content for comparison."""
-        import re
         content = MLXEngine._flatten_multipart(content)
         if role == "system":
             # Normalize dynamic date (e.g. "Today's date: Tue Mar 10 2026" → placeholder)
-            content = re.sub(
-                r"Today's date:\s*\w{3}\s+\w{3}\s+\d{1,2}\s+\d{4}",
+            content = _NORMALIZE_RE_TODAYS_DATE.sub(
                 "Today's date: __DATE__",
                 content,
             )
         # Strip <system-reminder>...</system-reminder> tags injected dynamically by clients
-        content = re.sub(
-            r"\n?<system-reminder>.*?</system-reminder>",
+        content = _NORMALIZE_RE_SYSTEM_REMINDER.sub(
             "",
             content,
-            flags=re.DOTALL,
         )
         # Strip thinking and tool calls from assistant messages for comparison.
         # Only the actual text content matters for cache matching.
@@ -1181,12 +1584,12 @@ class MLXEngine:
             elif "</think>" in content:
                 content = content[content.rindex("</think>") + len("</think>"):]
             else:
-                content = re.sub(r"^<think>\n?", "", content)
-                content = re.sub(r"^<\|channel>thought\n?", "", content)
-                content = re.sub(r"^thought\n", "", content)
+                content = _NORMALIZE_RE_THINK_PREFIX.sub("", content)
+                content = _NORMALIZE_RE_CHANNEL_THOUGHT_PREFIX.sub("", content)
+                content = _NORMALIZE_RE_THOUGHT_PREFIX.sub("", content)
             # Strip tool call blocks (both ChatML and Gemma 4 formats)
-            content = re.sub(r"<\|?tool_call>.*?<\|?tool_call\|?>", "", content, flags=re.DOTALL)
-            content = re.sub(r"<tool_call>.*?</tool_call>", "", content, flags=re.DOTALL)
+            content = _NORMALIZE_RE_TOOL_CALL_CHANNEL.sub("", content)
+            content = _NORMALIZE_RE_TOOL_CALL_XML.sub("", content)
         return content.strip()
 
     def _messages_match(self, stored: list[dict], incoming: list[dict]) -> bool:
@@ -1212,10 +1615,8 @@ class MLXEngine:
             # 1. stored="<tool_call>..." vs incoming="" (pure tool call)
             # 2. stored="text\n\n<tool_call>..." vs incoming="text" (text + tool call)
             if role == "assistant" and s_content != i_content:
-                import re
-                tc_pattern = r"\n*<tool_call>"
-                s_stripped = re.split(tc_pattern, s_content, maxsplit=1)[0].rstrip()
-                i_stripped = re.split(tc_pattern, i_content, maxsplit=1)[0].rstrip()
+                s_stripped = _NORMALIZE_RE_TOOL_CALL_SPLIT.split(s_content, maxsplit=1)[0].rstrip()
+                i_stripped = _NORMALIZE_RE_TOOL_CALL_SPLIT.split(i_content, maxsplit=1)[0].rstrip()
                 if s_stripped == i_stripped:
                     logger.debug(
                         f"[Match] msg[{i}] assistant tool_call content mismatch ignored "
@@ -1694,6 +2095,10 @@ class MLXEngine:
         )
 
         # Stream generate — mlx-vlm for VLM models, mlx-lm for text models
+        # PERF: accumulate token texts in a list and ``"".join`` once after
+        # the loop. The previous ``accumulated_text += text`` triggers a
+        # fresh string allocation/copy each token — O(N^2) over the run.
+        text_parts: list[str] = []
         accumulated_text = ""
         t_gen_start = time.perf_counter()
         t_first_token = None
@@ -1736,12 +2141,24 @@ class MLXEngine:
 
         # Configurable progress log interval (tokens between INFO snapshots)
         progress_interval = 50  # tokens — every ~2s at 25 TPS
+        # PERF: hoist hot-path lookups out of the per-token loop.
+        # ``logger.isEnabledFor`` is cheap but called per token, and
+        # the f-string in ``logger.debug(...)`` is evaluated even when
+        # DEBUG is disabled — gate it explicitly.
+        _debug_enabled = logger.isEnabledFor(logging.DEBUG)
+        _logger = logger
+        # PERF: deferred drafter-stats finalize, invoked exactly once after
+        # the stream loop exits (normal end OR cancellation break). Replaces
+        # the per-token ``_stream_ctx_wrapper`` generator frame that used to
+        # cost ~30 tps at high TPS on the VLM speculative-decoding hot path.
+        _drafter_finalize = getattr(self, "_pending_drafter_finalize", None)
+        self._pending_drafter_finalize = None
         for resp in gen_iter:
-            if cancel_event and cancel_event.is_set():
+            if cancel_event is not None and cancel_event.is_set():
                 # Report last token state when cancelled so we can see
                 # where generation was when the client disconnected.
-                tail = accumulated_text[-200:].replace('\n', '\\n')
-                logger.info(
+                tail = ("".join(text_parts))[-200:].replace('\n', '\\n')
+                _logger.info(
                     f"[Generate] session={session_id} | CANCELLED at token {gen_token_count} | "
                     f"last_tps={last_gen_tps:.1f} | tail={tail!r}"
                 )
@@ -1750,36 +2167,42 @@ class MLXEngine:
 
             gen_token_count += 1
             text = resp.text if hasattr(resp, "text") else ""
-            token = (resp.token if hasattr(resp, "token") and resp.token is not None
-                     else 0)
+            tok_attr = getattr(resp, "token", None)
+            token = tok_attr if tok_attr is not None else 0
             prompt_tps = getattr(resp, "prompt_tps", 0.0) or 0.0
             gen_tps = getattr(resp, "generation_tps", 0.0) or 0.0
 
-            accumulated_text += text
+            # PERF: append-to-list + post-loop join avoids the O(N^2)
+            # cost of repeated ``str += text`` (each += allocates a new
+            # string and copies the entire accumulated buffer).
+            text_parts.append(text)
             # Track yielded token IDs so the post-loop update keeps
             # cache_state.token_ids == full_prompt_token_ids + generated_token_ids
             # on both paths. resp.token may be None on the synthetic terminal
             # frame; in that case the token has already been counted earlier.
-            if hasattr(resp, "token") and resp.token is not None:
-                generated_token_ids.append(int(resp.token))
+            if tok_attr is not None:
+                generated_token_ids.append(int(tok_attr))
 
             if t_first_token is None:
                 t_first_token = time.perf_counter()
                 last_prompt_tps = prompt_tps
-                logger.info(
+                _logger.info(
                     f"[Generate] TTFT={round((t_first_token - t_gen_start)*1000)}ms"
                 )
 
-            # Per-token DEBUG log (very verbose — only when --verbose)
-            logger.debug(
-                f"[Token] session={session_id} | n={gen_token_count} id={token} text={text!r}"
-            )
+            # PERF: guard the per-token DEBUG f-string so it's not built
+            # unless DEBUG logging is actually enabled. The default --verbose
+            # off case skips the f-string entirely.
+            if _debug_enabled:
+                _logger.debug(
+                    f"[Token] session={session_id} | n={gen_token_count} id={token} text={text!r}"
+                )
 
             # Periodic INFO snapshot (every 50 tokens) so we can see progress
             # when verbose is off
             if gen_token_count % progress_interval == 0:
-                tail = accumulated_text[-120:].replace('\n', '\\n')
-                logger.info(
+                tail = ("".join(text_parts[-40:]))[-120:].replace('\n', '\\n')
+                _logger.info(
                     f"[Generate] session={session_id} | "
                     f"tokens={gen_token_count} | tps={gen_tps:.1f} | "
                     f"tail={tail!r}"
@@ -1796,6 +2219,16 @@ class MLXEngine:
                 generation_tps=gen_tps,
             )
 
+        # PERF: single join at end of loop — replaces O(N^2) accumulation.
+        accumulated_text = "".join(text_parts)
+        # PERF: drafter-stats finalize (post-stream, exactly once). Captures
+        # all drafter.accept_lens accumulated during _mtp_rounds → log + per-
+        # session bookkeeping. Replaces the per-token generator wrapper.
+        if _drafter_finalize is not None:
+            try:
+                _drafter_finalize()
+            except Exception:  # noqa: BLE001 — finalize must never break inference
+                logger.exception("[Drafter] post-stream finalize failed")
         self._touch_gpu()
 
         # Unified post-generation cache_state update (both VLM and legacy
@@ -1818,18 +2251,15 @@ class MLXEngine:
             cache_state.cache = prompt_cache
         cache_state.token_ids = full_prompt_token_ids + list(generated_token_ids)
 
-        # Force-materialize all lazy mx.array objects in the KV cache BEFORE
-        # this worker thread exits. mlx-vlm's _step uses
-        # `with mx.stream(generation_stream): ...` which schedules ops on a
-        # ThreadLocalStream owned by THIS worker thread. Any lazy array left
-        # in cache_state.cache carries an internal reference to that
-        # thread-local stream slot — when the NEXT request's worker thread
-        # picks up the cache and tries to evaluate, MLX raises
-        # `RuntimeError: There is no Stream(gpu, N) in current thread.`
-        # Fully evaluating here makes the cached arrays thread-portable.
-        # Only required on the VLM path; mlx-lm legacy runs on the request
-        # thread and has no thread-local stream to evict from.
-        if self._use_vlm and cache_state.cache is not None:
+        # WHY: F3 pins every mlx-vlm call to one persistent _vlm_executor
+        # worker thread (model + drafter + generation_stream all bound to
+        # that thread). Under F3 there is no cross-thread lazy-array
+        # hazard — the post-gen _eval_cache here is redundant and the
+        # forced full materialization adds measurable per-request overhead
+        # (large KV tensor sync). We now skip it on the VLM path and only
+        # keep it for the legacy mlx-lm path as a defensive no-op (mlx-lm
+        # runs on the request thread; this is a cheap final eval).
+        if (not self._use_vlm) and cache_state.cache is not None:
             try:
                 self._eval_cache(cache_state.cache)
             except Exception as _eval_err:  # noqa: BLE001 — best-effort
@@ -2051,6 +2481,45 @@ class MLXEngine:
             logits_processors=logits_processors if logits_processors else None,
         )
         drafter = getattr(self, "_drafter", None)
+        # Layer-A safety net: if the next generation will cross the
+        # RotatingKVCache sliding-window boundary (ring buffer wrap),
+        # skip the drafter for this request only. Even with the B-series
+        # monkey-patches active, we keep this guard so a future mlx-vlm
+        # version that re-introduces the bug — or any unforeseen edge
+        # case in the patch — cannot regress drafter acceptance to ~0.
+        # We mutate the LOCAL ``drafter`` variable only; ``self._drafter``
+        # stays loaded and the next non-wrapping request resumes MTP.
+        wrap_imminent = self._will_wrap_during_generate(
+            prompt_token_ids, cache_state
+        )
+        if drafter is not None and wrap_imminent:
+            logger.warning(
+                f"[Drafter] session={session_id} skip: RotatingKVCache wrap "
+                f"imminent (sliding_window={self._sliding_window_size}) — "
+                f"drafter bypassed for this request only"
+            )
+            drafter = None
+        # PERF: flip the module-level fast-path flag so the B1/B2-v2
+        # monkey-patches become near-noop pass-throughs when wrap CANNOT
+        # happen for this entire request (including max_tokens worth of
+        # generation). This eliminates per-token guard work (dict lookups,
+        # layer iteration) on the speculative-decoding verify hot path.
+        # The patches still run their full check whenever wrap is even
+        # remotely possible (correctness-critical regime).
+        win = int(getattr(self, "_sliding_window_size", 0) or 0)
+        has_rot = bool(getattr(self, "_has_rotating_cache", False))
+        cur_offset = 0
+        if cache_state is not None:
+            _cache = getattr(cache_state, "cache", None)
+            if _cache:
+                cur_offset = int(getattr(_cache[0], "offset", 0) or 0)
+        wrap_possible = (
+            has_rot
+            and win > 0
+            and (cur_offset + len(prompt_token_ids or []) + int(max_tokens or 0)) >= win
+        )
+        global _HOT_PATH_FAST
+        _HOT_PATH_FAST = not wrap_possible
         if drafter is not None:
             gen_kwargs["draft_model"] = drafter
             gen_kwargs["draft_kind"] = getattr(self, "_draft_kind", None)
@@ -2077,31 +2546,62 @@ class MLXEngine:
             **gen_kwargs,
         )
 
-        # Drafter-stats wrapper: forward stream items unchanged and log
-        # acceptance bookkeeping on exit. Stream-context defense lives
-        # in F3-LOAD (model + drafter loaded on the worker thread), so
-        # no `with mx.stream(...)` is needed here.
-        def _stream_ctx_wrapper():
-            try:
-                for item in stream_iter:
-                    yield item
-            finally:
-                if drafter is not None:
-                    lens = list(getattr(drafter, "accept_lens", []) or [])
-                    if lens:
-                        mean_a = sum(lens) / len(lens)
-                        max_a = max(lens)
-                        logger.debug(
-                            f"[Drafter] session={session_id} rounds={len(lens)} "
-                            f"mean_accepted={mean_a:.2f} max_accepted={max_a}"
-                        )
-                    else:
-                        logger.debug(
-                            f"[Drafter] session={session_id} no rounds recorded "
-                            f"(drafter present but accept_lens empty)"
-                        )
+        # PERF: ALWAYS return the raw stream_iter (no per-token wrapper).
+        # The drafter-stats wrapper used to wrap every yielded token in an
+        # extra Python generator frame (~30 tps cost at high TPS). The
+        # stats are pure post-stream bookkeeping — accumulate them ONCE
+        # after the stream is exhausted via a deferred finalize stash on
+        # ``self``. The VLM executor is single-worker so a per-engine stash
+        # is safe across the in-flight request.
+        if drafter is None:
+            self._pending_drafter_finalize = None
+            return stream_iter
 
-        return _stream_ctx_wrapper()
+        # Defer finalize to a single post-stream call. Capture only the
+        # locals needed; no per-token cost.
+        _drafter_ref = drafter
+        _sid = session_id
+
+        def _finalize() -> None:
+            lens = list(getattr(_drafter_ref, "accept_lens", []) or [])
+            if lens:
+                n_rounds = len(lens)
+                total_accepted = sum(lens)
+                mean_accepted = total_accepted / n_rounds
+                max_a = max(lens)
+                logger.debug(
+                    f"[Drafter] session={_sid} rounds={n_rounds} "
+                    f"mean_accepted={mean_accepted:.2f} max_accepted={max_a}"
+                )
+                if (
+                    mean_accepted < _DRAFTER_LOW_ACCEPT_THRESHOLD
+                    and n_rounds >= 10
+                ):
+                    logger.warning(
+                        f"[Drafter] session={_sid} low acceptance: "
+                        f"mean_accepted={mean_accepted:.2f} over {n_rounds} rounds — "
+                        f"drafter may be net negative; consider --draft-block-size 2 "
+                        f"or different drafter weights"
+                    )
+                session = self._sessions.get(_sid)
+                if session is not None:
+                    stats = session.drafter_stats or {
+                        "requests": 0,
+                        "total_rounds": 0,
+                        "total_accepted": 0,
+                    }
+                    stats["requests"] += 1
+                    stats["total_rounds"] += n_rounds
+                    stats["total_accepted"] += total_accepted
+                    session.drafter_stats = stats
+            else:
+                logger.debug(
+                    f"[Drafter] session={_sid} no rounds recorded "
+                    f"(drafter present but accept_lens empty)"
+                )
+
+        self._pending_drafter_finalize = _finalize
+        return stream_iter
 
     def _run_lm_legacy(
         self,
@@ -2428,12 +2928,15 @@ class MLXEngine:
         """List all active sessions."""
         result = []
         for sid, s in self._sessions.items():
-            result.append({
+            entry = {
                 "session_id": sid,
                 "messages": len(s.messages),
                 "cache_tokens": s.total_cache_tokens,
                 "last_used": s.last_used,
-            })
+            }
+            if s.drafter_stats is not None:
+                entry["drafter_stats"] = s.drafter_stats
+            result.append(entry)
         return sorted(result, key=lambda x: x["last_used"], reverse=True)
 
     def get_session(self, session_id: str) -> dict | None:
@@ -2441,12 +2944,15 @@ class MLXEngine:
         s = self._sessions.get(session_id)
         if not s:
             return None
-        return {
+        info = {
             "session_id": session_id,
             "messages": len(s.messages),
             "cache_tokens": s.total_cache_tokens,
             "last_used": s.last_used,
         }
+        if s.drafter_stats is not None:
+            info["drafter_stats"] = s.drafter_stats
+        return info
 
     def delete_session(self, session_id: str) -> bool:
         """Delete a session and its cache."""

@@ -81,7 +81,22 @@ async def create_session(req: CreateSessionRequest):
 
 @router.get("/sessions")
 async def list_sessions():
-    return await db.list_sessions()
+    sessions = await db.list_sessions()
+    # Enrich with per-session in-memory drafter stats when present.
+    # Engine session IDs match DB session IDs; merge across all engines so
+    # multi-model deployments still surface stats for the active engine.
+    engine_stats: dict[str, dict] = {}
+    for eng in (_engines.values() if _engines else [engine] if engine else []):
+        for entry in eng.list_sessions():
+            ds = entry.get("drafter_stats")
+            if ds is not None:
+                engine_stats[entry["session_id"]] = ds
+    if engine_stats:
+        for row in sessions:
+            sid = row.get("id") or row.get("session_id")
+            if sid in engine_stats:
+                row["drafter_stats"] = engine_stats[sid]
+    return sessions
 
 
 @router.get("/sessions/{session_id}")
@@ -237,7 +252,9 @@ async def _stream_chat(
 
     t_start = time.perf_counter()
     t_first_token = None
-    accumulated_text = ""
+    # PERF: append-to-list + join at consumption points avoids the O(N^2)
+    # cost of repeated ``str += text`` across the streaming loop.
+    acc_parts: list[str] = []
     prompt_tokens = 0
     completion_tokens = 0
     gen_tps = 0.0
@@ -358,9 +375,9 @@ async def _stream_chat(
                             ensure_ascii=False,
                         )
                         yield f"data: {prefix_event}\n\n"
-                        accumulated_text += "<think>\n"
+                        acc_parts.append("<think>\n")
 
-                accumulated_text += result.text
+                acc_parts.append(result.text)
 
                 # Detect thinking end token for real-time SSE notification
                 thinking_end_detected = (
@@ -379,7 +396,7 @@ async def _stream_chat(
                 yield f"data: {event}\n\n"
     except (asyncio.CancelledError, GeneratorExit) as exc:
         client_disconnected = True
-        tail = accumulated_text[-200:].replace('\n', '\\n')
+        tail = ("".join(acc_parts))[-200:].replace('\n', '\\n')
         logger.info(
             f"[Stream] session={session_id} | client disconnected "
             f"({type(exc).__name__}) after {token_count} tokens | "
@@ -390,6 +407,8 @@ async def _stream_chat(
     engine_ttft = (t_first_token - (t_gen_actual or t_gen_start)) if t_first_token else 0
     total_time = t_end - t_start
 
+    # PERF: single join at end of loop — replaces O(N^2) accumulation.
+    accumulated_text = "".join(acc_parts)
     thinking, content = split_thinking_and_content(
         accumulated_text, model_family=eng.model_family
     )

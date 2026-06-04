@@ -5,9 +5,11 @@
 #   8-bit target's quantization; verified: loads, output byte-identical to plain greedy,
 #   pre-wrap acceptance ~2.6, slightly faster than the bf16 drafter). Override with
 #   DRAFT_PATH=... to use the bf16 drafter (mlx-community/gemma-4-26B-A4B-it-assistant-bf16).
-# Post-wrap behaviour: the engine auto-disables the drafter once the 1024 sliding-window
-#   ring wraps (acceptance collapses there) and falls back to plain decode — so throughput
-#   floors at plain-decode speed instead of going net-negative. See _rotating_wrapped().
+# Post-wrap behaviour: the B4 RoPE-frame fix (true offset + absolute-position drafter
+#   mask) restores the drafter's post-wrap acceptance (~1.1-1.2), so MTP stays ~2x past
+#   the 1024 sliding-window ring wrap. The old wrap-gate (drafter -> plain decode after
+#   wrap) is now an opt-in fallback only: SOLOHEAVEN_MTP_WRAP_GATE=1. See _rotating_wrapped()
+#   and the B4 patch in mlx_engine._install_mtp_wrap_patches().
 # To disable MTP entirely, comment the active DRAFT_ARGS line below and uncomment the empty one.
 MODEL_PATH="$HOME/.lmstudio/models/lmstudio-community/gemma-4-26B-A4B-it-MLX-8bit"
 DRAFT_PATH="${DRAFT_PATH:-$HOME/.lmstudio/models/guardiangate1775/gemma-4-26B-A4B-it-assistant-8bit}"

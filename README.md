@@ -15,18 +15,19 @@ SoloHeaven turns your Mac into a personal AI server with sub-second response tim
 - **Multimodal (VLM) support** — Gemma 4, Qwen3-VL, GLM4V, and other vision/omni models via mlx-vlm, with automatic mlx-lm fallback for text-only models
 - **Per-model thinking control** — Enable/disable `<think>` tags per model (e.g., `:no_think_tag` for non-reasoning models)
 - **Thinking budget control** — Configurable token limit for reasoning models, with per-request override
-- **Prompt Lookup Decoding (PLD)** — Optional speculative decoding for prompt-echo-heavy workloads (+37% on copy tasks)
+- **Prompt Lookup Decoding (PLD)** — Optional draft-model-free speculative decoding for prompt-echo-heavy workloads (+37% on copy tasks)
+- **Speculative decoding (MTP)** — Gemma 4 multi-token-prediction drafter via mlx-vlm (`--draft-model`); ~2x decode, byte-identical output, with sliding-window wrap fixes
+- **Separate-process engine (default)** — Generation runs in a child process on its main thread for ~+30% tok/s at temp>0 (the FastAPI parent holds no MLX); switch off with `--engine-mode inprocess`
 - **Structured output (`response_format`)** — OpenAI-compatible JSON mode and JSON Schema constraints via logits-level FSM masking (100% schema adherence, no prompt engineering)
 - **Prefill chunk tuning** — Configurable `prefill_step_size` for 1.3-1.5x long-prompt speedup
 - **KV cache quantization** — Optional 4/8-bit KV quant (mlx-lm path)
 - **Budget-based cache eviction** — No time-based TTL, evicts LRU only when memory/disk budget exceeded; disk files auto-pruned when exceeding `--disk-budget-gb`
 - **GPU keepalive** — Optional Metal idle prevention with periodic micro-computations (`--gpu-keepalive`)
-- **Full OpenAI API compatibility** — Streaming SSE, tool calling, `developer` role, `/v1/chat/completions`, `/v1/models`
+- **OpenAI-compatible API** — Streaming SSE, tool calling, `developer` role, `response_format`, `/v1/chat/completions`, `/v1/models` (note: `stop`/`seed`/`tool_choice` are accepted in the request schema but not yet enforced)
 - **Built-in web UI** — Chat interface with model selector, live thinking display, TPS stats, cache hit indicators, branch/regenerate/delete controls
 - **Admin dashboard** — Real-time log viewer, cache/DB overview, and reset controls at `/admin`
-- **Conversation branching** — Fork any conversation at any turn with instant KV cache restore from DeltaNet checkpoints
-- **Regenerate & Delete** — Re-roll the last response or remove turns, with cache state automatically restored
-- **DeltaNet checkpoint persistence** — Turn-level snapshots saved to disk, survive server restarts
+- **Conversation branching** — Fork any conversation at any turn; the new session's KV cache is rebuilt by reprocessing the truncated history (no checkpoint restore)
+- **Regenerate & Delete** — Re-roll the last response or remove turns; the cache is rebuilt from the truncated history
 - **Disk persistence** — KV caches survive server restarts via safetensors serialization
 - **Client disconnect handling** — Frees the generation lock immediately, tolerates content mismatches on reconnect
 - **Base cache pool** — System prompt KV caches shared across sessions for fast cold starts
@@ -39,10 +40,12 @@ multimodal + text coverage from a single code path.
 
 | Model family | Backend | Cache structure | Notes |
 |--------------|---------|-----------------|-------|
-| **Gemma 4** (`gemma4`, e.g. 31B/26B-A4B/E4B) | mlx-vlm | `KVCache` + `RotatingKVCache` (sliding window) | Multimodal (text/vision/audio). Uses `<\|channel>thought\|...\|<channel\|>` for reasoning. VLM models automatically enable `mlx-vlm` native stream_generate. |
-| **Qwen3.5 / Qwen3.6 MoE** (`qwen3_5_moe`, e.g. 122B/397B/35B-A3B) | mlx-vlm → falls through | `ArraysCache` (DeltaNet linear) + `KVCache` (full attn every 4th) | Uses ChatML. **PLD not applicable** — DeltaNet state is not trimmable. Use `--kv-bits 0` (quantization won't help; only 2 KV heads per layer). |
+| **Gemma 4** (`gemma4`, e.g. 31B/26B-A4B/E4B) | mlx-vlm | 50 `RotatingKVCache` (sliding window=1024) + 10 `KVCache` (full attn) | Multimodal (text/vision/audio). Uses `<\|channel>thought\|...\|<channel\|>` for reasoning. VLM models automatically enable `mlx-vlm` native stream_generate. **MTP speculative decoding** supported (`--draft-model`, gemma4-only). Past 1024 cumulative tokens the sliding ring wraps — handled by append-only wrapped-cache reuse + the MTP B4 wrap fix (see notes below). |
+| **Qwen3.5 MoE** (`qwen3_5_moe`, e.g. 122B/397B) | mlx-vlm → falls through | `ArraysCache` (DeltaNet linear) + `KVCache` (full attn every 4th) | Uses ChatML. **PLD not applicable** — DeltaNet state is not trimmable. **MTP not applicable** (drafter is gemma4-only). Use `--kv-bits 0` (quantization won't help; only 2 KV heads per layer). No sliding window — cache prefix reuse stays valid across long chats. |
+| **Qwen3.6-27B** (`qwen3_5`, dense-hybrid) | mlx-vlm → falls through | `ArraysCache` (DeltaNet) + `KVCache` (full attn) | 64 layers: 48 Gated-DeltaNet + 16 full-attention, **no sliding window**. ChatML. **PLD not applicable** (DeltaNet ArraysCache not trimmable); **MTP not applicable** (gemma4-only). Dense → bandwidth-bound decode. |
+| **Qwen3.6-35B-A3B** (`qwen3_5_moe`, MoE) | mlx-vlm → falls through | `ArraysCache` (DeltaNet) + `KVCache` (full attn) | 40 layers, 256 experts / 8 active (~3B active), **no sliding window**. ChatML. **PLD not applicable**; **MTP not applicable** (gemma4-only). MoE → fast decode, structurally stable multi-turn TTFT (no wrap). |
 | **Qwen3-VL / Qwen3-Omni** | mlx-vlm | Varies per model | Vision/omni variants. |
-| **GLM-5.1 / DeepSeek-V3.2** (`glm_moe_dsa`, `deepseek_v32`) | mlx-lm | `CacheList(KVCache, KVCache)` per layer (MLA + DSA indexer) | **Multi-head Latent Attention (MLA)**: KV is pre-compressed to `kv_lora_rank=512` — cache is ~1/3 of typical. **PLD compatible.** Use `--no-thinking --prefill-step-size 8192 --pld` for best performance. |
+| **GLM-5.1 / DeepSeek-V3.2** (`glm_moe_dsa`, `deepseek_v32`) | mlx-lm | `CacheList(KVCache, KVCache)` per layer (MLA + DSA indexer) | **Multi-head Latent Attention (MLA)**: KV is pre-compressed to `kv_lora_rank=512` — cache is ~1/3 of typical. **PLD-capable** (CacheList is trimmable), but `--pld` is off by default here — acceptance was ~12% on casual/reasoning; add it back only for copy-heavy workloads. Use `--no-thinking` (keep `prefill-step-size` at the default `2048` — `8192` OOMs on >100K prompts). |
 | **GLM-4.5 / 4.7** (`glm4_moe`, `glm4_moe_lite`) | mlx-lm | `KVCache` or `RotatingKVCache` mix | ChatML-ish format with `<\|user\|>`/`<\|assistant\|>`. PLD compatible on pure-KVCache variants. |
 | **GLM4V / GLM-OCR** | mlx-vlm | Per-model | Vision variants. |
 | **MiniMax, GPT-OSS** | mlx-lm | Standard `KVCache` | ChatML. |
@@ -79,7 +82,13 @@ SoloHeaven was born from a systematic benchmarking study on KV cache optimizatio
 
 ## Benchmark Results
 
-### Systematic Comparison (11 turns, Qwen3.5-122B-A10B-bf16, M3 Ultra 512GB)
+The systematic study and the Qwen3.5 / 397B / GLM-5.1 numbers below are
+**historical (Mac Studio M3 Ultra 512GB)** and remain valid for those models.
+The current dev/optimization target is **M5 Max 128GB** — see
+[M5 Max 128GB (Gemma 4 / Qwen3.6)](#m5-max-128gb-gemma-4--qwen36) for the
+latest measurements.
+
+### Systematic Comparison (11 turns, Qwen3.5-122B-A10B-bf16, M3 Ultra 512GB) *(historical)*
 
 | Strategy | Avg TTFT | Avg TPS | TPS Drop (T0→T10) | Final Cache | Quality |
 |----------|----------|---------|--------------------|----|---------|
@@ -91,7 +100,27 @@ SoloHeaven was born from a systematic benchmarking study on KV cache optimizatio
 | ThinkTrim | 0.66s | 28.48 | 4.9% | 26.5K | Layer mismatch |
 | NoCache (rebuild) | 10.46s | 28.52 | 4.8% | N/A | Good but slow |
 
-### Production Metrics (Qwen3.5-122B-A10B-bf16)
+### M5 Max 128GB (Gemma 4 / Qwen3.6)
+
+Current-generation measurements on a **MacBook Pro M5 Max 128GB** with 8-bit
+models. Methodology: a single long generation (`max_tokens=2500`,
+`temp=0.6`) for flat decode tok/s, plus an 8-turn multi-turn conversation to
+~14K tokens for per-turn TTFT and cold-fill counts.
+
+| Model (M5 Max 128GB, 8-bit) | Decode tok/s (2500-tok gen, flat) | Multi-turn TTFT (8 turns, ~14K tok) | Cold-fills | Notes |
+|---|---|---|---|---|
+| Qwen3.6-35B-A3B (MoE ~3B active) | ~92.5 (flat, ~94→92.5) | 41–62 ms | 0 | No sliding window → stable TTFT, no cold-fill; MoE fast decode. Best all-round. |
+| Qwen3.6-27B (dense-hybrid) | ~17 (flat) | 232–276 ms | 0 | Dense → bandwidth-bound slow decode (~27 GB/token). Stable TTFT. |
+| Gemma4-26B-A4B + MTP (8-bit drafter) | ~97.8 (after B4 fix) | ~60 ms (after cold-fill fix) | 0 | MTP ~2x; needs the wrap fixes (B4 + cold-fill reconcile). |
+| Gemma4-26B-A4B (no drafter) | ~83 (flat) | — | — | Plain decode baseline. |
+
+**Model-selection takeaway:** for interactive multi-turn use,
+**Qwen3.6-35B-A3B** is the strongest all-round on M5 Max (fast MoE decode +
+structurally stable TTFT, no wrap handling needed); **Gemma4-26B-A4B + MTP**
+is competitive on single long generations but relies on the sliding-window
+fixes; **Qwen3.6-27B** dense is decode-bound.
+
+### Production Metrics (Qwen3.5-122B-A10B-bf16) *(historical, M3 Ultra 512GB)*
 
 | Metric | Without Cache | With Cache | Improvement |
 |--------|--------------|------------|-------------|
@@ -100,7 +129,7 @@ SoloHeaven was born from a systematic benchmarking study on KV cache optimizatio
 | Generation TPS | 27.5 tok/s | 27.5 tok/s | No degradation |
 | Quality (5-point scale) | 4.64 | 4.64 | No degradation |
 
-### Real-World Usage: Qwen3.5-122B-A10B-bf16 (1 hour with OpenCode)
+### Real-World Usage: Qwen3.5-122B-A10B-bf16 (1 hour with OpenCode) *(historical, M3 Ultra 512GB)*
 
 **Machine:** Mac Studio M3 Ultra 512GB / 4TB
 
@@ -112,7 +141,7 @@ Over 191 messages in a real coding session:
 - **Total tokens saved**: 11.8M (99.9% reduction)
 - **Peak context**: 131,072 tokens
 
-### Real-World Usage: Qwen3.5-397B-A17B-MLX-8bit (OpenClaw agent session)
+### Real-World Usage: Qwen3.5-397B-A17B-MLX-8bit (OpenClaw agent session) *(historical, M3 Ultra 512GB)*
 
 **Machine:** Mac Studio M3 Ultra 512GB / 4TB
 
@@ -156,7 +185,7 @@ Live data from a coding agent session (OpenClaw, 266 messages, 131K context):
 - KV cache is 4.1 GB/session, but 512GB memory can hold 7 sessions simultaneously (model weight ~160GB + KV cache ~10GB)
 - Disk save runs in background without lock, no blocking on generation requests
 
-### GLM-5.1 (MLA + DSA + MoE 256 experts, M3 Ultra 512GB)
+### GLM-5.1 (MLA + DSA + MoE 256 experts, M3 Ultra 512GB) *(historical, M3 Ultra 512GB)*
 
 GLM-5.1 (`mlx-community/GLM-5.1-MXFP4-Q8`) inherits DeepSeek-V3.2's
 architecture: **Multi-head Latent Attention** (kv_lora_rank=512) +
@@ -188,21 +217,29 @@ further KV-side gains.
 # or:
 mlx-soloheaven --model ~/models/GLM-5.1-MXFP4-Q8 \
   --memory-budget-gb 50 \
-  --no-thinking \
-  --prefill-step-size 8192 \
-  --pld \
-  --gpu-keepalive --verbose
+  --gpu-keepalive \
+  --no-thinking
 ```
+
+> **Why no `--prefill-step-size 8192` or `--pld`** (both removed from
+> `start_glm5.1.sh`): `8192` causes Metal OOM on >100K-token prompts — each
+> chunk's attention against the full KV cache exceeds the ~60 GB free after the
+> ~450 GB model loads, so the default `2048` is kept. `--pld` was removed
+> because acceptance was only ~12% on casual/reasoning workloads (verification
+> overhead exceeds the gain); add it back **only** for copy-heavy workloads
+> (code editing, RAG, tool-arg repetition) where acceptance typically exceeds
+> 30%.
 
 **What each flag buys**:
 
 | Flag | Effect on GLM-5.1 |
 |------|-------------------|
 | `--no-thinking` | Skips `<think>` generation — in OpenClaw agent workloads, thinking turns often eat 80% of generation tokens; disabling it is a large effective speedup. |
-| `--prefill-step-size 8192` | 1.3–1.5x faster prefill on long prompts (reduces TTFT on large tool-result turns). |
-| `--pld` | Prompt Lookup Decoding: up to +37% TPS on tool-heavy / file-editing turns where the model echoes parts of the prompt. Automatic — uses the trimmable CacheList KV cache GLM-5.1 ships with. Logs `[PLD] accepted X/Y (Z%)` per request — track Z to verify it helps. |
 | `--memory-budget-gb 50` | Leaves ~60 GB headroom on top of the ~450 GB model for KV growth before session LRU eviction kicks in. |
-| `--disk-budget-gb 100` (default) | Disk session cache now enforces this budget via LRU eviction — previously it just grew unbounded. |
+| `--gpu-keepalive` | Keeps Metal warm to avoid the idle-wakeup penalty. |
+| `--prefill-step-size 8192` *(NOT recommended here)* | 1.3–1.5x faster prefill on long prompts in general, but on GLM-5.1's huge model it OOMs on >100K-token prompts — keep the default `2048`. |
+| `--pld` *(workload-dependent, off by default)* | Prompt Lookup Decoding: +30–40% TPS on copy-heavy turns where the model echoes the prompt, but ~12% acceptance on GLM-5.1 casual/reasoning makes it net-negative there. Logs `[PLD] accepted X/Y (Z%)` — keep it only if Z > 30%. |
+| `--disk-budget-gb 100` (default) | Disk session cache enforces this budget via LRU eviction. |
 
 **Known limitations**:
 
@@ -221,8 +258,8 @@ mlx-soloheaven --model ~/models/GLM-5.1-MXFP4-Q8 \
 
 ### Prerequisites
 
-- macOS with Apple Silicon (M1/M2/M3/M4)
-- Python 3.11+ (recommended: 3.12 via [pyenv](https://github.com/pyenv/pyenv))
+- macOS with Apple Silicon (M1/M2/M3/M4/M5)
+- Python 3.11+ (tested on 3.12 and 3.14; install via [pyenv](https://github.com/pyenv/pyenv))
 - An MLX-format model (e.g., from [mlx-community on HuggingFace](https://huggingface.co/mlx-community))
 
 ### Setup from Scratch
@@ -332,13 +369,29 @@ Options:
   --thinking-budget     Max thinking tokens before forcing </think> (default: 8192, 0=unlimited)
   --memory-budget-gb    In-memory KV cache budget in GB (default: 200)
   --disk-budget-gb      On-disk KV cache budget in GB, auto-evicts oldest (default: 100)
+  --max-checkpoints     Max DeltaNet checkpoints per session for branching (default: 50, 0=unlimited)
   --data-dir            Directory for SQLite DB and cache files (default: ./data)
   --no-thinking         Disable thinking mode globally
   --gpu-keepalive       Keep Metal GPU warm to avoid idle penalty (env: SOLOHEAVEN_GPU_KEEPALIVE)
   --verbose, -v         Enable verbose logging (env: SOLOHEAVEN_VERBOSE)
 
+Engine mode:
+  --engine-mode         'process' (default; run generation in a separate child
+                        process on its main thread for higher decode tok/s;
+                        single --model only, --models auto-falls-back to inprocess)
+                        or 'inprocess' (env: SOLOHEAVEN_ENGINE_MODE)
+
+Streaming:
+  --stream-coalesce-n   Max tokens batched per SSE frame (default: 4; <=1 disables coalescing)
+  --stream-coalesce-ms  Max ms to hold a partial batch before flushing (default: 30)
+
+Speculative decoding (mlx-vlm drafter, Gemma 4):
+  --draft-model         Path to drafter MLX model directory (enables speculative decoding)
+  --draft-kind          Drafter kind: 'mtp' (Gemma 4) or 'dflash' (Qwen3); default: auto-detect
+  --draft-block-size    Drafter block size (default: use drafter config)
+
 Performance tuning (see Performance Tuning Flags section below):
-  --prefill-step-size   Prefill chunk size (default: 2048; try 8192)
+  --prefill-step-size   Prefill chunk size (default: 2048; try 4096/8192)
   --pld                 Enable Prompt Lookup Decoding (speculative decoding via prompt n-grams)
   --pld-num-draft       Max draft tokens per step (default: 10)
   --pld-ngram-k         N-gram size for PLD matching (default: 3)
@@ -417,11 +470,41 @@ the main model verifies in one forward pass.
 
 **Compatibility**: Requires a trimmable KV cache. Automatic detection:
 - ✅ GLM-5.1 (CacheList/KVCache), GLM-4.7, DeepSeek-V3/V3.2, Llama, Mistral
-- ❌ Qwen3.5/3.6 MoE (DeltaNet ArraysCache is not trimmable — auto-falls back, zero overhead)
+- ❌ Qwen3.5 / Qwen3.6 (DeltaNet ArraysCache is not trimmable — auto-falls back, zero overhead)
 - ❌ mlx-vlm path (use the VLM's own speculation path if available)
 
 **Acceptance rate**: logged after every request as `[PLD] accepted X/Y draft tokens (Z%)`.
 Rule of thumb: Z > 30% is a net win; Z < 20% means PLD is hurting — disable for that workload.
+
+#### Speculative Decoding (MTP)
+
+In addition to PLD (which needs no draft model), SoloHeaven supports a real
+**draft-model speculative decoder** for **Gemma 4 only**, via mlx-vlm's
+multi-token-prediction (MTP) path. Enable it with `--draft-model <drafter>`
+(plus optional `--draft-block-size`); `--draft-kind` auto-detects as `mtp` for
+gemma4 assistant drafters.
+
+**Verified setup** (`start_gemma4_26b_a4b_mtp.sh`): an 8-bit assistant drafter
+(`guardiangate1775/gemma-4-26B-A4B-it-assistant-8bit`) with `--draft-block-size 3`,
+against the 8-bit target. Output is **byte-identical to plain greedy** decode,
+at ~2x decode throughput (≈97.8 tok/s vs ≈83 tok/s plain on M5 Max).
+
+**The hard part — the sliding-window wrap.** Gemma 4 is 50 sliding-attention
+layers (`RotatingKVCache`, window=1024) + 10 full-attention layers. The drafter
+relies on the sliding-window state; past the 1024-token ring wrap the drafter's
+query RoPE phase was being corrupted (by the old offset-clamp), collapsing
+acceptance from ~1.2 to ~0.2 and making MTP net-negative. The **B4 RoPE-frame
+fix** (feed the *true* offset + build an absolute-position drafter mask)
+recovers post-wrap acceptance to ~1.1–1.2, so MTP stays ~2x even past the wrap.
+A `SOLOHEAVEN_MTP_WRAP_GATE=1` env fallback can disable the drafter post-wrap
+(plain decode) if a future drafter/model ever regresses.
+
+**Compatibility**:
+- ✅ Gemma 4 (mlx-vlm MTP path)
+- ❌ Qwen3.5 / Qwen3.6 (DeltaNet) — not supported by the MTP drafter (see
+  [Future Directions](#future-directions) for native Qwen3.6 MTP / DFlash)
+- ❌ Combined with `--models` (multi-model) — drafter is single-`--model` only
+- Independent of PLD — MTP is a separate, model-specific path
 
 ### Structured Output (`response_format`)
 
@@ -625,6 +708,11 @@ SoloHeaven handles common quirks of OpenAI-compatible clients:
 
 ## Architecture
 
+In the default **process** engine mode, the FastAPI parent holds no MLX state —
+it talks to a child process that owns the model and runs generation on its main
+thread, over three `multiprocessing.Pipe`s (cmd / resp / ctrl). In `inprocess`
+mode the MLX Engine block lives directly inside the FastAPI process.
+
 ```
 ┌─────────────────────────────────────────────┐
 │                 Client                       │
@@ -632,9 +720,10 @@ SoloHeaven handles common quirks of OpenAI-compatible clients:
 └──────────────┬──────────────────────────────┘
                │ HTTP/SSE
 ┌──────────────▼──────────────────────────────┐
-│  FastAPI Server                              │
+│  FastAPI Server  (parent process)            │
 │  ├── /v1/chat/completions  (OpenAI compat)   │
 │  ├── /v1/models            (model listing)   │
+│  ├── /v1/sessions[/{id}]   (list/get/delete) │
 │  ├── /api/sessions/*/chat  (Web UI)          │
 │  ├── /api/admin/*          (Admin dashboard) │
 │  ├── /api/sessions/*/settings  (per-session) │
@@ -642,30 +731,70 @@ SoloHeaven handles common quirks of OpenAI-compatible clients:
 │  ├── /api/sessions/*/branch    (branching)   │
 │  ├── /api/sessions/*/regenerate              │
 │  ├── /api/sessions/*/delete-last             │
+│  ├── /api/memories[/search]  (web memories)  │
 │  └── /health                                 │
-├──────────────────────────────────────────────┤
-│  MLX Engine (per model, shared GPU lock)     │
-│  ├── Session-based KV cache (in-memory)      │
-│  ├── Base cache pool (system prompt reuse)   │
-│  ├── Suffix injection (new turn only)        │
-│  ├── Thinking budget processor (logits)      │
-│  ├── Tool call parser (XML ↔ OpenAI JSON)    │
-│  ├── GPU keepalive thread (optional)         │
-│  ├── DeltaNet checkpoints (branch/regen)     │
-│  ├── Client disconnect cancellation          │
-│  └── Disk persistence (safetensors + ckpt)   │
-├──────────────────────────────────────────────┤
-│  Cache Manager                               │
-│  ├── Budget-based LRU eviction               │
-│  ├── Memory → Disk spillover                 │
-│  └── Prefix matching                         │
-├──────────────────────────────────────────────┤
-│  SQLite Storage                              │
-│  ├── Sessions & messages                     │
-│  ├── Long-term memories                      │
-│  └── Compaction history                      │
-└──────────────────────────────────────────────┘
+│                                              │
+│  engine_mode=process → EngineProcessProxy    │
+│    (no MLX in parent; looks like MLXEngine)  │
+└──────────────┬───────────────────────────────┘
+               │ cmd / resp / ctrl Pipes
+┌──────────────▼───────────────────────────────┐
+│  Child process — MLXEngine                    │
+│  (execution_mode="main_thread")               │
+│  ├── Generation on the MAIN thread (temp>0 ↑) │
+│  ├── Session-based KV cache (in-memory)       │
+│  ├── Base cache pool (system prompt reuse)    │
+│  ├── Suffix injection (new turn only)         │
+│  ├── Thinking budget processor (logits)       │
+│  ├── Tool call parser (XML ↔ OpenAI JSON)     │
+│  ├── PLD / MTP speculative decoding           │
+│  ├── Branch/regen rebuild (reprocess history) │
+│  ├── Client disconnect cancellation           │
+│  └── Disk persistence (safetensors)           │
+├───────────────────────────────────────────────┤
+│  Cache Manager                                │
+│  ├── Budget-based LRU eviction                │
+│  ├── Memory → Disk spillover                  │
+│  └── Prefix matching                          │
+├───────────────────────────────────────────────┤
+│  SQLite Storage                               │
+│  ├── Sessions & messages                      │
+│  ├── Long-term memories                       │
+│  └── Compaction history                       │
+└───────────────────────────────────────────────┘
 ```
+
+### Engine Modes
+
+SoloHeaven runs the MLX engine in one of two modes (`--engine-mode`, default
+`process`):
+
+| Mode | Where generation runs | When to use |
+|------|----------------------|-------------|
+| **`process`** (default) | A **child process**, on its **main thread** (`MLXEngine(execution_mode="main_thread")`). The FastAPI parent holds an `EngineProcessProxy` and talks to the child over cmd/resp/ctrl Pipes. | Single-model serving. Restores throughput lost to a worker-thread temp>0 penalty. |
+| **`inprocess`** | Inside the FastAPI process (the original F3 worker-thread engine). | Multi-model (`--models`), or when you need GPU-keepalive (see below). |
+
+**Why process mode is the default:** running generation on a *non-main* thread
+with `temp > 0` incurs a ~25% throughput penalty (a Metal / `mx.random`
+interaction). Running generation on the **child's main thread** restores
+~+30% tok/s at `temp > 0`.
+
+**Constraints of process mode:**
+- **Single `--model` only.** Passing `--models` (multi-model) auto-falls back to
+  in-process mode.
+- **`--draft-model` is single-model only** (so it pairs with process mode).
+- **GPU-keepalive is disabled** in process (main-thread) mode — the keepalive
+  ping thread (and the dirty-session disk flush it drives) is not started.
+
+> **Disk-persistence caveat for process mode.** The dirty-session disk flush is
+> driven by the keepalive loop and an `atexit`/signal shutdown handler, both of
+> which are registered only when keepalive starts — i.e. **not** in process
+> (main-thread) mode. The child worker also just exits on shutdown without a
+> final flush. So in the default process mode, dirty sessions are persisted to
+> disk less reliably than in `inprocess` mode (per-request saves still happen on
+> the explicit save path, but there is no periodic or shutdown flush). If you
+> need the strongest disk persistence of in-flight sessions, run
+> `--engine-mode inprocess --gpu-keepalive`.
 
 ### How KV Cache Reuse Works
 
@@ -680,15 +809,19 @@ This works because OpenAI API clients always send the full conversation history,
 
 ### Cache Modes
 
+The engine reports exactly one of four `cache_mode` values per request:
+
 | Mode | When | Action |
 |------|------|--------|
-| `hit` | Existing session, one new user message | Reuse all cached tokens, process suffix only |
-| `hit_multi` | Multiple new messages (e.g., tool results) | Reuse cached prefix, process all new messages |
-| `base_hit` | System prompt matches base cache pool | Clone base cache, process remaining tokens |
-| `base_build` | New system prompt, no base cache | Process system tokens, register base cache |
-| `branch` | Incoming shorter than stored, prefix matches | Restore from DeltaNet checkpoint, process new suffix |
-| `retry` | Same session, messages don't match | Discard stale cache, full re-process |
-| `miss` | New session | Full process from scratch |
+| `hit` | Existing session whose stored messages are a prefix of the request (one **or more** new messages — e.g. tool results) | Reuse all cached tokens, process only the new-message suffix |
+| `base_hit` | Cache miss, but the system prompt matches the base cache pool | Clone the base cache, process the remaining tokens |
+| `retry` | Same session, but stored messages match exactly (nothing new) | Discard stale cache, full re-process |
+| `miss` | New session (no base hit) | Full process from scratch |
+
+> Multi-new-message turns (tool results, several queued messages) are still a
+> plain `hit` — the suffix just covers all the new messages. Branching and
+> regeneration are **not** cache modes; they rebuild the cache by reprocessing
+> the truncated history (see [Conversation Branching](#conversation-branching--regeneration)).
 
 ### Message Matching
 
@@ -734,49 +867,62 @@ This preserves the full cache prefix while adding context compression at the bou
 
 ### Hybrid Attention Architecture Note
 
-Qwen3.5 uses a hybrid architecture: 36 DeltaNet layers (linear attention with recurrent state) + 12 full attention layers (standard KV cache). This has important implications:
+**Qwen3.5 / Qwen3.6 (DeltaNet hybrid, no sliding window).** Qwen3.5 uses a
+hybrid architecture: 36 DeltaNet layers (linear attention with recurrent state)
++ 12 full attention layers (standard KV cache); Qwen3.6-27B is 48 Gated-DeltaNet
++ 16 full-attention (64 layers) and 3.6-35B-A3B is a 40-layer MoE variant. None
+of them use a sliding window. Implications:
 
-- **DeltaNet layers (ArraysCache)** store compressed recurrent state — cannot be sliced or partially reused
+- **DeltaNet layers (ArraysCache)** store compressed recurrent state — cannot be sliced or partially reused, and the state is non-reversible (can't roll back to an arbitrary position)
 - **Full attention layers (KVCache)** store standard key-value pairs — can be sliced but must stay consistent with DeltaNet state
-- **DeltaNet state is non-reversible** — cannot be rolled back to an arbitrary position. SoloHeaven solves this with turn-level DeltaNet snapshots (checkpoints) that enable instant cache restoration at any turn boundary
+- **No sliding window** means there is no ring-buffer wrap: the cached KV always corresponds to a contiguous prefix of the logical history, so **cache prefix reuse stays valid across long multi-turn chats** with no cold-fills
+
+**Gemma 4 (sliding-window hybrid, ring wrap).** Gemma 4 is 50 sliding-attention
+layers (`RotatingKVCache`, window=1024) + 10 full-attention layers (`KVCache`).
+Past 1024 cumulative tokens the sliding ring **wraps** — the physical buffer
+holds only the most-recent 1024 tokens, no longer a contiguous prefix of the
+logical history. SoloHeaven handles this with two fixes:
+
+- **Append-only wrapped-cache reuse** — strict-append turns (the cached history
+  is a prefix of the new prompt) reuse the wrapped cache; the suffix is processed
+  against it (`RotatingKVCache._update_concat` trims-to-window correctly), so
+  TTFT stays ~60 ms instead of cold-filling to ~600 ms. Divergent / edit turns
+  past the wrap still cold-fill (the ring no longer holds the needed prefix).
+- **Save-time offset↔len reconcile + MTP finally-rollback** — a both-direction
+  `cache.offset` ↔ `len(token_ids)` reconcile at save time, plus a
+  `finally`-rollback in the MTP drafter loop, eliminated multi-turn cold-fills
+  (TTFT 5–14 s → ~60 ms) caused by the cache advancing past the recorded token ids.
 
 ### Conversation Branching & Regeneration
 
-SoloHeaven supports branching conversations at any turn, regenerating responses, and deleting turns — all with instant KV cache restoration.
+SoloHeaven supports branching conversations at any turn, regenerating the last
+response, and deleting turns. **Branching and regeneration rebuild the KV cache
+by reprocessing the truncated history — there is no instant checkpoint restore.**
 
-**The challenge:** In Qwen3.5's hybrid architecture, KVCache (full attention) can be sliced by offset, but DeltaNet (linear attention) is a recurrent state that cannot be reversed. To branch at turn 5 of a 10-turn conversation, you need the exact DeltaNet state at turn 5.
+**How it works:** `branch_from_turn()` / `truncate_session()` /
+`prepare_regenerate()` all funnel into `_rebuild_session()`, which:
 
-**The solution:** Save a DeltaNet snapshot (`deepcopy`) at every turn boundary. These checkpoints are persisted to disk alongside the main cache.
+1. Takes the truncated message list (history up to the branch/regen point)
+2. Seeds from the base cache pool if the system-prompt prefix matches
+3. Prefills the remaining tokens into a fresh KV cache
+4. Stores the new session — the next user message is then a normal cache `hit`
+
+The operation returns `method: "build"` with a `build_time` (typically a couple
+of seconds for short histories, longer for long ones — it is a full prefill of
+the truncated prompt, not a snapshot restore).
 
 ```
-Turn 1: [sys, user1] → generate → checkpoint #1 (DeltaNet snapshot + KV offset)
-Turn 2: [sys, user1, asst1, user2] → generate → checkpoint #2
-Turn 3: [sys, user1, asst1, user2, asst2, user3] → generate → checkpoint #3
-...
+Source session: [sys, user1, asst1, user2, asst2, user3, asst3]
+
 Branch at Turn 2:
-  1. Find checkpoint #2
-  2. Restore DeltaNet state (deepcopy from snapshot)
-  3. Slice KVCache to checkpoint offset
+  1. Truncate to [sys, user1, asst1, user2]
+  2. Try base cache for the system-prompt prefix
+  3. Prefill the remaining tokens → fresh KV cache  (method: "build")
   4. New session ready — next message is a cache HIT
 ```
 
-**Branch modes:**
-
-| Mode | When | Speed |
-|------|------|-------|
-| **COPY** | Branch at last turn (full conversation copy) | Instant (deepcopy) |
-| **CHECKPOINT** | Branch at earlier turn, checkpoint exists | Instant (snapshot restore + KV slice) |
-| **BUILD** | No checkpoint available (e.g., pre-existing sessions) | 2-3s (prefill from scratch) |
-
-**Disk persistence:**
-
-Each session stores two files:
-- `session_{id}.safetensors` — KV cache (existing)
-- `session_{id}_ckpt.safetensors` — DeltaNet snapshots at each turn boundary
-
-After server restart, checkpoints are loaded from disk — branching and regeneration remain instant without needing to rebuild.
-
-**Storage cost:** ~5MB per checkpoint (36 DeltaNet layers × fixed-size state), max 50 checkpoints per session (~250MB). Negligible compared to the KV cache itself (100-200MB per session).
+> The SQLite DB stores branch **metadata** (parent/child session links) only;
+> the KV cache itself is always reconstructed by reprocessing.
 
 ## API Reference
 
@@ -786,6 +932,10 @@ After server restart, checkpoints are loaded from disk — branching and regener
 |--------|------|-------------|
 | POST | `/v1/chat/completions` | Chat completion (streaming & non-streaming) |
 | GET | `/v1/models` | List available models |
+| GET | `/v1/sessions` | List active sessions (engine view) |
+| GET | `/v1/sessions/{id}` | Get session info |
+| DELETE | `/v1/sessions/{id}` | Delete a session's cache |
+| POST | `/v1/sessions/{id}/compact` | Compact a session (OpenAI-namespaced) |
 
 ### Web Chat API
 
@@ -801,6 +951,15 @@ After server restart, checkpoints are loaded from disk — branching and regener
 | POST | `/api/sessions/{id}/branch` | Branch conversation at a specific turn |
 | POST | `/api/sessions/{id}/regenerate` | Remove last turn and regenerate |
 | POST | `/api/sessions/{id}/delete-last` | Delete last user+assistant turn |
+| GET | `/api/cache/stats` | Cache statistics |
+
+### Memories (Web UI)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/memories` | Create a long-term memory |
+| GET | `/api/memories` | List memories |
+| GET | `/api/memories/search` | Search memories |
 
 ### Settings & Compaction
 
@@ -810,6 +969,8 @@ After server restart, checkpoints are loaded from disk — branching and regener
 | PATCH | `/api/sessions/{id}/settings` | Update settings |
 | POST | `/api/sessions/{id}/compact` | Trigger context compaction |
 | GET | `/api/sessions/{id}/compaction-status` | Get context utilization |
+| GET | `/api/sessions/{id}/compaction-prompt` | Preview the compaction prompt |
+| GET | `/api/sessions/{id}/compactions` | List past compactions for the session |
 
 ### Admin
 
@@ -820,7 +981,9 @@ After server restart, checkpoints are loaded from disk — branching and regener
 | GET | `/api/admin/models` | Loaded models with default parameters |
 | GET | `/api/admin/cache` | Cache overview (all models) |
 | GET | `/api/admin/db` | Database overview |
-| POST | `/api/admin/reset` | Reset caches, DB, or all |
+| POST | `/api/admin/cache/reset` | Reset caches only |
+| POST | `/api/admin/db/reset` | Reset the database only |
+| POST | `/api/admin/reset-all` | Reset caches and database |
 
 ### Extra Request Fields
 
@@ -863,10 +1026,16 @@ src/mlx_soloheaven/
 ├── config.py           # Configuration dataclass (ModelConfig + Config)
 ├── server.py           # FastAPI app factory, multi-model setup
 ├── engine/
-│   ├── mlx_engine.py   # Core: model loading, generation, KV cache (~1300 lines)
-│   ├── thinking.py     # Thinking budget logits processor
-│   ├── tool_parser.py  # XML tool calls <-> OpenAI JSON conversion
-│   └── compaction.py   # Context compaction engine
+│   ├── mlx_engine.py      # Core: model loading, generation, KV cache, drafter (~3700 lines)
+│   ├── thinking.py        # Thinking budget logits processor
+│   ├── tool_parser.py     # XML tool calls <-> OpenAI JSON conversion
+│   ├── compaction.py      # Context compaction engine
+│   ├── pld.py             # Prompt Lookup Decoding (draft-model-free speculation)
+│   ├── structured.py      # JSON-schema FSM logits masking (response_format)
+│   ├── types.py           # mlx-free GenerationResult/CompletionResult for IPC
+│   ├── process_client.py  # EngineProcessProxy (parent side of process mode)
+│   ├── process_worker.py  # Child-process worker (main-thread generation)
+│   └── process_protocol.py # cmd/resp/ctrl Pipe message protocol
 ├── api/
 │   ├── openai_compat.py  # /v1/chat/completions, /v1/models
 │   ├── chat.py           # /api/sessions/*/chat (web UI)
@@ -916,7 +1085,16 @@ A future option could split GPU resources for concurrent processing:
 
 ### Other Ideas
 
-- **Speculative decoding** — Use a small draft model followed by verification from the large model to improve TPS
+- **Native MTP / DFlash for Qwen3.6** — Qwen3.6 ships built-in MTP heads
+  (`mtp_num_hidden_layers=1`) and z-lab publishes DFlash drafters, but mlx-vlm
+  currently strips the MTP weights. Wiring native MTP (cf. mlx-lm PR #990 /
+  MTPLX, ~1.5–2.2x on Qwen3.6-27B) or DFlash into the mlx-vlm path is a future
+  lever. Note: native MTP is ineffective on the 35B-A3B MoE (~11% acceptance —
+  a single MTP layer can't predict expert routing).
+
+> Generic draft-model **speculative decoding is already implemented** for
+> Gemma 4 (see [Speculative Decoding (MTP)](#speculative-decoding-mtp)) and for
+> trimmable-cache models via [PLD](#prompt-lookup-decoding-pld).
 
 ## Acknowledgments
 

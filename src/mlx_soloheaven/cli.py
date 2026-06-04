@@ -187,9 +187,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["inprocess", "process"],
         default=_env("ENGINE_MODE", "process"),
         help="Engine execution mode: 'process' (default; run generation in a "
-             "separate child process on its main thread — ~+15-30% tok/s; single "
-             "--model only, --models auto-falls-back to inprocess) or 'inprocess'. "
-             "(env: SOLOHEAVEN_ENGINE_MODE)",
+             "separate child process on its main thread for higher decode tok/s; "
+             "single --model only, --models auto-falls-back to inprocess) or "
+             "'inprocess'. (env: SOLOHEAVEN_ENGINE_MODE)",
     )
 
     p.add_argument("--pld", dest="pld_enabled", action="store_true",

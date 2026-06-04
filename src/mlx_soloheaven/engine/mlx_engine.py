@@ -1509,16 +1509,33 @@ class MLXEngine:
         return (cur_offset + len(prompt_token_ids or [])) >= win
 
     @staticmethod
-    def _safe_to_reuse_cache(cache_state) -> bool:
-        """Return False if any cache entry is a RotatingKVCache whose
-        internal ring buffer has wrapped (offset > max_size). In that case
-        the buffer no longer corresponds to a contiguous token prefix, and
-        prefix-trim based reuse (mlx-vlm's `c.keys.shape[2]` slicing path)
-        would silently mis-align KV entries with the new prompt's tokens.
+    def _safe_to_reuse_cache(cache_state, prompt_token_ids=None) -> bool:
+        """Return whether the prior-turn KV cache may be reused for the new
+        prompt, given the new prompt's token ids.
+
+        The danger is a RotatingKVCache (sliding-window attention, e.g.
+        gemma4's 50 sliding layers) whose internal ring buffer has wrapped
+        (offset > max_size). Once wrapped the physical buffer holds only the
+        most-recent ``max_size`` tokens — it no longer corresponds to a
+        contiguous *prefix* of the logical history, so prefix-trim based
+        reuse on a DIVERGENT prompt (branch/edit past the wrap) would
+        silently mis-align KV entries with the new prompt's tokens.
+
+        However, for a STRICT APPEND — where the entire cached logical
+        history is a prefix of the new prompt — mlx-vlm processes only the
+        suffix against the wrapped cache, and RotatingKVCache._update_concat
+        temporal-orders + trims-to-window + appends correctly. There is no
+        mis-aligned slice because the logical prefix length (>> the physical
+        buffer) drives the trim. So append-only wrapped reuse is SAFE; only
+        genuine divergence past the wrap must cold-fill.
 
         Reference: `mlx_lm/models/cache.py::RotatingKVCache` exposes
         `.offset` (cumulative tokens seen) and `.max_size` (ring capacity).
-        Non-rotating caches (KVCache, ArraysCache, ...) are always safe.
+        Non-rotating caches (KVCache, ArraysCache, ...) and non-wrapped
+        rotating caches are always safe.
+
+        ``prompt_token_ids`` defaults to None: callers that cannot supply it
+        get the conservative pre-existing behavior (wrapped → cold-fill).
 
         Empty / None cache lists return True (nothing to gate).
         """
@@ -1527,15 +1544,34 @@ class MLXEngine:
         cache = getattr(cache_state, "cache", None)
         if not cache:
             return True
+
+        has_wrapped_rotating = False
         for c in cache:
             if type(c).__name__ != "RotatingKVCache":
                 continue
             max_size = getattr(c, "max_size", None)
             offset = getattr(c, "offset", None)
             if max_size is None or offset is None:
-                # Unknown layout — be conservative and force cold-fill.
                 return False
             if offset > max_size:
+                has_wrapped_rotating = True
+
+        if not has_wrapped_rotating:
+            return True  # non-wrapped (or no rotating cache) — unchanged behavior
+
+        # Wrapped: only safe to reuse when the ENTIRE cached logical history is a
+        # strict prefix of the new prompt (pure append). Any divergence/branch must
+        # cold-fill — the rotating ring holds the old tail, not the new prefix's window.
+        cached_ids = getattr(cache_state, "token_ids", None)
+        if not cached_ids or prompt_token_ids is None:
+            return False
+        prefix_len = cache_state.find_prefix_length(prompt_token_ids)
+        if prefix_len != len(cached_ids) or prefix_len >= len(prompt_token_ids):
+            return False
+        # Defensive: RoPE continuation needs cache.offset == logical history length.
+        for c in cache:
+            offset = getattr(c, "offset", None)
+            if offset is not None and int(offset) != prefix_len:
                 return False
         return True
 
@@ -2518,7 +2554,7 @@ class MLXEngine:
             )
 
         # Safety gate: drop wrapped RotatingKVCache before reuse.
-        if not self._safe_to_reuse_cache(cache_state):
+        if not self._safe_to_reuse_cache(cache_state, prompt_token_ids):
             logger.warning(
                 f"[KV Cache] session={session_id} | "
                 f"COLD-FILL (RotatingKVCache wrapped) — dropping cache and "

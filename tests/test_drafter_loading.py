@@ -102,7 +102,7 @@ def _bare_engine(*, use_vlm: bool, draft_model: str | None) -> MLXEngine:
     eng.model_id = "stub"
     eng._drafter = None
     eng._draft_kind = None
-    eng._safe_to_reuse_cache = lambda cs: True
+    eng._safe_to_reuse_cache = lambda cs, pids=None: True
     return eng
 
 

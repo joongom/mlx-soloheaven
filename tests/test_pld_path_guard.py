@@ -34,7 +34,7 @@ def _make_engine(*, use_vlm: bool, pld_enabled: bool) -> MLXEngine:
     eng.tokenizer = SimpleNamespace()
     eng.model_id = "stub"
     # _run_vlm checks _safe_to_reuse_cache; only reached if guard passes.
-    eng._safe_to_reuse_cache = lambda cs: True
+    eng._safe_to_reuse_cache = lambda cs, pids=None: True
     return eng
 
 

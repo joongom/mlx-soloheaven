@@ -25,7 +25,7 @@ def _engine():
     eng._processor = SimpleNamespace()
     eng._drafter = SimpleNamespace(accept_lens=[])
     eng._draft_kind = "mtp"
-    eng._safe_to_reuse_cache = lambda cs: True
+    eng._safe_to_reuse_cache = lambda cs, pids=None: True
     return eng
 
 

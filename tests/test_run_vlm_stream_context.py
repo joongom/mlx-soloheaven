@@ -55,7 +55,7 @@ def _bare_vlm_engine() -> MLXEngine:
     eng._processor = SimpleNamespace()
     eng._drafter = None
     eng._draft_kind = None
-    eng._safe_to_reuse_cache = lambda cs: True
+    eng._safe_to_reuse_cache = lambda cs, pids=None: True
     return eng
 
 

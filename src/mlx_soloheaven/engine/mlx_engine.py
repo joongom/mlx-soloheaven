@@ -1075,8 +1075,33 @@ class MLXEngine:
             "last_used": str(session.last_used),
             "token_ids": json.dumps(session.cache_state.token_ids or []),
         }
-        try:
+        def _do_save():
+            # WHY: VLM KV-cache tensors are lazy and bound to the
+            # _vlm_executor worker thread's generation_stream (post-gen
+            # _eval_cache is skipped on the VLM path for perf, see F3 below).
+            # Materializing AND serializing must therefore happen on that
+            # same worker thread, or mx.eval raises "There is no Stream(gpu, 1)
+            # in current thread." _eval_cache covers keys/values AND ArraysCache
+            # .state arrays (DeltaNet recurrent state). On the legacy mlx-lm
+            # path this runs inline on the request/flush thread (default stream).
+            MLXEngine._eval_cache(session.cache_state.cache)
             save_prompt_cache(path, session.cache_state.cache, metadata=metadata)
+
+        try:
+            if getattr(self, "_use_vlm", False) and getattr(self, "_vlm_executor", None) is not None:
+                try:
+                    fut = self._vlm_executor.submit(_do_save)
+                except RuntimeError:
+                    # Executor already shut down (can happen during
+                    # _flush_all_on_shutdown). Best-effort inline save.
+                    _do_save()
+                else:
+                    # Exceptions raised inside _do_save propagate out of
+                    # .result(), so the surrounding except still classifies
+                    # them (empty-array permanent skip vs unexpected re-raise).
+                    fut.result(timeout=60)
+            else:
+                _do_save()
         except Exception as e:
             if "empty array" in str(e).lower() or "cannot serialize" in str(e).lower():
                 # Some models (GLM MoE) have empty arrays that safetensors can't handle

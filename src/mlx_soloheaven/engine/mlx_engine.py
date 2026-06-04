@@ -2720,22 +2720,23 @@ class MLXEngine:
             logits_processors=logits_processors if logits_processors else None,
         )
         drafter = getattr(self, "_drafter", None)
-        # Layer-A safety net: if the next generation will cross the
-        # RotatingKVCache sliding-window boundary (ring buffer wrap),
-        # skip the drafter for this request only. Even with the B-series
-        # monkey-patches active, we keep this guard so a future mlx-vlm
-        # version that re-introduces the bug — or any unforeseen edge
-        # case in the patch — cannot regress drafter acceptance to ~0.
-        # We mutate the LOCAL ``drafter`` variable only; ``self._drafter``
-        # stays loaded and the next non-wrapping request resumes MTP.
+        # Layer-A safety net (SUPERSEDED by the B4 RoPE-frame fix): for a
+        # request whose cache is ALREADY wrapped at the start (e.g. turn 3+
+        # of a long chat, offset > sliding_window), this used to bypass the
+        # drafter entirely — which on multi-turn chats dropped throughput to
+        # plain-decode speed for every later turn. B4 makes the drafter
+        # wrap-safe, so we keep it ON by default and only honour this
+        # bypass when the explicit fallback (SOLOHEAVEN_MTP_WRAP_GATE=1) is
+        # set. The LOCAL ``drafter`` is mutated; ``self._drafter`` stays
+        # loaded for the next request.
         wrap_imminent = self._will_wrap_during_generate(
             prompt_token_ids, cache_state
         )
-        if drafter is not None and wrap_imminent:
+        if drafter is not None and wrap_imminent and _MTP_WRAP_GATE:
             logger.warning(
                 f"[Drafter] session={session_id} skip: RotatingKVCache wrap "
                 f"imminent (sliding_window={self._sliding_window_size}) — "
-                f"drafter bypassed for this request only"
+                f"drafter bypassed (SOLOHEAVEN_MTP_WRAP_GATE fallback)"
             )
             drafter = None
         # PERF: flip the module-level fast-path flag so the B1/B2-v2

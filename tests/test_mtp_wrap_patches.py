@@ -354,58 +354,62 @@ def test_will_wrap_returns_true_at_boundary():
         eng.close()
 
 
-def test_run_vlm_skips_drafter_when_will_wrap(monkeypatch):
-    """When _will_wrap_during_generate returns True, _run_vlm must NOT
-    pass ``draft_model`` to ``vlm_stream_generate``.
+def test_run_vlm_drafter_through_wrap_default_vs_fallback(monkeypatch):
+    """B4 makes the drafter wrap-safe, so by DEFAULT _run_vlm KEEPS the
+    drafter (forwards ``draft_model``) even when the cache is already wrapped
+    — this is what fixes multi-turn chats (turn 3+ start already-wrapped).
+    The legacy bypass only fires under the SOLOHEAVEN_MTP_WRAP_GATE fallback.
     """
     eng = _bare_vlm_engine()
     try:
-        # Pretend a drafter is loaded.
         sentinel_drafter = SimpleNamespace(accept_lens=[])
         eng._drafter = sentinel_drafter
         eng._draft_kind = "mtp"
         eng._has_rotating_cache = True
         eng._sliding_window_size = 1024
 
-        captured_kwargs = {}
+        from mlx_vlm.generate import PromptCacheState
+
+        captured = {}
 
         def _fake_stream(*_args, **kwargs):
-            captured_kwargs.update(kwargs)
+            captured.clear()
+            captured.update(kwargs)
             return iter([])
 
         monkeypatch.setattr(
             mlx_engine_module, "vlm_stream_generate", _fake_stream
         )
 
-        # Force wrap-imminent: cache_state offset=1000, prompt=200.
-        from mlx_vlm.generate import PromptCacheState
-
-        cs = PromptCacheState()
-        cs.cache = [SimpleNamespace(offset=1000)]
-        cs.token_ids = [0] * 1000
-
         def _drive():
+            # Wrap-imminent: cache already at offset=1000, +200 new prompt.
+            cs = PromptCacheState()
+            cs.cache = [SimpleNamespace(offset=1000)]
+            cs.token_ids = [0] * 1000
             gen = eng._run_vlm(
-                cache_state=cs,
-                prompt_token_ids=[0] * 200,
-                max_tokens=4,
-                temperature=0.0,
-                top_p=1.0,
-                min_p=0.0,
-                top_k=0,
-                logits_processors=None,
-                session_id="s-wrap",
+                cache_state=cs, prompt_token_ids=[0] * 200, max_tokens=4,
+                temperature=0.0, top_p=1.0, min_p=0.0, top_k=0,
+                logits_processors=None, session_id="s-wrap",
                 total_prompt_tokens=200,
             )
             list(gen)
 
+        # DEFAULT (gate off): the drafter is KEPT through the wrap (B4).
+        monkeypatch.setattr(mlx_engine_module, "_MTP_WRAP_GATE", False)
         eng._vlm_executor.submit(_drive).result(timeout=10)
-
-        assert "draft_model" not in captured_kwargs, (
-            f"draft_model must not be forwarded when wrap imminent, "
-            f"got kwargs keys={list(captured_kwargs.keys())}"
+        assert "draft_model" in captured, (
+            "B4: drafter must be KEPT through the wrap by default, "
+            f"got kwargs keys={list(captured.keys())}"
         )
-        # And the loaded drafter must remain attached for future requests.
+
+        # FALLBACK (SOLOHEAVEN_MTP_WRAP_GATE=1): legacy bypass re-engages.
+        monkeypatch.setattr(mlx_engine_module, "_MTP_WRAP_GATE", True)
+        eng._vlm_executor.submit(_drive).result(timeout=10)
+        assert "draft_model" not in captured, (
+            "fallback gate must bypass the drafter when wrap imminent, "
+            f"got kwargs keys={list(captured.keys())}"
+        )
+        # The loaded drafter stays attached for future requests either way.
         assert eng._drafter is sentinel_drafter
     finally:
         eng.close()

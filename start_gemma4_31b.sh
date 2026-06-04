@@ -1,7 +1,7 @@
 #!/bin/bash
 # Start SoloHeaven with Qwen3.6-35B-A3B-mxfp8 (MoE, 3B active)
 # Note: Qwen3.5/3.6 MoE uses DeltaNet (ArraysCache) — PLD incompatible
-MODEL_PATH="$HOME/.lmstudio/models/mlx-community/Qwen3.6-35B-A3B-8bit"
+MODEL_PATH="$HOME/.lmstudio/models/lmstudio-community/gemma-4-31B-it-MLX-8bit"
 
 cd "$(dirname "$0")"
 source .venv/bin/activate
@@ -9,8 +9,5 @@ export SOLOHEAVEN_MODELS=""
 mlx-soloheaven \
   --model "$MODEL_PATH" \
   --memory-budget-gb 20 \
-  --no-thinking \
   --gpu-keepalive \
-  --prefill-step-size 4096 \
-  --verbose \
   "$@"

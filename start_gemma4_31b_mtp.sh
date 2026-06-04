@@ -10,14 +10,12 @@ cd "$(dirname "$0")"
 source .venv/bin/activate
 export SOLOHEAVEN_MODELS=""
 
-DRAFT_ARGS=()
-# DRAFT_ARGS=(--draft-model "$DRAFT_PATH")
+# DRAFT_ARGS=()
+DRAFT_ARGS=(--draft-model "$DRAFT_PATH" --draft-block-size 3)
 
 mlx-soloheaven \
   --model "$MODEL_PATH" \
   "${DRAFT_ARGS[@]}" \
   --memory-budget-gb 20 \
   --gpu-keepalive \
-  --prefill-step-size 1024 \
-  --verbose \
   "$@"

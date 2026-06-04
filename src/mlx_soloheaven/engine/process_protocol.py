@@ -18,12 +18,22 @@ generate (cmd):
         "params":{session_id, max_tokens, temperature, top_p, min_p, top_k,
                   repetition_penalty, tools, thinking, thinking_budget,
                   response_format}}}
+generate_scalar (cmd):
+    Same shape as ``generate`` but op == "generate_scalar". Drives
+    ``engine.generate_stream_async`` (scalar, one GenerationResult per frame —
+    no coalescing) instead of the batched path. Used by the compaction summary
+    streamer which consumes per-result.
+rpc (cmd):  generic synchronous engine method call (Stage 2)
+    {"v":1, "id":<str>, "op":"rpc", "method":<str>, "args":[...],
+     "kwargs":{...}}  -- args/kwargs MUST be pickle/JSON-serializable.
 cancel (ctrl):
     {"op":"cancel", "id":<str>}
 
 ready (resp):
     {"type":"ready", "model_id", "model_family", "enable_thinking",
-     "think_end_token"}
+     "think_end_token", "cfg":<dict>}
+rpc_result (resp):
+    {"id":<str>, "type":"rpc_result", "result":<json/picklable>}
 batch (resp):
     {"id":<str>, "type":"batch", "items":[GenerationResultDict, ...]}
 final (resp):
@@ -92,20 +102,47 @@ def make_generate(request_id: str, messages: list, params: dict) -> dict:
     }
 
 
+def make_generate_scalar(request_id: str, messages: list, params: dict) -> dict:
+    return {
+        "v": PROTOCOL_VERSION,
+        "id": request_id,
+        "op": "generate_scalar",
+        "payload": {"messages": messages, "params": params},
+    }
+
+
+def make_rpc(request_id: str, method: str, args: list, kwargs: dict) -> dict:
+    return {
+        "v": PROTOCOL_VERSION,
+        "id": request_id,
+        "op": "rpc",
+        "method": method,
+        "args": list(args),
+        "kwargs": dict(kwargs),
+    }
+
+
 def make_cancel(request_id: str) -> dict:
     return {"op": "cancel", "id": request_id}
 
 
 # --- response frames (CHILD -> PARENT) -----------------------------------
 
-def make_ready(model_id, model_family, enable_thinking, think_end_token) -> dict:
+def make_ready(
+    model_id, model_family, enable_thinking, think_end_token, cfg=None
+) -> dict:
     return {
         "type": "ready",
         "model_id": model_id,
         "model_family": model_family,
         "enable_thinking": enable_thinking,
         "think_end_token": think_end_token,
+        "cfg": cfg or {},
     }
+
+
+def make_rpc_result(request_id: str, result) -> dict:
+    return {"id": request_id, "type": "rpc_result", "result": result}
 
 
 def make_batch(request_id: str, items: list[dict]) -> dict:

@@ -76,12 +76,17 @@ def worker_main(cfg_dict, cmd_conn, resp_conn, ctrl_conn):
 
     threading.Thread(target=_ctrl_loop, daemon=True, name="proc-ctrl").start()
 
-    # Signal readiness with model metadata the parent proxy exposes.
+    # Signal readiness with model metadata the parent proxy exposes. The cfg
+    # snapshot carries the read-only fields the API reads (default_*, thinking,
+    # token IDs, budgets, cache_dir) AFTER the child's load-time detection
+    # (e.g. think_end_token auto-detect, enable_thinking auto-disable) so the
+    # parent's cfg view matches the child's authoritative config.
     resp_conn.send(proto.make_ready(
         model_id=engine.model_id,
         model_family=engine.model_family,
         enable_thinking=engine.cfg.enable_thinking,
         think_end_token=engine.cfg.think_end_token,
+        cfg=_cfg_snapshot(engine.cfg),
     ))
 
     # Coalescing config (mirrors generate_stream_batches_async).
@@ -101,7 +106,20 @@ def worker_main(cfg_dict, cmd_conn, resp_conn, ctrl_conn):
         op = cmd.get("op")
         if op == "shutdown":
             break
-        if op != "generate":
+
+        # --- generic synchronous RPC (Stage 2) ---
+        if op == "rpc":
+            rid = cmd.get("id", "")
+            method = cmd.get("method", "")
+            args = cmd.get("args", []) or []
+            kwargs = cmd.get("kwargs", {}) or {}
+            try:
+                _run_rpc(engine, rid, method, args, kwargs, resp_conn)
+            except Exception as e:  # noqa: BLE001
+                resp_conn.send(proto.make_error(rid, str(e), traceback.format_exc()))
+            continue
+
+        if op not in ("generate", "generate_scalar"):
             # Unknown op — report loudly against its id if present.
             resp_conn.send(proto.make_error(
                 cmd.get("id", ""), f"unknown op {op!r}", ""
@@ -112,6 +130,7 @@ def worker_main(cfg_dict, cmd_conn, resp_conn, ctrl_conn):
         payload = cmd.get("payload", {})
         messages = payload.get("messages", [])
         params = dict(payload.get("params", {}))
+        scalar = (op == "generate_scalar")
 
         cancel_event = threading.Event()
         with active_lock:
@@ -120,7 +139,7 @@ def worker_main(cfg_dict, cmd_conn, resp_conn, ctrl_conn):
         try:
             _run_generate(
                 engine, rid, messages, params, cancel_event, resp_conn,
-                coalesce_n, coalesce_ms, coalescing,
+                coalesce_n, coalesce_ms, coalescing, scalar=scalar,
             )
         except Exception as e:  # noqa: BLE001
             resp_conn.send(proto.make_error(rid, str(e), traceback.format_exc()))
@@ -129,11 +148,76 @@ def worker_main(cfg_dict, cmd_conn, resp_conn, ctrl_conn):
                 active.pop(rid, None)
 
 
+def _run_rpc(engine, rid, method, args, kwargs, resp_conn):
+    """Dispatch a generic engine method call on the child main thread.
+
+    Looks up ``getattr(engine, method)``, invokes it with the (already
+    serialized-as-plain) args/kwargs, runs it to completion if it returns a
+    coroutine, normalizes engine result objects to plain dicts, and sends an
+    ``rpc_result`` frame. Exceptions surface as ``error`` frames.
+    """
+    import asyncio as _asyncio
+
+    fn = getattr(engine, method, None)
+    if fn is None or not callable(fn):
+        resp_conn.send(proto.make_error(
+            rid, f"engine has no callable method {method!r}", ""
+        ))
+        return
+
+    # response_format crosses the wire as a plain dict (the parent serialized
+    # its pydantic model); rehydrate to the engine-compatible duck-typed view.
+    if "response_format" in kwargs:
+        kwargs = dict(kwargs)
+        kwargs["response_format"] = proto.deserialize_response_format(
+            kwargs.get("response_format")
+        )
+
+    result = fn(*args, **kwargs)
+    if _asyncio.iscoroutine(result):
+        result = _asyncio.run(result)
+
+    resp_conn.send(proto.make_rpc_result(rid, _serialize_rpc_result(result)))
+
+
+def _serialize_rpc_result(result):
+    """Normalize an engine method's return value to a plain, picklable value.
+
+    CompletionResult / GenerationResult expose ``to_dict``. Everything else
+    the wired methods return is already plain (dict / list / bool / None / str
+    / int), so it passes through unchanged.
+    """
+    if hasattr(result, "to_dict") and callable(result.to_dict):
+        return {"__type__": type(result).__name__, "value": result.to_dict()}
+    return result
+
+
+def _cfg_snapshot(cfg) -> dict:
+    """Serializable read-only snapshot of the cfg fields the API reads.
+
+    Sent in the ``ready`` frame so the parent proxy's ``cfg`` view reflects the
+    child's authoritative config after load-time detection (think_end_token,
+    enable_thinking auto-disable, etc.)."""
+    fields = (
+        "default_temperature", "default_top_p", "default_min_p", "default_top_k",
+        "default_repetition_penalty", "default_max_tokens", "thinking_budget",
+        "enable_thinking", "think_end_token", "think_start_token",
+        "memory_budget_gb", "disk_budget_gb", "cache_dir", "model_path",
+    )
+    return {f: getattr(cfg, f, None) for f in fields}
+
+
 def _run_generate(engine, rid, messages, params, cancel_event, resp_conn,
-                  coalesce_n, coalesce_ms, coalescing):
+                  coalesce_n, coalesce_ms, coalescing, scalar=False):
     """Iterate engine.generate_stream synchronously on the main thread,
     applying the same flush rules as generate_stream_batches_async and
-    sending batch / final / done frames on resp_conn."""
+    sending batch / final / done frames on resp_conn.
+
+    ``scalar=True`` disables coalescing so every GenerationResult is posted as
+    its own 1-item batch — mirrors generate_stream_async (used by the summary
+    streamer / compaction)."""
+    if scalar:
+        coalescing = False
     # Rehydrate response_format into an engine-compatible duck-typed view.
     response_format = proto.deserialize_response_format(params.get("response_format"))
 

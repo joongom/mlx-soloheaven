@@ -1,17 +1,35 @@
-"""PARENT-side proxy for process-mode generation (Stage 1).
+"""PARENT-side proxy for process-mode generation (Stage 2).
 
-``EngineProcessProxy`` looks (enough) like an ``MLXEngine`` for the
-``/v1/chat/completions`` streaming path: it exposes
-``generate_stream_batches_async``, ``model_id``, ``model_family``,
-``enable_thinking``, ``think_end_token``, ``cfg`` (for ``cfg.enable_thinking``),
-and ``update_session_messages`` (no-op — the child owns sessions). All other
-engine methods the OTHER endpoints call raise NotImplementedError so failures
-are loud rather than silently wrong.
+``EngineProcessProxy`` looks (enough) like an ``MLXEngine`` for EVERY endpoint:
+the ``/v1/chat/completions`` streaming + non-streaming paths, the web-UI chat
+endpoints, session lifecycle (list/get/delete/branch/truncate/regenerate),
+compaction (summary streaming + compact_session), and admin cache
+overview/reset. It exposes:
+
+  - ``generate_stream_batches_async`` (batched streaming) and
+    ``generate_stream_async`` (scalar streaming, for the compaction summarizer).
+  - model metadata (``model_id``, ``model_family``, ``enable_thinking``,
+    ``think_end_token``) populated from the child's ``ready`` frame.
+  - ``cfg`` — a real Config passed in by the server, refreshed from the child's
+    ``ready`` cfg snapshot so default_*/thinking/token-id reads match the child.
+  - ``cache_manager`` — a tiny parent-side shim whose ``stats()`` forwards to the
+    child's cache_overview RPC (chat.py /api/cache/stats reads this directly).
+  - generic engine methods (``complete``, ``compact_session``,
+    ``list_sessions``, ``session_stats``, ``get_session``, ``delete_session``,
+    ``base_cache_stats``, ``branch_from_turn``, ``prepare_regenerate``,
+    ``truncate_session``, ``update_session_messages``, ``cache_overview``,
+    ``clear_caches``) — each forwards to the child via a generic synchronous RPC
+    and blocks on the result. These callers invoke the methods synchronously
+    (not awaited), so the proxy methods are synchronous too; the brief block on
+    a fast metadata RPC matches the in-process engine's existing behavior.
+
+The parent imports NO mlx / mlx_engine — all MLX work stays in the child.
 
 Architecture: one CHILD process spawned with the spawn context; three Pipes
 (cmd / resp / ctrl). One daemon READER thread does ``resp_conn.recv()`` and
-routes frames by request id into a per-request asyncio.Queue via
-``loop.call_soon_threadsafe``.
+routes frames: streaming frames (batch/final/done/error) go into per-request
+asyncio.Queues; ``rpc_result``/``error`` for an RPC id resolve a threading
+future registered in ``_rpc_results``.
 """
 
 import asyncio
@@ -20,6 +38,7 @@ import multiprocessing as mp
 import threading
 import uuid
 from dataclasses import asdict
+from types import SimpleNamespace
 
 from mlx_soloheaven.engine import process_protocol as proto
 from mlx_soloheaven.engine.types import GenerationResult
@@ -40,14 +59,24 @@ def _config_to_dict(cfg) -> dict:
     return d
 
 
-class _NotSupported:
-    """Mixin providing loud stubs for engine methods not wired in stage 1."""
+class _RpcError(RuntimeError):
+    """Raised parent-side when the child reports an error for an RPC call."""
 
-    @staticmethod
-    def _nope(*_a, **_k):
-        raise NotImplementedError(
-            "not supported in process mode (stage 1)"
-        )
+
+class _CacheManagerShim:
+    """Parent-side stand-in for ``engine.cache_manager``.
+
+    chat.py's /api/cache/stats reads ``engine.cache_manager.stats()`` directly.
+    In process mode the real cache_manager lives in the child, so this shim
+    forwards ``stats()`` to the child's ``cache_overview`` RPC and projects the
+    cache_manager sub-dict (byte-identical shape to CacheManager.stats())."""
+
+    def __init__(self, proxy):
+        self._proxy = proxy
+
+    def stats(self) -> dict:
+        overview = self._proxy.cache_overview()
+        return overview.get("cache_manager", {})
 
 
 class EngineProcessProxy:
@@ -70,12 +99,26 @@ class EngineProcessProxy:
         self.enable_thinking = bool(getattr(cfg, "enable_thinking", True))
         self.think_end_token = int(getattr(cfg, "think_end_token", -1))
 
-        # Per-request routing. The reader thread routes frames into these
-        # queues keyed by request id. Each queue is created on the request's
-        # own event loop; routing uses call_soon_threadsafe.
+        # Parent-side cache_manager shim (chat.py reads .cache_manager.stats()).
+        self.cache_manager = _CacheManagerShim(self)
+
+        # Per-request STREAMING routing. The reader thread routes batch/final/
+        # done/error frames into these queues keyed by request id. Each queue is
+        # created on the request's own event loop; routing uses
+        # call_soon_threadsafe.
         self._queues: dict[str, asyncio.Queue] = {}
         self._loops: dict[str, asyncio.AbstractEventLoop] = {}
         self._routing_lock = threading.Lock()
+
+        # Per-request RPC results. Synchronous engine-method calls register a
+        # threading.Event-backed slot keyed by request id; the reader thread
+        # fills it on rpc_result / error and sets the event. The cmd pipe is
+        # serialized with a send lock so a streaming send and an RPC send from
+        # different threads never interleave a single frame.
+        self._rpc_results: dict[str, dict] = {}
+        self._rpc_lock = threading.Lock()
+        self._cmd_send_lock = threading.Lock()
+        self._ctrl_send_lock = threading.Lock()
 
         # Stage-1 single-flight tracking (loud-ish; not a hard gate).
         self._inflight = 0
@@ -116,7 +159,8 @@ class EngineProcessProxy:
 
     def close(self):
         try:
-            self._cmd_parent.send({"op": "shutdown"})
+            with self._cmd_send_lock:
+                self._cmd_parent.send({"op": "shutdown"})
         except Exception:  # noqa: BLE001
             pass
         if self._proc is not None:
@@ -127,7 +171,8 @@ class EngineProcessProxy:
     # --- reader thread ----------------------------------------------------
 
     def _reader_loop(self):
-        """Drain resp pipe; route frames into per-request asyncio queues."""
+        """Drain resp pipe; route streaming frames into per-request asyncio
+        queues and RPC results into their threading-future slots."""
         while True:
             try:
                 frame = self._resp_parent.recv()
@@ -138,22 +183,22 @@ class EngineProcessProxy:
 
             ftype = frame.get("type")
             if ftype == "ready":
-                self.model_id = frame.get("model_id", "")
-                self.model_family = frame.get("model_family", "chatml")
-                self.enable_thinking = bool(frame.get("enable_thinking", True))
-                self.think_end_token = int(frame.get("think_end_token", -1))
-                # Keep cfg.enable_thinking consistent (openai_compat reads it).
-                try:
-                    self.cfg.enable_thinking = self.enable_thinking
-                    self.cfg.think_end_token = self.think_end_token
-                except Exception:  # noqa: BLE001
-                    pass
-                self._ready_event.set()
+                self._apply_ready(frame)
                 continue
 
             rid = frame.get("id")
             if rid is None:
                 continue
+
+            # RPC result / error for a pending synchronous call.
+            with self._rpc_lock:
+                slot = self._rpc_results.get(rid)
+            if slot is not None and ftype in ("rpc_result", "error"):
+                slot["frame"] = frame
+                slot["event"].set()
+                continue
+
+            # Otherwise it's a streaming frame — route to the request's queue.
             with self._routing_lock:
                 q = self._queues.get(rid)
                 loop = self._loops.get(rid)
@@ -166,16 +211,78 @@ class EngineProcessProxy:
                 # Loop closed — request gone.
                 pass
 
-    # --- generation -------------------------------------------------------
+    def _apply_ready(self, frame: dict):
+        self.model_id = frame.get("model_id", "")
+        self.model_family = frame.get("model_family", "chatml")
+        self.enable_thinking = bool(frame.get("enable_thinking", True))
+        self.think_end_token = int(frame.get("think_end_token", -1))
+        # Refresh cfg view from the child's authoritative post-load snapshot so
+        # the API's default_*/thinking/token-id reads match the child.
+        snap = frame.get("cfg") or {}
+        for k, v in snap.items():
+            if v is not None:
+                try:
+                    setattr(self.cfg, k, v)
+                except Exception:  # noqa: BLE001
+                    pass
+        # Keep these two consistent even if not in the snapshot.
+        try:
+            self.cfg.enable_thinking = self.enable_thinking
+            self.cfg.think_end_token = self.think_end_token
+        except Exception:  # noqa: BLE001
+            pass
+        self._ready_event.set()
+
+    # --- generic synchronous RPC -----------------------------------------
+
+    def _rpc(self, method: str, *args, timeout: float = 600.0, **kwargs):
+        """Forward a synchronous engine-method call to the child and block on
+        the result. Returns the deserialized result; raises _RpcError on a
+        child-side exception."""
+        rid = uuid.uuid4().hex
+        ev = threading.Event()
+        with self._rpc_lock:
+            self._rpc_results[rid] = {"event": ev, "frame": None}
+        try:
+            with self._cmd_send_lock:
+                self._cmd_parent.send(proto.make_rpc(rid, method, list(args), kwargs))
+            if not ev.wait(timeout=timeout):
+                raise _RpcError(
+                    f"process-mode RPC {method!r} timed out after {timeout}s"
+                )
+            with self._rpc_lock:
+                slot = self._rpc_results.get(rid)
+            frame = (slot or {}).get("frame") or {}
+        finally:
+            with self._rpc_lock:
+                self._rpc_results.pop(rid, None)
+
+        if frame.get("type") == "error":
+            err = frame.get("error", "unknown")
+            tb = frame.get("traceback", "")
+            logger.error(f"[ProcessProxy] RPC {method!r} error: {err}\n{tb}")
+            raise _RpcError(f"process-mode RPC {method!r} error: {err}")
+        return _deserialize_rpc_result(frame.get("result"))
+
+    # --- generation (streaming) ------------------------------------------
 
     async def generate_stream_batches_async(self, messages, **params):
-        """Send a generate command; yield list[GenerationResult] batches.
+        """Send a generate command; yield list[GenerationResult] batches."""
+        async for batch in self._stream(messages, params, scalar=False):
+            yield batch
 
-        Mirrors MLXEngine.generate_stream_batches_async's contract: each
-        yielded item is a list of GenerationResult. The terminal finish
-        result arrives as a `final` frame and is re-yielded as a 1-item batch
-        so the openai_compat consumer sees `result.finish_reason`.
-        """
+    async def generate_stream_async(self, messages, **params):
+        """Send a scalar generate command; yield individual GenerationResult.
+
+        Mirrors MLXEngine.generate_stream_async — used by the compaction summary
+        streamer (CompactionEngine.generate_summary_stream)."""
+        async for batch in self._stream(messages, params, scalar=True):
+            for item in batch:
+                yield item
+
+    async def _stream(self, messages, params, scalar: bool):
+        """Shared streaming driver for batched + scalar paths. Yields
+        list[GenerationResult] batches (scalar path yields 1-item batches)."""
         loop = asyncio.get_event_loop()
         rid = uuid.uuid4().hex
         q: asyncio.Queue = asyncio.Queue()
@@ -202,9 +309,12 @@ class EngineProcessProxy:
             "response_format": proto.serialize_response_format(rf),
         }
 
+        make_cmd = proto.make_generate_scalar if scalar else proto.make_generate
+
         cancel_sent = False
         try:
-            self._cmd_parent.send(proto.make_generate(rid, messages, wire_params))
+            with self._cmd_send_lock:
+                self._cmd_parent.send(make_cmd(rid, messages, wire_params))
 
             while True:
                 try:
@@ -234,7 +344,8 @@ class EngineProcessProxy:
             # Client disconnect — tell the child to cancel this request.
             if not cancel_sent:
                 try:
-                    self._ctrl_parent.send(proto.make_cancel(rid))
+                    with self._ctrl_send_lock:
+                        self._ctrl_parent.send(proto.make_cancel(rid))
                     cancel_sent = True
                 except Exception:  # noqa: BLE001
                     pass
@@ -253,44 +364,85 @@ class EngineProcessProxy:
         with self._inflight_lock:
             return self._inflight > 0
 
-    # --- session/admin methods used by OTHER endpoints (loud stubs) -------
+    # --- non-streaming completion ----------------------------------------
 
-    def update_session_messages(self, *_a, **_k):
-        # No-op: the child owns session state. The parent has no session to
-        # touch; the child already persists on its own. Keeping this a no-op
-        # (rather than raising) lets the /v1/chat/completions handler finish
-        # cleanly without special-casing process mode.
-        return None
+    def complete(self, messages, **kwargs):
+        """Non-streaming completion. Returns a CompletionResult (rehydrated
+        from the child's serialized dict).
 
-    def session_stats(self) -> dict:
-        return {"active_sessions": 0, "sessions": {}, "mode": "process"}
+        ``response_format`` is a pydantic model on this side; serialize it to a
+        plain dict for the wire (the worker rehydrates a duck-typed view, same
+        as the streaming path) so we never pickle pydantic across the Pipe."""
+        if "response_format" in kwargs:
+            kwargs["response_format"] = proto.serialize_response_format(
+                kwargs.get("response_format")
+            )
+        return self._rpc("complete", messages, **kwargs)
 
-    def complete(self, *a, **k):
-        _NotSupported._nope(*a, **k)
+    # --- session lifecycle (synchronous RPCs) ----------------------------
 
-    def compact_session(self, *a, **k):
-        _NotSupported._nope(*a, **k)
+    def update_session_messages(self, session_id, messages):
+        # Real RPC now (Stage 1 was a no-op). The child's engine intentionally
+        # ignores the caller messages (its internal thinking-bearing messages
+        # are authoritative for cache matching) — it only touches + marks the
+        # session dirty. Forwarding lets the child persist its KV cache.
+        return self._rpc("update_session_messages", session_id, messages)
 
-    def list_sessions(self, *a, **k):
-        _NotSupported._nope(*a, **k)
+    def compact_session(self, session_id, messages):
+        return self._rpc("compact_session", session_id, messages)
 
-    def get_session(self, *a, **k):
-        _NotSupported._nope(*a, **k)
+    def truncate_session(self, session_id, target_msg_count):
+        return self._rpc("truncate_session", session_id, target_msg_count)
 
-    def delete_session(self, *a, **k):
-        _NotSupported._nope(*a, **k)
+    def prepare_regenerate(self, session_id):
+        return self._rpc("prepare_regenerate", session_id)
 
-    def base_cache_stats(self, *a, **k):
-        _NotSupported._nope(*a, **k)
+    def branch_from_turn(self, source_session_id, new_session_id, branch_turn,
+                         branch_messages=None):
+        return self._rpc(
+            "branch_from_turn", source_session_id, new_session_id, branch_turn,
+            branch_messages=branch_messages,
+        )
 
-    def summarize(self, *a, **k):
-        _NotSupported._nope(*a, **k)
+    def get_session(self, session_id):
+        return self._rpc("get_session", session_id)
 
-    def compact(self, *a, **k):
-        _NotSupported._nope(*a, **k)
+    def delete_session(self, session_id):
+        return self._rpc("delete_session", session_id)
 
-    def generate_summary_stream(self, *a, **k):
-        _NotSupported._nope(*a, **k)
+    def list_sessions(self):
+        return self._rpc("list_sessions")
 
-    def generate_stream_async(self, *a, **k):
-        _NotSupported._nope(*a, **k)
+    def session_stats(self):
+        return self._rpc("session_stats")
+
+    def base_cache_stats(self):
+        return self._rpc("base_cache_stats")
+
+    # --- admin cache overview / reset (synchronous RPCs) -----------------
+
+    def cache_overview(self):
+        return self._rpc("cache_overview")
+
+    def clear_caches(self):
+        return self._rpc("clear_caches")
+
+    def reset(self):
+        return self._rpc("reset")
+
+
+def _deserialize_rpc_result(value):
+    """Rehydrate the value produced by ``_serialize_rpc_result`` in the worker.
+
+    Wrapped engine objects ({"__type__","value"}) become their dataclass; all
+    other values pass through unchanged."""
+    if isinstance(value, dict) and "__type__" in value and "value" in value:
+        t = value["__type__"]
+        payload = value["value"]
+        if t == "CompletionResult":
+            from mlx_soloheaven.engine.types import CompletionResult
+            return CompletionResult.from_dict(payload)
+        if t == "GenerationResult":
+            return GenerationResult.from_dict(payload)
+        return payload
+    return value

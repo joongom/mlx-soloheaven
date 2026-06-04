@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import os
-import time
 from collections import deque
 from typing import AsyncGenerator
 
@@ -152,7 +151,7 @@ async def models_overview():
                 "memory_gb": cfg.memory_budget_gb,
                 "disk_gb": cfg.disk_budget_gb,
             },
-            "sessions": len(engine._sessions),
+            "sessions": engine.session_stats().get("active_sessions", 0),
         })
     return {"models": models}
 
@@ -161,7 +160,11 @@ async def models_overview():
 
 @router.get("/cache")
 async def cache_overview():
-    """Detailed cache overview across all engines."""
+    """Detailed cache overview across all engines.
+
+    Reads each engine's cache state via ``engine.cache_overview()`` so the
+    same code path works for in-process engines AND process-mode proxies (the
+    proxy RPCs this to the child, the authoritative cache owner)."""
     result = {
         "engines": {},
         "disk_files": [],
@@ -170,59 +173,24 @@ async def cache_overview():
     }
 
     for model_id, engine in _engines.items():
-        sessions = []
-        for sid, s in engine._sessions.items():
-            cache = s.cache_state.cache if s.cache_state else None
-            cache_size = engine.cache_manager._estimate_cache_size(cache) if cache else 0
-            sessions.append({
-                "session_id": sid,
-                "messages": len(s.messages),
-                "cache_tokens": s.total_cache_tokens,
-                "cache_size_mb": round(cache_size / 1e6, 1),
-                "last_used": s.last_used,
-                "age_s": round(time.time() - s.last_used, 0),
-            })
-        sessions.sort(key=lambda x: x["last_used"], reverse=True)
-
-        base_caches = []
-        for h, bc in engine._base_caches.items():
-            base_caches.append({
-                "hash": h,
-                "token_count": bc.token_count,
-                "hit_count": bc.hit_count,
-                "created": bc.created,
-            })
-
+        ov = engine.cache_overview()
         result["engines"][model_id] = {
-            "model_id": engine.model_id,
-            "enable_thinking": engine.cfg.enable_thinking,
-            "sessions": sessions,
-            "session_count": len(sessions),
-            "base_caches": base_caches,
-            "cache_manager": engine.cache_manager.stats(),
+            "model_id": ov.get("model_id"),
+            "enable_thinking": ov.get("enable_thinking"),
+            "sessions": ov.get("sessions", []),
+            "session_count": ov.get("session_count", 0),
+            "base_caches": ov.get("base_caches", []),
+            "cache_manager": ov.get("cache_manager", {}),
         }
+        for df in ov.get("disk_files", []):
+            result["disk_files"].append({
+                "file": df.get("file"),
+                "size_mb": df.get("size_mb"),
+                "model": model_id,
+            })
+        result["total_disk_gb"] += ov.get("disk_bytes", 0) / 1e9
+        result["total_memory_gb"] += ov.get("memory_bytes", 0) / 1e9
 
-    # Disk files
-    for model_id, engine in _engines.items():
-        cache_dir = engine.cfg.cache_dir
-        if os.path.isdir(cache_dir):
-            for fname in sorted(os.listdir(cache_dir)):
-                if fname.endswith(".safetensors"):
-                    fpath = os.path.join(cache_dir, fname)
-                    fsize = os.path.getsize(fpath)
-                    result["disk_files"].append({
-                        "file": fname,
-                        "size_mb": round(fsize / 1e6, 1),
-                        "model": model_id,
-                    })
-                    result["total_disk_gb"] += fsize / 1e9
-
-    # Total memory
-    for model_id, engine in _engines.items():
-        for sid, s in engine._sessions.items():
-            cache = s.cache_state.cache if s.cache_state else None
-            if cache:
-                result["total_memory_gb"] += engine.cache_manager._estimate_cache_size(cache) / 1e9
     result["total_memory_gb"] = round(result["total_memory_gb"], 2)
     result["total_disk_gb"] = round(result["total_disk_gb"], 2)
 
@@ -274,36 +242,18 @@ async def db_overview():
 
 @router.post("/cache/reset")
 async def reset_cache():
-    """Clear all KV caches (memory + disk) and DB cache references."""
+    """Clear all KV caches (memory + disk) and DB cache references.
+
+    Delegates to ``engine.clear_caches()`` so the same path works for
+    in-process engines AND process-mode proxies (the proxy RPCs the clear to
+    the child, the authoritative cache owner)."""
     cleared = {"memory_sessions": 0, "disk_files": 0, "base_caches": 0}
 
     for model_id, engine in _engines.items():
-        # Clear in-memory sessions
-        cleared["memory_sessions"] += len(engine._sessions)
-        engine._sessions.clear()
-
-        # Clear base caches
-        cleared["base_caches"] += len(engine._base_caches)
-        engine._base_caches.clear()
-
-        # Clear cache manager
-        engine.cache_manager.memory_caches.clear()
-        engine.cache_manager.disk_index.clear()
-
-        # Delete disk cache files
-        cache_dir = engine.cfg.cache_dir
-        if os.path.isdir(cache_dir):
-            for fname in os.listdir(cache_dir):
-                if fname.endswith(".safetensors"):
-                    try:
-                        os.remove(os.path.join(cache_dir, fname))
-                        cleared["disk_files"] += 1
-                    except OSError:
-                        pass
-
-        # Clear disk index
-        if hasattr(engine, "_disk_session_ids"):
-            engine._disk_session_ids.clear()
+        c = engine.clear_caches()
+        cleared["memory_sessions"] += c.get("memory_sessions", 0)
+        cleared["base_caches"] += c.get("base_caches", 0)
+        cleared["disk_files"] += c.get("disk_files", 0)
 
     return {"status": "ok", "cleared": cleared}
 

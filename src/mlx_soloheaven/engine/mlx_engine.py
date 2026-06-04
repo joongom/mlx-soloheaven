@@ -3399,3 +3399,108 @@ class MLXEngine:
                 for sid, s in self._sessions.items()
             },
         }
+
+    # --- Admin: cache overview + reset (process-mode-safe) ---------------
+    #
+    # These wrap the previously-direct admin.py accesses to ``_sessions`` /
+    # ``_base_caches`` / ``cache_manager`` so the admin endpoints can read +
+    # mutate cache state through the engine API. In process mode the proxy
+    # RPCs these to the child (the authoritative cache owner); in-process they
+    # operate on local state directly — both return plain JSON-serializable
+    # dicts.
+
+    def cache_overview(self) -> dict:
+        """Serializable per-engine cache overview (memory sessions, base
+        caches, cache-manager stats, disk files). Used by /api/admin/cache
+        and /api/cache/stats. Reads in-memory + disk state directly."""
+        sessions = []
+        total_memory_bytes = 0
+        for sid, s in self._sessions.items():
+            cache = s.cache_state.cache if s.cache_state else None
+            cache_size = self.cache_manager._estimate_cache_size(cache) if cache else 0
+            total_memory_bytes += cache_size
+            sessions.append({
+                "session_id": sid,
+                "messages": len(s.messages),
+                "cache_tokens": s.total_cache_tokens,
+                "cache_size_mb": round(cache_size / 1e6, 1),
+                "last_used": s.last_used,
+                "age_s": round(time.time() - s.last_used, 0),
+            })
+        sessions.sort(key=lambda x: x["last_used"], reverse=True)
+
+        base_caches = [
+            {
+                "hash": h,
+                "token_count": bc.token_count,
+                "hit_count": bc.hit_count,
+                "created": bc.created,
+            }
+            for h, bc in self._base_caches.items()
+        ]
+
+        disk_files = []
+        total_disk_bytes = 0
+        cache_dir = self.cfg.cache_dir
+        if os.path.isdir(cache_dir):
+            for fname in sorted(os.listdir(cache_dir)):
+                if fname.endswith(".safetensors"):
+                    fpath = os.path.join(cache_dir, fname)
+                    try:
+                        fsize = os.path.getsize(fpath)
+                    except OSError:
+                        continue
+                    total_disk_bytes += fsize
+                    disk_files.append({
+                        "file": fname,
+                        "size_mb": round(fsize / 1e6, 1),
+                    })
+
+        return {
+            "model_id": self.model_id,
+            "enable_thinking": self.cfg.enable_thinking,
+            "sessions": sessions,
+            "session_count": len(sessions),
+            "base_caches": base_caches,
+            "cache_manager": self.cache_manager.stats(),
+            "disk_files": disk_files,
+            "memory_bytes": total_memory_bytes,
+            "disk_bytes": total_disk_bytes,
+            "cache_dir": cache_dir,
+        }
+
+    def clear_caches(self) -> dict:
+        """Clear all KV caches (memory sessions + base caches + cache_manager +
+        disk files). Returns counts cleared. Used by /api/admin/cache/reset."""
+        cleared = {"memory_sessions": 0, "disk_files": 0, "base_caches": 0}
+
+        with self._dirty_lock:
+            self._dirty_sessions.clear()
+
+        cleared["memory_sessions"] += len(self._sessions)
+        self._sessions.clear()
+
+        cleared["base_caches"] += len(self._base_caches)
+        self._base_caches.clear()
+
+        self.cache_manager.memory_caches.clear()
+        self.cache_manager.disk_index.clear()
+
+        cache_dir = self.cfg.cache_dir
+        if os.path.isdir(cache_dir):
+            for fname in os.listdir(cache_dir):
+                if fname.endswith(".safetensors"):
+                    try:
+                        os.remove(os.path.join(cache_dir, fname))
+                        cleared["disk_files"] += 1
+                    except OSError:
+                        pass
+
+        if hasattr(self, "_disk_session_ids"):
+            self._disk_session_ids.clear()
+
+        return cleared
+
+    # Alias: codex spec mentions reset(...); admin uses clear_caches semantics.
+    def reset(self) -> dict:
+        return self.clear_caches()

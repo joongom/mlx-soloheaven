@@ -7,36 +7,40 @@ import asyncio
 import json
 import time
 import logging
-from typing import AsyncGenerator
+from typing import AsyncGenerator, TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from mlx_soloheaven.engine.mlx_engine import MLXEngine
 from mlx_soloheaven.engine.tool_parser import split_thinking_and_content
 from mlx_soloheaven.storage import database as db
 from mlx_soloheaven.api.compaction import build_post_compaction_messages
 
+if TYPE_CHECKING:
+    # Type-only import: avoids pulling mlx.core/mlx_vlm into the FastAPI parent
+    # process. In `--engine-mode process`, MLX must only live in the child.
+    from mlx_soloheaven.engine.mlx_engine import MLXEngine
+
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
 
-engine: MLXEngine = None  # type: ignore
-_engines: dict[str, MLXEngine] = {}
+engine: "MLXEngine" = None  # type: ignore
+_engines: dict[str, "MLXEngine"] = {}
 
 
-def set_engine(e: MLXEngine):
+def set_engine(e: "MLXEngine"):
     global engine
     engine = e
 
 
-def set_engines(engines: dict[str, MLXEngine], default: MLXEngine):
+def set_engines(engines: dict[str, "MLXEngine"], default: "MLXEngine"):
     global engine, _engines
     _engines = engines
     engine = default
 
 
-def _get_engine(model: str | None) -> MLXEngine:
+def _get_engine(model: str | None) -> "MLXEngine":
     """Resolve model name to engine."""
     if not model or not _engines:
         return engine
@@ -238,7 +242,7 @@ async def chat(session_id: str, req: SendMessageRequest):
 async def _stream_chat(
     session_id: str,
     messages: list[dict],
-    eng: MLXEngine | None = None,
+    eng: "MLXEngine | None" = None,
     temperature: float = 0.6,
     top_p: float = 1.0,
     min_p: float = 0.0,
@@ -261,15 +265,27 @@ async def _stream_chat(
     prompt_tps = 0.0
     token_count = 0
 
-    # Cache info for stats
+    # Cache info for stats.
+    # In process mode the engine is an EngineProcessProxy: the parent holds NO
+    # session/KV-cache state (the child owns it), so the in-memory/disk peek
+    # below would raise AttributeError on ._sessions / ._has_disk_cache. Web
+    # chat is not a Stage-1 process-mode target; skip the preflight (the child
+    # still reuses its own cache) and report a neutral cache_info.
     t_cache_check = time.perf_counter()
-    session_state = eng._sessions.get(session_id)
-    if not session_state and eng._has_disk_cache(session_id):
-        session_state = eng._load_session_from_disk(session_id)
-        if session_state:
-            eng._sessions[session_id] = session_state
+    in_process_engine = hasattr(eng, "_sessions") and hasattr(eng, "_has_disk_cache")
+    session_state = None
+    if in_process_engine:
+        session_state = eng._sessions.get(session_id)
+        if not session_state and eng._has_disk_cache(session_id):
+            session_state = eng._load_session_from_disk(session_id)
+            if session_state:
+                eng._sessions[session_id] = session_state
     cache_hit = False
-    cache_info = {"type": "none", "detail": "New session"}
+    cache_info = (
+        {"type": "none", "detail": "New session"}
+        if in_process_engine
+        else {"type": "process", "detail": "Cache managed by generation process"}
+    )
     if session_state:
         if eng._messages_match(session_state.messages, messages):
             cache_hit = (
@@ -310,7 +326,14 @@ async def _stream_chat(
     )
     yield f"data: {start_event}\n\n"
 
-    is_queued = eng._lock.locked()
+    # In-process engine exposes a generation ._lock; the process-mode proxy
+    # exposes .is_busy() instead (no parent-side lock). Use whichever exists.
+    if hasattr(eng, "_lock"):
+        is_queued = eng._lock.locked()
+    elif hasattr(eng, "is_busy"):
+        is_queued = eng.is_busy()
+    else:
+        is_queued = False
     if is_queued:
         queued_event = json.dumps(
             {"type": "queued", "message": "Another request is in progress. Please wait..."},
@@ -328,8 +351,29 @@ async def _stream_chat(
     enable_thinking = eng.cfg.enable_thinking
     thinking_prefix_sent = False
 
+    # COALESCING: consume batches of GenerationResult. Control results
+    # (status / finish_reason / empty-keepalive / thinking-prefix) keep their
+    # exact per-result semantics; consecutive normal content results within a
+    # batch are concatenated into ONE "text" SSE frame. A think_end_token
+    # mid-batch splits the frame so "thinking_done":True still rides on the
+    # frame that ends with the thinking-close token. The concatenation of all
+    # emitted "content" equals the old per-token concatenation.
+    finished = False
+
+    def _content_frame(text: str, gen_tps: float, thinking_done: bool) -> str:
+        event = json.dumps(
+            {
+                "type": "text",
+                "content": text,
+                "tps": round(gen_tps, 1) if gen_tps else 0,
+                **({"thinking_done": True} if thinking_done else {}),
+            },
+            ensure_ascii=False,
+        )
+        return f"data: {event}\n\n"
+
     try:
-        async for result in eng.generate_stream_async(
+        async for batch in eng.generate_stream_batches_async(
             messages,
             session_id=session_id,
             temperature=temperature,
@@ -340,27 +384,43 @@ async def _stream_chat(
             thinking_budget=thinking_budget,
             max_tokens=max_tokens,
         ):
-            if result.status == "generating":
-                t_gen_actual = time.perf_counter()
-                queue_wait = t_gen_actual - t_gen_start
-                continue
+            # Accumulate consecutive normal content within this batch so we emit
+            # one frame per run (flushed on think_end split or at batch end).
+            pending_text: list[str] = []
+            pending_tps = 0.0
 
-            if result.finish_reason is not None:
-                prompt_tokens = result.prompt_tokens
-                completion_tokens = result.completion_tokens
-                gen_tps = result.generation_tps
-                prompt_tps = result.prompt_tps
-                if result.cache_info:
-                    engine_cache_info = result.cache_info
-                break
+            def _flush_pending(thinking_done: bool = False):
+                nonlocal pending_text, pending_tps
+                if pending_text:
+                    frame = _content_frame(
+                        "".join(pending_text), pending_tps, thinking_done
+                    )
+                    pending_text = []
+                    return frame
+                return None
 
-            if not (result.text or result.token):
-                # Empty heartbeat from engine during long prefill — forward as
-                # SSE comment to keep client connection alive
-                yield ": keepalive\n\n"
-                continue
+            for result in batch:
+                if result.status == "generating":
+                    t_gen_actual = time.perf_counter()
+                    queue_wait = t_gen_actual - t_gen_start
+                    continue
 
-            if result.text or result.token:
+                if result.finish_reason is not None:
+                    prompt_tokens = result.prompt_tokens
+                    completion_tokens = result.completion_tokens
+                    gen_tps = result.generation_tps
+                    prompt_tps = result.prompt_tps
+                    if result.cache_info:
+                        engine_cache_info = result.cache_info
+                    finished = True
+                    break
+
+                if not (result.text or result.token):
+                    # Empty heartbeat from engine during long prefill — forward
+                    # as SSE comment to keep client connection alive
+                    yield ": keepalive\n\n"
+                    continue
+
                 token_count += 1
                 if t_first_token is None:
                     t_first_token = time.perf_counter()
@@ -378,22 +438,26 @@ async def _stream_chat(
                         acc_parts.append("<think>\n")
 
                 acc_parts.append(result.text)
+                pending_text.append(result.text)
+                pending_tps = result.generation_tps
 
-                # Detect thinking end token for real-time SSE notification
+                # Detect thinking end token for real-time SSE notification — the
+                # frame up to and including this result carries "thinking_done".
                 thinking_end_detected = (
                     think_end_token >= 0 and result.token == think_end_token
                 )
+                if thinking_end_detected:
+                    frame = _flush_pending(thinking_done=True)
+                    if frame:
+                        yield frame
 
-                event = json.dumps(
-                    {
-                        "type": "text",
-                        "content": result.text,
-                        "tps": round(result.generation_tps, 1) if result.generation_tps else 0,
-                        **({"thinking_done": True} if thinking_end_detected else {}),
-                    },
-                    ensure_ascii=False,
-                )
-                yield f"data: {event}\n\n"
+            # Flush any remaining content accumulated in this batch.
+            frame = _flush_pending()
+            if frame:
+                yield frame
+
+            if finished:
+                break
     except (asyncio.CancelledError, GeneratorExit) as exc:
         client_disconnected = True
         tail = ("".join(acc_parts))[-200:].replace('\n', '\\n')
@@ -479,7 +543,7 @@ async def _stream_chat(
     yield f"data: {done_event}\n\n"
 
 
-async def _sync_chat(session_id: str, messages: list[dict], eng: MLXEngine | None = None) -> dict:
+async def _sync_chat(session_id: str, messages: list[dict], eng: "MLXEngine | None" = None) -> dict:
     """Non-streaming chat response."""
     eng = eng or engine
     result = eng.complete(messages, session_id=session_id)

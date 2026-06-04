@@ -83,6 +83,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Max thinking tokens before forcing </think> (default: 8192, 0=unlimited)",
     )
     p.add_argument(
+        "--stream-coalesce-n",
+        type=int,
+        default=int(_env("STREAM_COALESCE_N", "4")),
+        help="Max tokens batched per SSE frame (default: 4; <=1 disables coalescing). "
+             "(env: SOLOHEAVEN_STREAM_COALESCE_N)",
+    )
+    p.add_argument(
+        "--stream-coalesce-ms",
+        type=int,
+        default=int(_env("STREAM_COALESCE_MS", "30")),
+        help="Max ms to hold a partial batch before flushing (default: 30). "
+             "(env: SOLOHEAVEN_STREAM_COALESCE_MS)",
+    )
+    p.add_argument(
         "--memory-budget-gb",
         type=float,
         default=float(_env("MEMORY_BUDGET_GB", "200")),
@@ -166,6 +180,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=int(_env("DRAFT_BLOCK_SIZE", "0")) or None,
         help="Drafter block size (default: use drafter config).",
+    )
+
+    p.add_argument(
+        "--engine-mode",
+        choices=["inprocess", "process"],
+        default=_env("ENGINE_MODE", "inprocess"),
+        help="Engine execution mode: 'inprocess' (default) or 'process' "
+             "(run generation in a separate child process on its main thread; "
+             "single --model only). (env: SOLOHEAVEN_ENGINE_MODE)",
     )
 
     p.add_argument("--pld", dest="pld_enabled", action="store_true",

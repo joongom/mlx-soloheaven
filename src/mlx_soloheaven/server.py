@@ -4,12 +4,18 @@ import logging
 import os
 import socket
 import sys
+from typing import TYPE_CHECKING
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from mlx_soloheaven.config import Config
+
+if TYPE_CHECKING:
+    # Type-only: never imported at runtime so the parent process stays
+    # mlx-free in `--engine-mode process`.
+    from mlx_soloheaven.engine.mlx_engine import MLXEngine
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,7 +26,10 @@ logger = logging.getLogger("soloheaven")
 
 def create_app(cfg: Config) -> FastAPI:
     """Build the FastAPI application with all routes and middleware."""
-    from mlx_soloheaven.engine.mlx_engine import MLXEngine
+    # NOTE: do NOT import mlx_engine (or anything pulling in mlx.core/mlx_vlm)
+    # at parent-process scope. In `--engine-mode process`, MLX must initialize
+    # only in the child. The in-process path imports MLXEngine lazily, inside
+    # its construction branch below.
     from mlx_soloheaven.storage import database as db
     from mlx_soloheaven.api import openai_compat, chat, admin, settings, compaction
 
@@ -65,10 +74,69 @@ def create_app(cfg: Config) -> FastAPI:
             content={"detail": exc.errors()},
         )
 
-    # Build per-model configs and engines
-    engines: dict[str, MLXEngine] = {}
+    # Build per-model configs and engines. Annotated as the union of the
+    # in-process engine and its process-mode proxy; kept as a string so this
+    # module never imports MLXEngine at runtime.
+    engines: "dict[str, MLXEngine]" = {}
 
-    if cfg.models:
+    # Opt-in process mode (Stage 1): run a SINGLE model's generation in a
+    # separate child process on its main thread. Requires --model (single),
+    # NOT --models. Falls back to inprocess otherwise (with a warning).
+    use_process_mode = getattr(cfg, "engine_mode", "inprocess") == "process"
+    if use_process_mode and cfg.models and len(cfg.models) == 1:
+        from mlx_soloheaven.engine.process_client import EngineProcessProxy
+
+        mcfg = cfg.models[0]
+        model_cfg = Config(
+            model_path=mcfg.model_path,
+            host=cfg.host,
+            port=cfg.port,
+            default_temperature=mcfg.default_temperature,
+            default_top_p=mcfg.default_top_p,
+            default_min_p=mcfg.default_min_p,
+            default_top_k=mcfg.default_top_k,
+            default_repetition_penalty=mcfg.default_repetition_penalty,
+            default_max_tokens=mcfg.default_max_tokens,
+            thinking_budget=mcfg.thinking_budget,
+            enable_thinking=mcfg.enable_thinking,
+            memory_budget_gb=cfg.memory_budget_gb,
+            disk_budget_gb=cfg.disk_budget_gb,
+            data_dir=cfg.data_dir,
+            verbose=cfg.verbose,
+            gpu_keepalive=cfg.gpu_keepalive,
+            kv_bits=cfg.kv_bits,
+            kv_group_size=cfg.kv_group_size,
+            quantized_kv_start=cfg.quantized_kv_start,
+            prefill_step_size=cfg.prefill_step_size,
+            pld_enabled=cfg.pld_enabled,
+            pld_num_draft_tokens=cfg.pld_num_draft_tokens,
+            pld_ngram_k=cfg.pld_ngram_k,
+            draft_model=cfg.draft_model,
+            draft_kind=cfg.draft_kind,
+            draft_block_size=cfg.draft_block_size,
+            stream_coalesce_n=cfg.stream_coalesce_n,
+            stream_coalesce_ms=cfg.stream_coalesce_ms,
+            engine_mode="process",
+        )
+        engines[mcfg.model_id] = EngineProcessProxy(model_cfg)  # type: ignore[assignment]
+        logger.info(
+            f"[engine-mode] PROCESS mode enabled for single model "
+            f"{mcfg.model_id} (separate child process, main-thread generation)"
+        )
+    elif use_process_mode:
+        logger.warning(
+            "[engine-mode] process mode requested but requires a single "
+            "--model (got --models or none) — falling back to inprocess."
+        )
+        use_process_mode = False
+
+    if engines:
+        pass  # process-mode proxy already built above
+    elif cfg.models:
+        # In-process path: import MLXEngine lazily HERE (only reached when NOT
+        # in process mode) so the parent stays mlx-free under --engine-mode
+        # process.
+        from mlx_soloheaven.engine.mlx_engine import MLXEngine
         for mcfg in cfg.models:
             # Create a Config per model with shared server settings
             model_cfg = Config(
@@ -107,11 +175,13 @@ def create_app(cfg: Config) -> FastAPI:
             engine = MLXEngine(model_cfg)
             engines[mcfg.model_id] = engine
     else:
+        # In-process single-engine path — same lazy import rationale as above.
+        from mlx_soloheaven.engine.mlx_engine import MLXEngine
         engine = MLXEngine(cfg)
         engines["default"] = engine
 
     # Default engine = first loaded
-    default_engine: MLXEngine = None  # type: ignore
+    default_engine: "MLXEngine" = None  # type: ignore
 
     @app.on_event("startup")
     async def startup():
@@ -122,7 +192,13 @@ def create_app(cfg: Config) -> FastAPI:
         logger.info(f"Database initialized: {cfg.db_path}")
 
         for model_id, engine in engines.items():
-            engine.load_model()
+            # Process-mode proxy: spawn child + block until ready (it has
+            # .start() and no .load_model()). In-process engine: load weights
+            # on this thread.
+            if hasattr(engine, "load_model"):
+                engine.load_model()
+            else:
+                engine.start()
             logger.info(f"Model ready: {model_id} -> {engine.model_id}")
 
         default_engine = list(engines.values())[0]

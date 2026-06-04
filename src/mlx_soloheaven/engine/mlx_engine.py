@@ -168,32 +168,10 @@ def _pld_response_adapter(pld_iter, tokenizer):
         )
 
 
-@dataclass
-class GenerationResult:
-    """A single token/chunk from generation."""
-    text: str = ""
-    token: int = 0
-    finish_reason: Optional[str] = None
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    prompt_tps: float = 0.0
-    generation_tps: float = 0.0
-    status: Optional[str] = None  # "generating" when lock acquired
-    cache_info: Optional[dict] = None  # cache hit/miss details
-
-
-@dataclass
-class CompletionResult:
-    """Full completion result after generation finishes."""
-    content: Optional[str] = None
-    thinking: Optional[str] = None
-    tool_calls: Optional[list[dict]] = None
-    finish_reason: str = "stop"
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    prompt_tps: float = 0.0
-    generation_tps: float = 0.0
-    cache_info: Optional[dict] = None
+# GenerationResult / CompletionResult moved to engine/types.py (no-mlx module
+# so they can be imported in the process-mode parent + child). Re-exported
+# here so existing `from .mlx_engine import GenerationResult` imports work.
+from mlx_soloheaven.engine.types import GenerationResult, CompletionResult
 
 
 @dataclass
@@ -643,7 +621,19 @@ class MLXEngine:
     _global_keepalive_stop = threading.Event()
     _all_engines: list["MLXEngine"] = []
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, execution_mode: str = "worker"):
+        # execution_mode:
+        #   "worker"      — DEFAULT, unchanged F3 behavior: a dedicated
+        #                   persistent ThreadPoolExecutor worker thread owns
+        #                   the mlx-vlm `generation_stream` + model + drafter.
+        #   "main_thread" — process-mode (Stage 1): the engine is constructed
+        #                   inside a dedicated CHILD process and ALL mlx work
+        #                   (load + generation + disk save + MTP patches) runs
+        #                   inline on the calling (== child's main) thread. No
+        #                   `_vlm_executor` is created, and the GPU-keepalive
+        #                   background thread is never started (no background
+        #                   thread may touch MLX cache tensors in this mode).
+        self.execution_mode = execution_mode
         self.cfg = cfg
         self._vlm_model = None
         self._language_model = None
@@ -681,6 +671,15 @@ class MLXEngine:
         # `RuntimeError: There is no Stream(gpu, N) in current thread.`
         # By dedicating one long-lived worker we register the stream ONCE
         # and every subsequent call inherits a consistent slot.
+        # main_thread mode: do NOT create the worker executor. Generation,
+        # load, and MTP-patch install all happen inline on this (main) thread.
+        if self.execution_mode == "main_thread":
+            self._vlm_executor = None
+            self._vlm_worker_ready_event = threading.Event()
+            self._vlm_worker_ready_event.set()
+            MLXEngine._all_engines.append(self)
+            return
+
         self._vlm_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="mlx-vlm-worker"
         )
@@ -747,6 +746,27 @@ class MLXEngine:
         logger.info(f"Loading model: {self.cfg.model_path}")
         t0 = time.perf_counter()
 
+        # main_thread mode: install the mlx-vlm thread-local generation_stream
+        # + MTP wrap patches on THIS (main) thread before loading weights, so
+        # that load + generation share a consistent per-thread MLX stream slot
+        # (the same invariant the F3 worker provides on its dedicated thread).
+        if self.execution_mode == "main_thread":
+            try:
+                import mlx_vlm.generate  # noqa: F401 — populate sys.modules
+                _mvg = sys.modules["mlx_vlm.generate"]
+                _new = mx.new_thread_local_stream(mx.default_device())
+                _mvg.generation_stream = _new
+                with mx.stream(_new):
+                    _probe = mx.array([1.0]) * 1.0
+                    mx.eval(_probe)
+                _install_mtp_wrap_patches()
+                logger.debug(
+                    f"[MAIN-THREAD-INIT] thread={threading.current_thread().name} "
+                    f"new_stream={_new!r}"
+                )
+            except Exception:  # noqa: BLE001 — mirror worker init best-effort
+                logger.exception("[MAIN-THREAD-INIT] stream/patch install failed")
+
         # Detect model type from config.json
         model_config = {}
         config_path = os.path.join(self.cfg.model_path, "config.json")
@@ -777,9 +797,12 @@ class MLXEngine:
                 def _vlm_load_on_worker():
                     return vlm_load(self.cfg.model_path)
 
-                self._vlm_model, self._processor = self._vlm_executor.submit(
-                    _vlm_load_on_worker
-                ).result()
+                if self.execution_mode == "main_thread":
+                    self._vlm_model, self._processor = _vlm_load_on_worker()
+                else:
+                    self._vlm_model, self._processor = self._vlm_executor.submit(
+                        _vlm_load_on_worker
+                    ).result()
                 self._language_model = getattr(
                     self._vlm_model, "language_model", self._vlm_model
                 )
@@ -901,9 +924,12 @@ class MLXEngine:
                     kind=self.cfg.draft_kind,
                 )
 
-            self._drafter, self._draft_kind = self._vlm_executor.submit(
-                _load_drafter_on_worker
-            ).result()
+            if self.execution_mode == "main_thread":
+                self._drafter, self._draft_kind = _load_drafter_on_worker()
+            else:
+                self._drafter, self._draft_kind = self._vlm_executor.submit(
+                    _load_drafter_on_worker
+                ).result()
 
         # Set wired limit once at startup
         if mx.metal.is_available():
@@ -931,9 +957,16 @@ class MLXEngine:
 
         self._build_disk_index()
         self._touch_gpu()  # Mark GPU active after model load
-        if self.cfg.gpu_keepalive:
+        if self.cfg.gpu_keepalive and self.execution_mode != "main_thread":
             self._start_gpu_keepalive()
             logger.info(f"[{self.model_id}] GPU keepalive enabled (interval={self.GPU_KEEPALIVE_INTERVAL}s)")
+        elif self.cfg.gpu_keepalive and self.execution_mode == "main_thread":
+            # No background thread may touch MLX cache tensors in main-thread
+            # mode (codex constraint). The keepalive flush is skipped entirely.
+            logger.info(
+                f"[{self.model_id}] GPU keepalive DISABLED (main_thread mode — "
+                f"no background MLX access permitted)"
+            )
 
     # --- Model detection helpers ---
 
@@ -1088,7 +1121,11 @@ class MLXEngine:
             save_prompt_cache(path, session.cache_state.cache, metadata=metadata)
 
         try:
-            if getattr(self, "_use_vlm", False) and getattr(self, "_vlm_executor", None) is not None:
+            if getattr(self, "execution_mode", "worker") == "main_thread":
+                # main_thread mode: model + cache tensors are bound to THIS
+                # thread's stream slot. Materialize + serialize inline.
+                _do_save()
+            elif getattr(self, "_use_vlm", False) and getattr(self, "_vlm_executor", None) is not None:
                 try:
                     fut = self._vlm_executor.submit(_do_save)
                 except RuntimeError:
@@ -3046,7 +3083,7 @@ class MLXEngine:
         # flow via the existing asyncio.Queue plumbing. mlx-lm legacy
         # has no thread-local stream constraint and uses a one-shot
         # daemon thread to avoid contention with the VLM worker.
-        if self._use_vlm:
+        if self._use_vlm and getattr(self, "execution_mode", "worker") != "main_thread":
             self._vlm_executor.submit(_run)
         else:
             threading.Thread(target=_run, daemon=True).start()
@@ -3070,6 +3107,178 @@ class MLXEngine:
             logger.info(
                 f"[Stream] session={session_id} | client disconnected "
                 f"({type(exc).__name__}) — cancelling generation"
+            )
+            raise
+
+    async def generate_stream_batches_async(
+        self,
+        messages: list[dict],
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        min_p: float | None = None,
+        top_k: int | None = None,
+        repetition_penalty: float | None = None,
+        session_id: str | None = None,
+        tools: list | None = None,
+        thinking: bool | None = None,
+        thinking_budget: int | None = None,
+        response_format=None,
+    ) -> AsyncGenerator[list[GenerationResult], None]:
+        """Batched async wrapper for generate_stream.
+
+        Same contract as generate_stream_async but yields *batches* (lists) of
+        GenerationResult instead of one result at a time. Coalescing only
+        changes BATCHING — the concatenation of all results across all batches
+        is byte-identical to the scalar generate_stream_async ordering.
+
+        Flush rules in the worker:
+        - status="generating", finish_reason set, and the FIRST content token
+          flush immediately as their own single-item batch (preserves the
+          control-signal semantics + TTFT).
+        - other normal content tokens accumulate; flushed when the batch reaches
+          ``stream_coalesce_n`` OR ``stream_coalesce_ms`` has elapsed since the
+          last flush.
+        - cancellation, exceptions, and end-of-stream flush any pending batch
+          first, then signal completion.
+
+        ``stream_coalesce_n <= 1`` disables coalescing: every result is posted
+        as a 1-item batch (uniform batch interface, scalar timing).
+        """
+        loop = asyncio.get_event_loop()
+        q: asyncio.Queue[tuple[GenerationResult, ...] | None | Exception] = asyncio.Queue()
+        cancel_event = threading.Event()
+
+        coalesce_n = getattr(self.cfg, "stream_coalesce_n", 4)
+        coalesce_ms = getattr(self.cfg, "stream_coalesce_ms", 30)
+        # n <= 1 disables coalescing (1-item batches).
+        coalescing = coalesce_n > 1
+
+        def _run():
+            batch: list[GenerationResult] = []
+            last_flush = time.perf_counter()
+            first_content_seen = False
+
+            def _flush_batch():
+                # Post a NEW tuple each time — never enqueue a list we then
+                # mutate/clear. Caller resets ``batch`` + ``last_flush`` after.
+                if batch:
+                    loop.call_soon_threadsafe(q.put_nowait, tuple(batch))
+
+            try:
+                for result in self.generate_stream(
+                    messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    min_p=min_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
+                    session_id=session_id,
+                    tools=tools,
+                    cancel_event=cancel_event,
+                    thinking=thinking,
+                    thinking_budget=thinking_budget,
+                    response_format=response_format,
+                ):
+                    if cancel_event.is_set():
+                        # Flush whatever's batched, then stop.
+                        _flush_batch()
+                        batch = []
+                        break
+
+                    is_content = (
+                        result.status is None and result.finish_reason is None
+                    )
+                    # FLUSH-IMMEDIATELY conditions:
+                    #  - control signals (status / finish_reason)
+                    #  - the very first content token (preserve TTFT)
+                    #  - coalescing disabled (n <= 1): every result on its own
+                    flush_now = (
+                        result.status == "generating"
+                        or result.finish_reason is not None
+                        or (is_content and not first_content_seen)
+                        or not coalescing
+                    )
+                    if is_content:
+                        first_content_seen = True
+
+                    if flush_now:
+                        # Post any pending batch first (preserve order), then
+                        # this result as its own single-item batch.
+                        _flush_batch()
+                        batch = []
+                        loop.call_soon_threadsafe(q.put_nowait, (result,))
+                        last_flush = time.perf_counter()
+                        continue
+
+                    batch.append(result)
+                    now = time.perf_counter()
+                    if len(batch) >= coalesce_n or (now - last_flush) * 1000 >= coalesce_ms:
+                        loop.call_soon_threadsafe(q.put_nowait, tuple(batch))
+                        batch = []
+                        last_flush = now
+            except Exception as e:
+                if not cancel_event.is_set():
+                    # Flush any pending normal tokens before the error so their
+                    # content is not lost, then post the exception.
+                    _flush_batch()
+                    batch = []
+                    loop.call_soon_threadsafe(q.put_nowait, e)
+            finally:
+                _flush_batch()
+                loop.call_soon_threadsafe(q.put_nowait, None)
+
+        # F3: same worker-submit logic as generate_stream_async — VLM is pinned
+        # to the persistent _vlm_executor worker; legacy mlx-lm uses a one-shot
+        # daemon thread.
+        if self._use_vlm and getattr(self, "execution_mode", "worker") != "main_thread":
+            self._vlm_executor.submit(_run)
+        else:
+            threading.Thread(target=_run, daemon=True).start()
+
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(q.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    # Keepalive batch (single empty result) during prompt processing
+                    yield [GenerationResult(text="")]
+                    continue
+                if item is None:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                # ``item`` is a batch (tuple/list). Drain any immediately
+                # available batches to collapse backlog while preserving order,
+                # then yield each batch in order.
+                pending: list[tuple[GenerationResult, ...]] = [item]
+                while True:
+                    try:
+                        nxt = q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if nxt is None:
+                        # End sentinel arrived in the backlog — yield what we
+                        # have, then stop after this drain.
+                        for b in pending:
+                            yield list(b)
+                        return
+                    if isinstance(nxt, Exception):
+                        # Yield content gathered so far, then raise.
+                        for b in pending:
+                            yield list(b)
+                        raise nxt
+                    pending.append(nxt)
+                for b in pending:
+                    yield list(b)
+        except (asyncio.CancelledError, GeneratorExit) as exc:
+            cancel_event.set()
+            # INFO-level so we always see disconnects (debugging client timeouts etc.)
+            logger.info(
+                f"[Stream] session={session_id} | client disconnected "
+                f"({type(exc).__name__}) — cancelling generation (batched)"
             )
             raise
 

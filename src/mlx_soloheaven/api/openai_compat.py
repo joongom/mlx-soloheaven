@@ -9,7 +9,7 @@ import json
 import time
 import uuid
 import logging
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, Optional, TYPE_CHECKING
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -31,7 +31,6 @@ from mlx_soloheaven.api.schemas import (
     FunctionCall,
     UsageInfo,
 )
-from mlx_soloheaven.engine.mlx_engine import MLXEngine
 from mlx_soloheaven.engine.tool_parser import (
     generate_call_id,
     get_tool_markers,
@@ -41,21 +40,26 @@ from mlx_soloheaven.engine.tool_parser import (
     try_extract_tool_name,
 )
 
+if TYPE_CHECKING:
+    # Type-only import: keeps mlx.core/mlx_vlm out of the FastAPI parent
+    # process so `--engine-mode process` actually isolates MLX in the child.
+    from mlx_soloheaven.engine.mlx_engine import MLXEngine
+
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # Engine registry set by server.py on startup
-_engines: dict[str, MLXEngine] = {}
-_default_engine: MLXEngine = None  # type: ignore
+_engines: dict[str, "MLXEngine"] = {}
+_default_engine: "MLXEngine" = None  # type: ignore
 
 
-def set_engines(engines: dict[str, MLXEngine], default: MLXEngine):
+def set_engines(engines: dict[str, "MLXEngine"], default: "MLXEngine"):
     global _engines, _default_engine
     _engines = engines
     _default_engine = default
 
 
-def _get_engine(model: str) -> MLXEngine:
+def _get_engine(model: str) -> "MLXEngine":
     """Resolve model name to engine. Tries exact match, then substring match."""
     if model in _engines:
         return _engines[model]
@@ -132,7 +136,7 @@ async def chat_completions(request: ChatCompletionRequest):
         return _sync_completion(request, engine)
 
 
-def _sync_completion(request: ChatCompletionRequest, engine: MLXEngine) -> ChatCompletionResponse:
+def _sync_completion(request: ChatCompletionRequest, engine: "MLXEngine") -> ChatCompletionResponse:
     """Non-streaming completion."""
     messages = strip_thinking_tags(
         [m.model_dump(exclude_none=True) for m in request.messages]
@@ -212,7 +216,7 @@ def _sync_completion(request: ChatCompletionRequest, engine: MLXEngine) -> ChatC
 
 async def _stream_completion(
     request: ChatCompletionRequest,
-    engine: MLXEngine,
+    engine: "MLXEngine",
 ) -> AsyncGenerator[str, None]:
     """Streaming SSE completion with tool call detection."""
     messages = strip_thinking_tags(
@@ -286,8 +290,18 @@ async def _stream_completion(
         )
         response_format = None
 
+    # COALESCING: consume batches of GenerationResult.
+    #  - has_tools False: concatenate the batch's content and emit ONE content
+    #    delta chunk per batch (reuse the existing chunk builder).
+    #  - has_tools True: feed the batch's concatenated text through the existing
+    #    tool-call parser, restructured as a loop so an arbitrary chunk that may
+    #    contain TOOL_START...TOOL_END (or partial / multiple blocks / trailing
+    #    content) is processed correctly. The emitted JSON for both content and
+    #    tool_calls is byte-identical to the prior per-token behavior; only the
+    #    BATCHING of the content deltas changes.
+    finished = False
     try:
-        async for result in engine.generate_stream_async(
+        async for batch in engine.generate_stream_batches_async(
             messages,
             max_tokens=request.max_tokens or request.max_completion_tokens,
             temperature=request.temperature,
@@ -301,127 +315,147 @@ async def _stream_completion(
             thinking_budget=thinking_budget,
             response_format=response_format,
         ):
-            if result.finish_reason is not None:
-                final_prompt_tokens = result.prompt_tokens
-                final_completion_tokens = result.completion_tokens
-                final_cache_info = result.cache_info
-                break
+            # Concatenate the batch's content text; capture finish separately.
+            chunk_text_parts: list[str] = []
+            for result in batch:
+                if result.finish_reason is not None:
+                    final_prompt_tokens = result.prompt_tokens
+                    final_completion_tokens = result.completion_tokens
+                    final_cache_info = result.cache_info
+                    finished = True
+                    break
+                if result.status == "generating":
+                    continue
+                if not result.text:
+                    continue
+                chunk_text_parts.append(result.text)
 
-            text = result.text
-            if not text:
-                # Send SSE comment as keepalive during prompt processing
+            chunk_text = "".join(chunk_text_parts)
+            if not chunk_text:
+                if finished:
+                    break
+                # Empty batch (keepalive / status-only) during prompt processing
                 yield ": keepalive\n\n"
                 continue
 
-            acc_parts.append(text)
+            acc_parts.append(chunk_text)
             token_count += 1
 
-            if tc_active:
-                tc_block += text
+            if not has_tools:
+                # Plain content path — one delta chunk per batch.
+                chunk = _make_content_chunk(chunk_id, created, model, chunk_text)
+                yield f"data: {chunk}\n\n"
+                if finished:
+                    break
+                continue
 
-                # Try to emit first chunk (id + name) as soon as name is known.
-                if not tc_name_sent:
-                    name = try_extract_tool_name(tc_block, model_family)
-                    if name:
-                        first = ChatCompletionChunk(
-                            id=chunk_id, created=created, model=model,
-                            choices=[ChunkChoice(delta=DeltaMessage(tool_calls=[{
-                                "index": tc_index,
-                                "id": tc_id,
-                                "type": "function",
-                                "function": {"name": name, "arguments": ""},
-                            }]))],
-                        )
-                        yield f"data: {first.model_dump_json(exclude_none=True)}\n\n"
-                        tc_name_sent = True
+            # has_tools True — drive the tool-call state machine over the chunk.
+            # ``chunk`` is the remaining unconsumed text; loop until it is empty
+            # or no further progress can be made (partial block / partial start).
+            chunk = chunk_text
+            while chunk:
+                if tc_active:
+                    tc_block += chunk
+                    chunk = ""
 
-                # Check for block close.
-                if TOOL_END in tc_block:
-                    end_idx = tc_block.index(TOOL_END)
-                    block_text = TOOL_START + tc_block[:end_idx] + TOOL_END
-                    _, calls = parse_tool_calls(block_text, model_family=model_family)
-                    if calls:
-                        tc = calls[0]
-                        # If name chunk wasn't emitted yet (rare: whole block
-                        # arrived in one token), emit it now.
-                        if not tc_name_sent:
+                    # Emit first chunk (id + name) as soon as name is known.
+                    if not tc_name_sent:
+                        name = try_extract_tool_name(tc_block, model_family)
+                        if name:
                             first = ChatCompletionChunk(
                                 id=chunk_id, created=created, model=model,
                                 choices=[ChunkChoice(delta=DeltaMessage(tool_calls=[{
                                     "index": tc_index,
                                     "id": tc_id,
                                     "type": "function",
-                                    "function": {
-                                        "name": tc["function"]["name"],
-                                        "arguments": "",
-                                    },
+                                    "function": {"name": name, "arguments": ""},
                                 }]))],
                             )
                             yield f"data: {first.model_dump_json(exclude_none=True)}\n\n"
-                        args_chunk = ChatCompletionChunk(
-                            id=chunk_id, created=created, model=model,
-                            choices=[ChunkChoice(delta=DeltaMessage(tool_calls=[{
-                                "index": tc_index,
-                                "function": {"arguments": tc["function"]["arguments"]},
-                            }]))],
-                        )
-                        yield f"data: {args_chunk.model_dump_json(exclude_none=True)}\n\n"
-                        # Use the id we generated at block-start so session
-                        # + SSE agree.
-                        tc["id"] = tc_id
-                        parsed_tool_calls.append(tc)
+                            tc_name_sent = True
 
-                    # Reset for next block; any trailing text after TOOL_END
-                    # goes back into the holdback/content path.
-                    trailing = tc_block[end_idx + len(TOOL_END):]
-                    tc_active = False
-                    tc_block = ""
+                    # Check for block close.
+                    if TOOL_END in tc_block:
+                        end_idx = tc_block.index(TOOL_END)
+                        block_text = TOOL_START + tc_block[:end_idx] + TOOL_END
+                        _, calls = parse_tool_calls(block_text, model_family=model_family)
+                        if calls:
+                            tc = calls[0]
+                            # If name chunk wasn't emitted yet (whole block
+                            # arrived at once), emit it now.
+                            if not tc_name_sent:
+                                first = ChatCompletionChunk(
+                                    id=chunk_id, created=created, model=model,
+                                    choices=[ChunkChoice(delta=DeltaMessage(tool_calls=[{
+                                        "index": tc_index,
+                                        "id": tc_id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": tc["function"]["name"],
+                                            "arguments": "",
+                                        },
+                                    }]))],
+                                )
+                                yield f"data: {first.model_dump_json(exclude_none=True)}\n\n"
+                            args_chunk = ChatCompletionChunk(
+                                id=chunk_id, created=created, model=model,
+                                choices=[ChunkChoice(delta=DeltaMessage(tool_calls=[{
+                                    "index": tc_index,
+                                    "function": {"arguments": tc["function"]["arguments"]},
+                                }]))],
+                            )
+                            yield f"data: {args_chunk.model_dump_json(exclude_none=True)}\n\n"
+                            # Use the id we generated at block-start so session
+                            # + SSE agree.
+                            tc["id"] = tc_id
+                            parsed_tool_calls.append(tc)
+
+                        # Reset for next block; any trailing text after TOOL_END
+                        # is re-processed through the holdback/content path.
+                        trailing = tc_block[end_idx + len(TOOL_END):]
+                        tc_active = False
+                        tc_block = ""
+                        tc_name_sent = False
+                        tc_id = None
+                        if trailing:
+                            chunk = trailing
+                    # else: block still open, wait for more text (chunk empty).
+                    continue
+
+                holdback += chunk
+                chunk = ""
+
+                if TOOL_START.startswith(holdback.lstrip()):
+                    # Possible partial start tag — hold until more text arrives.
+                    continue
+
+                if TOOL_START in holdback:
+                    idx = holdback.index(TOOL_START)
+                    before = holdback[:idx]
+                    if before:
+                        content_chunk = _make_content_chunk(
+                            chunk_id, created, model, before
+                        )
+                        yield f"data: {content_chunk}\n\n"
+                    tc_active = True
+                    tc_index += 1
+                    tc_id = generate_call_id()
                     tc_name_sent = False
-                    tc_id = None
-                    if trailing:
-                        holdback += trailing
-                continue
+                    # Re-feed everything after TOOL_START into the active-block
+                    # branch on the next loop turn (handles full block in chunk).
+                    chunk = holdback[idx + len(TOOL_START):]
+                    holdback = ""
+                    continue
 
-            holdback += text
+                if holdback:
+                    content_chunk = _make_content_chunk(
+                        chunk_id, created, model, holdback
+                    )
+                    yield f"data: {content_chunk}\n\n"
+                    holdback = ""
 
-            if has_tools and TOOL_START.startswith(holdback.lstrip()):
-                continue
-
-            if has_tools and TOOL_START in holdback:
-                idx = holdback.index(TOOL_START)
-                before = holdback[:idx]
-                if before:
-                    chunk = _make_content_chunk(chunk_id, created, model, before)
-                    yield f"data: {chunk}\n\n"
-                tc_active = True
-                tc_index += 1
-                tc_id = generate_call_id()
-                tc_name_sent = False
-                tc_block = holdback[idx + len(TOOL_START):]
-                holdback = ""
-                # The just-received text may already contain the full block;
-                # fall through by re-triggering on next iteration is fine,
-                # but we can also short-circuit by running detection now.
-                if tc_block:
-                    name = try_extract_tool_name(tc_block, model_family)
-                    if name and not tc_name_sent:
-                        first = ChatCompletionChunk(
-                            id=chunk_id, created=created, model=model,
-                            choices=[ChunkChoice(delta=DeltaMessage(tool_calls=[{
-                                "index": tc_index,
-                                "id": tc_id,
-                                "type": "function",
-                                "function": {"name": name, "arguments": ""},
-                            }]))],
-                        )
-                        yield f"data: {first.model_dump_json(exclude_none=True)}\n\n"
-                        tc_name_sent = True
-                continue
-
-            if holdback:
-                chunk = _make_content_chunk(chunk_id, created, model, holdback)
-                yield f"data: {chunk}\n\n"
-                holdback = ""
+            if finished:
+                break
     except (asyncio.CancelledError, GeneratorExit) as exc:
         tail = ("".join(acc_parts))[-200:].replace('\n', '\\n')
         logger.info(

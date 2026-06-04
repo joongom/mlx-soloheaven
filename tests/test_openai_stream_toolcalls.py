@@ -31,6 +31,8 @@ from mlx_soloheaven.api.schemas import (
 class StubResult:
     """Matches the fields the stream reader touches on a GenerationResult."""
     text: str = ""
+    token: int = 0
+    status: Optional[str] = None
     finish_reason: Optional[str] = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -50,7 +52,7 @@ class StubEngine:
             enable_thinking = False
         self.cfg = _Cfg()
 
-    async def generate_stream_async(self, *args, **kwargs) -> AsyncGenerator:
+    def _iter_results(self):
         for tok in self._stream:
             yield StubResult(text=tok)
         yield StubResult(
@@ -61,6 +63,16 @@ class StubEngine:
             prompt_tps=100.0,
             generation_tps=20.0,
         )
+
+    async def generate_stream_async(self, *args, **kwargs) -> AsyncGenerator:
+        for result in self._iter_results():
+            yield result
+
+    async def generate_stream_batches_async(self, *args, **kwargs) -> AsyncGenerator:
+        # Singleton batches preserve scalar ordering — exactly what the
+        # tool-call byte-identity assertions in this module expect.
+        for result in self._iter_results():
+            yield [result]
 
     def update_session_messages(self, *args, **kwargs):
         pass

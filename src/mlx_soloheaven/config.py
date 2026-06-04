@@ -58,6 +58,12 @@ class Config:
     host: str = "0.0.0.0"
     port: int = 8000
 
+    # Engine execution mode: "inprocess" (default, current F3 behavior) or
+    # "process" (opt-in: run generation in a separate child process on its
+    # MAIN thread for ~90 tok/s at temp>0). Process mode requires a single
+    # --model (not --models).
+    engine_mode: str = "inprocess"
+
     # Generation defaults (used as fallback for models without override)
     default_temperature: float = 0.6
     default_top_p: float = 1.0
@@ -90,6 +96,12 @@ class Config:
     draft_model: str | None = None
     draft_kind: str | None = None
     draft_block_size: int | None = None
+
+    # Streaming coalescing: batch per-token SSE/JSON frames to recover decode
+    # throughput lost to per-token cross-thread + asyncio.Queue + GIL overhead.
+    # stream_coalesce_n <= 1 DISABLES coalescing (scalar behavior, for A/B).
+    stream_coalesce_n: int = 4
+    stream_coalesce_ms: int = 30
 
     # Cache budgets (no time-based TTL — evict LRU when over budget)
     memory_budget_gb: float = 200.0
@@ -171,6 +183,7 @@ class Config:
             model_path=args.model or (models[0].model_path if models else ""),
             host=args.host,
             port=args.port,
+            engine_mode=getattr(args, "engine_mode", "inprocess"),
             default_temperature=args.temperature,
             default_top_p=args.top_p,
             default_min_p=args.min_p,
@@ -179,6 +192,8 @@ class Config:
             default_max_tokens=args.max_tokens,
             thinking_budget=args.thinking_budget,
             enable_thinking=not args.no_thinking,
+            stream_coalesce_n=args.stream_coalesce_n,
+            stream_coalesce_ms=args.stream_coalesce_ms,
             memory_budget_gb=args.memory_budget_gb,
             disk_budget_gb=args.disk_budget_gb,
             max_checkpoints=args.max_checkpoints,

@@ -62,7 +62,7 @@ class Config:
     # "process" (opt-in: run generation in a separate child process on its
     # MAIN thread for ~90 tok/s at temp>0). Process mode requires a single
     # --model (not --models).
-    engine_mode: str = "inprocess"
+    engine_mode: str = "process"
 
     # Generation defaults (used as fallback for models without override)
     default_temperature: float = 0.6
@@ -183,7 +183,7 @@ class Config:
             model_path=args.model or (models[0].model_path if models else ""),
             host=args.host,
             port=args.port,
-            engine_mode=getattr(args, "engine_mode", "inprocess"),
+            engine_mode=getattr(args, "engine_mode", "process"),
             default_temperature=args.temperature,
             default_top_p=args.top_p,
             default_min_p=args.min_p,

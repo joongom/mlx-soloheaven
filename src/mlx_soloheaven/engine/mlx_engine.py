@@ -1709,10 +1709,18 @@ class MLXEngine:
         prefix_len = cache_state.find_prefix_length(prompt_token_ids)
         if prefix_len != len(cached_ids) or prefix_len >= len(prompt_token_ids):
             return False
-        # Defensive: RoPE continuation needs cache.offset == logical history length.
+        # Defensive: RoPE continuation needs cache.offset == logical history
+        # length. token_ids is reconciled to cache.offset at save time (see
+        # the post-generation update), so these match for a strict append;
+        # any residual mismatch (e.g. a cache that advanced beyond the
+        # recorded ids) is genuinely unsafe and must cold-fill.
         for c in cache:
             offset = getattr(c, "offset", None)
             if offset is not None and int(offset) != prefix_len:
+                logger.warning(
+                    f"[KV Cache] offset/ids mismatch ({type(c).__name__}."
+                    f"offset={int(offset)} != prefix_len={prefix_len}) — cold-fill"
+                )
                 return False
         return True
 
@@ -2488,7 +2496,23 @@ class MLXEngine:
         # post-generation KV cache lives.
         if prompt_cache is not None:
             cache_state.cache = prompt_cache
-        cache_state.token_ids = full_prompt_token_ids + list(generated_token_ids)
+        # Reconcile token_ids to the cache's TRUE offset. The MTP speculative
+        # path's yielded-token count can drift ±1 from cache.offset (the bonus
+        # is yielded before it is forwarded; EOS/partial-block edges). If
+        # token_ids != cache logical length, next turn's wrapped-cache reuse
+        # cold-fills (offset != prefix_len → full re-prefill, multi-second
+        # TTFT). Trim any un-forwarded tail so token_ids EXACTLY matches the
+        # cache content; the dropped 1–2 tokens are reprocessed as part of the
+        # next turn's suffix (cheap). Cache-ahead (offset > recorded) is left
+        # as-is and cold-fills safely — we cannot recover the unrecorded token.
+        _actual_token_ids = full_prompt_token_ids + list(generated_token_ids)
+        _cache_off = (
+            self._get_cache_offset(cache_state.cache) if cache_state.cache else None
+        )
+        if _cache_off is not None and 0 < _cache_off < len(_actual_token_ids):
+            cache_state.token_ids = _actual_token_ids[:_cache_off]
+        else:
+            cache_state.token_ids = _actual_token_ids
 
         # WHY: F3 pins every mlx-vlm call to one persistent _vlm_executor
         # worker thread (model + drafter + generation_stream all bound to

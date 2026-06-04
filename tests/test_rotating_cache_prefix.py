@@ -148,6 +148,22 @@ def test_safe_to_reuse_cache_wrapped_strict_append_returns_true():
     assert MLXEngine._safe_to_reuse_cache(cache_state, prompt) is True
 
 
+def test_safe_to_reuse_cache_wrapped_offset_drift_returns_false():
+    """Regression: wrapped strict-APPEND but cache.offset drifts from
+    len(token_ids) (the MTP bonus/terminal-flush ±1 bookkeeping drift) →
+    cold-fill. The defensive offset==prefix_len gate catches the drift so we
+    never reuse a cache whose logical length disagrees with the recorded ids.
+    The post-generation reconcile (token_ids trimmed to cache.offset) keeps
+    these equal in practice so wrapped append reuse actually fires.
+    """
+    cached_ids = list(range(2048))
+    # Cache advanced 1 past the recorded ids (e.g. terminal flush double-count).
+    rot = _make_rotating_mock(offset=2049, max_size=1024)
+    cache_state = _FakeCacheState(cache=[rot], token_ids=cached_ids)
+    prompt = cached_ids + [9000, 9001, 9002]
+    assert MLXEngine._safe_to_reuse_cache(cache_state, prompt) is False
+
+
 def test_safe_to_reuse_cache_wrapped_divergence_returns_false():
     """Case 2: wrapped + prompt shares 1500 tokens then diverges → False."""
     cached_ids = list(range(2048))

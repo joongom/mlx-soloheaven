@@ -409,3 +409,40 @@ def test_run_vlm_skips_drafter_when_will_wrap(monkeypatch):
         assert eng._drafter is sentinel_drafter
     finally:
         eng.close()
+
+
+def test_b4_absolute_drafter_mask_window_correct_post_wrap():
+    """B4: the patched drafter SWA mask uses ABSOLUTE key positions, so for a
+    wrapped state (true query offset >> window) the bidirectional window stays
+    correct — the oldest key (dist == window) is excluded, the rest allowed —
+    instead of the upstream mask masking everything once offset >= 2*window.
+    """
+    try:
+        import mlx_vlm.speculative.drafters.gemma4_assistant.gemma4_assistant as g4a
+    except Exception:  # pragma: no cover - drafter module unavailable
+        pytest.skip("gemma4_assistant drafter module unavailable")
+
+    _reset_patch_state()
+    assert _install_mtp_wrap_patches() is True
+    mdm = g4a.make_drafter_masks
+    assert getattr(mdm, "_mtp_wrap_patch", False) is True
+
+    window = 1024
+    # Wrapped: true offset 1500, sliding ring holds `window` keys; full holds all.
+    skv = {
+        "sliding_attention": (mx.zeros((1, 1, window, 8)), mx.zeros((1, 1, window, 8))),
+        "full_attention": (mx.zeros((1, 1, 1500, 8)), mx.zeros((1, 1, 1500, 8))),
+    }
+    masks = mdm(skv, query_len=1, query_offset=1500,
+                sliding_window=window, dtype=mx.float32)
+
+    # Full layer: true offset => every real key is in range => no mask.
+    assert masks["full_attention"] is None
+    sm = masks["sliding_attention"]
+    assert sm is not None and tuple(sm.shape) == (1, 1, 1, window)
+    row = sm[0, 0, 0]
+    # Physical key 0 is absolute 476; dist = 1500-476 = 1024 == window => excluded.
+    assert float(row[0].item()) < -1e30
+    # Keys 1..window-1 are within the bidirectional window => allowed (0.0).
+    assert float(row[1].item()) == 0.0
+    assert float(row[window - 1].item()) == 0.0

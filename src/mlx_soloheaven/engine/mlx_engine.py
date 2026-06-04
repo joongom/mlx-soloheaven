@@ -256,6 +256,14 @@ _MTP_PATCHES_INSTALLED = False
 # Flag is single-worker safe — VLM executor pins all calls to one thread.
 _HOT_PATH_FAST = False
 
+# Post-wrap drafter gate (plain-decode fallback). SUPERSEDED by the B4
+# RoPE-frame fix, which restores post-wrap drafter acceptance (~1.1) so the
+# drafter stays net-positive past the wrap — gating it off would now throw
+# away that speedup. Kept OFF by default as a safety fallback; set
+# SOLOHEAVEN_MTP_WRAP_GATE=1 to force plain decode past the wrap (e.g. if a
+# future drafter/model regresses post-wrap acceptance).
+_MTP_WRAP_GATE = os.environ.get("SOLOHEAVEN_MTP_WRAP_GATE", "0") != "0"
+
 
 def _clamped_kv_offset(prompt_cache):
     """Return ``prompt_cache[0].offset`` clamped to ``max_size`` for a
@@ -399,6 +407,70 @@ def _install_mtp_wrap_patches() -> bool:
     _patched_textmodel_call._mtp_wrap_patch = True  # marker for tests
     _g4lang.Gemma4TextModel.__call__ = _patched_textmodel_call
 
+    # ----- B4: RoPE-frame fix — absolute-position drafter mask -----
+    # The original drafter SWA mask returns a correct (None) bias only while
+    # ``query_offset + query_len <= kv_len + window``; past that (true offset
+    # >= ~2*window) it builds an explicit mask using PHYSICAL key indices and
+    # masks out valid keys. More importantly, pairing the mask with B2's
+    # clamped offset (below) keeps the mask happy but pins the query's RoPE
+    # phase to max_size while the shared keys keep their TRUE absolute RoPE
+    # positions [N-window..N-1] — shifting the query/key relative phase by
+    # -(N-max_size) and corrupting drafter attention for BOTH sliding and
+    # full layers. MEASURED: acceptance collapses ~1.1 -> ~0.2 right at the
+    # wrap on real content. Fix (validated by A/B, codex-reviewed): feed the
+    # TRUE offset (see the clone below) and build the sliding mask from the
+    # keys' ABSOLUTE positions so the window is correct at any offset; full
+    # layers then need no mask. Recovers post-wrap acceptance to ~1.1.
+    try:
+        import mlx_vlm.speculative.drafters.gemma4_assistant.gemma4_assistant as _g4a
+        _orig_make_drafter_masks = _g4a.make_drafter_masks
+
+        def _abs_make_drafter_masks(
+            shared_kv_states, query_len, query_offset, sliding_window,
+            dtype=mx.float32,
+        ):
+            # Unbatched (B=1) server path: scalar query_offset. Delegate the
+            # rare batched/padded path to upstream for safety.
+            if isinstance(query_offset, int):
+                qo = query_offset
+            elif hasattr(query_offset, "ndim") and query_offset.ndim == 0:
+                qo = int(query_offset.item())
+            else:
+                return _orig_make_drafter_masks(
+                    shared_kv_states, query_len, query_offset,
+                    sliding_window, dtype,
+                )
+            masks = {}
+            for lt, kv in shared_kv_states.items():
+                kv_len = int(kv[0].shape[-2])
+                if lt == "sliding_attention":
+                    valid = min(qo, kv_len)
+                    # keys occupy absolute positions [qo-valid, qo-valid+kv_len)
+                    k_abs = (qo - valid) + mx.arange(kv_len)
+                    q_abs = mx.arange(qo, qo + query_len)
+                    dist = q_abs[:, None] - k_abs[None, :]
+                    inside = (
+                        (mx.arange(kv_len) < valid)
+                        & (dist > -sliding_window)
+                        & (dist < sliding_window)
+                    )
+                    masks[lt] = mx.where(
+                        inside,
+                        mx.array(0.0, dtype=dtype),
+                        mx.array(-mx.inf, dtype=dtype),
+                    )[None, None, :, :]
+                else:
+                    # full attention: with the true offset every real key is
+                    # in range, so no mask is needed (matches upstream None).
+                    masks[lt] = None
+            return masks
+
+        _abs_make_drafter_masks._mtp_wrap_patch = True
+        _g4a.make_drafter_masks = _abs_make_drafter_masks
+        logger.debug("[MTP-Patch B4] installed absolute-position drafter mask")
+    except Exception:  # noqa: BLE001 — patch must never break inference
+        logger.exception("[MTP-Patch B4] failed to install absolute-position mask")
+
     # ----- B2: clamp kv_offset on wrapped RotatingKVCache -----
     # Clone-replace: re-implement _mtp_rounds with the offset clamp
     # applied at BOTH read sites. The old save/restore patch only
@@ -467,8 +539,11 @@ def _install_mtp_wrap_patches() -> bool:
             if hidden.shape[1] > 1:
                 hidden = hidden[:, -1:, :]
 
-            # B2 fix (read #1): entry-time clamped offset.
-            kv_offset = _clamped_kv_offset(prompt_cache)
+            # B4 (supersedes B2): feed the TRUE offset, NOT the clamp, so the
+            # drafter's query RoPE phase matches the shared keys' absolute
+            # positions. The absolute-position mask (installed above) keeps
+            # the sliding window correct without clamping.
+            kv_offset = int(prompt_cache[0].offset)
             draft_model.set_shared_kv(shared_kv_states, kv_offset)
 
             b = first_bonus
@@ -494,7 +569,7 @@ def _install_mtp_wrap_patches() -> bool:
                 # (measured: 60→84 tok/s at 2500 tokens). Output is
                 # unchanged — speculative decoding is exact-greedy, so
                 # pre-wrap MTP == greedy and post-wrap plain == greedy.
-                if _rotating_wrapped(prompt_cache):
+                if _MTP_WRAP_GATE and _rotating_wrapped(prompt_cache):
                     logger.info(
                         f"[MTP] ring wrapped at emitted={emitted} — drafter "
                         "disabled, plain decode for remainder"
@@ -576,10 +651,10 @@ def _install_mtp_wrap_patches() -> bool:
                             K[..., :valid, :],
                             V[..., :valid, :],
                         )
-                # B2 fix (read #2): inner-loop clamped offset. Without
-                # this, after wrap the drafter's SWA mask receives
-                # q_idx > max_size and rejects every in-window key.
-                kv_offset = _clamped_kv_offset(prompt_cache)
+                # B4 (supersedes B2): true offset (see read #1). The
+                # absolute-position drafter mask keeps the window correct
+                # without clamping the RoPE phase.
+                kv_offset = int(prompt_cache[0].offset)
                 draft_model.set_shared_kv(next_shared_kv, kv_offset)
 
                 if emitted % 256 == 0:

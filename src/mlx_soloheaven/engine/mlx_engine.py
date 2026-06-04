@@ -283,6 +283,31 @@ def _clamped_kv_offset(prompt_cache):
     return off
 
 
+def _rotating_wrapped(prompt_cache) -> bool:
+    """True iff the model's sliding-window (RotatingKVCache) ring buffer has
+    wrapped — i.e. cumulative ``offset`` has reached the physical
+    ``max_size``.
+
+    Past this point the Gemma 4 MTP drafter's acceptance collapses
+    (~1.2 → ~0.25, MEASURED) because its SWA mask can no longer align with
+    the rotated ring buffer, making speculative decoding NET-NEGATIVE vs
+    plain decode (measured: 60 vs 83 tok/s by 2500 tokens on M5 Max). Used
+    by the patched ``_mtp_rounds`` to switch to plain single-token decode
+    for the remainder of a long generation once the ring wraps, while
+    keeping the drafter's ~+40% pre-wrap win on the first ~``max_size``
+    tokens. ``offset`` is a plain Python int (no mx sync) so this check is
+    free on the per-round hot path.
+    """
+    # Scan for the first RotatingKVCache (layer 0 for Gemma 4, but be
+    # robust to layouts where a non-sliding layer comes first).
+    for c in prompt_cache:
+        if type(c).__name__ == "RotatingKVCache":
+            ms = int(getattr(c, "max_size", 0) or 0)
+            off = int(getattr(c, "offset", 0) or 0)
+            return ms > 0 and off >= ms
+    return False
+
+
 def _install_mtp_wrap_patches() -> bool:
     """Patch the three mlx-vlm 0.5.0 Gemma 4 MTP wrap-around bugs.
 
@@ -449,7 +474,48 @@ def _install_mtp_wrap_patches() -> bool:
             b = first_bonus
             emitted = 1  # caller already yielded the first bonus
 
+            # Plain (non-speculative) single-token decode step used by the
+            # post-wrap gate below. Omits return_hidden/return_shared_kv so
+            # it runs at full plain-decode speed and bypasses the B1
+            # temporal-order patch (which keys on shared_kv_sink).
+            def _plain_step(yarr):
+                with mx.stream(_generation_stream):
+                    logits = lm(yarr, cache=prompt_cache).logits
+                    return sampler(logits)
+
             while emitted < max_tokens:
+                # PERF: dynamic wrap gate. Once the RotatingKVCache ring has
+                # wrapped, the Gemma 4 drafter's acceptance collapses
+                # (~1.2 → ~0.25, MEASURED) and speculative decoding goes
+                # net-negative. Switch to plain decode for the rest of the
+                # stream: this keeps the drafter's pre-wrap win (the first
+                # ~max_size tokens) and FLOORS throughput at plain-decode
+                # speed afterwards instead of the net-negative tail
+                # (measured: 60→84 tok/s at 2500 tokens). Output is
+                # unchanged — speculative decoding is exact-greedy, so
+                # pre-wrap MTP == greedy and post-wrap plain == greedy.
+                if _rotating_wrapped(prompt_cache):
+                    logger.info(
+                        f"[MTP] ring wrapped at emitted={emitted} — drafter "
+                        "disabled, plain decode for remainder"
+                    )
+                    # Pipelined plain decode: dispatch the NEXT forward
+                    # before materializing the current token so the GPU
+                    # never idles on the per-token sync (mirrors mlx-vlm's
+                    # non-speculative generate_step loop).
+                    y = _plain_step(mx.array([[b]], dtype=token_dtype))
+                    mx.async_eval(y)
+                    mx.eval(y)
+                    while emitted < max_tokens:
+                        next_y = _plain_step(y.reshape(1, 1))
+                        mx.async_eval(next_y)
+                        yield int(y.reshape(-1)[0].item()), None
+                        emitted += 1
+                        if emitted % 256 == 0:
+                            mx.clear_cache()
+                        y = next_y
+                    return
+
                 bs = min(block_total, max_tokens - emitted + 1)
                 if bs <= 1:
                     break

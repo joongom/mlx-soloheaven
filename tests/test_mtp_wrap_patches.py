@@ -35,6 +35,7 @@ from mlx_soloheaven.engine.mlx_engine import (
     MLXEngine,
     _clamped_kv_offset,
     _install_mtp_wrap_patches,
+    _rotating_wrapped,
 )
 
 
@@ -243,6 +244,43 @@ def test_b2v2_no_clamp_when_within_max():
     _UnwrappedRot.__name__ = "RotatingKVCache"
 
     assert _clamped_kv_offset([_UnwrappedRot()]) == 500
+
+
+# ---------------------------------------------------------------------------
+# Post-wrap GATE predicate (_rotating_wrapped): switch the drafter off and
+# fall back to plain decode once the sliding-window ring has wrapped.
+# ---------------------------------------------------------------------------
+
+
+def _rot(offset, max_size=1024):
+    cls = type("RotatingKVCache", (), {"offset": offset, "max_size": max_size})
+    return cls()
+
+
+def test_rotating_wrapped_true_at_and_past_boundary():
+    """Gate fires at offset == max_size (boundary) and beyond — `>=` predicate."""
+    assert _rotating_wrapped([_rot(1024)]) is True   # exactly full → next write rotates
+    assert _rotating_wrapped([_rot(1100)]) is True   # well past wrap
+
+
+def test_rotating_wrapped_false_before_wrap():
+    """Pre-wrap (offset < max_size) the drafter stays ON (gate does not fire)."""
+    assert _rotating_wrapped([_rot(0)]) is False
+    assert _rotating_wrapped([_rot(1023)]) is False
+
+
+def test_rotating_wrapped_ignores_non_rotating_and_scans():
+    """Only a RotatingKVCache triggers the gate; a plain KVCache never does,
+    and the predicate scans for the first rotating layer (robust to layouts
+    where layer 0 is not sliding)."""
+    plain = type("KVCache", (), {"offset": 5000, "max_size": 0})()
+    assert _rotating_wrapped([plain]) is False
+    # First entry non-rotating, second is a wrapped RotatingKVCache → True.
+    assert _rotating_wrapped([plain, _rot(2000)]) is True
+
+
+def test_rotating_wrapped_empty_cache():
+    assert _rotating_wrapped([]) is False
 
 
 def test_b3_removed_upstream_rollback_used():

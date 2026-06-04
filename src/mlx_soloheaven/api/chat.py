@@ -482,6 +482,21 @@ async def _stream_chat(
     if engine_cache_info and "build_time" in engine_cache_info:
         build_time = engine_cache_info["build_time"]
 
+    # The engine's finish result carries the REAL cache decision. Prefer it for
+    # the displayed stats — in process mode the parent preflight can't see the
+    # child's cache, so cache_info/cache_hit above are a neutral stub.
+    if engine_cache_info and "cache_mode" in engine_cache_info:
+        cm = engine_cache_info["cache_mode"]
+        cached = engine_cache_info.get("cached_tokens", 0)
+        newt = engine_cache_info.get("new_tokens", 0)
+        cache_hit = cm in ("hit", "base_hit")
+        cache_info = {
+            "type": "kv_cache_hit" if cache_hit else ("kv_cache_rebuild" if cm == "retry" else "kv_cache_miss"),
+            "detail": (f"KV Cache reuse: {cached} tokens cached, {newt} new"
+                       if cache_hit else f"Processing {newt} new tokens (cache {cm})"),
+            "cached_tokens": cached,
+        }
+
     stats = {
         "ttft": round(engine_ttft, 2),
         "queue_wait": round(queue_wait, 2),

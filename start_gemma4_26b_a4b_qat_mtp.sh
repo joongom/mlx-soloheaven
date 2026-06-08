@@ -37,6 +37,9 @@ mlx-soloheaven \
   "${DRAFT_ARGS[@]}" \
   --memory-budget-gb 20 \
   --gpu-keepalive \
+  --temperature 1.0 \
+  --top-k 64 \
+  --top-p 0.95 \
   --repetition-penalty 1.1 \
   --thinking-budget 4096 \
   "$@"

@@ -20,8 +20,12 @@
 #  - --repetition-penalty 1.1: wired into the MTP path; safety net against degenerate loops.
 #  - Code fixes (auto): tool-call object-array parser, _HOT_PATH_FAST 2-token fix,
 #    gemma4 <|channel>thought stripping on the OpenAI endpoint.
-#  - NOTE: model card recommends temp=1.0 / top_p=0.95 / top_k=64 / repeat=1.0 for QAT;
-#    OpenCode/clients can override per-request. rep-penalty 1.1 is kept as a loop safety net.
+#  - NOTE: the --temperature/--top-k/--top-p flags below MIRROR this model's
+#    generation_config.json (temp=1.0 / top_k=64 / top_p=0.95). The engine now
+#    AUTO-APPLIES those same generation_config values as defaults, so the flags
+#    are redundant-but-explicit: kept for visibility + easy per-deploy override.
+#    OpenCode/clients can still override per-request. rep-penalty 1.1 is kept as
+#    a loop safety net (NOT auto-read from generation_config).
 MODEL_PATH="$HOME/.lmstudio/models/lmstudio-community/gemma-4-26B-A4B-it-QAT-MLX-4bit"
 DRAFT_PATH="${DRAFT_PATH:-$HOME/.lmstudio/models/mlx-community/gemma-4-26B-A4B-it-qat-assistant-4bit}"
 

@@ -40,29 +40,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=int(_env("PORT", "8000")),
         help="Listen port (default: 8000)",
     )
+    # Sampling defaults use a None sentinel (NOT a hardcoded number) so that an
+    # UNSET flag is distinguishable from an explicitly-set one. None means
+    # "fall through to the model's generation_config.json (then to the built-in
+    # dataclass fallback)"; a concrete value (CLI flag or SOLOHEAVEN_* env)
+    # pins the field so generation_config can't override it. Guard the env
+    # coercion: float()/int() must only run when the env value is present,
+    # else float(None) raises at parse time. argparse's type= applies only to
+    # values actually given on argv, so a None default passes through untouched.
+    _temp_env = _env("TEMPERATURE")
     p.add_argument(
         "--temperature",
         type=float,
-        default=float(_env("TEMPERATURE", "0.6")),
-        help="Default sampling temperature (default: 0.6)",
+        default=float(_temp_env) if _temp_env is not None else None,
+        help="Default sampling temperature (unset: use model generation_config, "
+             "then fallback 0.6)",
     )
+    _top_p_env = _env("TOP_P")
     p.add_argument(
         "--top-p",
         type=float,
-        default=float(_env("TOP_P", "1.0")),
-        help="Default nucleus sampling top-p (default: 1.0, disabled)",
+        default=float(_top_p_env) if _top_p_env is not None else None,
+        help="Default nucleus sampling top-p (unset: use model generation_config, "
+             "then fallback 1.0=disabled)",
     )
+    _min_p_env = _env("MIN_P")
     p.add_argument(
         "--min-p",
         type=float,
-        default=float(_env("MIN_P", "0.0")),
-        help="Default min-p sampling threshold (default: 0.0, disabled)",
+        default=float(_min_p_env) if _min_p_env is not None else None,
+        help="Default min-p sampling threshold (unset: use model generation_config, "
+             "then fallback 0.0=disabled)",
     )
+    _top_k_env = _env("TOP_K")
     p.add_argument(
         "--top-k",
         type=int,
-        default=int(_env("TOP_K", "0")),
-        help="Default top-k sampling (default: 0, disabled)",
+        default=int(_top_k_env) if _top_k_env is not None else None,
+        help="Default top-k sampling (unset: use model generation_config, "
+             "then fallback 0=disabled)",
     )
     p.add_argument(
         "--repetition-penalty",

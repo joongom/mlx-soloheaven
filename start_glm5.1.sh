@@ -3,6 +3,7 @@
 # Note: prefill_step_size kept at default (2048). 8192 causes Metal OOM on
 # long prompts (>100K tokens) because each chunk's attention against the
 # full KV cache exceeds the ~60GB free memory after model load (~450GB).
+# no generation_config sampling available; engine uses built-in fallback defaults
 MODEL_PATH="$HOME/.lmstudio/models/mlx-community/GLM-5.1-MXFP4-Q8"
 
 cd "$(dirname "$0")"

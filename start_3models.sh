@@ -1,5 +1,8 @@
 #!/bin/bash
 # Start SoloHeaven with 3 models (Qwen3.5-122B + Qwen3-Coder-Next + Qwen3.5-9B)
+# Multi-model launcher: CLI sampling flags are shared, so no per-model flags
+# here. Each model auto-reads its own generation_config.json sampling defaults
+# in the engine; per-request overrides still apply.
 cd "$(dirname "$0")"
 source .venv/bin/activate
 mlx-soloheaven \

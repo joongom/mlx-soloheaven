@@ -26,6 +26,12 @@
 #    OpenAI endpoint output + history (was leaking raw markers -> context poisoning).
 #  - NOTE: an already-running OpenCode conversation whose history is poisoned will keep
 #    repeating; start a FRESH session after this server restart.
+#  - NOTE: the --temperature/--top-k/--top-p flags below MIRROR this model's
+#    generation_config.json (temp=1.0 / top_k=64 / top_p=0.95). The engine now
+#    AUTO-APPLIES the same generation_config values as defaults; the flags are
+#    redundant-but-explicit for visibility + easy override (clients still
+#    override per-request). rep-penalty 1.1 stays a loop safety net (NOT
+#    auto-read from generation_config).
 MODEL_PATH="$HOME/.lmstudio/models/lmstudio-community/gemma-4-26B-A4B-it-MLX-8bit"
 DRAFT_PATH="${DRAFT_PATH:-$HOME/.lmstudio/models/guardiangate1775/gemma-4-26B-A4B-it-assistant-8bit}"
 
@@ -41,6 +47,9 @@ mlx-soloheaven \
   "${DRAFT_ARGS[@]}" \
   --memory-budget-gb 20 \
   --gpu-keepalive \
+  --temperature 1.0 \
+  --top-k 64 \
+  --top-p 0.95 \
   --repetition-penalty 1.1 \
   --thinking-budget 4096 \
   "$@"

@@ -1,5 +1,6 @@
 #!/bin/bash
 # Start SoloHeaven with GLM-4.7-8bit
+# no generation_config sampling available; engine uses built-in fallback defaults
 MODEL_PATH="$HOME/.lmstudio/models/mlx-community/GLM-4.7-8bit"
 
 cd "$(dirname "$0")"

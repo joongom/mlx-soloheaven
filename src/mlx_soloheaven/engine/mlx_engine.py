@@ -230,6 +230,48 @@ def _detect_token_ids(tokenizer, text: str) -> list[int]:
     return list(ids)
 
 
+def _load_generation_config_sampling(model_path: str) -> dict:
+    """Read sampling DEFAULTS from ``<model_path>/generation_config.json``.
+
+    Returns a dict containing ONLY the keys among
+    ``{temperature, top_p, top_k, min_p}`` that are present AND of the expected
+    numeric type. Anything else (missing file, invalid JSON, missing keys,
+    wrong types) yields ``{}`` for that key — never raises.
+
+    Notes:
+      - ``repetition_penalty`` is intentionally NOT read here: soloheaven
+        defaults it to 1.05 (gemma4 anti-repetition FIX 2) and HF's value
+        (often 1.0/absent) would silently disable that mitigation.
+      - HF stores ``top_k=0`` / ``top_p=1.0`` to mean "disabled", which already
+        matches soloheaven's disabled sentinels, so no remapping is needed.
+    """
+    out: dict = {}
+    if not model_path:
+        return out
+    path = os.path.join(model_path, "generation_config.json")
+    if not os.path.exists(path):
+        return out
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception:  # noqa: BLE001 — malformed/unreadable -> configless
+        return out
+    if not isinstance(data, dict):
+        return out
+    # Only accept the right numeric type. bool is a subclass of int, so reject
+    # it explicitly; reject ints-where-float-is-fine is fine (we coerce floats).
+    for key in ("temperature", "top_p", "min_p"):
+        val = data.get(key)
+        if isinstance(val, bool):
+            continue
+        if isinstance(val, (int, float)):
+            out[key] = float(val)
+    top_k = data.get("top_k")
+    if not isinstance(top_k, bool) and isinstance(top_k, int):
+        out["top_k"] = top_k
+    return out
+
+
 # --- mlx-vlm 0.5.0 Gemma 4 MTP wrap-around patches ---
 #
 # Two coordinated bugs surface once a ``RotatingKVCache`` ring buffer
@@ -1331,6 +1373,16 @@ class MLXEngine:
         # Auto-detect thinking end token (needed for SSE thinking_done signal)
         self._detect_special_tokens()
 
+        # Sampling defaults precedence: CLI-pinned flag > generation_config.json
+        # > built-in dataclass fallback (see _apply_generation_config_sampling).
+        try:
+            self._apply_generation_config_sampling()
+        except Exception:  # noqa: BLE001 — never let genconfig parsing break load
+            logger.exception(
+                f"[{self.model_id}] generation_config sampling apply failed "
+                f"(keeping current defaults)"
+            )
+
         # Detect cache layer types (for logging/diagnostics)
         test_cache = make_prompt_cache(self._language_model)
         self._has_rotating_cache = any(
@@ -1465,6 +1517,57 @@ class MLXEngine:
                 f"[{self.model_id}] GPU keepalive DISABLED (main_thread mode — "
                 f"no background MLX access permitted)"
             )
+
+    def _apply_generation_config_sampling(self) -> dict:
+        """Populate self.cfg.default_* sampling fields from the model's
+        ``generation_config.json``, honouring CLI precedence.
+
+        Precedence (this method only decides what self.cfg.default_* HOLDS at
+        load time; the per-request and CLI-vs-default layers are elsewhere):
+            CLI-pinned flag (cfg.cli_set_sampling) > generation_config.json >
+            built-in dataclass fallback (already in place).
+
+        For each of temperature/top_p/min_p/top_k PRESENT in the model's
+        generation_config.json, write it into self.cfg.default_* UNLESS the
+        field was explicitly pinned on the CLI. Fields neither CLI-pinned nor in
+        generation_config keep the dataclass fallback — so a model with no
+        generation_config (or no sampling fields) is byte-for-byte unchanged.
+
+        Returns the dict of values actually applied (for tests/diagnostics).
+        """
+        cli_pinned = getattr(self.cfg, "cli_set_sampling", frozenset()) or frozenset()
+        gen_sampling = _load_generation_config_sampling(self.cfg.model_path)
+        applied: dict = {}
+        for name in ("temperature", "top_p", "min_p", "top_k"):
+            if name in cli_pinned:
+                continue  # CLI flag wins — do not override
+            if name in gen_sampling:
+                setattr(self.cfg, f"default_{name}", gen_sampling[name])
+                applied[name] = gen_sampling[name]
+
+        sources = []
+        if cli_pinned:
+            sources.append("CLI=" + ",".join(sorted(cli_pinned)))
+        if applied:
+            sources.append(
+                "generation_config="
+                + ",".join(f"{k}={v}" for k, v in applied.items())
+            )
+        fallback = [
+            n for n in ("temperature", "top_p", "min_p", "top_k")
+            if n not in cli_pinned and n not in gen_sampling
+        ]
+        if fallback:
+            sources.append("fallback=" + ",".join(fallback))
+        logger.info(
+            f"[{getattr(self, 'model_id', '?')}] sampling defaults — "
+            + ("; ".join(sources) if sources else "fallback (all)")
+            + f" -> temp={self.cfg.default_temperature}, "
+            f"top_p={self.cfg.default_top_p}, "
+            f"min_p={self.cfg.default_min_p}, "
+            f"top_k={self.cfg.default_top_k}"
+        )
+        return applied
 
     # --- Model detection helpers ---
 

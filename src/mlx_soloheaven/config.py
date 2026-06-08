@@ -16,6 +16,11 @@ class ModelConfig:
     default_top_p: float = 1.0
     default_min_p: float = 0.0
     default_top_k: int = 0
+    # Names of sampling fields ({"temperature","top_p","min_p","top_k"}) that
+    # were EXPLICITLY set on the CLI/env (non-None). The engine uses this at
+    # load time to decide precedence: a CLI-pinned field is NOT overridden by
+    # generation_config.json; an unpinned field IS. Empty => nothing pinned.
+    cli_set_sampling: frozenset[str] = field(default_factory=frozenset)
     # FIX 2: enabled by default (1.05) to suppress gemma4's long-session
     # closing-paragraph repetition loop. Overridable via --repetition-penalty
     # / REPETITION_PENALTY. 1.0 disables (RepetitionPenaltyProcessor no-op).
@@ -72,6 +77,10 @@ class Config:
     default_top_p: float = 1.0
     default_min_p: float = 0.0
     default_top_k: int = 0
+    # Names of sampling fields ({"temperature","top_p","min_p","top_k"}) that
+    # were EXPLICITLY set on the CLI/env (non-None). See ModelConfig for the
+    # precedence semantics the engine applies with this marker.
+    cli_set_sampling: frozenset[str] = field(default_factory=frozenset)
     # FIX 2: enabled by default (1.05) to suppress gemma4's long-session
     # closing-paragraph repetition loop. Overridable via --repetition-penalty
     # / REPETITION_PENALTY. 1.0 disables (RepetitionPenaltyProcessor no-op).
@@ -135,6 +144,27 @@ class Config:
 
     @classmethod
     def from_args(cls, args: Namespace) -> "Config":
+        # Sampling sentinel resolution: an UNSET CLI flag arrives as None, which
+        # must leave the dataclass default in place (and be recorded as "not
+        # CLI-pinned" so generation_config.json may later fill it). Only fields
+        # that are non-None were explicitly set by the user.
+        _sampling_args = (
+            ("temperature", "default_temperature", args.temperature),
+            ("top_p", "default_top_p", args.top_p),
+            ("min_p", "default_min_p", args.min_p),
+            ("top_k", "default_top_k", args.top_k),
+        )
+        cli_set_sampling = frozenset(
+            name for name, _field, val in _sampling_args if val is not None
+        )
+        # kwargs for the dataclass: include default_* ONLY when the arg was set,
+        # so an unset flag preserves the dataclass fallback (0.6/1.0/0.0/0).
+        sampling_kwargs = {
+            field_name: val
+            for _name, field_name, val in _sampling_args
+            if val is not None
+        }
+
         models = []
         if args.models:
             for spec in args.models:
@@ -156,10 +186,11 @@ class Config:
                 models.append(ModelConfig(
                     model_path=path.strip(),
                     alias=alias.strip(),
-                    default_temperature=args.temperature,
-                    default_top_p=args.top_p,
-                    default_min_p=args.min_p,
-                    default_top_k=args.top_k,
+                    # Unset sampling flags fall through to the dataclass default
+                    # here AND leave cli_set_sampling empty for them, so each
+                    # model's generation_config.json can fill them at load time.
+                    **sampling_kwargs,
+                    cli_set_sampling=cli_set_sampling,
                     default_repetition_penalty=args.repetition_penalty,
                     default_max_tokens=args.max_tokens,
                     thinking_budget=args.thinking_budget,
@@ -171,10 +202,8 @@ class Config:
         elif args.model:
             models.append(ModelConfig(
                 model_path=args.model,
-                default_temperature=args.temperature,
-                default_top_p=args.top_p,
-                default_min_p=args.min_p,
-                default_top_k=args.top_k,
+                **sampling_kwargs,
+                cli_set_sampling=cli_set_sampling,
                 default_repetition_penalty=args.repetition_penalty,
                 default_max_tokens=args.max_tokens,
                 thinking_budget=args.thinking_budget,
@@ -190,10 +219,8 @@ class Config:
             host=args.host,
             port=args.port,
             engine_mode=getattr(args, "engine_mode", "process"),
-            default_temperature=args.temperature,
-            default_top_p=args.top_p,
-            default_min_p=args.min_p,
-            default_top_k=args.top_k,
+            **sampling_kwargs,
+            cli_set_sampling=cli_set_sampling,
             default_repetition_penalty=args.repetition_penalty,
             default_max_tokens=args.max_tokens,
             thinking_budget=args.thinking_budget,

@@ -95,6 +95,9 @@ def create_app(cfg: Config) -> FastAPI:
             default_top_p=mcfg.default_top_p,
             default_min_p=mcfg.default_min_p,
             default_top_k=mcfg.default_top_k,
+            # Carry the CLI-pinned marker so the child engine knows which
+            # sampling fields must NOT be overridden by generation_config.json.
+            cli_set_sampling=mcfg.cli_set_sampling,
             default_repetition_penalty=mcfg.default_repetition_penalty,
             default_max_tokens=mcfg.default_max_tokens,
             thinking_budget=mcfg.thinking_budget,
@@ -147,6 +150,10 @@ def create_app(cfg: Config) -> FastAPI:
                 default_top_p=mcfg.default_top_p,
                 default_min_p=mcfg.default_min_p,
                 default_top_k=mcfg.default_top_k,
+                # Carry the CLI-pinned marker so each per-model engine knows
+                # which sampling fields must NOT be overridden by
+                # generation_config.json.
+                cli_set_sampling=mcfg.cli_set_sampling,
                 default_repetition_penalty=mcfg.default_repetition_penalty,
                 default_max_tokens=mcfg.default_max_tokens,
                 thinking_budget=mcfg.thinking_budget,

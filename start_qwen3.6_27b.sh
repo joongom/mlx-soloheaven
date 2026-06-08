@@ -13,8 +13,11 @@
 # Do NOT add (not applicable to this arch):
 #   --draft-model / MTP : mlx-vlm MTP speculative decoding is gemma4-only.
 #   --pld               : DeltaNet ArraysCache is PLD-incompatible.
-# Recommended sampling (set per-request by the client / OpenCode config):
-#   temperature 0.6, top_k 20, top_p 0.95.
+# Sampling: the --temperature/--top-k/--top-p flags below MIRROR this model's
+#   generation_config.json (temp=1.0 / top_k=20 / top_p=0.95). The engine now
+#   AUTO-APPLIES the same generation_config values as defaults; the flags are
+#   redundant-but-explicit for visibility + easy override (clients still
+#   override per-request).
 #   Add --no-thinking below if you want faster, non-reasoning replies.
 #
 # NOTE: the LM Studio hub path (~/.lmstudio/hub/models/qwen/qwen3.6-27b) is a
@@ -29,4 +32,7 @@ mlx-soloheaven \
   --memory-budget-gb 20 \
   --gpu-keepalive \
   --prefill-step-size 2048 \
+  --temperature 1.0 \
+  --top-k 20 \
+  --top-p 0.95 \
   "$@"

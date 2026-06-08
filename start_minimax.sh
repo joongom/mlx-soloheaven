@@ -1,5 +1,6 @@
 #!/bin/bash
 # Start SoloHeaven with MiniMax-M2.5-MLX-8bit
+# no generation_config sampling available; engine uses built-in fallback defaults
 MODEL_PATH="$HOME/.lmstudio/models/lmstudio-community/MiniMax-M2.5-MLX-8bit"
 
 cd "$(dirname "$0")"

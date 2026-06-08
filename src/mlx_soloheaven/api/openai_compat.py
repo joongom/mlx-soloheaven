@@ -32,6 +32,9 @@ from mlx_soloheaven.api.schemas import (
     UsageInfo,
 )
 from mlx_soloheaven.engine.tool_parser import (
+    CHANNEL_REASONING,
+    ThinkingRouter,
+    _partial_marker_tail,
     generate_call_id,
     get_tool_markers,
     parse_tool_calls,
@@ -71,142 +74,33 @@ def _get_engine(model: str) -> "MLXEngine":
     return _default_engine
 
 
-_GEMMA4_CHANNEL_CLOSE = "<channel|>"
-_GEMMA4_CHANNEL_OPEN = "<|channel>"
-
-
-# Thought-channel opener tokens. Gemma 4 emits the full ``<|channel>thought\n``
-# form; the sliding-window / degenerate variant drops the ``<|channel>`` tag
-# and starts straight at ``thought\n``. We must detect BOTH so a thought span
-# is re-entered no matter which form the model produces.
-_GEMMA4_THOUGHT_OPEN_FULL = _GEMMA4_CHANNEL_OPEN + "thought\n"  # "<|channel>thought\n"
-_GEMMA4_THOUGHT_OPEN_BARE = "thought\n"
-
-
 class _Gemma4ThinkingStripper:
-    """Streaming-safe Gemma 4 thinking-channel stripper (FIX 3).
+    """Backward-compatible shim over the shared ``ThinkingRouter`` (FIX 3).
 
-    Gemma 4 emits its reasoning as ``<|channel>thought\\n...<channel|>answer``
-    (and sliding-window/degenerate variants where the opening tag is missing).
-    Raw, these markers leaked into the OpenAI ``content`` deltas and replayed
-    into OpenCode's conversation history. This filter removes EVERY thought
-    span — including degenerate MULTI-CYCLE output such as
-    ``<|channel>thought\\nA<channel|>partial<|channel>thought\\nB<channel|>final``
-    where a new ``<|channel>thought`` opener appears AFTER visible content — and
-    emits only the post-``<channel|>`` answer of each cycle. This mirrors the
-    batch parser's "remove ALL spans" behavior (see
-    ``tool_parser._gemma4_extract_content``), incrementally.
-
-    State machine (CORRECTION 1 + 2):
-      * ``content`` — passing text through, while scanning for a NEW thought
-        opener (full or bare). A partial opener tail straddling a chunk
-        boundary is held back so a split marker never leaks.
-      * ``thought`` — suppressing reasoning, while scanning for the
-        ``<channel|>`` close. A partial close tail is held back likewise.
-
-    CORRECTION 2: the stream does NOT begin assumed-inside-thought. It starts
-    in ``content`` mode; we only enter ``thought`` upon actually seeing a
-    thought opener. So a gemma4 (thinking-enabled) request whose model answers
-    with NO channel markers passes straight through unstripped instead of being
-    dropped.
-
-    ``feed(text)`` returns the content-visible portion of ``text`` (possibly
-    empty while inside a thought channel or holding a partial marker).
-    ``flush()`` returns any safely-emittable remainder at stream end. For
-    non-gemma4 / thinking-disabled callers, construct with ``active=False`` and
-    ``feed`` is a pass-through.
+    The reasoning-channel feature replaced the old strip-and-drop stripper with
+    ``tool_parser.ThinkingRouter``, which ROUTES the gemma4 thought channel to a
+    reasoning stream instead of dropping it. This shim keeps the old
+    ``feed(text) -> content_str`` / ``flush() -> content_str`` surface (returns
+    ONLY the content-channel text, dropping reasoning) so prior callers/tests
+    that just want the stripped answer still work. New code should use
+    ``ThinkingRouter`` directly to obtain BOTH channels.
     """
 
     def __init__(self, active: bool):
         self.active = active
-        # CORRECTION 2: start in CONTENT mode, not thought mode. We only enter
-        # thought mode when an opener is actually observed, so a model that
-        # answers without channel markers is not dropped.
-        self._in_thought = False
-        self._pending = ""  # held-back possible-partial marker tail
-
-    @staticmethod
-    def _partial_marker_tail(buf: str, markers: tuple[str, ...]) -> int:
-        """Length of the suffix of ``buf`` that could begin ANY of ``markers``.
-
-        Returns the longest proper-prefix-of-a-marker that is a suffix of
-        ``buf`` (so a marker split across chunk boundaries is held, never
-        leaked). 0 if no marker could start in the tail.
-        """
-        best = 0
-        for marker in markers:
-            max_len = min(len(buf), len(marker) - 1)
-            for n in range(max_len, best, -1):
-                if buf.endswith(marker[:n]):
-                    best = n
-                    break
-        return best
+        self._router = ThinkingRouter(active=active, model_family="gemma4")
 
     def feed(self, text: str) -> str:
         if not self.active:
             return text
-        buf = self._pending + text
-        self._pending = ""
-        out_parts: list[str] = []
-
-        while buf:
-            if self._in_thought:
-                # Suppress reasoning until the <channel|> close.
-                idx = buf.find(_GEMMA4_CHANNEL_CLOSE)
-                if idx == -1:
-                    # No close yet — hold a possible partial close-marker tail,
-                    # drop the rest (thought text must never reach content).
-                    keep = self._partial_marker_tail(
-                        buf, (_GEMMA4_CHANNEL_CLOSE,)
-                    )
-                    self._pending = buf[len(buf) - keep:] if keep else ""
-                    buf = ""
-                    break
-                # Close found — leave thought mode; reprocess the post-close
-                # remainder as content (it may contain a NEW thought opener).
-                self._in_thought = False
-                buf = buf[idx + len(_GEMMA4_CHANNEL_CLOSE):]
-                continue
-
-            # CONTENT mode: scan for a NEW thought opener (full or bare).
-            full = buf.find(_GEMMA4_THOUGHT_OPEN_FULL)
-            bare = buf.find(_GEMMA4_THOUGHT_OPEN_BARE)
-            candidates = [i for i in (full, bare) if i != -1]
-            if not candidates:
-                # No opener — emit content, but hold a tail that could be the
-                # start of an opener split across the chunk boundary.
-                keep = self._partial_marker_tail(
-                    buf,
-                    (_GEMMA4_THOUGHT_OPEN_FULL, _GEMMA4_THOUGHT_OPEN_BARE),
-                )
-                if keep:
-                    out_parts.append(buf[:len(buf) - keep])
-                    self._pending = buf[len(buf) - keep:]
-                else:
-                    out_parts.append(buf)
-                buf = ""
-                break
-            idx = min(candidates)
-            # Emit content before the opener; enter thought mode and drop the
-            # opener tag itself (whichever variant matched at idx).
-            out_parts.append(buf[:idx])
-            self._in_thought = True
-            if buf.startswith(_GEMMA4_THOUGHT_OPEN_FULL, idx):
-                buf = buf[idx + len(_GEMMA4_THOUGHT_OPEN_FULL):]
-            else:
-                buf = buf[idx + len(_GEMMA4_THOUGHT_OPEN_BARE):]
-            continue
-
-        return "".join(out_parts)
+        return "".join(
+            t for ch, t in self._router.feed(text) if ch != CHANNEL_REASONING
+        )
 
     def flush(self) -> str:
-        # At stream end: if still inside a thought channel, the held-back
-        # pending is thought-channel text — drop it (degenerate output that
-        # never closed). In content mode, a pending tail is a partial opener
-        # prefix that never completed; it is real content, so emit it.
-        out = "" if self._in_thought else self._pending
-        self._pending = ""
-        return out
+        return "".join(
+            t for ch, t in self._router.flush() if ch != CHANNEL_REASONING
+        )
 
 
 # --- POST /v1/chat/completions ---
@@ -318,6 +212,11 @@ def _sync_completion(request: ChatCompletionRequest, engine: "MLXEngine") -> Cha
     )
 
     msg = ResponseMessage(content=result.content)
+    # Expose the model's thinking as a SEPARATE reasoning channel (matches LM
+    # Studio's reasoning_content). The engine already split it via
+    # split_thinking_and_content; content stays the clean answer.
+    if result.thinking:
+        msg.reasoning_content = result.thinking
     if result.tool_calls:
         msg.tool_calls = [
             ToolCall(
@@ -397,21 +296,19 @@ async def _stream_completion(
 
     model_family = engine.model_family
 
-    # FIX 3: streaming-safe Gemma 4 thinking-channel stripper. Gemma 4 emits
-    # <|channel>thought...<channel|>answer; raw, those markers leaked into the
-    # OpenAI content deltas and replayed into OpenCode history. The stripper
-    # buffers until <channel|> and emits only the post-close answer. Active
-    # ONLY for gemma4 with thinking enabled; a pass-through otherwise (keeps
-    # non-gemma4 / thinking-disabled output byte-identical).
-    thinking_stripper = _Gemma4ThinkingStripper(
-        active=(enable_thinking and model_family == "gemma4")
+    # Reasoning-channel router (shared with the web chat path). Instead of
+    # dropping the thought channel, route it: thinking-phase text becomes
+    # ``delta.reasoning_content`` (LM-Studio shape), the post-thinking answer
+    # becomes ``delta.content``. Active when thinking is enabled (gemma4 detects
+    # <|channel>thought...<channel|>; chatml/glm stream begins inside <think>
+    # and routes up to </think>). A pass-through when thinking is disabled, so
+    # non-thinking output stays byte-identical.
+    thinking_router = ThinkingRouter(
+        active=enable_thinking, model_family=model_family
     )
-
-    # Send opening <think> tag if thinking is enabled
-    # Skip for Gemma 4 — it uses <|channel>thought...<channel|> natively
-    if enable_thinking and model_family != "gemma4":
-        think_chunk = _make_content_chunk(chunk_id, created, model, "<think>\n")
-        yield f"data: {think_chunk}\n\n"
+    # NOTE: we no longer inject an opening "<think>\n" content chunk for
+    # non-gemma4 — reasoning is now routed to reasoning_content instead of being
+    # wrapped in <think> tags inside content.
 
     # Generate and stream
     # PERF: append-to-list + join at consumption points avoids the O(N^2)
@@ -495,133 +392,147 @@ async def _stream_completion(
                 continue
 
             # Keep acc_parts RAW (drives session-persistence split + disconnect
-            # tail). FIX 3: filter the OUTBOUND text through the thinking
-            # stripper so the Gemma 4 thought channel never reaches content
-            # deltas. visible_text == chunk_text for non-gemma4 / thinking-off.
+            # tail). Route the OUTBOUND text through the shared ThinkingRouter so
+            # thinking-phase text is emitted as reasoning_content deltas and the
+            # post-thinking answer as content deltas. For non-thinking output the
+            # router is a pass-through (all content). Segments are processed IN
+            # ORDER so reasoning/content interleaving (multi-cycle) is preserved.
             acc_parts.append(chunk_text)
             token_count += 1
-            visible_text = thinking_stripper.feed(chunk_text)
-            if not visible_text:
-                # Still inside the thought channel (or holding a partial close
-                # marker) — nothing to emit as content yet.
+            segments = thinking_router.feed(chunk_text)
+            if not segments:
+                # Reasoning-only held partial marker / nothing emittable yet.
                 if finished:
                     break
                 yield ": keepalive\n\n"
                 continue
-            chunk_text = visible_text
 
-            if not has_tools:
-                # Plain content path — one delta chunk per batch.
-                chunk = _make_content_chunk(chunk_id, created, model, chunk_text)
-                yield f"data: {chunk}\n\n"
-                if finished:
-                    break
-                continue
+            # Process each routed segment in order. Reasoning segments emit a
+            # reasoning_content delta; content segments go through the existing
+            # content / tool-call path (the tool state machine consumes content
+            # text only — tool XML never appears on the reasoning channel).
+            for seg_channel, seg_text in segments:
+                if not seg_text:
+                    continue
+                if seg_channel == CHANNEL_REASONING:
+                    yield f"data: {_make_reasoning_chunk(chunk_id, created, model, seg_text)}\n\n"
+                    continue
 
-            # has_tools True — drive the tool-call state machine over the chunk.
-            # ``chunk`` is the remaining unconsumed text; loop until it is empty
-            # or no further progress can be made (partial block / partial start).
-            chunk = chunk_text
-            while chunk:
-                if tc_active:
-                    tc_block += chunk
-                    chunk = ""
+                if not has_tools:
+                    # Plain content path — one delta chunk per content segment.
+                    chunk = _make_content_chunk(chunk_id, created, model, seg_text)
+                    yield f"data: {chunk}\n\n"
+                    continue
 
-                    # Emit first chunk (id + name) as soon as name is known.
-                    if not tc_name_sent:
-                        name = try_extract_tool_name(tc_block, model_family)
-                        if name:
-                            first = ChatCompletionChunk(
-                                id=chunk_id, created=created, model=model,
-                                choices=[ChunkChoice(delta=DeltaMessage(tool_calls=[{
-                                    "index": tc_index,
-                                    "id": tc_id,
-                                    "type": "function",
-                                    "function": {"name": name, "arguments": ""},
-                                }]))],
-                            )
-                            yield f"data: {first.model_dump_json(exclude_none=True)}\n\n"
-                            tc_name_sent = True
+                # has_tools True — drive the tool-call state machine over this
+                # content segment. ``chunk`` is the remaining unconsumed text;
+                # loop until empty or no further progress (partial block / start).
+                chunk = seg_text
+                while chunk:
+                    if tc_active:
+                        tc_block += chunk
+                        chunk = ""
 
-                    # Check for block close.
-                    if TOOL_END in tc_block:
-                        end_idx = tc_block.index(TOOL_END)
-                        block_text = TOOL_START + tc_block[:end_idx] + TOOL_END
-                        _, calls = parse_tool_calls(block_text, model_family=model_family)
-                        if calls:
-                            tc = calls[0]
-                            # If name chunk wasn't emitted yet (whole block
-                            # arrived at once), emit it now.
-                            if not tc_name_sent:
+                        # Emit first chunk (id + name) as soon as name is known.
+                        if not tc_name_sent:
+                            name = try_extract_tool_name(tc_block, model_family)
+                            if name:
                                 first = ChatCompletionChunk(
                                     id=chunk_id, created=created, model=model,
                                     choices=[ChunkChoice(delta=DeltaMessage(tool_calls=[{
                                         "index": tc_index,
                                         "id": tc_id,
                                         "type": "function",
-                                        "function": {
-                                            "name": tc["function"]["name"],
-                                            "arguments": "",
-                                        },
+                                        "function": {"name": name, "arguments": ""},
                                     }]))],
                                 )
                                 yield f"data: {first.model_dump_json(exclude_none=True)}\n\n"
-                            args_chunk = ChatCompletionChunk(
-                                id=chunk_id, created=created, model=model,
-                                choices=[ChunkChoice(delta=DeltaMessage(tool_calls=[{
-                                    "index": tc_index,
-                                    "function": {"arguments": tc["function"]["arguments"]},
-                                }]))],
+                                tc_name_sent = True
+
+                        # Check for block close.
+                        if TOOL_END in tc_block:
+                            end_idx = tc_block.index(TOOL_END)
+                            block_text = TOOL_START + tc_block[:end_idx] + TOOL_END
+                            _, calls = parse_tool_calls(block_text, model_family=model_family)
+                            if calls:
+                                tc = calls[0]
+                                # If name chunk wasn't emitted yet (whole block
+                                # arrived at once), emit it now.
+                                if not tc_name_sent:
+                                    first = ChatCompletionChunk(
+                                        id=chunk_id, created=created, model=model,
+                                        choices=[ChunkChoice(delta=DeltaMessage(tool_calls=[{
+                                            "index": tc_index,
+                                            "id": tc_id,
+                                            "type": "function",
+                                            "function": {
+                                                "name": tc["function"]["name"],
+                                                "arguments": "",
+                                            },
+                                        }]))],
+                                    )
+                                    yield f"data: {first.model_dump_json(exclude_none=True)}\n\n"
+                                args_chunk = ChatCompletionChunk(
+                                    id=chunk_id, created=created, model=model,
+                                    choices=[ChunkChoice(delta=DeltaMessage(tool_calls=[{
+                                        "index": tc_index,
+                                        "function": {"arguments": tc["function"]["arguments"]},
+                                    }]))],
+                                )
+                                yield f"data: {args_chunk.model_dump_json(exclude_none=True)}\n\n"
+                                # Use the id we generated at block-start so session
+                                # + SSE agree.
+                                tc["id"] = tc_id
+                                parsed_tool_calls.append(tc)
+
+                            # Reset for next block; any trailing text after TOOL_END
+                            # is re-processed through the holdback/content path.
+                            trailing = tc_block[end_idx + len(TOOL_END):]
+                            tc_active = False
+                            tc_block = ""
+                            tc_name_sent = False
+                            tc_id = None
+                            if trailing:
+                                chunk = trailing
+                        # else: block still open, wait for more text (chunk empty).
+                        continue
+
+                    holdback += chunk
+                    chunk = ""
+
+                    if TOOL_START in holdback:
+                        idx = holdback.index(TOOL_START)
+                        before = holdback[:idx]
+                        if before:
+                            content_chunk = _make_content_chunk(
+                                chunk_id, created, model, before
                             )
-                            yield f"data: {args_chunk.model_dump_json(exclude_none=True)}\n\n"
-                            # Use the id we generated at block-start so session
-                            # + SSE agree.
-                            tc["id"] = tc_id
-                            parsed_tool_calls.append(tc)
-
-                        # Reset for next block; any trailing text after TOOL_END
-                        # is re-processed through the holdback/content path.
-                        trailing = tc_block[end_idx + len(TOOL_END):]
-                        tc_active = False
-                        tc_block = ""
+                            yield f"data: {content_chunk}\n\n"
+                        tc_active = True
+                        tc_index += 1
+                        tc_id = generate_call_id()
                         tc_name_sent = False
-                        tc_id = None
-                        if trailing:
-                            chunk = trailing
-                    # else: block still open, wait for more text (chunk empty).
-                    continue
+                        # Re-feed everything after TOOL_START into the active-block
+                        # branch on the next loop turn (handles full block in chunk).
+                        chunk = holdback[idx + len(TOOL_START):]
+                        holdback = ""
+                        continue
 
-                holdback += chunk
-                chunk = ""
-
-                if TOOL_START.startswith(holdback.lstrip()):
-                    # Possible partial start tag — hold until more text arrives.
-                    continue
-
-                if TOOL_START in holdback:
-                    idx = holdback.index(TOOL_START)
-                    before = holdback[:idx]
-                    if before:
+                    # FIX 3: a partial start marker may trail VISIBLE content
+                    # (e.g. "before <too"). Hold back only the LONGEST SUFFIX of
+                    # the buffer that is a prefix of TOOL_START, and emit the
+                    # preceding text now. The old check only held when the WHOLE
+                    # (stripped) buffer was a prefix, so it leaked the partial
+                    # marker as content. ``keep`` covers the all-prefix case too
+                    # (keep == len(holdback) -> emit nothing, hold everything).
+                    keep = _partial_marker_tail(holdback, (TOOL_START,))
+                    emit = holdback[: len(holdback) - keep]
+                    holdback = holdback[len(holdback) - keep:]
+                    if emit:
                         content_chunk = _make_content_chunk(
-                            chunk_id, created, model, before
+                            chunk_id, created, model, emit
                         )
                         yield f"data: {content_chunk}\n\n"
-                    tc_active = True
-                    tc_index += 1
-                    tc_id = generate_call_id()
-                    tc_name_sent = False
-                    # Re-feed everything after TOOL_START into the active-block
-                    # branch on the next loop turn (handles full block in chunk).
-                    chunk = holdback[idx + len(TOOL_START):]
-                    holdback = ""
-                    continue
-
-                if holdback:
-                    content_chunk = _make_content_chunk(
-                        chunk_id, created, model, holdback
-                    )
-                    yield f"data: {content_chunk}\n\n"
-                    holdback = ""
 
             if finished:
                 break
@@ -634,21 +545,23 @@ async def _stream_completion(
         )
         raise
 
-    # CORRECTION 2: flush the thinking stripper's held tail. In content mode a
-    # partial-opener prefix (e.g. a trailing "thought" that never completed
-    # into "thought\n") is held back as a possible split marker; at stream end
-    # it is real content and must be emitted, not dropped. (In thought mode the
-    # stripper returns "" — degenerate output that never closed the channel.)
-    flushed = thinking_stripper.flush()
-    if flushed:
-        if not has_tools:
-            chunk = _make_content_chunk(chunk_id, created, model, flushed)
+    # Flush the router's held tail. A partial-opener prefix held back as a
+    # possible split marker is real content/reasoning at stream end and must be
+    # emitted (a marker that never completed is not a marker). Reasoning that
+    # never closed its channel (degenerate) is dropped by the router itself.
+    for seg_channel, seg_text in thinking_router.flush():
+        if not seg_text:
+            continue
+        if seg_channel == CHANNEL_REASONING:
+            yield f"data: {_make_reasoning_chunk(chunk_id, created, model, seg_text)}\n\n"
+        elif not has_tools:
+            chunk = _make_content_chunk(chunk_id, created, model, seg_text)
             yield f"data: {chunk}\n\n"
         else:
-            # Route through the post-loop holdback flush below (the held tail
-            # cannot be a tool-start fragment — those are held in ``holdback``,
-            # not the stripper — so appending is safe).
-            holdback += flushed
+            # Route content through the post-loop holdback flush below (the held
+            # tail cannot be a tool-start fragment — those are held in
+            # ``holdback``, not the router — so appending is safe).
+            holdback += seg_text
 
     # Flush remaining holdback (only content path; tool_call active is handled below)
     if holdback and not tc_active:
@@ -693,8 +606,14 @@ async def _stream_completion(
     # chat template can render {% if m.tool_calls %} block (required for
     # multi-turn tool use with stateful clients like OpenClaw).
     if request.user:
+        # FIX 1: the chatml/glm stream began inside <think> when thinking was
+        # enabled (opener lives in the prompt suffix). Pass that so a degenerate
+        # no-</think> turn is persisted as reasoning (content="") — matching what
+        # the streaming router already emitted on the wire.
         thinking, content = split_thinking_and_content(
-            "".join(acc_parts), model_family=model_family
+            "".join(acc_parts),
+            model_family=model_family,
+            started_in_thinking=enable_thinking and model_family != "gemma4",
         )
         assistant_msg: dict = {"role": "assistant", "content": content or ""}
         if parsed_tool_calls:
@@ -731,6 +650,17 @@ def _make_content_chunk(chunk_id: str, created: int, model: str, text: str) -> s
         created=created,
         model=model,
         choices=[ChunkChoice(delta=DeltaMessage(content=text))],
+    )
+    return chunk.model_dump_json(exclude_none=True)
+
+
+def _make_reasoning_chunk(chunk_id: str, created: int, model: str, text: str) -> str:
+    """Reasoning-channel delta (LM-Studio shape): delta.reasoning_content."""
+    chunk = ChatCompletionChunk(
+        id=chunk_id,
+        created=created,
+        model=model,
+        choices=[ChunkChoice(delta=DeltaMessage(reasoning_content=text))],
     )
     return chunk.model_dump_json(exclude_none=True)
 

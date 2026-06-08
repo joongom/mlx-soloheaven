@@ -104,6 +104,10 @@ class ToolCall(BaseModel):
 class ResponseMessage(BaseModel):
     role: Literal["assistant"] = "assistant"
     content: Optional[str] = None
+    # Reasoning channel (matches LM Studio): the model's thinking, separate from
+    # the clean answer in ``content``. Populated for thinking models when the
+    # engine split off a non-empty thought span.
+    reasoning_content: Optional[str] = None
     tool_calls: Optional[list[ToolCall]] = None
 
 
@@ -127,6 +131,10 @@ class ChatCompletionResponse(BaseModel):
 class DeltaMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+    # Reasoning-channel delta (matches LM Studio): thinking-phase text is
+    # emitted here during the thought span, then ``content`` deltas for the
+    # answer. Never carries thinking markers.
+    reasoning_content: Optional[str] = None
     tool_calls: Optional[list[dict]] = None
 
 

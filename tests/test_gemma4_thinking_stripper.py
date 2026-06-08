@@ -119,14 +119,23 @@ def test_multi_cycle_three_channels():
 
 
 def test_multi_cycle_bare_reopener_after_content():
-    """The sliding-window variant drops the <|channel> tag and reopens with a
-    bare ``thought\\n`` AFTER visible content — must still be re-stripped."""
+    """FIX 4 (policy change): a BARE ``thought\\n`` opener is recognized ONLY at
+    the very START of generation (sliding-window first token). AFTER visible
+    content it is NOT a re-opener — a literal ``thought\\n`` line in content /
+    tool args must stay CONTENT, not be mis-routed to reasoning. So here only
+    the FIRST (full-marker) cycle is stripped; the bare ``thought\\n`` after
+    ``visible `` is content. (A real multi-cycle re-opener uses the FULL
+    ``<|channel>thought`` marker — see test_multi_cycle_two_channels_single_chunk.)
+    The orphan ``<channel|>`` left in content is a degenerate-input artifact, not
+    reasoning leakage."""
     s = _Gemma4ThinkingStripper(active=True)
     out = _feed_all(
         s,
         ["<|channel>thought\nA<channel|>visible thought\nB<channel|>tail"],
     )
-    assert out == "visible tail"
+    # OLD policy (pre-FIX-4) treated the bare reopener as reasoning -> "visible tail".
+    assert out == "visible thought\nB<channel|>tail"
+    assert out.startswith("visible ")  # cycle-1 reasoning "A" stripped, content kept
 
 
 def test_multi_cycle_markers_split_char_by_char():

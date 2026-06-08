@@ -204,10 +204,11 @@ class _ChatFakeEngine(FakeEngine):
 
 
 @pytest.mark.asyncio
-async def test_chat_layer_content_byte_identity_and_thinking_done(monkeypatch):
-    """The concatenation of all emitted chat SSE "content" equals the per-token
-    concatenation (plus the once-emitted <think>\\n prefix), and thinking_done
-    rides the frame ending with the think_end token."""
+async def test_chat_layer_reasoning_content_split_and_thinking_done(monkeypatch):
+    """Reasoning-channel protocol: the chat SSE stream now routes thinking into
+    "reasoning" frames and the answer into "content" frames (no raw <think>/
+    </think>/<channel|> markers anywhere). thinking_done rides the FIRST content
+    frame that follows reasoning."""
     from mlx_soloheaven.api import chat as chat_mod
 
     # Stub the async db surface _stream_chat calls after the stream loop.
@@ -239,19 +240,22 @@ async def test_chat_layer_content_byte_identity_and_thinking_done(monkeypatch):
             continue
         frames.append(json.loads(line[len("data: "):]))
 
-    # Collect emitted "text" content frames in order.
     text_frames = [f for f in frames if f.get("type") == "text"]
-    emitted = "".join(f["content"] for f in text_frames)
+    reasoning = "".join(f.get("reasoning", "") for f in text_frames)
+    content = "".join(f.get("content", "") for f in text_frames)
 
-    # Per-token concatenation (content results only) with the <think>\n prefix
-    # prepended once.
-    expected = "<think>\n" + "".join(
-        r.text for r in results if r.status is None and r.finish_reason is None
-    )
-    assert emitted == expected
+    # chatml stream begins inside the <think> block (opener is in the prompt
+    # suffix). Reasoning is everything before </think>; content is the rest.
+    # No markers leak into either channel.
+    assert reasoning == "Hello world"
+    assert content == "ABCDE"
+    for marker in ("<think>", "</think>", "<channel|>", "<|channel>"):
+        assert marker not in reasoning
+        assert marker not in content
 
-    # Exactly one frame carries thinking_done=True, and its content ends with
-    # the think-close token text.
+    # Exactly one content frame carries thinking_done=True (the first content
+    # frame after reasoning); no reasoning frame carries it.
     done_frames = [f for f in text_frames if f.get("thinking_done")]
     assert len(done_frames) == 1
-    assert done_frames[0]["content"].endswith("</think>")
+    assert done_frames[0].get("content")
+    assert not done_frames[0].get("reasoning")

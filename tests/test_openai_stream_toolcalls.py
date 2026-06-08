@@ -440,3 +440,82 @@ async def test_content_before_tool_call_emitted():
     # Raw XML must not leak into content
     assert "<tool_call>" not in joined
     assert "<function=" not in joined
+
+
+# ---------- FIX 3: partial tool-start marker AFTER visible text in one token ----------
+
+# A single token carries visible content AND the start of the tool marker
+# ("before <too"). The holdback must emit only the preceding visible text and
+# RETAIN the partial-marker suffix — the old code leaked "before <too" because
+# it only held when the WHOLE stripped buffer was a prefix of TOOL_START.
+QWEN_SPLIT_START_TOKENS = [
+    "Here is the result: ",
+    "<too",                         # visible text already emitted; this is a pure prefix
+    "l_call><function=web_search>",
+    "<parameter=query>",
+    "mlx",
+    "</parameter>",
+    "</function>",
+    "</tool_call>",
+]
+
+# Even harder: visible text and the partial marker share ONE token.
+QWEN_GLUED_START_TOKENS = [
+    "before <too",                  # visible "before " + partial "<too" together
+    "l_call><function=web_search>",
+    "<parameter=query>",
+    "mlx",
+    "</parameter>",
+    "</function>",
+    "</tool_call>",
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tokens", [QWEN_SPLIT_START_TOKENS, QWEN_GLUED_START_TOKENS])
+async def test_partial_tool_start_after_visible_text_not_leaked(tokens):
+    engine = StubEngine("chatml", tokens)
+    req = _build_request("chatml")
+    events = await _collect(engine, req)
+
+    content = "".join(
+        choice.get("delta", {}).get("content", "")
+        for ev in events
+        for choice in ev.get("choices", [])
+        if choice.get("delta", {}).get("content")
+    )
+    # The partial start marker must NOT leak into content...
+    assert "<too" not in content
+    assert "<tool_call>" not in content
+    assert "<function=" not in content
+    # ...but the preceding visible text must still be emitted intact.
+    if tokens is QWEN_SPLIT_START_TOKENS:
+        assert content == "Here is the result: "
+    else:
+        assert content == "before "
+
+    # And the tool call still parses correctly.
+    tc_chunks = _extract_tool_call_chunks(events)
+    assert tc_chunks[0]["function"]["name"] == "web_search"
+    args_chunk = next(c for c in tc_chunks if c.get("function", {}).get("arguments"))
+    assert json.loads(args_chunk["function"]["arguments"]) == {"query": "mlx"}
+    assert _final_finish_reason(events) == "tool_calls"
+
+
+@pytest.mark.asyncio
+async def test_partial_tool_start_at_stream_end_flushed_as_content():
+    """FIX 3 complement: a partial tool-start that NEVER completes (stream ends
+    on 'answer text <too') is real content — the held suffix must be flushed,
+    not dropped, and the visible prefix emitted before it."""
+    engine = StubEngine("chatml", ["answer text <too"])
+    # No real tool call -> finish must fall back to "stop"; reuse _build_request
+    # (tools present) but the model never closes a block.
+    req = _build_request("chatml")
+    events = await _collect(engine, req)
+    content = "".join(
+        choice.get("delta", {}).get("content", "")
+        for ev in events
+        for choice in ev.get("choices", [])
+        if choice.get("delta", {}).get("content")
+    )
+    assert content == "answer text <too"  # nothing dropped

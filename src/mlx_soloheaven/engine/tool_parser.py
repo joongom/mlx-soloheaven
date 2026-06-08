@@ -407,11 +407,261 @@ def _parse_gemma4_tool_calls(text: str) -> tuple[str, list[dict]]:
 # multi-cycle / sliding-window outputs emit repeated or orphaned markers.
 _GEMMA4_CHANNEL_OPEN = "<|channel>"
 _GEMMA4_CHANNEL_CLOSE = "<channel|>"
+# Thought-channel opener tokens. Gemma 4 emits the full ``<|channel>thought\n``
+# form; the sliding-window / degenerate variant drops the ``<|channel>`` tag and
+# starts straight at ``thought\n``. We detect BOTH so a thought span is entered
+# no matter which form the model produces.
+_GEMMA4_THOUGHT_OPEN_FULL = _GEMMA4_CHANNEL_OPEN + "thought\n"  # "<|channel>thought\n"
+_GEMMA4_THOUGHT_OPEN_BARE = "thought\n"
+# ChatML / GLM thinking close. The opening ``<think>`` lives in the prompt
+# suffix (not the model output), so the stream starts already inside reasoning
+# and we only ever see the ``</think>`` close in the generated text.
+_CHATML_THINK_OPEN = "<think>"
+_CHATML_THINK_CLOSE = "</think>"
 # Matches a full thought span, with or without the opening ``<|channel>`` tag
 # (the sliding-window variant drops it and starts straight at ``thought\n``).
 _GEMMA4_THOUGHT_SPAN_RE = re.compile(
     r"(?:<\|channel>)?thought\n.*?<channel\|>\s*", re.DOTALL
 )
+
+
+def _is_proper_prefix(s: str, marker: str) -> bool:
+    """True if ``s`` is a non-empty PROPER prefix of ``marker`` (i.e. the start
+    of an incomplete marker, not the whole marker). Used by ``flush`` to drop a
+    held partial-marker fragment instead of leaking it onto a channel."""
+    return bool(s) and len(s) < len(marker) and marker.startswith(s)
+
+
+def _partial_marker_tail(buf: str, markers: tuple[str, ...]) -> int:
+    """Length of the suffix of ``buf`` that could begin ANY of ``markers``.
+
+    Returns the longest proper-prefix-of-a-marker that is a suffix of ``buf``
+    (so a marker split across chunk boundaries is held, never leaked/emitted on
+    the wrong channel). 0 if no marker could start in the tail.
+    """
+    best = 0
+    for marker in markers:
+        max_len = min(len(buf), len(marker) - 1)
+        for n in range(max_len, best, -1):
+            if buf.endswith(marker[:n]):
+                best = n
+                break
+    return best
+
+
+# Channel labels emitted by ``ThinkingRouter``.
+CHANNEL_REASONING = "reasoning"
+CHANNEL_CONTENT = "content"
+
+
+class ThinkingRouter:
+    """Streaming-safe router that splits model output into reasoning vs content.
+
+    This is the shared engine of the OpenAI-compat streaming path AND the web
+    chat SSE path, so both surfaces route thinking identically. It supersedes
+    the old ``_Gemma4ThinkingStripper`` (which DROPPED reasoning); instead of
+    suppressing the thought channel, it now ROUTES each segment to a channel:
+
+      * ``CHANNEL_REASONING`` — model reasoning (LM-Studio ``reasoning_content``)
+      * ``CHANNEL_CONTENT``   — the visible answer
+
+    Two thinking families are handled:
+
+    * gemma4: ``<|channel>thought\\n...reasoning...<channel|>answer`` (and the
+      sliding-window / degenerate variants where the opening ``<|channel>`` tag
+      is dropped and reasoning starts straight at ``thought\\n``). The stream
+      STARTS in content mode and only enters reasoning on a thought opener, so a
+      model that answers with NO channel markers passes straight through as
+      content. Multi-cycle output (a NEW opener after visible content) re-enters
+      reasoning and routes each cycle correctly.
+    * chatml / glm: the opening ``<think>`` lives in the prompt suffix, so the
+      generated stream STARTS already inside reasoning and we route everything
+      up to the ``</think>`` close as reasoning, the remainder as content. (A
+      stray opening ``<think>`` in the output, if any, is consumed.)
+
+    Partial markers straddling a chunk boundary are held back in ``_pending``
+    and never emitted on the wrong channel.
+
+    ``feed(text)`` -> list[(channel, text)] segments (in order, possibly empty).
+    ``flush()`` -> list[(channel, text)] remainder safely emittable at stream
+    end. For non-thinking / non-routed callers construct with ``active=False``
+    and ``feed`` is a pass-through that yields ``(CHANNEL_CONTENT, text)``.
+    """
+
+    def __init__(self, active: bool, model_family: str = "chatml"):
+        self.active = active
+        self.model_family = model_family
+        self._is_gemma4 = model_family == "gemma4"
+        # gemma4 starts in CONTENT mode (enter reasoning on an opener); chatml /
+        # glm start in REASONING mode (the <think> opener is in the prompt
+        # suffix, so generated output begins inside the thought block).
+        self._in_reasoning = active and not self._is_gemma4
+        self._pending = ""  # held-back possible-partial marker tail
+        # FIX 4 (gemma4): the BARE ``thought\n`` opener is only valid at the
+        # very START of generation (the sliding-window variant where the
+        # ``<|channel>`` tag fell out of the window, so the model emits
+        # ``thought\n`` directly as its first token). Once ANY content has been
+        # emitted by the router, a literal ``thought\n`` line in content / tool
+        # args must NOT be mis-read as a re-opener — only the FULL
+        # ``<|channel>thought\n`` opener may re-open mid-content (real
+        # multi-cycle). Tracks whether the router has emitted any content yet.
+        self._content_seen = False
+
+    def feed(self, text: str) -> list[tuple[str, str]]:
+        if not self.active:
+            return [(CHANNEL_CONTENT, text)] if text else []
+        if self._is_gemma4:
+            return self._feed_gemma4(text)
+        return self._feed_chatml(text)
+
+    # --- gemma4: <|channel>thought\n ... <channel|> answer (multi-cycle) ---
+
+    def _feed_gemma4(self, text: str) -> list[tuple[str, str]]:
+        buf = self._pending + text
+        self._pending = ""
+        out: list[tuple[str, str]] = []
+
+        while buf:
+            if self._in_reasoning:
+                idx = buf.find(_GEMMA4_CHANNEL_CLOSE)
+                if idx == -1:
+                    # No close yet — emit reasoning, but hold a possible partial
+                    # close-marker tail so a split marker never leaks.
+                    keep = _partial_marker_tail(buf, (_GEMMA4_CHANNEL_CLOSE,))
+                    body = buf[: len(buf) - keep] if keep else buf
+                    if body:
+                        out.append((CHANNEL_REASONING, body))
+                    self._pending = buf[len(buf) - keep:] if keep else ""
+                    buf = ""
+                    break
+                # Reasoning up to the close marker; then leave reasoning mode and
+                # reprocess the remainder (it may open a NEW thought cycle).
+                if idx:
+                    out.append((CHANNEL_REASONING, buf[:idx]))
+                self._in_reasoning = False
+                buf = buf[idx + len(_GEMMA4_CHANNEL_CLOSE):]
+                continue
+
+            # CONTENT mode: scan for a NEW thought opener. The FULL
+            # ``<|channel>thought\n`` opener always re-opens (real multi-cycle).
+            # The BARE ``thought\n`` opener is recognized ONLY at the very START
+            # of generation — FIX 4 — i.e. before ANY content has been emitted
+            # (``not _content_seen``) AND at the very first position (``idx 0``,
+            # no content preceding it in this buffer). So a literal ``thought\n``
+            # line inside content / tool args is NOT mis-routed to reasoning,
+            # whether it appears after earlier content or after content in the
+            # same buffer.
+            at_gen_start = not self._content_seen
+            full = buf.find(_GEMMA4_THOUGHT_OPEN_FULL)
+            bare = buf.find(_GEMMA4_THOUGHT_OPEN_BARE)
+            # The bare opener only counts at absolute generation start (position
+            # 0 of the first content); any text before it is content, which would
+            # demote it to a post-content re-opener (not allowed for bare).
+            if not (at_gen_start and bare == 0):
+                bare = -1
+            # Across a chunk boundary we hold a partial FULL-opener prefix
+            # always; we hold a partial BARE-opener prefix only at generation
+            # start (otherwise a trailing partial ``thought\n`` is plain content).
+            openers = (
+                (_GEMMA4_THOUGHT_OPEN_FULL, _GEMMA4_THOUGHT_OPEN_BARE)
+                if at_gen_start
+                else (_GEMMA4_THOUGHT_OPEN_FULL,)
+            )
+            candidates = [i for i in (full, bare) if i != -1]
+            if not candidates:
+                keep = _partial_marker_tail(buf, openers)
+                body = buf[: len(buf) - keep] if keep else buf
+                if body:
+                    out.append((CHANNEL_CONTENT, body))
+                    self._content_seen = True
+                self._pending = buf[len(buf) - keep:] if keep else ""
+                buf = ""
+                break
+            idx = min(candidates)
+            if idx:
+                out.append((CHANNEL_CONTENT, buf[:idx]))
+                self._content_seen = True
+            self._in_reasoning = True
+            if buf.startswith(_GEMMA4_THOUGHT_OPEN_FULL, idx):
+                buf = buf[idx + len(_GEMMA4_THOUGHT_OPEN_FULL):]
+            else:
+                buf = buf[idx + len(_GEMMA4_THOUGHT_OPEN_BARE):]
+            continue
+
+        return out
+
+    # --- chatml / glm: stream starts in reasoning, </think> closes it ---
+
+    def _feed_chatml(self, text: str) -> list[tuple[str, str]]:
+        buf = self._pending + text
+        self._pending = ""
+        out: list[tuple[str, str]] = []
+
+        while buf:
+            if self._in_reasoning:
+                idx = buf.find(_CHATML_THINK_CLOSE)
+                if idx == -1:
+                    # Hold a possible partial close (and a possible stray opening
+                    # <think> prefix) so neither marker leaks into reasoning text.
+                    keep = _partial_marker_tail(
+                        buf, (_CHATML_THINK_CLOSE, _CHATML_THINK_OPEN)
+                    )
+                    body = buf[: len(buf) - keep] if keep else buf
+                    # Drop a stray full <think> opener that may have been echoed
+                    # at the very start of generation.
+                    body = body.replace(_CHATML_THINK_OPEN, "")
+                    if body:
+                        out.append((CHANNEL_REASONING, body))
+                    self._pending = buf[len(buf) - keep:] if keep else ""
+                    buf = ""
+                    break
+                head = buf[:idx].replace(_CHATML_THINK_OPEN, "")
+                if head:
+                    out.append((CHANNEL_REASONING, head))
+                self._in_reasoning = False
+                buf = buf[idx + len(_CHATML_THINK_CLOSE):]
+                continue
+
+            # CONTENT mode (post-</think>): pass through. A second <think> in the
+            # answer is unexpected for chatml; we leave it alone (rare/degenerate)
+            # except we never re-enter reasoning here.
+            out.append((CHANNEL_CONTENT, buf))
+            buf = ""
+
+        return out
+
+    def flush(self) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        pending = self._pending
+        self._pending = ""
+        if not pending:
+            return out
+        if self._is_gemma4:
+            # In reasoning mode a held tail is reasoning-channel text that never
+            # closed (degenerate) — drop it. In content mode it is a partial
+            # opener prefix that never completed → real content, emit it.
+            if not self._in_reasoning:
+                out.append((CHANNEL_CONTENT, pending))
+        else:
+            # chatml: a held tail is either a partial </think> close (drop — it
+            # was reasoning that never closed) or, once in content mode, trailing
+            # content. While still in reasoning, treat as reasoning remainder.
+            if self._in_reasoning:
+                # FIX 2: the held tail may be a partial marker (a proper prefix
+                # of </think> or <think>) split across the final chunk. Do NOT
+                # leak that fragment onto the reasoning channel — drop it (mirror
+                # the gemma4 reasoning-mode flush, which drops a held close-tail).
+                if _is_proper_prefix(pending, _CHATML_THINK_CLOSE) or _is_proper_prefix(
+                    pending, _CHATML_THINK_OPEN
+                ):
+                    return out
+                channel = CHANNEL_REASONING
+            else:
+                channel = CHANNEL_CONTENT
+            body = pending.replace(_CHATML_THINK_OPEN, "")
+            if body:
+                out.append((channel, body))
+        return out
 
 
 def _gemma4_extract_content(text: str) -> tuple[Optional[str], str]:
@@ -468,11 +718,22 @@ def _gemma4_extract_content(text: str) -> tuple[Optional[str], str]:
     return thinking, cleaned.strip()
 
 
-def split_thinking_and_content(text: str, model_family: str = "chatml") -> tuple[Optional[str], str]:
+def split_thinking_and_content(
+    text: str,
+    model_family: str = "chatml",
+    started_in_thinking: bool = False,
+) -> tuple[Optional[str], str]:
     """
     Split thinking from content in model output.
 
     Supports ChatML (<think>...</think>) and Gemma 4 (<|channel>thought...<channel|>).
+
+    ``started_in_thinking`` (chatml/glm only): set True when generation began
+    INSIDE the thought block (thinking enabled — the ``<think>`` opener is in the
+    prompt suffix, not the output). It only changes the DEGENERATE no-``</think>``
+    case, routing the whole output to reasoning (content="") so the non-streaming
+    split matches the streaming ``ThinkingRouter``. Default False preserves the
+    legacy "no markers -> content" behavior for non-thinking output.
     """
     if model_family == "gemma4":
         # Strengthened (FIX 3): handle ALL thought spans + orphan markers +
@@ -494,7 +755,25 @@ def split_thinking_and_content(text: str, model_family: str = "chatml") -> tuple
         content = text[end_idx + len("</think>"):].strip()
         return thinking, content
 
-    # Case 3: No thinking markers
+    # Case 3: No </think> close.
+    # FIX 1 — align with the streaming ``ThinkingRouter``: for chatml/glm the
+    # opening ``<think>`` lives in the PROMPT SUFFIX, so when thinking is active
+    # the generated stream begins INSIDE the thought block. If it never emits
+    # ``</think>``, the whole output is reasoning that produced no final answer.
+    # The streaming router (active=True) routes ALL of it to reasoning; mirror
+    # that here so stream == non-stream. We can only know the stream "started in
+    # thinking" from the caller, hence ``started_in_thinking``:
+    #   * started_in_thinking=True  -> reasoning=full_text, content="" (the
+    #     degenerate unclosed case; matches the router). A stray leading
+    #     ``<think>`` echoed at generation start is dropped.
+    #   * started_in_thinking=False -> legacy behavior: plain answer is content
+    #     (thinking disabled, or a non-thinking model — must NOT be misrouted to
+    #     reasoning, which would empty the content).
+    if started_in_thinking:
+        body = text.lstrip()
+        if body.startswith(_CHATML_THINK_OPEN):
+            body = body[len(_CHATML_THINK_OPEN):]
+        return (body.strip() or None), ""
     return None, text
 
 

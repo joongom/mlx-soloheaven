@@ -371,72 +371,41 @@ async function sendMessage() {
 
                 if (event.type === 'text') {
                     tokenCount++;
-                    fullText += event.content;
-
                     if (event.tps > 0) liveTps.textContent = event.tps.toFixed(1);
 
-                    if (!thinkingDone) {
-                        // Server signals thinking end via thinking_done flag (most reliable)
-                        // Also detect by text patterns as fallback
-                        let serverSignal = event.thinking_done === true;
-                        let endIdx = fullText.indexOf('</think>');
-                        let endLen = 8;
-                        if (endIdx === -1) {
-                            endIdx = fullText.indexOf('<channel|>');
-                            endLen = 10;
-                        }
+                    // The server now routes thinking vs answer into CLEAN
+                    // channels (no raw <|channel>/<channel|>/<think> markers):
+                    //   event.reasoning -> thinking-block text
+                    //   event.content   -> answer text
+                    //   event.thinking_done (on first content frame) collapses
+                    //                       the thinking block.
+                    // No client-side marker parsing — content never contains
+                    // thinking markers because the server stripped them.
+                    if (typeof event.reasoning === 'string' && event.reasoning) {
+                        thinkText += event.reasoning;
+                        fullText += event.reasoning;
+                        thinkBody.innerHTML = renderMarkdown(thinkText);
+                        thinkCount.textContent = `${countTokens(thinkText)} tok`;
+                        thinkBody.scrollTop = thinkBody.scrollHeight;
+                    }
 
-                        // Detect NO thinking: no thinking start pattern after a few tokens
-                        const hasThinkingStart = fullText.startsWith('<|channel>thought')
-                            || fullText.startsWith('thought\n')
-                            || fullText.startsWith('<think>')
-                            || fullText.includes('</think>');
-                        const noThinking = tokenCount > 5
-                            && endIdx === -1 && !serverSignal
-                            && !hasThinkingStart;
-
-                        if (noThinking) {
-                            // No thinking at all — show directly in content
+                    if (typeof event.content === 'string' && event.content) {
+                        fullText += event.content;
+                        // First answer text after thinking — collapse the block.
+                        if (!thinkingDone && (event.thinking_done === true || thinkText)) {
                             thinkingDone = true;
-                            thinkBlock.style.display = 'none';
-                            respText = fullText;
-                            contentEl.innerHTML = renderMarkdown(respText);
-                        } else if (serverSignal || endIdx !== -1) {
-                            // Thinking ended — split thinking and content
-                            thinkingDone = true;
-                            if (endIdx !== -1) {
-                                thinkText = fullText.substring(0, endIdx);
-                                respText = fullText.substring(endIdx + endLen).trimStart();
-                            } else {
-                                // Server signal but marker not in text yet — use accumulated
-                                thinkText = fullText;
-                                respText = '';
-                            }
-                            thinkText = stripThinkingPrefix(thinkText);
-                            // Strip <channel|> if it ended up in thinkText
-                            thinkText = thinkText.replace(/<channel\|>/g, '').trimEnd();
-
-                            thinkBody.innerHTML = renderMarkdown(thinkText);
-                            thinkCount.textContent = `${countTokens(thinkText)} tok`;
                             thinkBlock.classList.remove('streaming');
                             thinkBody.classList.remove('show');
                             thinkBlock.querySelector('.icon').classList.remove('open');
                             thinkBlock.querySelector('.thinking-label').innerHTML =
                                 '<span class="icon">&#9654;</span> Thinking';
-
-                            contentEl.innerHTML = renderMarkdown(respText);
-                        } else {
-                            // Still thinking — display in thinking block
-                            let displayThink = stripThinkingPrefix(fullText);
-                            thinkBody.innerHTML = renderMarkdown(displayThink);
-                            thinkCount.textContent = `${countTokens(displayThink)} tok`;
-                            thinkBody.scrollTop = thinkBody.scrollHeight;
                         }
-                    } else {
-                        // Content mode: strip any leftover thinking markers
-                        let ct = event.content;
-                        ct = ct.replace(/<\|channel>thought\n?/g, '').replace(/<channel\|>/g, '');
-                        respText += ct;
+                        // No reasoning seen at all -> hide the thinking block.
+                        if (!thinkText && !thinkingDone) {
+                            thinkBlock.style.display = 'none';
+                            thinkingDone = true;
+                        }
+                        respText += event.content;
                         contentEl.innerHTML = renderMarkdown(respText);
                     }
                     scrollBottom();

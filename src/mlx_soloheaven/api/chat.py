@@ -13,7 +13,11 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from mlx_soloheaven.engine.tool_parser import split_thinking_and_content
+from mlx_soloheaven.engine.tool_parser import (
+    CHANNEL_REASONING,
+    ThinkingRouter,
+    split_thinking_and_content,
+)
 from mlx_soloheaven.storage import database as db
 from mlx_soloheaven.api.compaction import build_post_compaction_messages
 
@@ -347,18 +351,23 @@ async def _stream_chat(
     client_disconnected = False
     engine_cache_info = None
     model_family = eng.model_family
-    think_end_token = eng.cfg.think_end_token
     enable_thinking = eng.cfg.enable_thinking
-    thinking_prefix_sent = False
 
-    # COALESCING: consume batches of GenerationResult. Control results
-    # (status / finish_reason / empty-keepalive / thinking-prefix) keep their
-    # exact per-result semantics; consecutive normal content results within a
-    # batch are concatenated into ONE "text" SSE frame. A think_end_token
-    # mid-batch splits the frame so "thinking_done":True still rides on the
-    # frame that ends with the thinking-close token. The concatenation of all
-    # emitted "content" equals the old per-token concatenation.
+    # COALESCING + reasoning routing: consume batches of GenerationResult.
+    # Control results (status / finish_reason / empty-keepalive) keep their exact
+    # per-result semantics. Normal content is routed through the shared
+    # ThinkingRouter (same logic as the OpenAI-compat path): thinking-phase text
+    # is emitted as "reasoning" SSE frames, the answer as "content" SSE frames.
+    # The server now owns the thinking-vs-content split — the client no longer
+    # parses raw <|channel>/<channel|>/<think> markers. The first content frame
+    # after reasoning carries "thinking_done":True. The concatenation of all
+    # emitted reasoning+content equals the routed split of the raw output.
     finished = False
+    # Router active when thinking is enabled for this model. Pass-through
+    # (all content) otherwise, so the non-thinking path is unchanged.
+    router = ThinkingRouter(active=enable_thinking, model_family=model_family)
+    reasoning_seen = False
+    thinking_done_signaled = False
 
     def _content_frame(text: str, gen_tps: float, thinking_done: bool) -> str:
         event = json.dumps(
@@ -367,6 +376,17 @@ async def _stream_chat(
                 "content": text,
                 "tps": round(gen_tps, 1) if gen_tps else 0,
                 **({"thinking_done": True} if thinking_done else {}),
+            },
+            ensure_ascii=False,
+        )
+        return f"data: {event}\n\n"
+
+    def _reasoning_frame(text: str, gen_tps: float) -> str:
+        event = json.dumps(
+            {
+                "type": "text",
+                "reasoning": text,
+                "tps": round(gen_tps, 1) if gen_tps else 0,
             },
             ensure_ascii=False,
         )
@@ -384,20 +404,11 @@ async def _stream_chat(
             thinking_budget=thinking_budget,
             max_tokens=max_tokens,
         ):
-            # Accumulate consecutive normal content within this batch so we emit
-            # one frame per run (flushed on think_end split or at batch end).
-            pending_text: list[str] = []
-            pending_tps = 0.0
-
-            def _flush_pending(thinking_done: bool = False):
-                nonlocal pending_text, pending_tps
-                if pending_text:
-                    frame = _content_frame(
-                        "".join(pending_text), pending_tps, thinking_done
-                    )
-                    pending_text = []
-                    return frame
-                return None
+            # Accumulate this batch's text, route once at batch end into ordered
+            # reasoning/content segments, and emit a frame per contiguous-channel
+            # run (reasoning frames + content frames).
+            batch_text: list[str] = []
+            batch_tps = 0.0
 
             for result in batch:
                 if result.status == "generating":
@@ -425,34 +436,45 @@ async def _stream_chat(
                 if t_first_token is None:
                     t_first_token = time.perf_counter()
 
-                    # Send thinking prefix on first token for non-Gemma models
-                    # (Gemma generates its own <|channel>thought prefix;
-                    #  ChatML/GLM have <think> in prompt suffix, not in output)
-                    if enable_thinking and model_family != "gemma4" and not thinking_prefix_sent:
-                        thinking_prefix_sent = True
-                        prefix_event = json.dumps(
-                            {"type": "text", "content": "<think>\n"},
-                            ensure_ascii=False,
-                        )
-                        yield f"data: {prefix_event}\n\n"
-                        acc_parts.append("<think>\n")
-
                 acc_parts.append(result.text)
-                pending_text.append(result.text)
-                pending_tps = result.generation_tps
+                batch_text.append(result.text)
+                batch_tps = result.generation_tps
 
-                # Detect thinking end token for real-time SSE notification — the
-                # frame up to and including this result carries "thinking_done".
-                thinking_end_detected = (
-                    think_end_token >= 0 and result.token == think_end_token
-                )
-                if thinking_end_detected:
-                    frame = _flush_pending(thinking_done=True)
+            # Route the batch's accumulated text into reasoning/content segments
+            # and emit frames. Coalesce consecutive same-channel segments.
+            segments = router.feed("".join(batch_text)) if batch_text else []
+            run_channel: str | None = None
+            run_parts: list[str] = []
+
+            def _flush_run():
+                nonlocal run_channel, run_parts, reasoning_seen
+                nonlocal thinking_done_signaled
+                if not run_parts:
+                    return None
+                text = "".join(run_parts)
+                run_parts = []
+                if run_channel == CHANNEL_REASONING:
+                    reasoning_seen = True
+                    return _reasoning_frame(text, batch_tps)
+                # content channel: signal thinking_done on the FIRST content
+                # frame that follows any reasoning.
+                signal = reasoning_seen and not thinking_done_signaled
+                if signal:
+                    thinking_done_signaled = True
+                return _content_frame(text, batch_tps, thinking_done=signal)
+
+            for seg_channel, seg_text in segments:
+                if not seg_text:
+                    continue
+                if run_channel is None:
+                    run_channel = seg_channel
+                elif seg_channel != run_channel:
+                    frame = _flush_run()
                     if frame:
                         yield frame
-
-            # Flush any remaining content accumulated in this batch.
-            frame = _flush_pending()
+                    run_channel = seg_channel
+                run_parts.append(seg_text)
+            frame = _flush_run()
             if frame:
                 yield frame
 
@@ -466,6 +488,21 @@ async def _stream_chat(
             f"({type(exc).__name__}) after {token_count} tokens | "
             f"tail={tail!r}"
         )
+
+    # Flush the router's held tail (a partial marker that never completed is
+    # real reasoning/content). Skip if the client already disconnected.
+    if not client_disconnected:
+        for seg_channel, seg_text in router.flush():
+            if not seg_text:
+                continue
+            if seg_channel == CHANNEL_REASONING:
+                reasoning_seen = True
+                yield _reasoning_frame(seg_text, gen_tps)
+            else:
+                signal = reasoning_seen and not thinking_done_signaled
+                if signal:
+                    thinking_done_signaled = True
+                yield _content_frame(seg_text, gen_tps, thinking_done=signal)
 
     t_end = time.perf_counter()
     engine_ttft = (t_first_token - (t_gen_actual or t_gen_start)) if t_first_token else 0

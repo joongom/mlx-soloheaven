@@ -286,6 +286,87 @@ class _FakeDraftModel:
         return mx.full((1, bs - 1), self.content_token, dtype=token_dtype)
 
 
+# --- Scripted fakes for the BARE-OPENER (gemma4 long-context) clone test ---
+#
+# A transition-map driven LM + drafter: position i predicts ``trans.get(prev, C)``
+# where ``prev`` is the prefix's last token. The drafter follows the SAME chain
+# from ``b``, so draft == target at every position (all drafts accept) and the
+# emitted stream is exactly the deterministic chain — until the budget forces END.
+
+BARE0 = 70   # first token of the bare ``thought\n`` opener
+BARE1 = 71   # second token of the bare ``thought\n`` opener
+CONTENT = 1  # thinking-content filler (loops to itself)
+
+
+class _ScriptedLM:
+    """Deterministic transition-driven gemma4 LM stub. ``trans[prev] -> next``;
+    unknown prev -> CONTENT (so thinking content loops forever absent a cap)."""
+
+    def __init__(self, trans, vocab=300):
+        self.trans = dict(trans)
+        self.vocab = vocab
+
+    def _next(self, prev):
+        return self.trans.get(int(prev), CONTENT)
+
+    def __call__(self, x, cache=None, return_hidden=False, return_shared_kv=False):
+        xrow = x.reshape(-1).tolist()
+        bs = int(x.shape[1])
+        rows = []
+        for i in range(bs):
+            nxt = self._next(xrow[i])  # prefix ends at position i
+            rows.append(
+                mx.where(mx.arange(self.vocab) == nxt, 1.0, 0.0)
+            )
+        logits = mx.stack(rows, axis=0).reshape(1, bs, self.vocab)
+        out = SimpleNamespace(logits=logits)
+        if return_hidden:
+            out.hidden_states = [mx.zeros((1, bs, 4))]
+        if return_shared_kv:
+            out.shared_kv_states = {}
+        return out
+
+    def rollback_speculative_cache(self, cache, sink, accepted, bs):
+        return None
+
+
+class _ScriptedDraftModel:
+    """Drafts by following the SAME transition chain from ``b`` so draft==target
+    (every draft accepts) and the emitted stream is the deterministic chain."""
+
+    def __init__(self, trans, block_size=4):
+        self.config = SimpleNamespace(block_size=block_size)
+        self.accept_lens = []
+        self.trans = dict(trans)
+
+    def reset(self, model):
+        return None
+
+    def set_shared_kv(self, shared_kv, offset):
+        return None
+
+    def draft_block(self, b, hidden, mask, bs, sampler, token_dtype):
+        toks = []
+        prev = int(b)
+        for _ in range(bs - 1):
+            nxt = self.trans.get(prev, CONTENT)
+            toks.append(nxt)
+            prev = nxt
+        return mx.array([toks], dtype=token_dtype)
+
+
+def _drive_scripted_clone(clone, trans, *, max_tokens, first_bonus):
+    model = SimpleNamespace(language_model=_ScriptedLM(trans))
+    draft = _ScriptedDraftModel(trans, block_size=4)
+    cache = [SimpleNamespace(offset=0)]
+    gen = clone(
+        model, draft, cache, mx.zeros((1, 1, 4)), {},
+        first_bonus=first_bonus, max_tokens=max_tokens, sampler=_argmax_sampler,
+        draft_block_size=4, token_dtype=mx.int32,
+    )
+    return [int(tok) for tok, _ in gen]
+
+
 def _make_clone():
     """Install the wrap patches and return the soloheaven MTP clone."""
     mlx_engine_module._MTP_PATCHES_INSTALLED = False
@@ -316,11 +397,14 @@ def _drive_clone(clone, *, max_tokens, first_bonus=START):
     return [int(tok) for tok, _ in gen]
 
 
-def _set_budget_stash(budget, family="gemma4", seed=None):
+def _set_budget_stash(budget, family="gemma4", seed=None, bare_open=None):
     mlx_engine_module._MTP_THINK_BUDGET = budget
     mlx_engine_module._MTP_THINK_END_TOKEN = END
     mlx_engine_module._MTP_THINK_START_TOKEN = START
     mlx_engine_module._MTP_THINK_FAMILY = family
+    mlx_engine_module._MTP_THINK_BARE_OPEN_TOKENS = (
+        list(bare_open) if bare_open else None
+    )
     mlx_engine_module._MTP_TOKEN_HISTORY_SEED = list(seed or [])
     # No rep-penalty / FSM processors — isolate the thinking-budget path.
     mlx_engine_module._MTP_LOGITS_PROCESSORS = None
@@ -331,6 +415,7 @@ def _clear_stash():
     mlx_engine_module._MTP_THINK_END_TOKEN = None
     mlx_engine_module._MTP_THINK_START_TOKEN = None
     mlx_engine_module._MTP_THINK_FAMILY = None
+    mlx_engine_module._MTP_THINK_BARE_OPEN_TOKENS = None
     mlx_engine_module._MTP_TOKEN_HISTORY_SEED = None
     mlx_engine_module._MTP_LOGITS_PROCESSORS = None
 
@@ -490,3 +575,566 @@ def test_run_vlm_populates_think_budget_stash_from_processor(monkeypatch):
     finally:
         _clear_stash()
         eng.close()
+
+
+# ---------------------------------------------------------------------------
+# BARE-OPENER FIX (gemma4 long-context): past the 1024 sliding window the
+# ``<|channel>`` prime falls out and the model opens thinking with a BARE
+# ``thought\n`` (no ``<|channel>`` token). The budget must still recognise that
+# opener (at GEN-START only — mirroring ThinkingRouter FIX 4) and cap thinking.
+# ---------------------------------------------------------------------------
+
+BARE = (BARE0, BARE1)  # token-id sequence of the bare ``thought\n`` opener
+
+
+# (a) bare opener (no <|channel>) -> thinking opens / count increments / fires.
+
+
+def test_helper_bare_opener_opens_thinking_and_counts():
+    """Gemma4 + bare ``thought\\n`` opener at gen-start (NO ``<|channel>``):
+    in_thinking flips True after the full bare sequence, the opener tokens count
+    toward the budget, and the cap fires — the long-context runaway is closed."""
+    # Only the first opener token emitted => partial match, not yet in thinking.
+    assert should_force_think_end(
+        [BARE0], budget=1, think_start_token=START, think_end_token=END,
+        model_family="gemma4", bare_open_tokens=BARE,
+    ) is False
+    # Full bare opener => in_thinking, count == len(opener) == 2.
+    assert should_force_think_end(
+        [BARE0, BARE1], budget=2, think_start_token=START, think_end_token=END,
+        model_family="gemma4", bare_open_tokens=BARE,
+    ) is True
+    assert should_force_think_end(
+        [BARE0, BARE1], budget=3, think_start_token=START, think_end_token=END,
+        model_family="gemma4", bare_open_tokens=BARE,
+    ) is False  # count 2 < 3
+    # One thinking-content token after the bare opener => count 3.
+    assert should_force_think_end(
+        [BARE0, BARE1, CONTENT], budget=3, think_start_token=START,
+        think_end_token=END, model_family="gemma4", bare_open_tokens=BARE,
+    ) is True
+
+
+def test_helper_bare_opener_disabled_without_bare_tokens():
+    """No bare_open_tokens supplied => the bare opener is inert (the original
+    ``<|channel>``-only behaviour). The same history never opens thinking."""
+    assert should_force_think_end(
+        [BARE0, BARE1, CONTENT, CONTENT, CONTENT], budget=1,
+        think_start_token=START, think_end_token=END, model_family="gemma4",
+        bare_open_tokens=None,
+    ) is False
+
+
+# (b) full <|channel> opener still caps as before (with bare detection ALSO on).
+
+
+def test_helper_full_channel_opener_still_caps_with_bare_active():
+    """With bare detection active, the FULL ``<|channel>`` opener (short-context)
+    must STILL open + cap exactly as before — the bare path must not regress the
+    token-id opener that already worked."""
+    # <|channel> (START) at gen-start opens immediately, count == 1.
+    assert should_force_think_end(
+        [START], budget=1, think_start_token=START, think_end_token=END,
+        model_family="gemma4", bare_open_tokens=BARE,
+    ) is True
+    assert should_force_think_end(
+        [START, CONTENT], budget=2, think_start_token=START, think_end_token=END,
+        model_family="gemma4", bare_open_tokens=BARE,
+    ) is True
+    # No opener at all => never fires (model answered with no thinking block).
+    assert should_force_think_end(
+        [CONTENT, CONTENT, CONTENT], budget=1, think_start_token=START,
+        think_end_token=END, model_family="gemma4", bare_open_tokens=BARE,
+    ) is False
+
+
+# (c) a literal ``thought\n`` AFTER content must NOT open thinking (no FP).
+
+
+def test_helper_bare_opener_not_at_gen_start_does_not_open():
+    """A literal ``thought\\n`` sequence appearing AFTER content (mid-generation)
+    must NOT be mis-read as a thinking opener — mirrors ThinkingRouter FIX 4's
+    gen-start constraint. content_seen latches True on the first real token, so
+    the later bare sequence is plain content and the budget never fires."""
+    # Content first, THEN the bare-opener byte sequence: must stay outside.
+    hist = [CONTENT, BARE0, BARE1, CONTENT, CONTENT, CONTENT]
+    assert should_force_think_end(
+        hist, budget=1, think_start_token=START, think_end_token=END,
+        model_family="gemma4", bare_open_tokens=BARE,
+    ) is False
+    # Also: a bare opener that re-appears AFTER a closed <|channel> block must
+    # not re-open (only the FULL <|channel> re-opens mid-stream).
+    hist2 = [START, CONTENT, END, BARE0, BARE1, CONTENT, CONTENT]
+    assert should_force_think_end(
+        hist2, budget=1, think_start_token=START, think_end_token=END,
+        model_family="gemma4", bare_open_tokens=BARE,
+    ) is False
+
+
+def test_helper_partial_bare_then_mismatch_is_content():
+    """A partial bare match that then DIVERGES (BARE0 followed by a non-BARE1
+    token) is real content, not a thinking opener — the partial match is
+    abandoned and content_seen latches."""
+    hist = [BARE0, CONTENT, CONTENT, CONTENT, CONTENT]
+    assert should_force_think_end(
+        hist, budget=1, think_start_token=START, think_end_token=END,
+        model_family="gemma4", bare_open_tokens=BARE,
+    ) is False
+
+
+# (d) MTP-clone helper and ThinkingBudgetProcessor AGREE on the bare opener.
+
+
+def _assert_helper_processor_lockstep_bare(history, budget, family, bare):
+    """Bare-opener lockstep: drive a single ``ThinkingBudgetProcessor`` (with the
+    bare opener configured) token-by-token and assert it forces at EXACTLY the
+    same positions as the history-derived helper (which the MTP clone uses)."""
+    proc = ThinkingBudgetProcessor(budget, END, START, family, bare_open_tokens=bare)
+    for k in range(len(history) + 1):
+        prefix = history[:k]
+        helper_force = should_force_think_end(
+            prefix, budget=budget, think_start_token=START, think_end_token=END,
+            model_family=family, bare_open_tokens=bare,
+        )
+        logits = mx.zeros((1, 1000))
+        out = proc(mx.array(prefix, dtype=mx.int32), logits)
+        proc_force = float(out[0, END].item()) >= 1e8
+        assert helper_force == proc_force, (
+            f"bare mismatch at k={k} budget={budget}: helper={helper_force} "
+            f"proc={proc_force}; prefix={prefix}"
+        )
+
+
+@pytest.mark.parametrize("budget", [1, 2, 3, 5])
+def test_helper_matches_processor_bare_opener(budget):
+    """Bare opener at gen-start then thinking content: clone helper == processor."""
+    history = [BARE0, BARE1, CONTENT, CONTENT, CONTENT, CONTENT, CONTENT]
+    _assert_helper_processor_lockstep_bare(history, budget, "gemma4", BARE)
+
+
+@pytest.mark.parametrize("budget", [1, 2, 3])
+def test_helper_matches_processor_bare_then_content_reappear(budget):
+    """Mid-content bare sequence + multi-cycle <|channel>: clone helper ==
+    processor across the full gen-start + re-open semantics."""
+    history = [BARE0, BARE1, CONTENT, END, CONTENT, BARE0, BARE1, START, CONTENT]
+    _assert_helper_processor_lockstep_bare(history, budget, "gemma4", BARE)
+
+
+# (a)+(d) end-to-end: the real MTP clone forces END on a BARE opener at long ctx.
+
+
+def test_clone_forces_think_end_on_bare_opener():
+    """End-to-end through the REAL MTP clone: with a bare ``thought\\n`` opener
+    (first_bonus=BARE0, then BARE1, then thinking content) and the bare-opener
+    stash set, the clone must FORCE the think_end token and EXIT thinking near
+    the budget — exactly the long-context fix (no run to max_tokens)."""
+    clone = _make_clone()
+    try:
+        # Chain: BARE0 -> BARE1 -> CONTENT -> CONTENT (loops). budget=4.
+        trans = {BARE0: BARE1, BARE1: CONTENT, CONTENT: CONTENT}
+        _set_budget_stash(budget=4, family="gemma4", bare_open=BARE)
+        emitted = _drive_scripted_clone(
+            clone, trans, max_tokens=64, first_bonus=BARE0
+        )
+        assert END in emitted, (
+            f"think_end ({END}) must be forced on a bare opener; got {emitted}"
+        )
+        end_idx = emitted.index(END)
+        # Opener (2) + content up to budget 4 => END around index ~4, well short
+        # of max_tokens. Allow a little slack for block boundaries.
+        assert end_idx <= 7, (
+            f"END forced too late on bare opener (idx={end_idx}): {emitted}"
+        )
+    finally:
+        _clear_stash()
+        mlx_engine_module._HOT_PATH_FAST = False
+
+
+def test_clone_no_force_on_bare_sequence_after_content():
+    """Gemma4 + bare stash set, but the bare sequence appears AFTER content
+    (first_bonus=CONTENT): the gen-start constraint means it does NOT open
+    thinking, so END is never forced (no false-positive at long context)."""
+    clone = _make_clone()
+    try:
+        # first_bonus=CONTENT => content_seen latches immediately; the later
+        # BARE0/BARE1 chain is plain content and must NOT open thinking.
+        trans = {CONTENT: BARE0, BARE0: BARE1, BARE1: CONTENT}
+        _set_budget_stash(budget=2, family="gemma4", bare_open=BARE)
+        emitted = _drive_scripted_clone(
+            clone, trans, max_tokens=24, first_bonus=CONTENT
+        )
+        assert END not in emitted, (
+            f"END must NOT be forced for a mid-content bare sequence; got {emitted}"
+        )
+    finally:
+        _clear_stash()
+        mlx_engine_module._HOT_PATH_FAST = False
+
+
+def test_clone_bare_stash_threaded_from_run_vlm(monkeypatch):
+    """_run_vlm must thread the gemma4 bare-opener token sequence off the
+    ThinkingBudgetProcessor onto _MTP_THINK_BARE_OPEN_TOKENS (so the clone sees
+    it). A processor WITHOUT bare tokens leaves the bare stash None."""
+    eng = _bare_vlm_engine()
+    try:
+        sentinel_drafter = SimpleNamespace(accept_lens=[])
+        eng._drafter = sentinel_drafter
+        eng._draft_kind = "mtp"
+        eng._has_rotating_cache = False
+        eng._sliding_window_size = 0
+
+        from mlx_vlm.generate import PromptCacheState
+
+        captured = {}
+
+        def _fake_stream(*_args, **kwargs):
+            captured["bare"] = mlx_engine_module._MTP_THINK_BARE_OPEN_TOKENS
+            return iter([])
+
+        monkeypatch.setattr(mlx_engine_module, "vlm_stream_generate", _fake_stream)
+        monkeypatch.setattr(mlx_engine_module, "_MTP_WRAP_GATE", False)
+
+        tbp = ThinkingBudgetProcessor(
+            budget=200, think_end_token=END, think_start_token=START,
+            model_family="gemma4", bare_open_tokens=[BARE0, BARE1],
+        )
+
+        def _drive(procs):
+            cs = PromptCacheState()
+            cs.cache = [SimpleNamespace(offset=0)]
+            cs.token_ids = []
+            gen = eng._run_vlm(
+                cache_state=cs, prompt_token_ids=[1, 2, 3], max_tokens=4,
+                temperature=0.0, top_p=1.0, min_p=0.0, top_k=0,
+                logits_processors=procs, session_id="s-bare",
+                total_prompt_tokens=3,
+            )
+            list(gen)
+
+        eng._vlm_executor.submit(_drive, [tbp]).result(timeout=10)
+        assert captured["bare"] == [BARE0, BARE1]
+
+        # A processor with no bare tokens => bare stash stays None.
+        captured.clear()
+        tbp_no_bare = ThinkingBudgetProcessor(
+            budget=200, think_end_token=END, think_start_token=START,
+            model_family="gemma4", bare_open_tokens=None,
+        )
+        eng._vlm_executor.submit(_drive, [tbp_no_bare]).result(timeout=10)
+        assert captured["bare"] is None
+    finally:
+        _clear_stash()
+        eng.close()
+
+
+# ---------------------------------------------------------------------------
+# BARE-OPENER PROMPT-SEED DEFEAT (codex HIGH, simulation-confirmed): the MTP
+# clone seeds the thinking state with the FULL PROMPT
+# (``_MTP_TOKEN_HISTORY_SEED``). Folding the prompt seed WITH the bare matcher
+# latched ``content_seen=True`` on the first (normal) prompt token, so the
+# GENERATED bare opener could never fire and the budget never capped — the
+# original long-context runaway was NOT actually fixed. The fix folds the
+# prompt seed with ``bare_open_tokens=()`` and re-arms the bare sub-state at the
+# generation boundary. These tests are the AUTHORITATIVE verification (the live
+# bare opener is stochastic and was a prior false-positive at 4626 tokens where
+# the model emitted the FULL ``<|channel>`` opener, not the bare one).
+# ---------------------------------------------------------------------------
+
+
+def test_clone_bare_opener_fires_despite_prompt_seed():
+    """codex's exact repro: a NON-BARE prompt seed (``seed=[999]``) followed by a
+    GENERATED bare opener (``first_bonus=BARE0`` then BARE1) MUST open thinking and
+    force think_end at the budget. Before the fix the prompt token 999 latched
+    content_seen and the budget never fired (think_end never appeared).
+    """
+    clone = _make_clone()
+    try:
+        # Chain from the bonus: BARE0 -> BARE1 -> CONTENT (loops). budget=2 so
+        # the cap fires right after the 2-token bare opener completes.
+        trans = {BARE0: BARE1, BARE1: CONTENT, CONTENT: CONTENT}
+        _set_budget_stash(
+            budget=2, family="gemma4", bare_open=BARE, seed=[999]
+        )
+        emitted = _drive_scripted_clone(
+            clone, trans, max_tokens=64, first_bonus=BARE0
+        )
+        # THE BUG: without the prompt/gen domain split, END never appears here.
+        assert END in emitted, (
+            f"think_end ({END}) must be forced on a bare opener EVEN WITH a "
+            f"non-bare prompt seed; got {emitted}"
+        )
+        end_idx = emitted.index(END)
+        assert end_idx <= 5, (
+            f"END forced too late despite prompt seed (idx={end_idx}): {emitted}"
+        )
+    finally:
+        _clear_stash()
+        mlx_engine_module._HOT_PATH_FAST = False
+
+
+def test_clone_bare_opener_fires_with_long_nonbare_prompt_seed():
+    """A LONGER, multi-token non-bare prompt seed (mimicking a 50K-ish prompt's
+    leading tokens) still must not defeat the generated bare opener."""
+    clone = _make_clone()
+    try:
+        trans = {BARE0: BARE1, BARE1: CONTENT, CONTENT: CONTENT}
+        seed = [999, 888, 777, 666, 555, 444, 333, 222, 111]
+        _set_budget_stash(
+            budget=3, family="gemma4", bare_open=BARE, seed=seed
+        )
+        emitted = _drive_scripted_clone(
+            clone, trans, max_tokens=64, first_bonus=BARE0
+        )
+        assert END in emitted, (
+            f"think_end ({END}) must fire on a bare opener after a long non-bare "
+            f"prompt seed; got {emitted}"
+        )
+    finally:
+        _clear_stash()
+        mlx_engine_module._HOT_PATH_FAST = False
+
+
+def test_clone_bare_opener_fires_after_prior_turn_channel_block_in_seed():
+    """Multi-turn realism: the prompt seed itself contains a PRIOR turn's
+    complete ``<|channel>...<channel|>`` block (full markers) and ends OUTSIDE
+    thinking (in_thinking=False at the boundary). A GENERATED bare opener must
+    still open and the budget must fire — the prior-turn markers were tracked
+    (so the seed's in_thinking is correct) WITHOUT latching the bare matcher."""
+    clone = _make_clone()
+    try:
+        trans = {BARE0: BARE1, BARE1: CONTENT, CONTENT: CONTENT}
+        # Seed = junk, a prior <|channel> block (START..END), then more junk.
+        seed = [999, START, 5, 6, END, 888, 777]
+        _set_budget_stash(
+            budget=2, family="gemma4", bare_open=BARE, seed=seed
+        )
+        emitted = _drive_scripted_clone(
+            clone, trans, max_tokens=64, first_bonus=BARE0
+        )
+        assert END in emitted, (
+            f"think_end ({END}) must fire on a generated bare opener even when "
+            f"the seed contains a prior <|channel> block; got {emitted}"
+        )
+    finally:
+        _clear_stash()
+        mlx_engine_module._HOT_PATH_FAST = False
+
+
+def test_clone_full_channel_opener_still_caps_with_seed_and_bare_active():
+    """Regression: the FULL ``<|channel>`` opener at "long context" (non-empty
+    seed) with bare detection ALSO active must STILL open + cap (the full opener
+    path opens regardless of content_seen and must not regress)."""
+    clone = _make_clone()
+    try:
+        # first_bonus=START (full <|channel>): opens immediately, count=1.
+        _set_budget_stash(
+            budget=3, family="gemma4", bare_open=BARE, seed=[999, 888, 777]
+        )
+        emitted = _drive_clone(clone, max_tokens=64, first_bonus=START)
+        assert END in emitted, (
+            f"full <|channel> opener must still cap with a seed + bare active; "
+            f"got {emitted}"
+        )
+        assert emitted.index(END) <= 6, emitted
+    finally:
+        _clear_stash()
+        mlx_engine_module._HOT_PATH_FAST = False
+
+
+def test_clone_mid_generation_bare_after_content_does_not_open_with_seed():
+    """Regression (gen-start-only preserved WITHIN the generation domain): with a
+    non-bare prompt seed, a bare sequence appearing AFTER generated content
+    (first_bonus=CONTENT) must NOT open thinking — content_seen latches on the
+    first GENERATED content token (not the prompt)."""
+    clone = _make_clone()
+    try:
+        trans = {CONTENT: BARE0, BARE0: BARE1, BARE1: CONTENT}
+        _set_budget_stash(
+            budget=2, family="gemma4", bare_open=BARE, seed=[999, 888]
+        )
+        emitted = _drive_scripted_clone(
+            clone, trans, max_tokens=24, first_bonus=CONTENT
+        )
+        assert END not in emitted, (
+            f"a mid-GENERATION bare sequence must NOT open thinking; got {emitted}"
+        )
+    finally:
+        _clear_stash()
+        mlx_engine_module._HOT_PATH_FAST = False
+
+
+# --- Pure helper: prompt/generation domain split (what the clone now does) ---
+
+
+def test_helper_prompt_seed_with_empty_bare_then_gen_boundary_opens():
+    """The MTP clone's exact recipe at the helper level: fold the prompt seed
+    with ``bare_open_tokens=()`` (so a non-bare prompt token does NOT latch
+    content_seen against the bare matcher), reset the bare sub-state at the
+    generation boundary, then a GENERATED ``[BARE0, BARE1]`` opens thinking."""
+    seed = [999, 888, 777]
+    state = initial_think_state("gemma4")
+    # Prompt domain: bare matcher OFF.
+    for t in seed:
+        state = advance_think_state(
+            state, t, think_start_token=START, think_end_token=END,
+            bare_open_tokens=(),
+        )
+    # The prompt seed must NOT have latched content_seen via the bare matcher;
+    # in_thinking stays False (no full markers in this seed).
+    assert state[0] is False
+    assert state[3] is True  # empty-bare fold latches content_seen (no bare path)
+    # Generation boundary: re-arm the bare sub-state (outside thinking).
+    state = (state[0], state[1], 0, False)
+    # Generation domain: bare matcher ON.
+    for t in (BARE0, BARE1):
+        state = advance_think_state(
+            state, t, think_start_token=START, think_end_token=END,
+            bare_open_tokens=BARE,
+        )
+    assert state[0] is True, "generated bare opener must open thinking"
+    assert state[1] == 2, "opener tokens must count toward the budget"
+    assert force_end_from_state(state, 2) is True
+
+
+def test_helper_seed_with_channel_block_ends_outside_thinking():
+    """A prompt seed containing a prior ``<|channel>...<channel|>`` block, folded
+    with empty-bare, ends with in_thinking=False (the block closed); then a
+    generated bare opener still opens after the boundary re-arm."""
+    seed = [999, START, 5, 6, END, 888]
+    state = initial_think_state("gemma4")
+    for t in seed:
+        state = advance_think_state(
+            state, t, think_start_token=START, think_end_token=END,
+            bare_open_tokens=(),
+        )
+    assert state[0] is False, "prior-turn channel block must be closed in seed"
+    state = (state[0], state[1], 0, False)  # boundary re-arm
+    for t in (BARE0, BARE1):
+        state = advance_think_state(
+            state, t, think_start_token=START, think_end_token=END,
+            bare_open_tokens=BARE,
+        )
+    assert state[0] is True
+    assert force_end_from_state(state, 2) is True
+
+
+# ---------------------------------------------------------------------------
+# ThinkingBudgetProcessor (plain path) prompt-boundary handling (codex (2)).
+# The processor receives the RUNNING tokens array; mlx-vlm folds the prompt tail
+# into it on the prefill step BEFORE the first generated token. The processor
+# must only bare-match GENERATED tokens (gated by the captured prompt boundary).
+# ---------------------------------------------------------------------------
+
+
+def _drive_processor_with_prompt_tail(proc, prompt_tail, generated):
+    """Drive the processor the way mlx-vlm does: tokens starts empty, the prefill
+    step appends the prompt tail (whole prompt when unchunked, else the last
+    token), then each step appends one generated token. Returns the list of
+    per-call force decisions (True iff END logit forced)."""
+    forced = []
+    tokens = list(prompt_tail)  # prefill _step appends prompt tail first
+    # First call: prompt tail present (this is what defeats the bare matcher
+    # unless gated).
+    logits = mx.zeros((1, 1000))
+    out = proc(mx.array(tokens, dtype=mx.int32), logits)
+    forced.append(float(out[0, END].item()) >= 1e8)
+    for g in generated:
+        tokens.append(g)
+        logits = mx.zeros((1, 1000))
+        out = proc(mx.array(tokens, dtype=mx.int32), logits)
+        forced.append(float(out[0, END].item()) >= 1e8)
+    return forced
+
+
+def test_processor_bare_opener_fires_despite_prompt_tail():
+    """codex (2): the prefill step folds the prompt tail (e.g. last prompt token
+    999) into the processor's tokens BEFORE generation. The processor must NOT
+    let that prompt token latch content_seen — a GENERATED bare opener must still
+    open and force END at the budget."""
+    proc = ThinkingBudgetProcessor(
+        budget=2, think_end_token=END, think_start_token=START,
+        model_family="gemma4", bare_open_tokens=BARE,
+    )
+    forced = _drive_processor_with_prompt_tail(
+        proc, prompt_tail=[999], generated=[BARE0, BARE1, CONTENT]
+    )
+    # forced[0]=prefill(prompt tail), [1]=after BARE0, [2]=after BARE1 (opens,
+    # count=2>=budget -> force), [3]=after CONTENT (still forcing).
+    assert forced == [False, False, True, True], forced
+    assert proc.in_thinking is True
+
+
+def test_processor_bare_opener_fires_with_whole_prompt_in_tokens():
+    """Unchunked prefill: the WHOLE prompt (many non-bare tokens) lands in the
+    processor's tokens on the first call. The generated bare opener must still
+    open."""
+    proc = ThinkingBudgetProcessor(
+        budget=3, think_end_token=END, think_start_token=START,
+        model_family="gemma4", bare_open_tokens=BARE,
+    )
+    forced = _drive_processor_with_prompt_tail(
+        proc, prompt_tail=[5, 6, 7, 8, 9, 999], generated=[BARE0, BARE1, CONTENT]
+    )
+    assert forced[-1] is True, forced  # budget 3 reached after one content tok
+    assert proc.in_thinking is True
+
+
+def test_processor_mid_generation_bare_after_content_does_not_open():
+    """Within the generation domain the gen-start constraint still holds: a bare
+    sequence after a GENERATED content token must NOT open (content_seen latches
+    on the first generated content token, not on the prompt tail)."""
+    proc = ThinkingBudgetProcessor(
+        budget=2, think_end_token=END, think_start_token=START,
+        model_family="gemma4", bare_open_tokens=BARE,
+    )
+    forced = _drive_processor_with_prompt_tail(
+        proc, prompt_tail=[999], generated=[CONTENT, BARE0, BARE1, CONTENT]
+    )
+    assert not any(forced), forced
+    assert proc.in_thinking is False
+
+
+def test_processor_full_channel_opener_still_caps_with_prompt_tail():
+    """Regression: the full ``<|channel>`` opener (generated) still opens + caps
+    even with a non-bare prompt tail and bare detection active."""
+    proc = ThinkingBudgetProcessor(
+        budget=2, think_end_token=END, think_start_token=START,
+        model_family="gemma4", bare_open_tokens=BARE,
+    )
+    forced = _drive_processor_with_prompt_tail(
+        proc, prompt_tail=[999], generated=[START, CONTENT]
+    )
+    # START opens (count 1), CONTENT -> count 2 >= budget -> force.
+    assert forced == [False, False, True], forced
+
+
+def test_processor_noop_when_bare_empty_with_prompt_tail():
+    """No-op safety: bare empty => the bare path is inert even with a prompt tail
+    + a generated bare-looking sequence (a literal ``thought\\n`` is plain
+    content). The prompt-boundary handling must not spuriously open thinking."""
+    proc_no_bare = ThinkingBudgetProcessor(
+        budget=2, think_end_token=END, think_start_token=START,
+        model_family="gemma4", bare_open_tokens=None,
+    )
+    forced = _drive_processor_with_prompt_tail(
+        proc_no_bare, prompt_tail=[999], generated=[BARE0, BARE1, CONTENT, CONTENT]
+    )
+    assert not any(forced), forced  # never opens without bare tokens
+    assert proc_no_bare.in_thinking is False
+
+
+def test_helper_budget_off_noop_with_prompt_seed_and_bare():
+    """budget<=0 => the history-derived helper (what the MTP clone uses; the
+    clone gates ``_think_active = budget > 0``) is a clean no-op even when a
+    non-bare prompt seed + a generated bare opener are present."""
+    # Mirror the clone recipe: seed folded with empty bare, boundary re-arm, then
+    # generated bare opener — but budget 0 => never force.
+    hist = [999, BARE0, BARE1, CONTENT, CONTENT]
+    assert should_force_think_end(
+        hist, budget=0, think_start_token=START, think_end_token=END,
+        model_family="gemma4", bare_open_tokens=BARE,
+    ) is False
+    assert should_force_think_end(
+        hist, budget=-1, think_start_token=START, think_end_token=END,
+        model_family="gemma4", bare_open_tokens=BARE,
+    ) is False

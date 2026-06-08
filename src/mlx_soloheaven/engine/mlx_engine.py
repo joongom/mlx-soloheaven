@@ -217,6 +217,19 @@ def _detect_token_id(tokenizer, text: str) -> int:
     return -1
 
 
+def _detect_token_ids(tokenizer, text: str) -> list[int]:
+    """Tokenize ``text`` to its full token-id SEQUENCE (no special tokens).
+
+    Unlike ``_detect_token_id`` (single-token only), this returns the multi-token
+    encoding used by the BARE ``thought\\n`` opener detection (gemma4 sliding-
+    window variant): past the 1024 window the ``<|channel>`` token is gone and the
+    model emits ``thought\\n`` as plain text, which encodes to >1 token. Returns
+    ``[]`` if the text encodes empty (defensive — bare detection then stays off).
+    """
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    return list(ids)
+
+
 # --- mlx-vlm 0.5.0 Gemma 4 MTP wrap-around patches ---
 #
 # Two coordinated bugs surface once a ``RotatingKVCache`` ring buffer
@@ -296,10 +309,21 @@ _MTP_TOKEN_HISTORY_SEED = None
 #   _MTP_THINK_END_TOKEN: int | None
 #   _MTP_THINK_START_TOKEN: int | None
 #   _MTP_THINK_FAMILY: str | None  ("gemma4" / "chatml" — drives start-state)
+#
+# BARE-OPENER FIX (2026-06, Option A): past the 1024 sliding window the gemma4
+# ``<|channel>`` think_start prime falls out of the window and the model emits a
+# BARE ``thought\n`` opener with NO ``<|channel>`` token — so the token-id based
+# open above never fires and the budget runs to max_tokens (observed: 8192 =
+# max_tokens at 50K context). We thread the token-id SEQUENCE of the bare
+# ``thought\n`` opener so ``advance_think_state`` can recognise it at GENERATION
+# START ONLY (mirrors ThinkingRouter FIX 4 — a literal ``thought\n`` mid-content
+# does NOT falsely open thinking). Empty/None => bare detection off => no-op.
+#   _MTP_THINK_BARE_OPEN_TOKENS: list[int] | None
 _MTP_THINK_BUDGET = None
 _MTP_THINK_END_TOKEN = None
 _MTP_THINK_START_TOKEN = None
 _MTP_THINK_FAMILY = None
+_MTP_THINK_BARE_OPEN_TOKENS = None
 
 # Post-wrap drafter gate (plain-decode fallback). SUPERSEDED by the B4
 # RoPE-frame fix, which restores post-wrap drafter acceptance (~1.1) so the
@@ -656,6 +680,9 @@ def _install_mtp_wrap_patches() -> bool:
                 else -1
             )
             _think_family = _MTP_THINK_FAMILY or "chatml"
+            # BARE-OPENER FIX: token-id sequence of the gemma4 long-context bare
+            # ``thought\n`` opener (no ``<|channel>``). Empty/None => bare path off.
+            _think_bare_open = tuple(_MTP_THINK_BARE_OPEN_TOKENS or ())
             _think_active = _think_budget > 0 and _think_end_tok >= 0
 
             _seed = _MTP_TOKEN_HISTORY_SEED or []
@@ -670,17 +697,64 @@ def _install_mtp_wrap_patches() -> bool:
             # Incremental thinking state derived ONLY from emitted tokens. Seed
             # by folding over the prompt seed + the already-emitted first bonus,
             # so the state matches ThinkingBudgetProcessor at the same point.
+            #
+            # BARE-OPENER PROMPT/GENERATION DOMAIN SPLIT (codex HIGH fix): the
+            # bare ``thought\n`` opener is a GENERATION-START phenomenon. The
+            # prompt seed (``_MTP_TOKEN_HISTORY_SEED`` = the FULL prompt) must NOT
+            # exercise the bare matcher — its first (normal) token mismatches the
+            # bare opener and would latch ``content_seen=True``, so the GENERATED
+            # bare opener could never fire and the budget never caps (the original
+            # long-context runaway). Fix: fold the PROMPT SEED with the bare
+            # matcher OFF (empty tuple) — prompt tokens still correctly track
+            # ``in_thinking`` via the full ``<|channel>`` markers (e.g. a prior
+            # turn's complete ``<|channel>...<channel|>`` block in history) WITHOUT
+            # latching the bare ``content_seen``. THEN, at the generation boundary
+            # (right before folding the first GENERATED token, the bonus ``b``),
+            # reset the bare sub-state (``bare_idx=0, content_seen=False``) iff
+            # gemma4 and currently OUTSIDE thinking, so a generated bare opener can
+            # open even though the prompt preceded it. From ``b`` onward the bare
+            # matcher is ON. ChatML / mid-prompt-thinking (in_thinking True at the
+            # boundary) keep ``content_seen`` True — no gen-start bare detection.
             if _think_active:
                 _think_state = initial_think_state(_think_family)
-                for _t in list(_seed) + [int(b)]:
+                # Prompt domain: bare matcher OFF (see comment above).
+                for _t in _seed:
                     _think_state = advance_think_state(
                         _think_state,
                         int(_t),
                         think_start_token=_think_start_tok,
                         think_end_token=_think_end_tok,
+                        bare_open_tokens=(),
                     )
+                # Generation boundary: reset the bare sub-state so the FIRST
+                # generated token can begin a bare-opener match. Only when gemma4
+                # and outside thinking (in_thinking False); inside thinking there
+                # is no gen-start bare opener to detect.
+                _gen_in_thinking = _think_state[0]
+                if (
+                    _think_family == "gemma4"
+                    and _think_bare_open
+                    and not _gen_in_thinking
+                ):
+                    _think_state = (
+                        _think_state[0],
+                        _think_state[1],
+                        0,      # bare_idx
+                        False,  # content_seen
+                    )
+                # Generation domain: bare matcher ON. Fold the already-emitted
+                # first bonus ``b`` so the state matches the same point as the
+                # stateful processor (which starts matching at the first sampled
+                # token).
+                _think_state = advance_think_state(
+                    _think_state,
+                    int(b),
+                    think_start_token=_think_start_tok,
+                    think_end_token=_think_end_tok,
+                    bare_open_tokens=_think_bare_open,
+                )
             else:
-                _think_state = (False, 0)
+                _think_state = initial_think_state(_think_family)
 
             def _advance_think(tok):
                 # O(1) emitted-token state advance (no-op when inactive).
@@ -691,6 +765,7 @@ def _install_mtp_wrap_patches() -> bool:
                         int(tok),
                         think_start_token=_think_start_tok,
                         think_end_token=_think_end_tok,
+                        bare_open_tokens=_think_bare_open,
                     )
 
             def _force_think(logits, state):
@@ -855,6 +930,7 @@ def _install_mtp_wrap_patches() -> bool:
                                         _dtok,
                                         think_start_token=_think_start_tok,
                                         think_end_token=_think_end_tok,
+                                        bare_open_tokens=_think_bare_open,
                                     )
                         target_tokens = mx.stack(
                             [t.reshape(-1) for t in _per_pos], axis=1
@@ -2554,11 +2630,22 @@ class MLXEngine:
                 self.tokenizer,
                 "<|channel>" if self.model_family == "gemma4" else "<think>",
             )
+            # BARE-OPENER FIX (gemma4 only): past the 1024 sliding window the
+            # ``<|channel>`` prime falls out and the model opens thinking with a
+            # bare ``thought\n`` (no ``<|channel>`` token). Tokenize that opener
+            # once here so the budget recognises it at generation start (mirrors
+            # ThinkingRouter's bare-opener handling). Empty/non-gemma4 => off.
+            bare_open_tokens = (
+                _detect_token_ids(self.tokenizer, "thought\n")
+                if self.model_family == "gemma4"
+                else []
+            )
             logits_processors.append(ThinkingBudgetProcessor(
                 budget=budget,
                 think_end_token=self.cfg.think_end_token,
                 think_start_token=think_start,
                 model_family=self.model_family,
+                bare_open_tokens=bare_open_tokens,
             ))
         # Structured output (response_format) via FSM-based logits masking.
         # Works on both mlx-vlm and mlx-lm paths (same logits_processors contract).
@@ -2684,7 +2771,7 @@ class MLXEngine:
         self._pending_drafter_finalize = None
         global _MTP_LOGITS_PROCESSORS, _MTP_TOKEN_HISTORY_SEED
         global _MTP_THINK_BUDGET, _MTP_THINK_END_TOKEN, _MTP_THINK_START_TOKEN
-        global _MTP_THINK_FAMILY
+        global _MTP_THINK_FAMILY, _MTP_THINK_BARE_OPEN_TOKENS
         try:
             for resp in gen_iter:
                 if cancel_event is not None and cancel_event.is_set():
@@ -2771,6 +2858,7 @@ class MLXEngine:
             _MTP_THINK_END_TOKEN = None
             _MTP_THINK_START_TOKEN = None
             _MTP_THINK_FAMILY = None
+            _MTP_THINK_BARE_OPEN_TOKENS = None
         # PERF: single join at end of loop — replaces O(N^2) accumulation.
         accumulated_text = "".join(text_parts)
         # PERF: drafter-stats finalize (post-stream, exactly once). Captures
@@ -3131,7 +3219,7 @@ class MLXEngine:
         )
         global _HOT_PATH_FAST, _MTP_LOGITS_PROCESSORS, _MTP_TOKEN_HISTORY_SEED
         global _MTP_THINK_BUDGET, _MTP_THINK_END_TOKEN, _MTP_THINK_START_TOKEN
-        global _MTP_THINK_FAMILY
+        global _MTP_THINK_FAMILY, _MTP_THINK_BARE_OPEN_TOKENS
         _HOT_PATH_FAST = not wrap_possible
         # FIX 2: stash the per-request logits_processors + prompt-token-history
         # seed so the MTP clone (_patched_mtp_rounds_v2) can apply them — the
@@ -3174,11 +3262,17 @@ class MLXEngine:
                 _MTP_THINK_END_TOKEN = int(_tbp.think_end_token)
                 _MTP_THINK_START_TOKEN = int(_tbp.think_start_token)
                 _MTP_THINK_FAMILY = _tbp.model_family
+                # BARE-OPENER FIX: thread the gemma4 bare ``thought\n`` opener
+                # token sequence so the MTP clone recognises it at gen-start too.
+                _MTP_THINK_BARE_OPEN_TOKENS = (
+                    list(_tbp.bare_open_tokens) or None
+                )
             else:
                 _MTP_THINK_BUDGET = None
                 _MTP_THINK_END_TOKEN = None
                 _MTP_THINK_START_TOKEN = None
                 _MTP_THINK_FAMILY = None
+                _MTP_THINK_BARE_OPEN_TOKENS = None
             gen_kwargs["draft_model"] = drafter
             gen_kwargs["draft_kind"] = getattr(self, "_draft_kind", None)
             if self.cfg.draft_block_size:
@@ -3194,6 +3288,7 @@ class MLXEngine:
             _MTP_THINK_END_TOKEN = None
             _MTP_THINK_START_TOKEN = None
             _MTP_THINK_FAMILY = None
+            _MTP_THINK_BARE_OPEN_TOKENS = None
 
         # F3: generation_stream is installed ONCE on the dedicated
         # _vlm_executor worker thread during engine __init__. Per-call

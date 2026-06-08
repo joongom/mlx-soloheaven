@@ -40,12 +40,13 @@ const sidebarBackdrop = document.getElementById('sidebar-backdrop');
 // Marked config
 const SKIP_HIGHLIGHT = new Set(['mermaid', 'plantuml', 'diagram', 'math', 'latex', 'text', 'txt', 'plain', 'csv']);
 
+// NOTE: marked v9 IGNORES the `highlight` option (the callback is never
+// invoked by marked.parse). Syntax highlighting is therefore done manually
+// via the hljs.highlightElement() loop in renderMarkdown(). Do not re-add a
+// `highlight` callback here expecting v9 to call it — feeding an undefined
+// code string to hljs.highlight/highlightAuto throws
+// "Cannot read properties of undefined (reading 'replace')".
 marked.setOptions({
-    highlight: (code, lang) => {
-        if (lang && SKIP_HIGHLIGHT.has(lang.toLowerCase())) return code;
-        if (lang && hljs.getLanguage(lang)) return hljs.highlight(code, { language: lang }).value;
-        return hljs.highlightAuto(code).value;
-    },
     breaks: true,
     gfm: true,
 });
@@ -73,20 +74,41 @@ function fixIndentedCodeFences(text) {
     );
 }
 
-function renderMarkdown(text) {
-    const html = marked.parse(fixIndentedCodeFences(fixCjkMarkdown(text || '')));
-    const tmp = document.createElement('div');
-    tmp.innerHTML = html;
-    tmp.querySelectorAll('pre code').forEach(el => {
-        const cls = el.className || '';
-        const langMatch = cls.match(/language-(\w+)/);
-        if (langMatch) {
-            el.setAttribute('data-lang', langMatch[1]);
-            if (SKIP_HIGHLIGHT.has(langMatch[1].toLowerCase())) return;
-        }
-        if (!el.classList.contains('hljs')) hljs.highlightElement(el);
-    });
-    return tmp.innerHTML;
+// Render markdown to HTML.
+//   highlight=true  -> run syntax highlighting (use only on FINAL/persisted
+//                      renders, never on partial streaming frames).
+//   highlight=false -> skip highlighting (streaming frames): cheaper and
+//                      avoids feeding partial/odd code blocks to hljs.
+// The whole render is wrapped so a transient failure on partial content
+// NEVER throws up to the streaming catch (which would show a scary
+// "Error: ..."). On failure we fall back to escaped plain text for this
+// frame; the next frame / the 'done' re-render produces clean output.
+function renderMarkdown(text, highlight = true) {
+    try {
+        const html = marked.parse(fixIndentedCodeFences(fixCjkMarkdown(text || '')));
+        const tmp = document.createElement('div');
+        tmp.innerHTML = html;
+        tmp.querySelectorAll('pre code').forEach(el => {
+            const cls = el.className || '';
+            const langMatch = cls.match(/language-(\w+)/);
+            if (langMatch) {
+                el.setAttribute('data-lang', langMatch[1]);
+                if (SKIP_HIGHLIGHT.has(langMatch[1].toLowerCase())) return;
+            }
+            if (!highlight) return;
+            // Guard the hljs call itself: an unknown language or an odd/partial
+            // block must never throw and break the whole render.
+            try {
+                if (!el.classList.contains('hljs')) hljs.highlightElement(el);
+            } catch (e) {
+                console.warn('hljs.highlightElement error (skipped):', e);
+            }
+        });
+        return tmp.innerHTML;
+    } catch (e) {
+        console.warn('renderMarkdown error (fallback to plain text):', e);
+        return esc(text || '');
+    }
 }
 
 // Cursor is now pure CSS (::after on last child) — no JS injection needed
@@ -384,7 +406,8 @@ async function sendMessage() {
                     if (typeof event.reasoning === 'string' && event.reasoning) {
                         thinkText += event.reasoning;
                         fullText += event.reasoning;
-                        thinkBody.innerHTML = renderMarkdown(thinkText);
+                        // Partial streaming frame: no highlighting (re-done on 'done').
+                        thinkBody.innerHTML = renderMarkdown(thinkText, false);
                         thinkCount.textContent = `${countTokens(thinkText)} tok`;
                         thinkBody.scrollTop = thinkBody.scrollHeight;
                     }
@@ -406,19 +429,22 @@ async function sendMessage() {
                             thinkingDone = true;
                         }
                         respText += event.content;
-                        contentEl.innerHTML = renderMarkdown(respText);
+                        // Partial streaming frame: no highlighting (re-done on 'done').
+                        contentEl.innerHTML = renderMarkdown(respText, false);
                     }
                     scrollBottom();
                 }
 
                 if (event.type === 'done') {
                     stats = event.stats;
-                    if (event.content) {
-                        respText = event.content;
-                        contentEl.innerHTML = renderMarkdown(respText);
-                    }
-                    if (event.thinking) {
-                        thinkText = event.thinking;
+                    // Streaming frames render with highlight=false, so this 'done'
+                    // render (default highlight=true) is the sole syntax-highlight
+                    // pass — always run it, falling back to the accumulated buffers
+                    // if the done payload omits content/thinking.
+                    respText = event.content || respText;
+                    contentEl.innerHTML = renderMarkdown(respText);
+                    if (event.thinking || thinkText) {
+                        thinkText = event.thinking || thinkText;
                         thinkBody.innerHTML = renderMarkdown(thinkText);
                     }
                     // Auto-compaction trigger
@@ -1002,19 +1028,21 @@ async function runCompaction(keepRecent, customPrompt) {
                         if (endIdx !== -1) {
                             thinkingDone = true;
                             summaryText = fullText.substring(endIdx + endLen).trimStart();
-                            liveEl.innerHTML = renderMarkdown(summaryText);
+                            // Partial streaming frame: no highlighting.
+                            liveEl.innerHTML = renderMarkdown(summaryText, false);
                         }
                     } else {
                         summaryText += event.content;
-                        liveEl.innerHTML = renderMarkdown(summaryText);
+                        // Partial streaming frame: no highlighting.
+                        liveEl.innerHTML = renderMarkdown(summaryText, false);
                     }
                     scrollBottom();
                 }
 
                 if (event.type === 'done') {
-                    if (event.summary) {
-                        liveEl.innerHTML = renderMarkdown(event.summary);
-                    }
+                    // Final highlighted render (streaming used highlight=false).
+                    summaryText = event.summary || summaryText;
+                    liveEl.innerHTML = renderMarkdown(summaryText);
                 }
 
                 if (event.type === 'error') {

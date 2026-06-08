@@ -8,6 +8,8 @@ import json
 import pytest
 
 from mlx_soloheaven.engine.tool_parser import (
+    _parse_gemma4_args,
+    _parse_gemma4_array,
     get_tool_markers,
     parse_tool_calls,
     try_extract_tool_name,
@@ -145,6 +147,89 @@ def test_gemma4_mixed_args():
         "passengers": 2,
         "direct": True,
     }
+
+
+# Array of objects (OpenCode todowrite). Each element is a nested struct.
+GEMMA4_TODOWRITE = (
+    '<|tool_call>call:todowrite{todos:['
+    '{content:<|"|>task 1<|"|>,status:<|"|>pending<|"|>},'
+    '{content:<|"|>task 2<|"|>,status:<|"|>in_progress<|"|>}'
+    ']}<tool_call|>'
+)
+
+# Array of strings where the strings themselves contain commas.
+GEMMA4_STRING_ARRAY_COMMAS = (
+    '<|tool_call>call:tag{labels:[<|"|>hello, world<|"|>,<|"|>second<|"|>]}<tool_call|>'
+)
+
+# Plain string array (no commas inside elements) — regression guard.
+GEMMA4_STRING_ARRAY_PLAIN = (
+    '<|tool_call>call:tag{labels:[<|"|>a<|"|>,<|"|>b<|"|>,<|"|>c<|"|>]}<tool_call|>'
+)
+
+# Nested array of arrays of numbers.
+GEMMA4_NESTED_ARRAY = (
+    '<|tool_call>call:grid{cells:[[1,2],[3,4]]}<tool_call|>'
+)
+
+
+def test_gemma4_todowrite_array_of_objects():
+    _, calls = parse_tool_calls(GEMMA4_TODOWRITE, model_family="gemma4")
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "todowrite"
+    args = json.loads(calls[0]["function"]["arguments"])
+    assert args == {
+        "todos": [
+            {"content": "task 1", "status": "pending"},
+            {"content": "task 2", "status": "in_progress"},
+        ]
+    }
+    # Each element must be a dict, not a garbage string.
+    assert all(isinstance(t, dict) for t in args["todos"])
+
+
+def test_gemma4_string_array_with_commas():
+    _, calls = parse_tool_calls(GEMMA4_STRING_ARRAY_COMMAS, model_family="gemma4")
+    args = json.loads(calls[0]["function"]["arguments"])
+    # Commas inside the string span are preserved; delimiters are stripped.
+    assert args == {"labels": ["hello, world", "second"]}
+
+
+def test_gemma4_string_array_plain_regression():
+    _, calls = parse_tool_calls(GEMMA4_STRING_ARRAY_PLAIN, model_family="gemma4")
+    args = json.loads(calls[0]["function"]["arguments"])
+    assert args == {"labels": ["a", "b", "c"]}
+
+
+def test_gemma4_nested_array():
+    _, calls = parse_tool_calls(GEMMA4_NESTED_ARRAY, model_family="gemma4")
+    args = json.loads(calls[0]["function"]["arguments"])
+    assert args == {"cells": [[1, 2], [3, 4]]}
+
+
+def test_gemma4_parse_args_helper_array_of_objects():
+    # Direct unit test of the struct parser (no surrounding markers).
+    out = _parse_gemma4_args(
+        '{todos:[{content:<|"|>x<|"|>,status:<|"|>pending<|"|>},'
+        '{content:<|"|>y<|"|>,status:<|"|>done<|"|>}]}'
+    )
+    assert out == {
+        "todos": [
+            {"content": "x", "status": "pending"},
+            {"content": "y", "status": "done"},
+        ]
+    }
+
+
+def test_gemma4_parse_array_helper_directly():
+    # _parse_gemma4_array operates on the inner contents (no outer brackets).
+    assert _parse_gemma4_array('<|"|>hello, world<|"|>,<|"|>second<|"|>') == [
+        "hello, world",
+        "second",
+    ]
+    assert _parse_gemma4_array("[1,2],[3,4]") == [[1, 2], [3, 4]]
+    assert _parse_gemma4_array("1,2,true,false") == [1, 2, True, False]
+    assert _parse_gemma4_array("") == []
 
 
 # ---------- Streaming helpers ----------

@@ -220,6 +220,72 @@ def _parse_gemma4_value(raw: str):
     return raw
 
 
+def _parse_gemma4_array(arr_str: str) -> list:
+    """Parse the inner contents of a Gemma 4 array (without outer [] brackets).
+
+    Splits on TOP-LEVEL commas only, respecting:
+    - <|"|>...<|"|> string spans (commas inside a string are not separators;
+      the delimiter tokens are stripped from the resulting string value)
+    - {...} object nesting (recurse into _parse_gemma4_args -> dict)
+    - [...] array nesting (recurse into _parse_gemma4_array -> list)
+    Bare tokens between top-level commas go through _parse_gemma4_value.
+    """
+    delim = "<|\"" + "|>"
+    elements = []
+    i = 0
+    n = len(arr_str)
+    elem_start = 0  # start of the current top-level element
+
+    def _flush(start: int, end: int) -> None:
+        seg = arr_str[start:end].strip()
+        if not seg:
+            return
+        if seg.startswith(delim) and seg.endswith(delim) and len(seg) >= 2 * len(delim):
+            elements.append(seg[len(delim):-len(delim)])
+        elif seg.startswith("{"):
+            elements.append(_parse_gemma4_args(seg))
+        elif seg.startswith("["):
+            inner = seg[1:-1] if seg.endswith("]") else seg[1:]
+            elements.append(_parse_gemma4_array(inner))
+        else:
+            elements.append(_parse_gemma4_value(seg))
+
+    while i < n:
+        if arr_str.startswith(delim, i):
+            # Skip over a string span (its inner commas are not separators)
+            end = arr_str.find(delim, i + len(delim))
+            i = (end + len(delim)) if end != -1 else n
+        elif arr_str[i] == "{":
+            depth = 1
+            i += 1
+            while i < n and depth > 0:
+                if arr_str[i] == "{":
+                    depth += 1
+                elif arr_str[i] == "}":
+                    depth -= 1
+                i += 1
+        elif arr_str[i] == "[":
+            depth = 1
+            i += 1
+            while i < n and depth > 0:
+                if arr_str[i] == "[":
+                    depth += 1
+                elif arr_str[i] == "]":
+                    depth -= 1
+                i += 1
+        elif arr_str[i] == ",":
+            # Top-level separator
+            _flush(elem_start, i)
+            i += 1
+            elem_start = i
+        else:
+            i += 1
+
+    # Flush the final element
+    _flush(elem_start, n)
+    return elements
+
+
 def _parse_gemma4_args(args_str: str) -> dict:
     """Parse Gemma 4 custom struct format: {key:<|"|>val<|"|>,key2:val2}
 
@@ -290,17 +356,10 @@ def _parse_gemma4_args(args_str: str) -> dict:
                 elif s[j] == "]":
                     depth -= 1
                 j += 1
-            # Simple array parsing: split by comma, parse each element
+            # Span-aware parsing: split only on top-level commas, respecting
+            # <|"|> string spans and nested {}/[].
             arr_str = s[i + 1 : j - 1]
-            elements = []
-            for elem in arr_str.split(","):
-                elem = elem.strip()
-                if elem.startswith("<|\"" + "|>") and elem.endswith("<|\"" + "|>"):
-                    delim = "<|\"" + "|>"
-                    elements.append(elem[len(delim):-len(delim)])
-                else:
-                    elements.append(_parse_gemma4_value(elem))
-            result[key] = elements
+            result[key] = _parse_gemma4_array(arr_str)
             i = j
         else:
             # Bare value (number, boolean) — read until comma or end

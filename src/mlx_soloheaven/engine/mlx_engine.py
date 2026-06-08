@@ -46,7 +46,13 @@ from mlx_vlm.generate import (
 )
 
 from mlx_soloheaven.config import Config
-from mlx_soloheaven.engine.thinking import ThinkingBudgetProcessor, RepetitionPenaltyProcessor
+from mlx_soloheaven.engine.thinking import (
+    ThinkingBudgetProcessor,
+    RepetitionPenaltyProcessor,
+    initial_think_state,
+    advance_think_state,
+    force_end_from_state,
+)
 from mlx_soloheaven.engine.tool_parser import (
     get_tool_markers,
     parse_tool_calls,
@@ -272,6 +278,28 @@ _HOT_PATH_FAST = False
 #   _MTP_TOKEN_HISTORY_SEED: list[int] | None  (prompt token ids)
 _MTP_LOGITS_PROCESSORS = None
 _MTP_TOKEN_HISTORY_SEED = None
+
+# RUNAWAY-THINKING FIX (2026-06): the thinking-budget cap was only enforced in
+# the post-wrap ``_plain_step`` (gated behind SOLOHEAVEN_MTP_WRAP_GATE, default
+# OFF), so during normal MTP speculative decoding the cap NEVER fired and a
+# thinking model could stay inside its ``<|channel>``…``<channel|>`` block until
+# max_tokens (observed: 21,600+ tokens of empty thinking). The stateful
+# ``ThinkingBudgetProcessor`` cannot be applied per verify-position (it
+# over-counts rejected drafts), so the clone instead enforces the budget with a
+# HISTORY-DERIVED helper (see thinking.advance_think_state/force_end_from_state)
+# driven by ACTUALLY-EMITTED tokens. These three globals thread the budget +
+# tokens into the clone alongside the existing stash; set in ``_run_vlm`` only
+# when use_thinking + budget>0 + think_end_token>=0 (same gate as the
+# ThinkingBudgetProcessor wiring), cleared in the same finally. When unset /
+# budget<=0 this is a complete no-op (greedy-exact, current behaviour).
+#   _MTP_THINK_BUDGET: int | None
+#   _MTP_THINK_END_TOKEN: int | None
+#   _MTP_THINK_START_TOKEN: int | None
+#   _MTP_THINK_FAMILY: str | None  ("gemma4" / "chatml" — drives start-state)
+_MTP_THINK_BUDGET = None
+_MTP_THINK_END_TOKEN = None
+_MTP_THINK_START_TOKEN = None
+_MTP_THINK_FAMILY = None
 
 # Post-wrap drafter gate (plain-decode fallback). SUPERSEDED by the B4
 # RoPE-frame fix, which restores post-wrap drafter acceptance (~1.1) so the
@@ -578,26 +606,58 @@ def _install_mtp_wrap_patches() -> bool:
             #     in the verify block with the correct cumulative history; this
             #     is THE repetition fix and applies on BOTH the speculative and
             #     post-wrap plain paths.
-            #   * _plain_procs = ThinkingBudgetProcessor / structured-FSM — these
-            #     mutate internal state ONCE PER CALL, so calling them per
-            #     verify-position (bs calls, only accepted+1 emitted) would
-            #     over-count. They are applied ONLY in the single-token
-            #     _plain_step (post-wrap path) where call==emit. LIMITATION: the
-            #     thinking-budget cap is NOT enforced during the pre-wrap
-            #     SPECULATIVE phase; once the ring wraps (or for short non-spec
-            #     decode) _plain_step enforces it. In practice gemma4 thinking
-            #     finishes well within the first sliding window, and the budget
-            #     also has upstream's prefill _step as a backstop for the first
-            #     token. Documented as a known gap rather than silently dropped.
+            #   * _plain_procs = structured-FSM — mutates internal state ONCE
+            #     PER CALL, so calling it per verify-position (bs calls, only
+            #     accepted+1 emitted) would over-count. Applied ONLY in the
+            #     single-token _plain_step (post-wrap path) where call==emit.
+            #     (Structured outputs disable the drafter entirely upstream of
+            #     here, so in practice this list is empty on the MTP path.)
+            #
+            # RUNAWAY-THINKING FIX: ThinkingBudgetProcessor is STATEFUL too, but
+            # the cap MUST fire during normal MTP speculative decoding (the
+            # default path) — leaving it for _plain_step (gated OFF by default)
+            # let thinking models run to max_tokens inside <|channel>…<channel|>.
+            # Applying the stateful processor per verify-position over-counts
+            # rejected drafts, so the clone DROPS ThinkingBudgetProcessor from
+            # the per-position lists and instead enforces the budget from the
+            # EMITTED-token history via a small incremental state (in_thinking,
+            # thinking_count) folded over actually-emitted tokens (see the
+            # _think_* setup below + force_end_from_state). This fires at the
+            # bonus sample, every block-verify position, and _plain_step.
             # With no processors (penalty==1.0, no budget) this is an exact
             # no-op — pre-/post-wrap output stays greedy-exact.
             _all_procs = list(_MTP_LOGITS_PROCESSORS or [])
             _block_procs = [
                 p for p in _all_procs if isinstance(p, RepetitionPenaltyProcessor)
             ]
+            # Drop ThinkingBudgetProcessor from BOTH per-position lists — the
+            # history-derived enforcement below replaces it for the MTP path
+            # (avoids the stateful over-count). Keep everything else (e.g. the
+            # structured-FSM processor) in _plain_procs for _plain_step.
             _plain_procs = [
-                p for p in _all_procs if not isinstance(p, RepetitionPenaltyProcessor)
+                p
+                for p in _all_procs
+                if not isinstance(
+                    p, (RepetitionPenaltyProcessor, ThinkingBudgetProcessor)
+                )
             ]
+
+            # ----- RUNAWAY-THINKING FIX: history-derived thinking-budget -----
+            # Threaded from _run_vlm via the dedicated stash (set only when
+            # use_thinking + budget>0 + think_end_token>=0). budget<=0 / unset
+            # => _think_budget<=0 => force_end_from_state always False => no-op.
+            _think_budget = int(_MTP_THINK_BUDGET or 0)
+            _think_end_tok = (
+                int(_MTP_THINK_END_TOKEN) if _MTP_THINK_END_TOKEN is not None else -1
+            )
+            _think_start_tok = (
+                int(_MTP_THINK_START_TOKEN)
+                if _MTP_THINK_START_TOKEN is not None
+                else -1
+            )
+            _think_family = _MTP_THINK_FAMILY or "chatml"
+            _think_active = _think_budget > 0 and _think_end_tok >= 0
+
             _seed = _MTP_TOKEN_HISTORY_SEED or []
             # Running token history as a 1-D mx.array (processor contract).
             # Seeded with the prompt ids + the first bonus (already yielded by
@@ -607,6 +667,42 @@ def _install_mtp_wrap_patches() -> bool:
             else:
                 _hist = None
 
+            # Incremental thinking state derived ONLY from emitted tokens. Seed
+            # by folding over the prompt seed + the already-emitted first bonus,
+            # so the state matches ThinkingBudgetProcessor at the same point.
+            if _think_active:
+                _think_state = initial_think_state(_think_family)
+                for _t in list(_seed) + [int(b)]:
+                    _think_state = advance_think_state(
+                        _think_state,
+                        int(_t),
+                        think_start_token=_think_start_tok,
+                        think_end_token=_think_end_tok,
+                    )
+            else:
+                _think_state = (False, 0)
+
+            def _advance_think(tok):
+                # O(1) emitted-token state advance (no-op when inactive).
+                nonlocal _think_state
+                if _think_active:
+                    _think_state = advance_think_state(
+                        _think_state,
+                        int(tok),
+                        think_start_token=_think_start_tok,
+                        think_end_token=_think_end_tok,
+                    )
+
+            def _force_think(logits, state):
+                # If the budget is reached and we're still inside thinking, force
+                # the think_end token (logit -> 1e9) so it is sampled next —
+                # exactly what ThinkingBudgetProcessor does. ``state`` is the
+                # thinking state DERIVED from the cumulative history up to (but
+                # excluding) the position being sampled. Returns ``logits``.
+                if _think_active and force_end_from_state(state, _think_budget):
+                    logits[:, _think_end_tok] = 1e9
+                return logits
+
             def _apply_procs(procs, logits, hist):
                 # logits: (1, vocab). hist: 1-D mx.array of prior tokens.
                 # Mirrors upstream _step: run each processor in order.
@@ -614,27 +710,41 @@ def _install_mtp_wrap_patches() -> bool:
                     logits = processor(hist, logits)
                 return logits
 
+            # Non-budget processors for the plain path, in logits_processors
+            # order (rep-penalty first, then any structured-FSM). The
+            # thinking-budget is intentionally EXCLUDED here and enforced via
+            # _force_think (history-derived) instead, so it is not
+            # double-enforced. Empty => exact no-op.
+            _plain_all_procs = _block_procs + _plain_procs
+            _plain_needs_procs = bool(_plain_all_procs) or _think_active
+
             # Plain (non-speculative) single-token decode step used by the
             # post-wrap gate below. Omits return_hidden/return_shared_kv so
             # it runs at full plain-decode speed and bypasses the B1
-            # temporal-order patch (which keys on shared_kv_sink). FIX 2:
-            # applies the FULL processor list (rep-penalty + thinking-budget +
-            # structured) against the running history — this is single-token so
-            # stateful processors are call==emit correct — then appends the
-            # sampled token so the next step's penalty is correct.
+            # temporal-order patch (which keys on shared_kv_sink). FIX 2 +
+            # RUNAWAY-THINKING FIX: applies the non-budget processors
+            # (rep-penalty + structured) against the running history — this is
+            # single-token so they are call==emit correct — then forces
+            # think_end from the emitted-token state (call==emit, so the
+            # incremental state stays exact), then appends the sampled token.
             def _plain_step(yarr):
                 nonlocal _hist
                 with mx.stream(_generation_stream):
                     logits = lm(yarr, cache=prompt_cache).logits
-                    if _all_procs:
+                    if _plain_needs_procs:
                         # logits here is (1, 1, vocab) — squeeze the time axis
                         # to (1, vocab) for the processor contract, then sample.
-                        li = _apply_procs(_all_procs, logits[:, -1, :], _hist)
+                        li = _apply_procs(_plain_all_procs, logits[:, -1, :], _hist)
+                        li = _force_think(li, _think_state)
                         y = sampler(li)
                     else:
                         y = sampler(logits)
                 if _all_procs:
                     _hist = mx.concat([_hist, y.reshape(-1).astype(token_dtype)])
+                if _think_active:
+                    # .item() forces a sync; only pay it when the budget is
+                    # actually active (otherwise this path stays pipelined).
+                    _advance_think(int(y.reshape(-1)[0].item()))
                 return y
 
             while emitted < max_tokens:
@@ -691,19 +801,23 @@ def _install_mtp_wrap_patches() -> bool:
                         return_shared_kv=True,
                     )
                     hidden_full = verify_out.hidden_states[-1]
-                    if _block_procs:
-                        # FIX 2 (block-aware repetition penalty): verify_out.logits
-                        # is (1, bs, vocab) — position i predicts the token
-                        # following the prefix [b, draft_0..draft_{i-1}]. Apply
-                        # the (stateless) rep-penalty processor per-position with
-                        # the CORRECT cumulative token history so the target's
-                        # greedy/sampled choice is repetition-penalised exactly as
-                        # plain decode would be. Accepting a draft iff it equals
-                        # the penalised target then keeps the emitted stream equal
-                        # to penalised greedy decode (exact for temp==0; for temp>0
-                        # it follows the same naive-equality scheme already used
-                        # upstream). Stateful processors (thinking-budget, FSM) are
-                        # intentionally NOT applied here — see _plain_procs note.
+                    if _block_procs or _think_active:
+                        # FIX 2 (block-aware repetition penalty) + RUNAWAY-
+                        # THINKING FIX (history-derived thinking budget):
+                        # verify_out.logits is (1, bs, vocab) — position i
+                        # predicts the token following the prefix
+                        # [b, draft_0..draft_{i-1}]. Per position we (a) apply the
+                        # (stateless) rep-penalty processor with the CORRECT
+                        # cumulative token history so the target's choice is
+                        # repetition-penalised exactly as plain decode would be,
+                        # and (b) force the think_end token when the budget is
+                        # reached for THAT position's cumulative thinking state.
+                        # Both are derived from the per-position prefix, so
+                        # accept/reject stays consistent with penalised+capped
+                        # greedy decode (exact for temp==0; temp>0 follows the
+                        # same naive-equality scheme upstream uses). The stateful
+                        # FSM processor is still NOT applied here — see the
+                        # _plain_procs note.
                         vl = verify_out.logits
                         _bs = int(vl.shape[1])
                         # Draft tokens proposed for positions 1..bs-1 (position 0
@@ -711,19 +825,37 @@ def _install_mtp_wrap_patches() -> bool:
                         # prefix-history build.
                         _draft_list = draft_tokens.reshape(-1).tolist()
                         _per_pos = []
-                        _pos_hist = _hist
+                        # rep-penalty needs the mx.array history; build it only
+                        # when rep-penalty is active to avoid the per-position
+                        # concat cost on the think-only path.
+                        _pos_hist = _hist if _block_procs else None
+                        # Position 0 is conditioned on the prefix ending at b,
+                        # which is already folded into _think_state.
+                        _pos_think = _think_state
                         for i in range(_bs):
-                            li = _apply_procs(_block_procs, vl[:, i, :], _pos_hist)
+                            li = vl[:, i, :]
+                            if _block_procs:
+                                li = _apply_procs(_block_procs, li, _pos_hist)
+                            li = _force_think(li, _pos_think)
                             _per_pos.append(sampler(li))
-                            # Extend history with the DRAFT token at position i
-                            # for the NEXT position's penalty context (mirrors the
+                            # Extend per-position context with the DRAFT token at
+                            # position i for the NEXT position (mirrors the
                             # autoregressive prefix the target attends to). The
                             # walk below decides which of these are actually kept.
                             if i < len(_draft_list):
-                                _pos_hist = mx.concat([
-                                    _pos_hist,
-                                    mx.array([int(_draft_list[i])], dtype=token_dtype),
-                                ])
+                                _dtok = int(_draft_list[i])
+                                if _block_procs:
+                                    _pos_hist = mx.concat([
+                                        _pos_hist,
+                                        mx.array([_dtok], dtype=token_dtype),
+                                    ])
+                                if _think_active:
+                                    _pos_think = advance_think_state(
+                                        _pos_think,
+                                        _dtok,
+                                        think_start_token=_think_start_tok,
+                                        think_end_token=_think_end_tok,
+                                    )
                         target_tokens = mx.stack(
                             [t.reshape(-1) for t in _per_pos], axis=1
                         )
@@ -745,6 +877,14 @@ def _install_mtp_wrap_patches() -> bool:
                         _hist,
                         mx.array(new_tokens, dtype=token_dtype),
                     ])
+                # RUNAWAY-THINKING FIX: advance the emitted-token thinking state
+                # over the tokens ACTUALLY emitted this block (accepted drafts +
+                # target bonus), so the next block's position-0 force decision
+                # uses the true thinking count — no over-count from rejected
+                # drafts (those were only tried per-position, never folded in).
+                if _think_active and new_tokens:
+                    for _ntok in new_tokens:
+                        _advance_think(_ntok)
 
                 try:
                     for tok in new_tokens:
@@ -2543,6 +2683,8 @@ class MLXEngine:
         _drafter_finalize = getattr(self, "_pending_drafter_finalize", None)
         self._pending_drafter_finalize = None
         global _MTP_LOGITS_PROCESSORS, _MTP_TOKEN_HISTORY_SEED
+        global _MTP_THINK_BUDGET, _MTP_THINK_END_TOKEN, _MTP_THINK_START_TOKEN
+        global _MTP_THINK_FAMILY
         try:
             for resp in gen_iter:
                 if cancel_event is not None and cancel_event.is_set():
@@ -2622,6 +2764,13 @@ class MLXEngine:
             # VLM request at a time).
             _MTP_LOGITS_PROCESSORS = None
             _MTP_TOKEN_HISTORY_SEED = None
+            # RUNAWAY-THINKING FIX: clear the thinking-budget stash in the SAME
+            # finally so it never leaks across requests (matches the MTP
+            # processor/seed clear above).
+            _MTP_THINK_BUDGET = None
+            _MTP_THINK_END_TOKEN = None
+            _MTP_THINK_START_TOKEN = None
+            _MTP_THINK_FAMILY = None
         # PERF: single join at end of loop — replaces O(N^2) accumulation.
         accumulated_text = "".join(text_parts)
         # PERF: drafter-stats finalize (post-stream, exactly once). Captures
@@ -2981,6 +3130,8 @@ class MLXEngine:
             and (cur_offset + len(prompt_token_ids or []) + int(max_tokens or 0)) >= win
         )
         global _HOT_PATH_FAST, _MTP_LOGITS_PROCESSORS, _MTP_TOKEN_HISTORY_SEED
+        global _MTP_THINK_BUDGET, _MTP_THINK_END_TOKEN, _MTP_THINK_START_TOKEN
+        global _MTP_THINK_FAMILY
         _HOT_PATH_FAST = not wrap_possible
         # FIX 2: stash the per-request logits_processors + prompt-token-history
         # seed so the MTP clone (_patched_mtp_rounds_v2) can apply them — the
@@ -3000,6 +3151,34 @@ class MLXEngine:
             # repetition penalty see prior-turn tokens and suppress cross-turn
             # repetition. Do NOT change to suffix-only.
             _MTP_TOKEN_HISTORY_SEED = list(prompt_token_ids)
+            # RUNAWAY-THINKING FIX: thread the thinking-budget cap into the MTP
+            # clone so it is enforced during NORMAL speculative decoding (the
+            # default path), not only in the gated _plain_step. The budget +
+            # token ids come from the ThinkingBudgetProcessor that
+            # generate_stream already built and added to logits_processors under
+            # the exact gate (use_thinking + budget>0 + think_end_token>=0) — we
+            # read them off that instance so this stays a no-op whenever thinking
+            # is off / budget<=0 (no processor present → stash stays None). The
+            # stateful processor itself is filtered OUT of the clone's
+            # per-position lists; the history-derived helper replaces it there.
+            _tbp = next(
+                (
+                    p
+                    for p in (logits_processors or [])
+                    if isinstance(p, ThinkingBudgetProcessor)
+                ),
+                None,
+            )
+            if _tbp is not None and _tbp.budget > 0 and _tbp.think_end_token >= 0:
+                _MTP_THINK_BUDGET = int(_tbp.budget)
+                _MTP_THINK_END_TOKEN = int(_tbp.think_end_token)
+                _MTP_THINK_START_TOKEN = int(_tbp.think_start_token)
+                _MTP_THINK_FAMILY = _tbp.model_family
+            else:
+                _MTP_THINK_BUDGET = None
+                _MTP_THINK_END_TOKEN = None
+                _MTP_THINK_START_TOKEN = None
+                _MTP_THINK_FAMILY = None
             gen_kwargs["draft_model"] = drafter
             gen_kwargs["draft_kind"] = getattr(self, "_draft_kind", None)
             if self.cfg.draft_block_size:
@@ -3011,6 +3190,10 @@ class MLXEngine:
         else:
             _MTP_LOGITS_PROCESSORS = None
             _MTP_TOKEN_HISTORY_SEED = None
+            _MTP_THINK_BUDGET = None
+            _MTP_THINK_END_TOKEN = None
+            _MTP_THINK_START_TOKEN = None
+            _MTP_THINK_FAMILY = None
 
         # F3: generation_stream is installed ONCE on the dedicated
         # _vlm_executor worker thread during engine __init__. Per-call

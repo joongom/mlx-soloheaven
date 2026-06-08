@@ -42,4 +42,5 @@ mlx-soloheaven \
   --memory-budget-gb 20 \
   --gpu-keepalive \
   --repetition-penalty 1.1 \
+  --thinking-budget 4096 \
   "$@"

@@ -228,6 +228,126 @@ async def test_gemma4_incremental_stream():
     assert _final_finish_reason(events) == "tool_calls"
 
 
+# ---------- FIX 3: Gemma 4 thinking-channel stripped from streamed content ----------
+
+GEMMA4_THINKING_TOKENS = [
+    "<|channel>thought\n",
+    "let me ", "reason about ", "this carefully",
+    "<channel|>",
+    "The ", "final ", "answer.",
+]
+
+
+class _ThinkingStubEngine(StubEngine):
+    """StubEngine with thinking ENABLED and a content (no-tool) finish."""
+
+    def __init__(self, model_family: str, token_stream: list[str]):
+        super().__init__(model_family, token_stream)
+
+        class _Cfg:
+            enable_thinking = True
+        self.cfg = _Cfg()
+
+    def _iter_results(self):
+        for tok in self._stream:
+            yield StubResult(text=tok)
+        yield StubResult(
+            text="",
+            finish_reason="stop",
+            prompt_tokens=10,
+            completion_tokens=len(self._stream),
+            prompt_tps=100.0,
+            generation_tps=20.0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_gemma4_streaming_strips_thinking_channel():
+    """FIX 3: the raw <|channel>thought...<channel|> markers (and the thought
+    text) must NOT appear in streamed content deltas; only the post-close
+    answer is emitted."""
+    engine = _ThinkingStubEngine("gemma4", GEMMA4_THINKING_TOKENS)
+    req = ChatCompletionRequest(
+        model="test-gemma4",
+        messages=[ChatMessage(role="user", content="hi")],
+        stream=True,
+        thinking=True,
+    )
+    events = await _collect(engine, req)
+
+    content = "".join(
+        choice.get("delta", {}).get("content", "")
+        for ev in events
+        for choice in ev.get("choices", [])
+        if choice.get("delta", {}).get("content")
+    )
+    assert "<|channel>" not in content
+    assert "<channel|>" not in content
+    assert "thought" not in content
+    assert "reason about" not in content  # thought text suppressed
+    assert content == "The final answer."
+    assert _final_finish_reason(events) == "stop"
+
+
+def _stream_content(events: list[dict]) -> str:
+    return "".join(
+        choice.get("delta", {}).get("content", "")
+        for ev in events
+        for choice in ev.get("choices", [])
+        if choice.get("delta", {}).get("content")
+    )
+
+
+# CORRECTION 1: a degenerate MULTI-CYCLE stream (a 2nd <|channel>thought opener
+# after visible content) must have ALL channels stripped end-to-end through
+# _stream_completion — no later marker/thought may leak into content deltas.
+GEMMA4_MULTICYCLE_TOKENS = [
+    "<|channel>thought\n", "reason A", "<channel|>",
+    "partial answer ",
+    "<|channel>thought\n", "reason B", "<channel|>",
+    "final answer.",
+]
+
+
+@pytest.mark.asyncio
+async def test_gemma4_streaming_strips_multicycle_thinking():
+    engine = _ThinkingStubEngine("gemma4", GEMMA4_MULTICYCLE_TOKENS)
+    req = ChatCompletionRequest(
+        model="test-gemma4",
+        messages=[ChatMessage(role="user", content="hi")],
+        stream=True,
+        thinking=True,
+    )
+    events = await _collect(engine, req)
+    content = _stream_content(events)
+    assert "<|channel>" not in content
+    assert "<channel|>" not in content
+    assert "thought" not in content
+    assert "reason A" not in content and "reason B" not in content
+    assert content == "partial answer final answer."
+    assert _final_finish_reason(events) == "stop"
+
+
+# CORRECTION 2: gemma4 thinking ENABLED but the model emits a plain answer with
+# NO channel markers → content must pass through unstripped (not be dropped).
+GEMMA4_PLAIN_TOKENS = ["Hello", ", this is ", "a plain ", "answer."]
+
+
+@pytest.mark.asyncio
+async def test_gemma4_streaming_plain_answer_passes_through():
+    engine = _ThinkingStubEngine("gemma4", GEMMA4_PLAIN_TOKENS)
+    req = ChatCompletionRequest(
+        model="test-gemma4",
+        messages=[ChatMessage(role="user", content="hi")],
+        stream=True,
+        thinking=True,
+    )
+    events = await _collect(engine, req)
+    content = _stream_content(events)
+    assert content == "Hello, this is a plain answer."
+    assert _final_finish_reason(events) == "stop"
+
+
 # ---------- Name emitted BEFORE block closes ----------
 
 @pytest.mark.asyncio

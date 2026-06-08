@@ -256,6 +256,23 @@ _MTP_PATCHES_INSTALLED = False
 # Flag is single-worker safe — VLM executor pins all calls to one thread.
 _HOT_PATH_FAST = False
 
+# FIX 2: per-request stash for wiring logits_processors (RepetitionPenalty +
+# ThinkingBudget) into the MTP clone ``_patched_mtp_rounds_v2``. Upstream
+# ``generate_step`` builds ``processors`` locally and threads them into its
+# non-speculative ``_step`` ONLY — the speculative ``_mtp_rounds`` path is
+# called with a BARE ``sampler`` and never sees the processors, so MTP-decoded
+# tokens were never repetition-penalised (gemma4 long-session closing-para
+# loop). We cannot change how upstream invokes the clone, so ``_run_vlm``
+# stashes the processors + the prompt-token-history seed here just before
+# calling ``vlm_stream_generate``; the clone reads them and applies the
+# processors itself (mirroring upstream ``_step``'s tokens/logits contract).
+# Single-worker safe for the same reason as ``_HOT_PATH_FAST`` (VLM executor
+# pins all calls to one thread). Cleared after each request by ``_run_vlm``.
+#   _MTP_LOGITS_PROCESSORS: list[Callable[[mx.array, mx.array], mx.array]] | None
+#   _MTP_TOKEN_HISTORY_SEED: list[int] | None  (prompt token ids)
+_MTP_LOGITS_PROCESSORS = None
+_MTP_TOKEN_HISTORY_SEED = None
+
 # Post-wrap drafter gate (plain-decode fallback). SUPERSEDED by the B4
 # RoPE-frame fix, which restores post-wrap drafter acceptance (~1.1) so the
 # drafter stays net-positive past the wrap — gating it off would now throw
@@ -499,22 +516,18 @@ def _install_mtp_wrap_patches() -> bool:
             draft_block_size=None,
             token_dtype=mx.int32,
         ):
-            # PERF: fast-path bypass when wrap is not imminent — delegate
-            # straight to the upstream _mtp_rounds. The clamp is only
-            # needed when a wrap has occurred (offset > max_size).
-            if _HOT_PATH_FAST:
-                return _orig_mtp_rounds(
-                    model,
-                    draft_model,
-                    prompt_cache,
-                    hidden,
-                    shared_kv_states,
-                    first_bonus=first_bonus,
-                    max_tokens=max_tokens,
-                    sampler=sampler,
-                    draft_block_size=draft_block_size,
-                    token_dtype=token_dtype,
-                )
+            # NOTE (2026-06: FIX 1): the previous ``if _HOT_PATH_FAST:
+            # return _orig_mtp_rounds(...)`` fast-path delegation was
+            # REMOVED. Delegating to upstream for short generations
+            # (prompt+max_tokens < sliding_window → wrap_possible=False →
+            # _HOT_PATH_FAST=True) produced broken 2-token early-EOS output
+            # because upstream lacks this clone's ``finally`` rollback of
+            # rejected speculative draft K/V (see the ``finally`` below).
+            # The clone is exact-greedy-equivalent to upstream pre-wrap
+            # (true offset identical, B4 mask all-allowed/None pre-wrap), so
+            # always running it is the minimal correct fix. The B1
+            # ``_HOT_PATH_FAST`` no-op at the TextModel ``__call__`` patch is
+            # left intact — it is a valid perf no-op pre-wrap.
 
             # --- Clone of mlx_vlm.generate._mtp_rounds with B2 clamp. ---
             lm = (
@@ -549,14 +562,80 @@ def _install_mtp_wrap_patches() -> bool:
             b = first_bonus
             emitted = 1  # caller already yielded the first bonus
 
+            # ----- FIX 2: logits_processors (RepetitionPenalty + ThinkingBudget) -----
+            # Upstream calls this clone with a BARE sampler, so processors built
+            # in generate_stream never reached MTP-decoded tokens (the active
+            # decode path) — nothing suppressed gemma4's long-session repetition
+            # loop. Read the per-request processors + prompt-token seed stashed
+            # by _run_vlm and apply them here, mirroring upstream
+            # generate_step._step's contract: each processor takes
+            # (running_token_history, logits) → processed logits, BEFORE sampling.
+            #
+            # We split by statefulness because speculative decoding samples a
+            # BLOCK of positions at once:
+            #   * _block_procs = RepetitionPenaltyProcessor — stateless (derives
+            #     everything from the ``tokens`` arg). Safe to apply per-position
+            #     in the verify block with the correct cumulative history; this
+            #     is THE repetition fix and applies on BOTH the speculative and
+            #     post-wrap plain paths.
+            #   * _plain_procs = ThinkingBudgetProcessor / structured-FSM — these
+            #     mutate internal state ONCE PER CALL, so calling them per
+            #     verify-position (bs calls, only accepted+1 emitted) would
+            #     over-count. They are applied ONLY in the single-token
+            #     _plain_step (post-wrap path) where call==emit. LIMITATION: the
+            #     thinking-budget cap is NOT enforced during the pre-wrap
+            #     SPECULATIVE phase; once the ring wraps (or for short non-spec
+            #     decode) _plain_step enforces it. In practice gemma4 thinking
+            #     finishes well within the first sliding window, and the budget
+            #     also has upstream's prefill _step as a backstop for the first
+            #     token. Documented as a known gap rather than silently dropped.
+            # With no processors (penalty==1.0, no budget) this is an exact
+            # no-op — pre-/post-wrap output stays greedy-exact.
+            _all_procs = list(_MTP_LOGITS_PROCESSORS or [])
+            _block_procs = [
+                p for p in _all_procs if isinstance(p, RepetitionPenaltyProcessor)
+            ]
+            _plain_procs = [
+                p for p in _all_procs if not isinstance(p, RepetitionPenaltyProcessor)
+            ]
+            _seed = _MTP_TOKEN_HISTORY_SEED or []
+            # Running token history as a 1-D mx.array (processor contract).
+            # Seeded with the prompt ids + the first bonus (already yielded by
+            # the caller). Tracked whenever ANY processor is active.
+            if _all_procs:
+                _hist = mx.array(list(_seed) + [int(b)], dtype=token_dtype)
+            else:
+                _hist = None
+
+            def _apply_procs(procs, logits, hist):
+                # logits: (1, vocab). hist: 1-D mx.array of prior tokens.
+                # Mirrors upstream _step: run each processor in order.
+                for processor in procs:
+                    logits = processor(hist, logits)
+                return logits
+
             # Plain (non-speculative) single-token decode step used by the
             # post-wrap gate below. Omits return_hidden/return_shared_kv so
             # it runs at full plain-decode speed and bypasses the B1
-            # temporal-order patch (which keys on shared_kv_sink).
+            # temporal-order patch (which keys on shared_kv_sink). FIX 2:
+            # applies the FULL processor list (rep-penalty + thinking-budget +
+            # structured) against the running history — this is single-token so
+            # stateful processors are call==emit correct — then appends the
+            # sampled token so the next step's penalty is correct.
             def _plain_step(yarr):
+                nonlocal _hist
                 with mx.stream(_generation_stream):
                     logits = lm(yarr, cache=prompt_cache).logits
-                    return sampler(logits)
+                    if _all_procs:
+                        # logits here is (1, 1, vocab) — squeeze the time axis
+                        # to (1, vocab) for the processor contract, then sample.
+                        li = _apply_procs(_all_procs, logits[:, -1, :], _hist)
+                        y = sampler(li)
+                    else:
+                        y = sampler(logits)
+                if _all_procs:
+                    _hist = mx.concat([_hist, y.reshape(-1).astype(token_dtype)])
+                return y
 
             while emitted < max_tokens:
                 # PERF: dynamic wrap gate. Once the RotatingKVCache ring has
@@ -612,13 +691,60 @@ def _install_mtp_wrap_patches() -> bool:
                         return_shared_kv=True,
                     )
                     hidden_full = verify_out.hidden_states[-1]
-                    target_tokens = sampler(verify_out.logits)
+                    if _block_procs:
+                        # FIX 2 (block-aware repetition penalty): verify_out.logits
+                        # is (1, bs, vocab) — position i predicts the token
+                        # following the prefix [b, draft_0..draft_{i-1}]. Apply
+                        # the (stateless) rep-penalty processor per-position with
+                        # the CORRECT cumulative token history so the target's
+                        # greedy/sampled choice is repetition-penalised exactly as
+                        # plain decode would be. Accepting a draft iff it equals
+                        # the penalised target then keeps the emitted stream equal
+                        # to penalised greedy decode (exact for temp==0; for temp>0
+                        # it follows the same naive-equality scheme already used
+                        # upstream). Stateful processors (thinking-budget, FSM) are
+                        # intentionally NOT applied here — see _plain_procs note.
+                        vl = verify_out.logits
+                        _bs = int(vl.shape[1])
+                        # Draft tokens proposed for positions 1..bs-1 (position 0
+                        # is conditioned only on [b]). Materialise once for the
+                        # prefix-history build.
+                        _draft_list = draft_tokens.reshape(-1).tolist()
+                        _per_pos = []
+                        _pos_hist = _hist
+                        for i in range(_bs):
+                            li = _apply_procs(_block_procs, vl[:, i, :], _pos_hist)
+                            _per_pos.append(sampler(li))
+                            # Extend history with the DRAFT token at position i
+                            # for the NEXT position's penalty context (mirrors the
+                            # autoregressive prefix the target attends to). The
+                            # walk below decides which of these are actually kept.
+                            if i < len(_draft_list):
+                                _pos_hist = mx.concat([
+                                    _pos_hist,
+                                    mx.array([int(_draft_list[i])], dtype=token_dtype),
+                                ])
+                        target_tokens = mx.stack(
+                            [t.reshape(-1) for t in _per_pos], axis=1
+                        )
+                    else:
+                        target_tokens = sampler(verify_out.logits)
                 mx.async_eval(target_tokens, hidden_full)
 
                 accepted, new_tokens = _speculative_walk(
                     draft_tokens, target_tokens, max_tokens - emitted
                 )
                 draft_model.accept_lens.append(accepted)
+                # FIX 2: extend the running token history with the tokens
+                # ACTUALLY emitted this block so subsequent positions/steps see
+                # the correct repetition context. new_tokens = accepted drafts +
+                # one target bonus (see _speculative_walk). Tracked whenever ANY
+                # processor is active (the plain path past the wrap reads _hist).
+                if _all_procs and new_tokens:
+                    _hist = mx.concat([
+                        _hist,
+                        mx.array(new_tokens, dtype=token_dtype),
+                    ])
 
                 try:
                     for tok in new_tokens:
@@ -2399,6 +2525,7 @@ class MLXEngine:
             logits_processors=logits_processors,
             session_id=session_id,
             total_prompt_tokens=total_prompt_tokens,
+            response_format=response_format,
         )
 
         # Configurable progress log interval (tokens between INFO snapshots)
@@ -2415,72 +2542,86 @@ class MLXEngine:
         # cost ~30 tps at high TPS on the VLM speculative-decoding hot path.
         _drafter_finalize = getattr(self, "_pending_drafter_finalize", None)
         self._pending_drafter_finalize = None
-        for resp in gen_iter:
-            if cancel_event is not None and cancel_event.is_set():
-                # Report last token state when cancelled so we can see
-                # where generation was when the client disconnected.
-                tail = ("".join(text_parts))[-200:].replace('\n', '\\n')
-                _logger.info(
-                    f"[Generate] session={session_id} | CANCELLED at token {gen_token_count} | "
-                    f"last_tps={last_gen_tps:.1f} | tail={tail!r}"
+        global _MTP_LOGITS_PROCESSORS, _MTP_TOKEN_HISTORY_SEED
+        try:
+            for resp in gen_iter:
+                if cancel_event is not None and cancel_event.is_set():
+                    # Report last token state when cancelled so we can see
+                    # where generation was when the client disconnected.
+                    tail = ("".join(text_parts))[-200:].replace('\n', '\\n')
+                    _logger.info(
+                        f"[Generate] session={session_id} | CANCELLED at token {gen_token_count} | "
+                        f"last_tps={last_gen_tps:.1f} | tail={tail!r}"
+                    )
+                    cancelled = True
+                    break
+
+                gen_token_count += 1
+                text = resp.text if hasattr(resp, "text") else ""
+                tok_attr = getattr(resp, "token", None)
+                token = tok_attr if tok_attr is not None else 0
+                prompt_tps = getattr(resp, "prompt_tps", 0.0) or 0.0
+                gen_tps = getattr(resp, "generation_tps", 0.0) or 0.0
+
+                # PERF: append-to-list + post-loop join avoids the O(N^2)
+                # cost of repeated ``str += text`` (each += allocates a new
+                # string and copies the entire accumulated buffer).
+                text_parts.append(text)
+                # Track yielded token IDs so the post-loop update keeps
+                # cache_state.token_ids == full_prompt_token_ids + generated_token_ids
+                # on both paths. resp.token may be None on the synthetic terminal
+                # frame; in that case the token has already been counted earlier.
+                if tok_attr is not None:
+                    generated_token_ids.append(int(tok_attr))
+
+                if t_first_token is None:
+                    t_first_token = time.perf_counter()
+                    last_prompt_tps = prompt_tps
+                    _logger.info(
+                        f"[Generate] TTFT={round((t_first_token - t_gen_start)*1000)}ms"
+                    )
+
+                # PERF: guard the per-token DEBUG f-string so it's not built
+                # unless DEBUG logging is actually enabled. The default --verbose
+                # off case skips the f-string entirely.
+                if _debug_enabled:
+                    _logger.debug(
+                        f"[Token] session={session_id} | n={gen_token_count} id={token} text={text!r}"
+                    )
+
+                # Periodic INFO snapshot (every 50 tokens) so we can see progress
+                # when verbose is off
+                if gen_token_count % progress_interval == 0:
+                    tail = ("".join(text_parts[-40:]))[-120:].replace('\n', '\\n')
+                    _logger.info(
+                        f"[Generate] session={session_id} | "
+                        f"tokens={gen_token_count} | tps={gen_tps:.1f} | "
+                        f"tail={tail!r}"
+                    )
+
+                last_gen_tps = gen_tps
+
+                yield GenerationResult(
+                    text=text,
+                    token=token,
+                    prompt_tokens=total_prompt_tokens,
+                    completion_tokens=gen_token_count,
+                    prompt_tps=prompt_tps,
+                    generation_tps=gen_tps,
                 )
-                cancelled = True
-                break
 
-            gen_token_count += 1
-            text = resp.text if hasattr(resp, "text") else ""
-            tok_attr = getattr(resp, "token", None)
-            token = tok_attr if tok_attr is not None else 0
-            prompt_tps = getattr(resp, "prompt_tps", 0.0) or 0.0
-            gen_tps = getattr(resp, "generation_tps", 0.0) or 0.0
-
-            # PERF: append-to-list + post-loop join avoids the O(N^2)
-            # cost of repeated ``str += text`` (each += allocates a new
-            # string and copies the entire accumulated buffer).
-            text_parts.append(text)
-            # Track yielded token IDs so the post-loop update keeps
-            # cache_state.token_ids == full_prompt_token_ids + generated_token_ids
-            # on both paths. resp.token may be None on the synthetic terminal
-            # frame; in that case the token has already been counted earlier.
-            if tok_attr is not None:
-                generated_token_ids.append(int(tok_attr))
-
-            if t_first_token is None:
-                t_first_token = time.perf_counter()
-                last_prompt_tps = prompt_tps
-                _logger.info(
-                    f"[Generate] TTFT={round((t_first_token - t_gen_start)*1000)}ms"
-                )
-
-            # PERF: guard the per-token DEBUG f-string so it's not built
-            # unless DEBUG logging is actually enabled. The default --verbose
-            # off case skips the f-string entirely.
-            if _debug_enabled:
-                _logger.debug(
-                    f"[Token] session={session_id} | n={gen_token_count} id={token} text={text!r}"
-                )
-
-            # Periodic INFO snapshot (every 50 tokens) so we can see progress
-            # when verbose is off
-            if gen_token_count % progress_interval == 0:
-                tail = ("".join(text_parts[-40:]))[-120:].replace('\n', '\\n')
-                _logger.info(
-                    f"[Generate] session={session_id} | "
-                    f"tokens={gen_token_count} | tps={gen_tps:.1f} | "
-                    f"tail={tail!r}"
-                )
-
-            last_gen_tps = gen_tps
-
-            yield GenerationResult(
-                text=text,
-                token=token,
-                prompt_tokens=total_prompt_tokens,
-                completion_tokens=gen_token_count,
-                prompt_tps=prompt_tps,
-                generation_tps=gen_tps,
-            )
-
+        finally:
+            # CORRECTION 4: clear the per-request MTP stash once the stream
+            # is fully driven — on normal completion, the cancel/EOS break
+            # ABOVE, AND any exception / GeneratorExit propagating through a
+            # yield inside the loop. Otherwise the drafter path leaves the
+            # logits-processor instances + the FULL prompt token history
+            # stashed on module globals across requests (stale-state /
+            # memory / privacy risk) until the next drafter request
+            # overwrites them. Single-worker assumption holds (one in-flight
+            # VLM request at a time).
+            _MTP_LOGITS_PROCESSORS = None
+            _MTP_TOKEN_HISTORY_SEED = None
         # PERF: single join at end of loop — replaces O(N^2) accumulation.
         accumulated_text = "".join(text_parts)
         # PERF: drafter-stats finalize (post-stream, exactly once). Captures
@@ -2688,6 +2829,7 @@ class MLXEngine:
         logits_processors,
         session_id,
         total_prompt_tokens,
+        response_format=None,
     ):
         """Backend dispatcher. Returns `(gen_iter, prompt_cache_or_none)`.
 
@@ -2716,6 +2858,7 @@ class MLXEngine:
                     logits_processors=logits_processors,
                     session_id=session_id,
                     total_prompt_tokens=total_prompt_tokens,
+                    response_format=response_format,
                 ),
                 None,
             )
@@ -2740,6 +2883,7 @@ class MLXEngine:
         logits_processors,
         session_id,
         total_prompt_tokens,
+        response_format=None,
     ):
         """mlx-vlm streaming path. Mutates `cache_state` in place.
 
@@ -2779,6 +2923,25 @@ class MLXEngine:
             logits_processors=logits_processors if logits_processors else None,
         )
         drafter = getattr(self, "_drafter", None)
+        # CORRECTION 3: structured output (response_format) requires the
+        # FSM/structured-output logits processor to advance EXACTLY one token
+        # per step. Speculative MTP decoding samples a BLOCK of positions at
+        # once and the clone only applies stateless rep-penalty to the
+        # speculative block (stateful FSM processors run only in the post-wrap
+        # _plain_step), so pre-wrap speculative tokens would bypass the
+        # constraint and a later _plain_step would see stale FSM state → the
+        # structured schema could be violated. Simplest safe fix: DISABLE the
+        # drafter for the whole request so generation uses the plain path where
+        # the FSM processor (already in logits_processors) is applied correctly
+        # on every token.
+        if response_format is not None and drafter is not None:
+            logger.info(
+                f"[Drafter] session={session_id} disabled: response_format="
+                f"{getattr(response_format, 'type', response_format)!r} "
+                f"(structured output requires single-step FSM advance; "
+                f"speculative decoding is incompatible)"
+            )
+            drafter = None
         # Layer-A safety net (SUPERSEDED by the B4 RoPE-frame fix): for a
         # request whose cache is ALREADY wrapped at the start (e.g. turn 3+
         # of a long chat, offset > sliding_window), this used to bypass the
@@ -2817,9 +2980,26 @@ class MLXEngine:
             and win > 0
             and (cur_offset + len(prompt_token_ids or []) + int(max_tokens or 0)) >= win
         )
-        global _HOT_PATH_FAST
+        global _HOT_PATH_FAST, _MTP_LOGITS_PROCESSORS, _MTP_TOKEN_HISTORY_SEED
         _HOT_PATH_FAST = not wrap_possible
+        # FIX 2: stash the per-request logits_processors + prompt-token-history
+        # seed so the MTP clone (_patched_mtp_rounds_v2) can apply them — the
+        # clone is the active decode path and upstream calls it with a BARE
+        # sampler. Only meaningful on the drafter (MTP) path; cleared after the
+        # stream is built on the non-drafter path. Single-worker safe (same
+        # contract as _HOT_PATH_FAST). The seed is the FULL prompt so the
+        # rep-penalty context matches upstream generate_step (which accumulates
+        # the prompt tokens into its running ``tokens`` array during prefill).
         if drafter is not None:
+            _MTP_LOGITS_PROCESSORS = (
+                list(logits_processors) if logits_processors else None
+            )
+            # NOTE (codex risk #3 — INTENTIONAL): seed the rep-penalty history
+            # with the FULL logical prompt (incl. cache-hit prior turns), NOT
+            # upstream's suffix-trimmed tail. This is deliberate: it lets the
+            # repetition penalty see prior-turn tokens and suppress cross-turn
+            # repetition. Do NOT change to suffix-only.
+            _MTP_TOKEN_HISTORY_SEED = list(prompt_token_ids)
             gen_kwargs["draft_model"] = drafter
             gen_kwargs["draft_kind"] = getattr(self, "_draft_kind", None)
             if self.cfg.draft_block_size:
@@ -2828,6 +3008,9 @@ class MLXEngine:
             # log line below reports this request's stats only.
             if hasattr(drafter, "accept_lens"):
                 drafter.accept_lens = []
+        else:
+            _MTP_LOGITS_PROCESSORS = None
+            _MTP_TOKEN_HISTORY_SEED = None
 
         # F3: generation_stream is installed ONCE on the dedicated
         # _vlm_executor worker thread during engine __init__. Per-call

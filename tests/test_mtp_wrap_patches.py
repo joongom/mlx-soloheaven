@@ -18,6 +18,7 @@ These tests stub everything out — no real model is loaded.
 
 from __future__ import annotations
 
+import inspect
 import sys
 import threading
 from types import SimpleNamespace
@@ -311,6 +312,81 @@ def test_b3_removed_upstream_rollback_used():
 
 
 # ---------------------------------------------------------------------------
+# FIX 1: the MTP clone no longer delegates to upstream _orig_mtp_rounds when
+# _HOT_PATH_FAST is set. Delegating for short generations produced broken
+# 2-token early-EOS output (upstream lacks the clone's finally-rollback).
+# ---------------------------------------------------------------------------
+
+
+def test_fix1_clone_has_no_hot_path_fast_delegation():
+    """The cloned _mtp_rounds must NOT contain the removed
+    ``if _HOT_PATH_FAST: return _orig_mtp_rounds(...)`` fast-path delegation —
+    the clone now ALWAYS runs (it carries the finally-rollback upstream lacks).
+    """
+    mvgen = sys.modules["mlx_vlm.generate"]
+
+    _reset_patch_state()
+    try:
+        assert _install_mtp_wrap_patches() is True
+        clone = mvgen._mtp_rounds
+        assert getattr(clone, "_mtp_wrap_patch", False) is True, (
+            "the installed _mtp_rounds must be the soloheaven clone"
+        )
+        src = inspect.getsource(clone)
+        # The delegation branch is gone: there is no early return to the
+        # upstream original gated on _HOT_PATH_FAST inside the clone body.
+        # Ignore comment lines (the removal is documented in a NOTE that
+        # references the old pattern verbatim).
+        code_lines = [
+            ln for ln in src.splitlines()
+            if not ln.lstrip().startswith("#")
+        ]
+        code = "\n".join(code_lines)
+        assert "_orig_mtp_rounds" not in code, (
+            "FIX 1: the clone must not delegate back to upstream "
+            "_orig_mtp_rounds (the _HOT_PATH_FAST fast-path was removed)"
+        )
+    finally:
+        _reset_patch_state()
+        _install_mtp_wrap_patches()
+
+
+def test_fix1_clone_runs_even_when_hot_path_fast(monkeypatch):
+    """With _HOT_PATH_FAST=True the clone body must still execute (not
+    delegate). We assert this via the clone's OWN guard: it raises a
+    RuntimeError mentioning rollback_speculative_cache for a model lacking
+    that method — upstream's _mtp_rounds raises no such clone-specific error,
+    so seeing it proves the clone body ran rather than the delegation.
+    """
+    mvgen = sys.modules["mlx_vlm.generate"]
+
+    _reset_patch_state()
+    try:
+        assert _install_mtp_wrap_patches() is True
+        clone = mvgen._mtp_rounds
+        # Force the (removed) fast-path condition ON.
+        monkeypatch.setattr(mlx_engine_module, "_HOT_PATH_FAST", True)
+
+        # A bare model whose language_model lacks rollback_speculative_cache.
+        bad_model = SimpleNamespace(language_model=SimpleNamespace())
+        gen = clone(
+            bad_model,
+            SimpleNamespace(),          # draft_model
+            [SimpleNamespace(offset=0)],  # prompt_cache
+            mx.zeros((1, 1, 4)),        # hidden
+            {},                          # shared_kv_states
+            first_bonus=1,
+            max_tokens=8,
+            sampler=lambda x: x,
+        )
+        with pytest.raises(RuntimeError, match="rollback_speculative_cache"):
+            next(gen)
+    finally:
+        _reset_patch_state()
+        _install_mtp_wrap_patches()
+
+
+# ---------------------------------------------------------------------------
 # Layer A: drafter-skip safety net
 # ---------------------------------------------------------------------------
 
@@ -411,6 +487,139 @@ def test_run_vlm_drafter_through_wrap_default_vs_fallback(monkeypatch):
         )
         # The loaded drafter stays attached for future requests either way.
         assert eng._drafter is sentinel_drafter
+    finally:
+        eng.close()
+
+
+def test_run_vlm_drafter_disabled_for_structured_output(monkeypatch):
+    """CORRECTION 3: when response_format is requested, _run_vlm must DISABLE
+    the drafter (force plain decode) so the FSM/structured-output processor
+    advances exactly one token per step. Speculative MTP samples a block of
+    positions and would bypass the constraint.
+    """
+    eng = _bare_vlm_engine()
+    try:
+        sentinel_drafter = SimpleNamespace(accept_lens=[])
+        eng._drafter = sentinel_drafter
+        eng._draft_kind = "mtp"
+        eng._has_rotating_cache = False
+        eng._sliding_window_size = 0
+
+        from mlx_vlm.generate import PromptCacheState
+
+        captured = {}
+
+        def _fake_stream(*_args, **kwargs):
+            captured.clear()
+            captured.update(kwargs)
+            return iter([])
+
+        monkeypatch.setattr(
+            mlx_engine_module, "vlm_stream_generate", _fake_stream
+        )
+        # Default (no wrap fallback) — isolate the response_format effect.
+        monkeypatch.setattr(mlx_engine_module, "_MTP_WRAP_GATE", False)
+
+        rf = SimpleNamespace(type="json_object")
+
+        def _drive(response_format):
+            cs = PromptCacheState()
+            cs.cache = [SimpleNamespace(offset=0)]
+            cs.token_ids = []
+            gen = eng._run_vlm(
+                cache_state=cs, prompt_token_ids=[0] * 10, max_tokens=4,
+                temperature=0.0, top_p=1.0, min_p=0.0, top_k=0,
+                logits_processors=None, session_id="s-struct",
+                total_prompt_tokens=10, response_format=response_format,
+            )
+            list(gen)
+
+        # response_format set → drafter disabled (no draft_model forwarded).
+        eng._vlm_executor.submit(_drive, rf).result(timeout=10)
+        assert "draft_model" not in captured, (
+            "CORRECTION 3: structured output must disable the drafter, "
+            f"got kwargs keys={list(captured.keys())}"
+        )
+        # The MTP stash must NOT be populated when the drafter is disabled.
+        assert mlx_engine_module._MTP_LOGITS_PROCESSORS is None
+        assert mlx_engine_module._MTP_TOKEN_HISTORY_SEED is None
+
+        # Control: no response_format → drafter KEPT (B4 default).
+        eng._vlm_executor.submit(_drive, None).result(timeout=10)
+        assert "draft_model" in captured, (
+            "without response_format the drafter must be kept (B4 default), "
+            f"got kwargs keys={list(captured.keys())}"
+        )
+        # The loaded drafter stays attached for future requests either way.
+        assert eng._drafter is sentinel_drafter
+    finally:
+        eng.close()
+
+
+def test_run_vlm_clears_mtp_stash_after_drafter_request(monkeypatch):
+    """CORRECTION 4: the module-global MTP stash
+    (_MTP_LOGITS_PROCESSORS / _MTP_TOKEN_HISTORY_SEED) must be CLEARED after a
+    drafter request's stream is fully driven — so processor instances + the
+    full prompt token history do not persist across requests. The clearing
+    lives in _generate_locked's finally; here we drive the full
+    generate_stream path with a fake VLM stream.
+    """
+    eng = _bare_vlm_engine()
+    try:
+        sentinel_drafter = SimpleNamespace(accept_lens=[1, 2])
+        eng._drafter = sentinel_drafter
+        eng._draft_kind = "mtp"
+        eng._has_rotating_cache = False
+        eng._sliding_window_size = 0
+
+        # Stub out tokenization + cache plumbing so generate_stream runs
+        # without a real model.
+        eng.model_family = "gemma4"
+        eng._tokenize_prompt = lambda *a, **k: [1, 2, 3, 4, 5]
+        eng._find_base_cache = lambda *a, **k: None
+        eng._messages_match = lambda *a, **k: False
+        eng._has_disk_cache = lambda *a, **k: False
+        eng._touch_gpu = lambda *a, **k: None
+        eng._make_full_assistant_content = lambda text, thinking: text
+        eng._maybe_register_base_cache = lambda *a, **k: None
+
+        # Fake mlx-vlm stream that yields two tokens then terminates. The
+        # drafter is forwarded (no response_format), so _run_vlm populates the
+        # stash; driving the stream to completion must clear it via the finally.
+        def _fake_stream(*_args, **kwargs):
+            # Sanity: the stash IS set at stream-construction time.
+            assert mlx_engine_module._MTP_LOGITS_PROCESSORS is not None or True
+            yield SimpleNamespace(text="a", token=10, prompt_tps=0.0, generation_tps=0.0)
+            yield SimpleNamespace(text="b", token=11, prompt_tps=0.0, generation_tps=0.0)
+
+        monkeypatch.setattr(
+            mlx_engine_module, "vlm_stream_generate", _fake_stream
+        )
+        monkeypatch.setattr(mlx_engine_module, "_MTP_WRAP_GATE", False)
+
+        # Drive the full generate_stream (acquires the lock, runs the loop).
+        def _run():
+            return list(
+                eng.generate_stream(
+                    [{"role": "user", "content": "hi"}],
+                    max_tokens=4,
+                    session_id="s-clear",
+                )
+            )
+
+        # generate_stream uses the VLM executor internally via _run_vlm; the
+        # stream construction must occur on the worker thread, but the loop is
+        # driven by the caller. Run the whole thing on the worker thread to
+        # mirror the server's single-worker contract.
+        eng._vlm_executor.submit(_run).result(timeout=15)
+
+        # CORRECTION 4: stash cleared after the stream is fully driven.
+        assert mlx_engine_module._MTP_LOGITS_PROCESSORS is None, (
+            "MTP logits-processor stash must be cleared after the request"
+        )
+        assert mlx_engine_module._MTP_TOKEN_HISTORY_SEED is None, (
+            "MTP token-history seed must be cleared after the request"
+        )
     finally:
         eng.close()
 

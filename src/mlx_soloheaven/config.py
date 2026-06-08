@@ -16,7 +16,10 @@ class ModelConfig:
     default_top_p: float = 1.0
     default_min_p: float = 0.0
     default_top_k: int = 0
-    default_repetition_penalty: float = 1.0
+    # FIX 2: enabled by default (1.05) to suppress gemma4's long-session
+    # closing-paragraph repetition loop. Overridable via --repetition-penalty
+    # / REPETITION_PENALTY. 1.0 disables (RepetitionPenaltyProcessor no-op).
+    default_repetition_penalty: float = 1.05
     default_max_tokens: int = 32768
     thinking_budget: int = 8192
     enable_thinking: bool = True
@@ -69,7 +72,10 @@ class Config:
     default_top_p: float = 1.0
     default_min_p: float = 0.0
     default_top_k: int = 0
-    default_repetition_penalty: float = 1.0
+    # FIX 2: enabled by default (1.05) to suppress gemma4's long-session
+    # closing-paragraph repetition loop. Overridable via --repetition-penalty
+    # / REPETITION_PENALTY. 1.0 disables (RepetitionPenaltyProcessor no-op).
+    default_repetition_penalty: float = 1.05
     default_max_tokens: int = 32768
     thinking_budget: int = 8192
     enable_thinking: bool = True

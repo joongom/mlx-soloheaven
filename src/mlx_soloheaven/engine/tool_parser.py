@@ -402,6 +402,72 @@ def _parse_gemma4_tool_calls(text: str) -> tuple[str, list[dict]]:
     return content_text, tool_calls
 
 
+# Gemma 4 thinking-channel markers. The well-formed shape is
+# ``<|channel>thought\n...reasoning...<channel|>answer``; degenerate
+# multi-cycle / sliding-window outputs emit repeated or orphaned markers.
+_GEMMA4_CHANNEL_OPEN = "<|channel>"
+_GEMMA4_CHANNEL_CLOSE = "<channel|>"
+# Matches a full thought span, with or without the opening ``<|channel>`` tag
+# (the sliding-window variant drops it and starts straight at ``thought\n``).
+_GEMMA4_THOUGHT_SPAN_RE = re.compile(
+    r"(?:<\|channel>)?thought\n.*?<channel\|>\s*", re.DOTALL
+)
+
+
+def _gemma4_extract_content(text: str) -> tuple[Optional[str], str]:
+    """Strip ALL Gemma 4 thought channels and return ``(thinking, content)``.
+
+    Robust to degenerate multi-cycle output: removes every
+    ``[<|channel>]thought\\n...<channel|>`` span (not just the first), then
+    treats any remaining orphan ``<channel|>`` as a reasoning/answer boundary
+    (content is everything after the LAST orphan close), and finally drops
+    leftover orphan ``<|channel>`` / ``<channel|>`` markers. ``thinking`` is the
+    concatenation of the removed reasoning (best-effort, for inspection).
+    """
+    # 1. Capture + remove all well-formed thought spans.
+    thoughts: list[str] = []
+
+    def _grab(m: re.Match) -> str:
+        span = m.group(0)
+        # Strip the open/close markers + the leading ``thought\n`` for the
+        # captured reasoning text.
+        inner = span
+        if inner.startswith(_GEMMA4_CHANNEL_OPEN):
+            inner = inner[len(_GEMMA4_CHANNEL_OPEN):]
+        if inner.startswith("thought\n"):
+            inner = inner[len("thought\n"):]
+        close = inner.rfind(_GEMMA4_CHANNEL_CLOSE)
+        if close != -1:
+            inner = inner[:close]
+        t = inner.strip()
+        if t:
+            thoughts.append(t)
+        return ""
+
+    cleaned = _GEMMA4_THOUGHT_SPAN_RE.sub(_grab, text)
+
+    # 2. Any orphan ``<channel|>`` left (reasoning that never opened a proper
+    #    channel, or a final degenerate cycle) — split at the LAST one; the tail
+    #    is the real answer, the head is leftover reasoning.
+    last_close = cleaned.rfind(_GEMMA4_CHANNEL_CLOSE)
+    if last_close != -1:
+        head = cleaned[:last_close]
+        head_t = head.replace(_GEMMA4_CHANNEL_OPEN, "").replace(
+            _GEMMA4_CHANNEL_CLOSE, ""
+        ).strip()
+        if head_t:
+            thoughts.append(head_t)
+        cleaned = cleaned[last_close + len(_GEMMA4_CHANNEL_CLOSE):]
+
+    # 3. Drop any leftover orphan open markers (degenerate, no close at all).
+    cleaned = cleaned.replace(_GEMMA4_CHANNEL_OPEN, "").replace(
+        _GEMMA4_CHANNEL_CLOSE, ""
+    )
+
+    thinking = "\n".join(thoughts).strip() or None
+    return thinking, cleaned.strip()
+
+
 def split_thinking_and_content(text: str, model_family: str = "chatml") -> tuple[Optional[str], str]:
     """
     Split thinking from content in model output.
@@ -409,21 +475,10 @@ def split_thinking_and_content(text: str, model_family: str = "chatml") -> tuple
     Supports ChatML (<think>...</think>) and Gemma 4 (<|channel>thought...<channel|>).
     """
     if model_family == "gemma4":
-        # Gemma 4: <|channel>thought\n...<channel|>content
-        m = re.match(r"<\|channel>thought\n(.*?)<channel\|>\s*(.*)", text, re.DOTALL)
-        if m:
-            return m.group(1).strip(), m.group(2).strip()
-        # Sliding window fallback: model generates "thought\n..." without <|channel>
-        # when <|think|> is out of the sliding window (prompt > 1024 tokens)
-        m = re.match(r"thought\n(.*?)<channel\|>\s*(.*)", text, re.DOTALL)
-        if m:
-            return m.group(1).strip(), m.group(2).strip()
-        # Bare <channel|> split (no opening tag at all)
-        end_idx = text.find("<channel|>")
-        if end_idx != -1:
-            thinking = text[:end_idx].strip()
-            content = text[end_idx + len("<channel|>"):].strip()
-            return thinking, content
+        # Strengthened (FIX 3): handle ALL thought spans + orphan markers +
+        # degenerate multi-cycle/trailing reasoning, not just the first block.
+        if _GEMMA4_CHANNEL_OPEN in text or _GEMMA4_CHANNEL_CLOSE in text or text.startswith("thought\n"):
+            return _gemma4_extract_content(text)
         return None, text
 
     # ChatML: <think>...</think>
@@ -476,11 +531,14 @@ def strip_thinking_tags(messages: list[dict], model_family: str = "chatml") -> l
 
         if m.get("role") == "assistant" and m.get("content"):
             content = m["content"]
-            # Strip Gemma 4 thinking channels
-            cleaned = re.sub(r"<\|channel>thought\n.*?<channel\|>\s*", "", content, flags=re.DOTALL)
-            end_idx = cleaned.find("<channel|>")
-            if end_idx != -1:
-                cleaned = cleaned[end_idx + len("<channel|>"):].lstrip()
+            # Strip Gemma 4 thinking channels — strengthened (FIX 3) to remove
+            # ALL <|channel>thought...<channel|> spans + orphan markers +
+            # degenerate trailing reasoning (the old single-span re.sub +
+            # first-<channel|> split left repeated cycles to replay raw).
+            if _GEMMA4_CHANNEL_OPEN in content or _GEMMA4_CHANNEL_CLOSE in content or content.startswith("thought\n"):
+                _, cleaned = _gemma4_extract_content(content)
+            else:
+                cleaned = content
             # Strip ChatML thinking tags
             cleaned = re.sub(r"<think>.*?</think>\s*", "", cleaned, flags=re.DOTALL)
             end_idx = cleaned.find("</think>")

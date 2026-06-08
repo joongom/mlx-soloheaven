@@ -12,6 +12,8 @@ from mlx_soloheaven.engine.tool_parser import (
     _parse_gemma4_array,
     get_tool_markers,
     parse_tool_calls,
+    split_thinking_and_content,
+    strip_thinking_tags,
     try_extract_tool_name,
 )
 
@@ -279,3 +281,114 @@ def test_no_tool_call_gemma4():
     text, calls = parse_tool_calls("Hello there.", model_family="gemma4")
     assert text == "Hello there."
     assert calls == []
+
+
+# ---------- FIX 3: Gemma 4 thinking-channel stripping ----------
+
+
+def test_g4_split_single_wellformed():
+    """Baseline (must keep passing): one well-formed thought channel."""
+    t, c = split_thinking_and_content(
+        "<|channel>thought\nreasoning here<channel|>The answer.", "gemma4"
+    )
+    assert t == "reasoning here"
+    assert c == "The answer."
+
+
+def test_g4_split_multiple_channel_spans():
+    """FIX 3: ALL <|channel>thought...<channel|> spans removed, not just the
+    first. Interstitial content between cycles is preserved; no thinking text
+    or channel markers survive in the content."""
+    text = (
+        "<|channel>thought\nfirst think<channel|>partial"
+        "<|channel>thought\nsecond think<channel|>Final answer."
+    )
+    t, c = split_thinking_and_content(text, "gemma4")
+    assert "first think" not in c and "second think" not in c
+    assert "<|channel>" not in c and "<channel|>" not in c
+    assert c == "partialFinal answer."
+    assert t is not None and "first think" in t and "second think" in t
+
+
+def test_g4_split_orphan_close_marker():
+    """FIX 3: orphan <channel|> (reasoning that never opened a channel) splits
+    at the boundary — content is everything after the LAST close."""
+    t, c = split_thinking_and_content(
+        "leftover reasoning<channel|>real content", "gemma4"
+    )
+    assert c == "real content"
+    assert "<channel|>" not in c
+
+
+def test_g4_split_orphan_open_marker_dropped():
+    """FIX 3: orphan <|channel> with no close is degenerate — the bare marker
+    must be dropped from content (not replayed)."""
+    t, c = split_thinking_and_content(
+        "answer text <|channel> dangling open", "gemma4"
+    )
+    assert "<|channel>" not in c
+
+
+def test_g4_split_sliding_window_variant():
+    """FIX 3: sliding-window output drops the opening tag (starts at
+    'thought\\n') — still split at <channel|>."""
+    t, c = split_thinking_and_content(
+        "thought\nmy reasoning<channel|>sliding answer", "gemma4"
+    )
+    assert c == "sliding answer"
+    assert t == "my reasoning"
+
+
+def test_g4_split_no_markers_passthrough():
+    t, c = split_thinking_and_content("just plain content", "gemma4")
+    assert t is None
+    assert c == "just plain content"
+
+
+def test_g4_strip_thinking_tags_multiple_spans():
+    """FIX 3: strip_thinking_tags removes ALL channel spans from an assistant
+    turn so degenerate multi-cycle history does not replay raw."""
+    msgs = [
+        {
+            "role": "assistant",
+            "content": (
+                "<|channel>thought\nA<channel|>X"
+                "<|channel>thought\nB<channel|>Y"
+            ),
+        }
+    ]
+    out = strip_thinking_tags(msgs, model_family="gemma4")
+    assert out[0]["content"] == "XY"
+    assert "thought" not in out[0]["content"]
+    assert "channel" not in out[0]["content"]
+
+
+def test_g4_strip_thinking_tags_orphans_and_trailing():
+    """FIX 3: orphan markers + degenerate trailing reasoning are removed."""
+    msgs = [
+        {
+            "role": "assistant",
+            "content": "early answer<channel|>more reasoning<channel|>kept tail",
+        }
+    ]
+    out = strip_thinking_tags(msgs, model_family="gemma4")
+    assert out[0]["content"] == "kept tail"
+    assert "<channel|>" not in out[0]["content"]
+
+
+def test_g4_strip_thinking_tags_wellformed_unchanged_behavior():
+    """FIX 3: keep passing behavior for the well-formed single-block case."""
+    msgs = [
+        {
+            "role": "assistant",
+            "content": "<|channel>thought\nthinking<channel|>the reply",
+        }
+    ]
+    out = strip_thinking_tags(msgs, model_family="gemma4")
+    assert out[0]["content"] == "the reply"
+
+
+def test_g4_strip_thinking_tags_no_markers_untouched():
+    msgs = [{"role": "assistant", "content": "plain reply"}]
+    out = strip_thinking_tags(msgs, model_family="gemma4")
+    assert out[0]["content"] == "plain reply"

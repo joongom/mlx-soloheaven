@@ -71,6 +71,144 @@ def _get_engine(model: str) -> "MLXEngine":
     return _default_engine
 
 
+_GEMMA4_CHANNEL_CLOSE = "<channel|>"
+_GEMMA4_CHANNEL_OPEN = "<|channel>"
+
+
+# Thought-channel opener tokens. Gemma 4 emits the full ``<|channel>thought\n``
+# form; the sliding-window / degenerate variant drops the ``<|channel>`` tag
+# and starts straight at ``thought\n``. We must detect BOTH so a thought span
+# is re-entered no matter which form the model produces.
+_GEMMA4_THOUGHT_OPEN_FULL = _GEMMA4_CHANNEL_OPEN + "thought\n"  # "<|channel>thought\n"
+_GEMMA4_THOUGHT_OPEN_BARE = "thought\n"
+
+
+class _Gemma4ThinkingStripper:
+    """Streaming-safe Gemma 4 thinking-channel stripper (FIX 3).
+
+    Gemma 4 emits its reasoning as ``<|channel>thought\\n...<channel|>answer``
+    (and sliding-window/degenerate variants where the opening tag is missing).
+    Raw, these markers leaked into the OpenAI ``content`` deltas and replayed
+    into OpenCode's conversation history. This filter removes EVERY thought
+    span — including degenerate MULTI-CYCLE output such as
+    ``<|channel>thought\\nA<channel|>partial<|channel>thought\\nB<channel|>final``
+    where a new ``<|channel>thought`` opener appears AFTER visible content — and
+    emits only the post-``<channel|>`` answer of each cycle. This mirrors the
+    batch parser's "remove ALL spans" behavior (see
+    ``tool_parser._gemma4_extract_content``), incrementally.
+
+    State machine (CORRECTION 1 + 2):
+      * ``content`` — passing text through, while scanning for a NEW thought
+        opener (full or bare). A partial opener tail straddling a chunk
+        boundary is held back so a split marker never leaks.
+      * ``thought`` — suppressing reasoning, while scanning for the
+        ``<channel|>`` close. A partial close tail is held back likewise.
+
+    CORRECTION 2: the stream does NOT begin assumed-inside-thought. It starts
+    in ``content`` mode; we only enter ``thought`` upon actually seeing a
+    thought opener. So a gemma4 (thinking-enabled) request whose model answers
+    with NO channel markers passes straight through unstripped instead of being
+    dropped.
+
+    ``feed(text)`` returns the content-visible portion of ``text`` (possibly
+    empty while inside a thought channel or holding a partial marker).
+    ``flush()`` returns any safely-emittable remainder at stream end. For
+    non-gemma4 / thinking-disabled callers, construct with ``active=False`` and
+    ``feed`` is a pass-through.
+    """
+
+    def __init__(self, active: bool):
+        self.active = active
+        # CORRECTION 2: start in CONTENT mode, not thought mode. We only enter
+        # thought mode when an opener is actually observed, so a model that
+        # answers without channel markers is not dropped.
+        self._in_thought = False
+        self._pending = ""  # held-back possible-partial marker tail
+
+    @staticmethod
+    def _partial_marker_tail(buf: str, markers: tuple[str, ...]) -> int:
+        """Length of the suffix of ``buf`` that could begin ANY of ``markers``.
+
+        Returns the longest proper-prefix-of-a-marker that is a suffix of
+        ``buf`` (so a marker split across chunk boundaries is held, never
+        leaked). 0 if no marker could start in the tail.
+        """
+        best = 0
+        for marker in markers:
+            max_len = min(len(buf), len(marker) - 1)
+            for n in range(max_len, best, -1):
+                if buf.endswith(marker[:n]):
+                    best = n
+                    break
+        return best
+
+    def feed(self, text: str) -> str:
+        if not self.active:
+            return text
+        buf = self._pending + text
+        self._pending = ""
+        out_parts: list[str] = []
+
+        while buf:
+            if self._in_thought:
+                # Suppress reasoning until the <channel|> close.
+                idx = buf.find(_GEMMA4_CHANNEL_CLOSE)
+                if idx == -1:
+                    # No close yet — hold a possible partial close-marker tail,
+                    # drop the rest (thought text must never reach content).
+                    keep = self._partial_marker_tail(
+                        buf, (_GEMMA4_CHANNEL_CLOSE,)
+                    )
+                    self._pending = buf[len(buf) - keep:] if keep else ""
+                    buf = ""
+                    break
+                # Close found — leave thought mode; reprocess the post-close
+                # remainder as content (it may contain a NEW thought opener).
+                self._in_thought = False
+                buf = buf[idx + len(_GEMMA4_CHANNEL_CLOSE):]
+                continue
+
+            # CONTENT mode: scan for a NEW thought opener (full or bare).
+            full = buf.find(_GEMMA4_THOUGHT_OPEN_FULL)
+            bare = buf.find(_GEMMA4_THOUGHT_OPEN_BARE)
+            candidates = [i for i in (full, bare) if i != -1]
+            if not candidates:
+                # No opener — emit content, but hold a tail that could be the
+                # start of an opener split across the chunk boundary.
+                keep = self._partial_marker_tail(
+                    buf,
+                    (_GEMMA4_THOUGHT_OPEN_FULL, _GEMMA4_THOUGHT_OPEN_BARE),
+                )
+                if keep:
+                    out_parts.append(buf[:len(buf) - keep])
+                    self._pending = buf[len(buf) - keep:]
+                else:
+                    out_parts.append(buf)
+                buf = ""
+                break
+            idx = min(candidates)
+            # Emit content before the opener; enter thought mode and drop the
+            # opener tag itself (whichever variant matched at idx).
+            out_parts.append(buf[:idx])
+            self._in_thought = True
+            if buf.startswith(_GEMMA4_THOUGHT_OPEN_FULL, idx):
+                buf = buf[idx + len(_GEMMA4_THOUGHT_OPEN_FULL):]
+            else:
+                buf = buf[idx + len(_GEMMA4_THOUGHT_OPEN_BARE):]
+            continue
+
+        return "".join(out_parts)
+
+    def flush(self) -> str:
+        # At stream end: if still inside a thought channel, the held-back
+        # pending is thought-channel text — drop it (degenerate output that
+        # never closed). In content mode, a pending tail is a partial opener
+        # prefix that never completed; it is real content, so emit it.
+        out = "" if self._in_thought else self._pending
+        self._pending = ""
+        return out
+
+
 # --- POST /v1/chat/completions ---
 
 @router.post("/v1/chat/completions")
@@ -138,8 +276,12 @@ async def chat_completions(request: ChatCompletionRequest):
 
 def _sync_completion(request: ChatCompletionRequest, engine: "MLXEngine") -> ChatCompletionResponse:
     """Non-streaming completion."""
+    # FIX 3: pass model_family so Gemma 4 <|channel>thought...<channel|> spans
+    # in the INPUT history are actually stripped (the default "chatml" left
+    # them — and degenerate trailing reasoning — to replay raw into the prompt).
     messages = strip_thinking_tags(
-        [m.model_dump(exclude_none=True) for m in request.messages]
+        [m.model_dump(exclude_none=True) for m in request.messages],
+        model_family=engine.model_family,
     )
     tools = [t.model_dump() for t in request.tools] if request.tools else None
 
@@ -219,8 +361,12 @@ async def _stream_completion(
     engine: "MLXEngine",
 ) -> AsyncGenerator[str, None]:
     """Streaming SSE completion with tool call detection."""
+    # FIX 3: pass model_family so Gemma 4 thinking channels (incl. degenerate
+    # multi-cycle / trailing reasoning) are stripped from the INPUT history
+    # rather than replayed raw into the prompt.
     messages = strip_thinking_tags(
-        [m.model_dump(exclude_none=True) for m in request.messages]
+        [m.model_dump(exclude_none=True) for m in request.messages],
+        model_family=engine.model_family,
     )
     tools = [t.model_dump() for t in request.tools] if request.tools else None
     has_tools = bool(tools)
@@ -250,6 +396,16 @@ async def _stream_completion(
         rep_penalty = 1.0 + (fp + pp) * 0.25
 
     model_family = engine.model_family
+
+    # FIX 3: streaming-safe Gemma 4 thinking-channel stripper. Gemma 4 emits
+    # <|channel>thought...<channel|>answer; raw, those markers leaked into the
+    # OpenAI content deltas and replayed into OpenCode history. The stripper
+    # buffers until <channel|> and emits only the post-close answer. Active
+    # ONLY for gemma4 with thinking enabled; a pass-through otherwise (keeps
+    # non-gemma4 / thinking-disabled output byte-identical).
+    thinking_stripper = _Gemma4ThinkingStripper(
+        active=(enable_thinking and model_family == "gemma4")
+    )
 
     # Send opening <think> tag if thinking is enabled
     # Skip for Gemma 4 — it uses <|channel>thought...<channel|> natively
@@ -338,8 +494,21 @@ async def _stream_completion(
                 yield ": keepalive\n\n"
                 continue
 
+            # Keep acc_parts RAW (drives session-persistence split + disconnect
+            # tail). FIX 3: filter the OUTBOUND text through the thinking
+            # stripper so the Gemma 4 thought channel never reaches content
+            # deltas. visible_text == chunk_text for non-gemma4 / thinking-off.
             acc_parts.append(chunk_text)
             token_count += 1
+            visible_text = thinking_stripper.feed(chunk_text)
+            if not visible_text:
+                # Still inside the thought channel (or holding a partial close
+                # marker) — nothing to emit as content yet.
+                if finished:
+                    break
+                yield ": keepalive\n\n"
+                continue
+            chunk_text = visible_text
 
             if not has_tools:
                 # Plain content path — one delta chunk per batch.
@@ -464,6 +633,22 @@ async def _stream_completion(
             f"tail={tail!r}"
         )
         raise
+
+    # CORRECTION 2: flush the thinking stripper's held tail. In content mode a
+    # partial-opener prefix (e.g. a trailing "thought" that never completed
+    # into "thought\n") is held back as a possible split marker; at stream end
+    # it is real content and must be emitted, not dropped. (In thought mode the
+    # stripper returns "" — degenerate output that never closed the channel.)
+    flushed = thinking_stripper.flush()
+    if flushed:
+        if not has_tools:
+            chunk = _make_content_chunk(chunk_id, created, model, flushed)
+            yield f"data: {chunk}\n\n"
+        else:
+            # Route through the post-loop holdback flush below (the held tail
+            # cannot be a tool-start fragment — those are held in ``holdback``,
+            # not the stripper — so appending is safe).
+            holdback += flushed
 
     # Flush remaining holdback (only content path; tool_call active is handled below)
     if holdback and not tc_active:

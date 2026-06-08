@@ -164,7 +164,7 @@ Add drafter loading and pass through to `stream_generate`.
 
 **Pre-flight (orchestrator confirmed 2026-05-11)**
 - Drafter slug verified: `mlx-community/gemma-4-31B-it-assistant-bf16` (HTTP 200, `model_type=gemma4_assistant` → auto-detected `kind="mtp"`).
-- Local drafter path: `/Users/joongom/.lmstudio/models/mlx-community/gemma-4-31B-it-assistant-bf16` (928 MB, present).
+- Local drafter path: `~/.lmstudio/models/mlx-community/gemma-4-31B-it-assistant-bf16` (928 MB, present).
 - Target candidates on user disk: `lmstudio-community/gemma-4-31B-it-MLX-8bit` (used by existing `start_gemma4_31b.sh`) and `mlx-community/gemma-4-31b-8bit`.
 - Caveat (A1 risk): mlx-vlm MTP path has only been validated with bf16+bf16 upstream. The 8bit target × bf16 drafter combination is exploratory. Phase 2 wires both paths; the user-validation step will reveal whether 8bit target works. If it fails, fallback is documented in start-script comments.
 

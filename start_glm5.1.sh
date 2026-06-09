@@ -9,7 +9,8 @@ MODEL_PATH="$HOME/.lmstudio/models/mlx-community/GLM-5.1-MXFP4-Q8"
 cd "$(dirname "$0")"
 source .venv/bin/activate
 export SOLOHEAVEN_MODELS=""
-mlx-soloheaven --model "$MODEL_PATH" --memory-budget-gb 50 --gpu-keepalive --no-thinking --verbose "$@"
+# --thinking-budget/--repetition-penalty: anti-loop safety net (overridable via "$@")
+mlx-soloheaven --model "$MODEL_PATH" --memory-budget-gb 50 --gpu-keepalive --no-thinking --verbose --thinking-budget 4096 --repetition-penalty 1.1 "$@"
 # NOTE: --pld removed. Observed acceptance rate ~12% on casual/reasoning
 # workloads, which means PLD's verification overhead exceeds the gain.
 # Add --pld back if the workload is copy-heavy (code editing, RAG, tool

@@ -7,4 +7,5 @@ MODEL_PATH="${SOLOHEAVEN_397B_PATH:-$HOME/.lmstudio/models/mlx-community/Qwen3.5
 cd "$(dirname "$0")"
 source .venv/bin/activate
 export SOLOHEAVEN_MODELS=""
-mlx-soloheaven --model "$MODEL_PATH" --memory-budget-gb 50 --gpu-keepalive --verbose "$@"
+# --thinking-budget/--repetition-penalty: anti-loop safety net (overridable via "$@")
+mlx-soloheaven --model "$MODEL_PATH" --memory-budget-gb 50 --gpu-keepalive --verbose --thinking-budget 4096 --repetition-penalty 1.1 "$@"

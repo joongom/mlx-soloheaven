@@ -5,9 +5,10 @@
 # in the engine; per-request overrides still apply.
 cd "$(dirname "$0")"
 source .venv/bin/activate
+# --thinking-budget/--repetition-penalty: anti-loop safety net (overridable via "$@")
 mlx-soloheaven \
   --models \
     "$HOME/.lmstudio/models/mlx-community/Qwen3.5-122B-A10B-bf16" \
     "$HOME/.lmstudio/models/mlx-community/Qwen3-Coder-Next-8bit:no_think_tag" \
     "$HOME/.lmstudio/models/mlx-community/Qwen3.5-9B-bf16" \
-  --memory-budget-gb 200 --gpu-keepalive --verbose "$@"
+  --memory-budget-gb 200 --gpu-keepalive --verbose --thinking-budget 4096 --repetition-penalty 1.1 "$@"

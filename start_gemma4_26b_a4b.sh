@@ -16,6 +16,7 @@ source .venv/bin/activate
 export SOLOHEAVEN_MODELS=""
 
 
+# --thinking-budget/--repetition-penalty: anti-loop safety net (overridable via "$@")
 mlx-soloheaven \
   --model "$MODEL_PATH" \
   --memory-budget-gb 20 \
@@ -23,4 +24,6 @@ mlx-soloheaven \
   --temperature 1.0 \
   --top-k 64 \
   --top-p 0.95 \
+  --thinking-budget 4096 \
+  --repetition-penalty 1.1 \
   "$@"

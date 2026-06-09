@@ -12,6 +12,7 @@ MODEL_PATH="$HOME/.lmstudio/models/mlx-community/Qwen3.6-35B-A3B-8bit"
 cd "$(dirname "$0")"
 source .venv/bin/activate
 export SOLOHEAVEN_MODELS=""
+# --thinking-budget/--repetition-penalty: anti-loop safety net (overridable via "$@")
 mlx-soloheaven \
   --model "$MODEL_PATH" \
   --memory-budget-gb 20 \
@@ -22,4 +23,6 @@ mlx-soloheaven \
   --top-k 20 \
   --top-p 0.95 \
   --verbose \
+  --thinking-budget 4096 \
+  --repetition-penalty 1.1 \
   "$@"

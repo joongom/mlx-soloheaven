@@ -6,4 +6,5 @@ MODEL_PATH="$HOME/.lmstudio/models/lmstudio-community/MiniMax-M2.5-MLX-8bit"
 cd "$(dirname "$0")"
 source .venv/bin/activate
 export SOLOHEAVEN_MODELS=""
-mlx-soloheaven --model "$MODEL_PATH" --memory-budget-gb 50 --gpu-keepalive --verbose "$@"
+# --thinking-budget/--repetition-penalty: anti-loop safety net (overridable via "$@")
+mlx-soloheaven --model "$MODEL_PATH" --memory-budget-gb 50 --gpu-keepalive --verbose --thinking-budget 4096 --repetition-penalty 1.1 "$@"

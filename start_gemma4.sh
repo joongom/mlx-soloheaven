@@ -6,8 +6,9 @@
 # overrides still apply.
 cd "$(dirname "$0")"
 source .venv/bin/activate
+# --thinking-budget/--repetition-penalty: anti-loop safety net (overridable via "$@")
 mlx-soloheaven \
   --models \
     "$HOME/.lmstudio/models/mlx-community/gemma-4-31b-it-4bit" \
     "$HOME/.lmstudio/models/mlx-community/gemma-4-26b-a4b-it-mxfp8" \
-  --memory-budget-gb 100 --gpu-keepalive --verbose "$@"
+  --memory-budget-gb 100 --gpu-keepalive --verbose --thinking-budget 4096 --repetition-penalty 1.1 "$@"

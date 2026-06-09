@@ -21,6 +21,7 @@ DRAFT_ARGS=(--draft-model "$DRAFT_PATH" --draft-block-size 3)
 # --backend mlx-vlm: after the mlx-lm-default migration, MTP is an explicit
 #   mlx-vlm opt-in. Without this flag the new backend gate would load this
 #   (text) model via mlx-lm and the --draft-model guard would raise.
+# --thinking-budget/--repetition-penalty: anti-loop safety net (overridable via "$@")
 mlx-soloheaven \
   --model "$MODEL_PATH" \
   --backend mlx-vlm \
@@ -30,4 +31,6 @@ mlx-soloheaven \
   --temperature 1.0 \
   --top-k 64 \
   --top-p 0.95 \
+  --thinking-budget 4096 \
+  --repetition-penalty 1.1 \
   "$@"

@@ -16,7 +16,7 @@ SoloHeaven turns your Mac into a personal AI server with sub-second response tim
 - **Per-model thinking control** — Enable/disable `<think>` tags per model (e.g., `:no_think_tag` for non-reasoning models)
 - **Thinking budget control** — Configurable token limit for reasoning models, with per-request override
 - **Prompt Lookup Decoding (PLD)** — Optional draft-model-free speculative decoding for prompt-echo-heavy workloads (+37% on copy tasks)
-- **Speculative decoding (MTP)** — Gemma 4 multi-token-prediction drafter via mlx-vlm (`--draft-model`); ~2x decode, byte-identical output, with sliding-window wrap fixes
+- **Speculative decoding (MTP)** — Gemma 4 multi-token-prediction drafter via mlx-vlm (`--backend mlx-vlm --draft-model`); ~2x decode, byte-identical output, with sliding-window wrap fixes
 - **Separate-process engine (default)** — Generation runs in a child process on its main thread for ~+30% tok/s at temp>0 (the FastAPI parent holds no MLX); switch off with `--engine-mode inprocess`
 - **Structured output (`response_format`)** — OpenAI-compatible JSON mode and JSON Schema constraints via logits-level FSM masking (100% schema adherence, no prompt engineering)
 - **Prefill chunk tuning** — Configurable `prefill_step_size` for 1.3-1.5x long-prompt speedup
@@ -34,16 +34,21 @@ SoloHeaven turns your Mac into a personal AI server with sub-second response tim
 
 ## Supported Model Families
 
-SoloHeaven tries `mlx-vlm` first for any model whose `model_type` has a module in
-mlx-vlm, then falls back to `mlx-lm` for text-only architectures. This gives
-multimodal + text coverage from a single code path.
+With `--backend auto` (the default), SoloHeaven loads **pure-text models —
+including Gemma 4 — via `mlx-lm`**, and uses `mlx-vlm` only for genuinely
+multimodal configs (those carrying `vision_config`, `audio_config`, or
+`image_token_index`) or when you pass `--backend mlx-vlm` explicitly. This
+keeps text coverage on the faster mlx-lm path while preserving multimodal +
+opt-in MTP support through mlx-vlm. (`--backend mlx-lm` forces the text path
+even for multimodal configs; `--backend mlx-vlm` forces the vlm path and is
+required for the MTP `--draft-model` drafter.)
 
-| Model family | Backend | Cache structure | Notes |
+| Model family | Backend (`--backend auto`) | Cache structure | Notes |
 |--------------|---------|-----------------|-------|
-| **Gemma 4** (`gemma4`, e.g. 31B/26B-A4B/E4B) | mlx-vlm | 50 `RotatingKVCache` (sliding window=1024) + 10 `KVCache` (full attn) | Multimodal (text/vision/audio). Uses `<\|channel>thought\|...\|<channel\|>` for reasoning. VLM models automatically enable `mlx-vlm` native stream_generate. **MTP speculative decoding** supported (`--draft-model`, gemma4-only). Past 1024 cumulative tokens the sliding ring wraps — handled by append-only wrapped-cache reuse + the MTP B4 wrap fix (see notes below). |
-| **Qwen3.5 MoE** (`qwen3_5_moe`, e.g. 122B/397B) | mlx-vlm → falls through | `ArraysCache` (DeltaNet linear) + `KVCache` (full attn every 4th) | Uses ChatML. **PLD not applicable** — DeltaNet state is not trimmable. **MTP not applicable** (drafter is gemma4-only). Use `--kv-bits 0` (quantization won't help; only 2 KV heads per layer). No sliding window — cache prefix reuse stays valid across long chats. |
-| **Qwen3.6-27B** (`qwen3_5`, dense-hybrid) | mlx-vlm → falls through | `ArraysCache` (DeltaNet) + `KVCache` (full attn) | 64 layers: 48 Gated-DeltaNet + 16 full-attention, **no sliding window**. ChatML. **PLD not applicable** (DeltaNet ArraysCache not trimmable); **MTP not applicable** (gemma4-only). Dense → bandwidth-bound decode. |
-| **Qwen3.6-35B-A3B** (`qwen3_5_moe`, MoE) | mlx-vlm → falls through | `ArraysCache` (DeltaNet) + `KVCache` (full attn) | 40 layers, 256 experts / 8 active (~3B active), **no sliding window**. ChatML. **PLD not applicable**; **MTP not applicable** (gemma4-only). MoE → fast decode, structurally stable multi-turn TTFT (no wrap). |
+| **Gemma 4** (`gemma4`, e.g. 31B/26B-A4B/E4B) | mlx-lm (text); mlx-vlm only for multimodal configs or `--backend mlx-vlm` | 50 `RotatingKVCache` (sliding window=1024) + 10 `KVCache` (full attn) | Pure-text gemma4 loads via mlx-lm by default. Multimodal (text/vision/audio) configs route to mlx-vlm. Uses `<\|channel>thought\|...\|<channel\|>` for reasoning. **MTP speculative decoding** (`--draft-model`, gemma4-only) requires `--backend mlx-vlm`; on the default mlx-lm path use `--pld`. Past 1024 cumulative tokens the sliding ring wraps — handled by append-only wrapped-cache reuse + the MTP B4 wrap fix (see notes below). |
+| **Qwen3.5 MoE** (`qwen3_5_moe`, e.g. 122B/397B) | mlx-lm | `ArraysCache` (DeltaNet linear) + `KVCache` (full attn every 4th) | Uses ChatML. **PLD not applicable** — DeltaNet state is not trimmable. **MTP not applicable** (drafter is gemma4-only). Use `--kv-bits 0` (quantization won't help; only 2 KV heads per layer). No sliding window — cache prefix reuse stays valid across long chats. |
+| **Qwen3.6-27B** (`qwen3_5`, dense-hybrid) | mlx-lm | `ArraysCache` (DeltaNet) + `KVCache` (full attn) | 64 layers: 48 Gated-DeltaNet + 16 full-attention, **no sliding window**. ChatML. **PLD not applicable** (DeltaNet ArraysCache not trimmable); **MTP not applicable** (gemma4-only). Dense → bandwidth-bound decode. |
+| **Qwen3.6-35B-A3B** (`qwen3_5_moe`, MoE) | mlx-lm | `ArraysCache` (DeltaNet) + `KVCache` (full attn) | 40 layers, 256 experts / 8 active (~3B active), **no sliding window**. ChatML. **PLD not applicable**; **MTP not applicable** (gemma4-only). MoE → fast decode, structurally stable multi-turn TTFT (no wrap). |
 | **Qwen3-VL / Qwen3-Omni** | mlx-vlm | Varies per model | Vision/omni variants. |
 | **GLM-5.1 / DeepSeek-V3.2** (`glm_moe_dsa`, `deepseek_v32`) | mlx-lm | `CacheList(KVCache, KVCache)` per layer (MLA + DSA indexer) | **Multi-head Latent Attention (MLA)**: KV is pre-compressed to `kv_lora_rank=512` — cache is ~1/3 of typical. **PLD-capable** (CacheList is trimmable), but `--pld` is off by default here — acceptance was ~12% on casual/reasoning; add it back only for copy-heavy workloads. Use `--no-thinking` (keep `prefill-step-size` at the default `2048` — `8192` OOMs on >100K prompts). |
 | **GLM-4.5 / 4.7** (`glm4_moe`, `glm4_moe_lite`) | mlx-lm | `KVCache` or `RotatingKVCache` mix | ChatML-ish format with `<\|user\|>`/`<\|assistant\|>`. PLD compatible on pure-KVCache variants. |
@@ -358,6 +363,9 @@ Run `mlx-soloheaven --help` for all options:
 Options:
   --model, -m           Path to MLX model directory
   --models              Multiple models: 'path' or 'path:no_think_tag' (env: SOLOHEAVEN_MODELS, comma-separated)
+  --backend             {auto,mlx-lm,mlx-vlm} inference backend (default: auto;
+                        text -> mlx-lm, multimodal -> mlx-vlm). 'mlx-vlm' is
+                        REQUIRED for the MTP --draft-model drafter (env: SOLOHEAVEN_BACKEND)
   --host                Bind address (default: 0.0.0.0)
   --port, -p            Listen port (default: 8000)
   --temperature         Default sampling temperature (default: 0.6)
@@ -385,8 +393,10 @@ Streaming:
   --stream-coalesce-n   Max tokens batched per SSE frame (default: 4; <=1 disables coalescing)
   --stream-coalesce-ms  Max ms to hold a partial batch before flushing (default: 30)
 
-Speculative decoding (mlx-vlm drafter, Gemma 4):
-  --draft-model         Path to drafter MLX model directory (enables speculative decoding)
+Speculative decoding (mlx-vlm drafter, Gemma 4) — requires --backend mlx-vlm:
+  --draft-model         Path to drafter MLX model directory (enables MTP speculative
+                        decoding; requires --backend mlx-vlm. On the default mlx-lm
+                        backend use --pld instead)
   --draft-kind          Drafter kind: 'mtp' (Gemma 4) or 'dflash' (Qwen3); default: auto-detect
   --draft-block-size    Drafter block size (default: use drafter config)
 
@@ -480,9 +490,12 @@ Rule of thumb: Z > 30% is a net win; Z < 20% means PLD is hurting — disable fo
 
 In addition to PLD (which needs no draft model), SoloHeaven supports a real
 **draft-model speculative decoder** for **Gemma 4 only**, via mlx-vlm's
-multi-token-prediction (MTP) path. Enable it with `--draft-model <drafter>`
-(plus optional `--draft-block-size`); `--draft-kind` auto-detects as `mtp` for
-gemma4 assistant drafters.
+multi-token-prediction (MTP) path. Since the mlx-lm-first migration the MTP
+drafter is an **explicit mlx-vlm opt-in**: launch with `--backend mlx-vlm`
+(`--backend auto`/`mlx-lm` would otherwise load gemma4 text via mlx-lm, where
+the drafter is unavailable — use `--pld` there instead). Then enable it with
+`--draft-model <drafter>` (plus optional `--draft-block-size`); `--draft-kind`
+auto-detects as `mtp` for gemma4 assistant drafters.
 
 **Verified setup** (`start_gemma4_26b_a4b_mtp.sh`): an 8-bit assistant drafter
 (`guardiangate1775/gemma-4-26B-A4B-it-assistant-8bit`) with `--draft-block-size 3`,

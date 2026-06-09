@@ -4,12 +4,42 @@ import os
 from argparse import Namespace
 from dataclasses import dataclass, field
 
+# Valid inference backends. `--backend` argparse `choices` only validates a
+# value passed explicitly on the CLI — it does NOT validate the argparse
+# default, which here is sourced from the SOLOHEAVEN_BACKEND env var, nor any
+# value set programmatically. So a typo in SOLOHEAVEN_BACKEND would silently
+# flow through to the engine and behave like a forced backend. We validate
+# here (in __post_init__) so an invalid value fails LOUDLY at startup.
+_VALID_BACKENDS = frozenset({"auto", "mlx-lm", "mlx-vlm"})
+
+
+def _normalize_backend(backend: str) -> str:
+    """Lowercase and validate a backend value, raising loudly if invalid.
+
+    Returns the normalized (lowercased) value. Raises ``ValueError`` for any
+    value not in {auto, mlx-lm, mlx-vlm} — this is the single guard that
+    catches bad env (SOLOHEAVEN_BACKEND) or programmatic values that bypass
+    argparse `choices`.
+    """
+    normalized = (backend or "auto").lower()
+    if normalized not in _VALID_BACKENDS:
+        raise ValueError(
+            f"invalid backend {backend!r}; "
+            f"choose one of auto/mlx-lm/mlx-vlm"
+        )
+    return normalized
+
 
 @dataclass
 class ModelConfig:
     """Per-model configuration."""
     model_path: str
     alias: str = ""  # Short name for routing (e.g., "qwen3.5-122b")
+
+    # Inference backend: "auto" (text -> mlx-lm, multimodal -> mlx-vlm),
+    # "mlx-lm" (force text backend), or "mlx-vlm" (force mlx-vlm; required for
+    # the MTP --draft-model speculative stack). See MLXEngine.load_model gate.
+    backend: str = "auto"
 
     # Generation defaults (per-model override)
     default_temperature: float = 0.6
@@ -48,6 +78,12 @@ class ModelConfig:
     pld_num_draft_tokens: int = 10         # Max draft tokens per step
     pld_ngram_k: int = 3                   # N-gram size for matching
 
+    def __post_init__(self) -> None:
+        # Normalize + validate the backend so a bad env/programmatic value
+        # (which bypasses argparse `choices`) fails loudly here rather than
+        # silently behaving like a forced backend downstream.
+        self.backend = _normalize_backend(self.backend)
+
     @property
     def model_id(self) -> str:
         """Model ID derived from directory name."""
@@ -71,6 +107,11 @@ class Config:
     # MAIN thread for ~90 tok/s at temp>0). Process mode requires a single
     # --model (not --models).
     engine_mode: str = "process"
+
+    # Inference backend: "auto" (text -> mlx-lm, multimodal -> mlx-vlm),
+    # "mlx-lm" (force text backend), or "mlx-vlm" (force mlx-vlm; required for
+    # the MTP --draft-model speculative stack). See MLXEngine.load_model gate.
+    backend: str = "auto"
 
     # Generation defaults (used as fallback for models without override)
     default_temperature: float = 0.6
@@ -107,7 +148,10 @@ class Config:
     pld_num_draft_tokens: int = 10         # Max draft tokens per step
     pld_ngram_k: int = 3                   # N-gram size for matching
 
-    # Speculative decoding via mlx-vlm drafter (MTP / DFlash); mlx-vlm path only.
+    # Speculative decoding via the mlx-vlm drafter (MTP / DFlash). Requires the
+    # mlx-vlm backend: set `backend="mlx-vlm"` (CLI `--backend mlx-vlm`). After
+    # the mlx-lm-first migration the drafter is an explicit mlx-vlm opt-in; on
+    # the default mlx-lm backend use PLD (pld_enabled) for speculative decoding.
     draft_model: str | None = None
     draft_kind: str | None = None
     draft_block_size: int | None = None
@@ -133,6 +177,13 @@ class Config:
 
     # GPU
     gpu_keepalive: bool = False
+
+    def __post_init__(self) -> None:
+        # Normalize + validate the backend so a bad env/programmatic value
+        # (which bypasses argparse `choices`) fails loudly here rather than
+        # silently behaving like a forced backend downstream. ModelConfig
+        # validates its own `backend` field in its own __post_init__.
+        self.backend = _normalize_backend(self.backend)
 
     @property
     def cache_dir(self) -> str:
@@ -186,6 +237,7 @@ class Config:
                 models.append(ModelConfig(
                     model_path=path.strip(),
                     alias=alias.strip(),
+                    backend=getattr(args, "backend", "auto"),
                     # Unset sampling flags fall through to the dataclass default
                     # here AND leave cli_set_sampling empty for them, so each
                     # model's generation_config.json can fill them at load time.
@@ -202,6 +254,7 @@ class Config:
         elif args.model:
             models.append(ModelConfig(
                 model_path=args.model,
+                backend=getattr(args, "backend", "auto"),
                 **sampling_kwargs,
                 cli_set_sampling=cli_set_sampling,
                 default_repetition_penalty=args.repetition_penalty,
@@ -219,6 +272,7 @@ class Config:
             host=args.host,
             port=args.port,
             engine_mode=getattr(args, "engine_mode", "process"),
+            backend=getattr(args, "backend", "auto"),
             **sampling_kwargs,
             cli_set_sampling=cli_set_sampling,
             default_repetition_penalty=args.repetition_penalty,

@@ -1,11 +1,15 @@
 """
 MLX Engine — model loading and generation with KV cache reuse.
 
-mlx-vlm-first; mlx-lm legacy fallback for text-only model_types not in
-mlx-vlm's registry. The mlx-vlm path is the canonical (and drafter-ready)
-generation surface; the mlx-lm branch remains load-bearing for text-only
-model_types such as Qwen3.5/3.6 dense, MiniMax-M2.5, GLM-4.7, and GLM-5.1
-that mlx-vlm does not currently register under `mlx_vlm.models.<type>`.
+mlx-lm-first for text; mlx-vlm for multimodal or `--backend mlx-vlm`.
+TEXT models (incl. gemma4) load via mlx-lm by default; mlx-vlm is used
+only for genuinely multimodal models (vision/audio/image_token in
+config.json) or when the caller passes `--backend mlx-vlm` explicitly.
+The mlx-vlm path remains the canonical (and drafter-ready / MTP)
+generation surface — it is the only backend that supports the
+`--draft-model` speculative MTP/DFlash stack — and stays load-bearing
+for that opt-in. The backend gate lives in `load_model` and keys off
+`cfg.backend` ∈ {auto, mlx-lm, mlx-vlm} plus `_is_multimodal()`.
 
 Session-based KV cache management is built on mlx-vlm's PromptCacheState
 which does prefix-matching on token IDs:
@@ -1330,8 +1334,14 @@ class MLXEngine:
         # up referencing stream slots the inference thread cannot
         # resolve, raising `Stream(gpu, N) in current thread`. Pinning
         # load + inference to the same worker eliminates the hand-off.
+        #
+        # mlx-lm-first gate: TEXT models default to mlx-lm. mlx-vlm is used
+        # only for genuinely multimodal configs (auto) or an explicit
+        # `--backend mlx-vlm` opt-in (e.g. the MTP drafter stack). When a vlm
+        # backend is requested but the model_type isn't in mlx-vlm's registry,
+        # we warn and fall through to the mlx-lm branch below.
         self._use_vlm = False
-        vlm_supported = self._vlm_supports(self._model_type)
+        vlm_supported = self._select_backend(model_config)
         if vlm_supported:
             try:
                 def _vlm_load_on_worker():
@@ -1461,11 +1471,9 @@ class MLXEngine:
         if self.cfg.draft_model:
             if not self._use_vlm:
                 raise RuntimeError(
-                    f"--draft-model is not supported on the mlx-lm legacy "
-                    f"path (model_type={self._model_type!r}). Speculative "
-                    f"decoding (MTP / DFlash) requires the mlx-vlm backend; "
-                    f"this model_type is not in mlx-vlm's registry. Drop "
-                    f"--draft-model or pick an mlx-vlm-supported target."
+                    "MTP drafter (--draft-model) requires --backend mlx-vlm; "
+                    "on the default mlx-lm backend use --pld for speculative "
+                    f"decoding. (model_type={self._model_type!r})"
                 )
 
             def _load_drafter_on_worker():
@@ -1570,6 +1578,67 @@ class MLXEngine:
         return applied
 
     # --- Model detection helpers ---
+
+    def _select_backend(self, model_config: dict) -> bool:
+        """Decide whether load_model should load via mlx-vlm vs mlx-lm.
+
+        Single source of truth for the mlx-lm-first backend gate (PR1). TEXT
+        models default to mlx-lm; mlx-vlm is used only for genuinely
+        multimodal configs (`backend=auto`) or an explicit `--backend mlx-vlm`
+        opt-in (e.g. the MTP drafter stack). When a vlm backend is *requested*
+        (`want_vlm`) but the model_type isn't in mlx-vlm's registry, we warn
+        and report mlx-lm so the caller falls through to the mlx-lm branch.
+
+        Returns True iff load_model should load via mlx-vlm; False -> mlx-lm.
+
+        load_model and tests/test_backend_selection.py both call this method
+        so the gate decision is never duplicated.
+        """
+        backend = (getattr(self.cfg, "backend", "auto") or "auto").lower()
+        # Defense-in-depth: Config validates this at startup, but a programmatic
+        # cfg.backend that bypassed that path must NOT silently fall through as
+        # "not vlm" (which would behave like a forced mlx-lm). Fail loudly.
+        if backend not in ("auto", "mlx-lm", "mlx-vlm"):
+            raise ValueError(
+                f"invalid backend {backend!r}; "
+                f"choose one of auto/mlx-lm/mlx-vlm"
+            )
+        want_vlm = backend == "mlx-vlm" or (
+            backend == "auto" and self._is_multimodal(model_config)
+        )
+        vlm_supported = want_vlm and self._vlm_supports(self._model_type)
+        if want_vlm and not vlm_supported:
+            logger.warning(
+                f"[{self._model_type or 'unknown'}] backend={backend!r} requested "
+                f"mlx-vlm but model_type is not in mlx-vlm's registry — "
+                f"loading via mlx-lm instead."
+            )
+        return vlm_supported
+
+    @staticmethod
+    def _is_multimodal(model_config: dict) -> bool:
+        """True if config.json describes a genuinely multimodal model.
+
+        Used by the mlx-lm-first backend gate (`_select_backend`): under
+        `backend=auto`, only a multimodal config routes to mlx-vlm; pure-text
+        models (incl. gemma4) load via mlx-lm. A model is multimodal if it
+        carries a truthy value for any recognized multimodal marker:
+
+            - ``vision_config``      (image/vision tower present)
+            - ``audio_config``       (audio encoder present)
+            - ``image_token_index``  (multimodal placeholder token wired in)
+
+        These are the ONLY markers recognized today; new VLM/omni types must
+        be onboarded here deliberately (add the marker) so a config that lacks
+        all three keeps loading via mlx-lm by default.
+        """
+        if not isinstance(model_config, dict):
+            return False
+        return bool(
+            model_config.get("vision_config")
+            or model_config.get("audio_config")
+            or model_config.get("image_token_index")
+        )
 
     @staticmethod
     def _vlm_supports(model_type: str) -> bool:
@@ -3485,8 +3554,9 @@ class MLXEngine:
         # Drafter is only wired on the mlx-vlm path; fail loud if reached here.
         if getattr(self, "_drafter", None) is not None:
             raise RuntimeError(
-                "--draft-model not supported on mlx-lm legacy path; "
-                "this model_type has no mlx-vlm support yet"
+                "MTP drafter (--draft-model) requires --backend mlx-vlm; "
+                "on the default mlx-lm backend use --pld for speculative "
+                "decoding."
             )
         prompt_cache = cache_state.cache
         if prompt_cache is None:

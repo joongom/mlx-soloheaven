@@ -40,6 +40,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=int(_env("PORT", "8000")),
         help="Listen port (default: 8000)",
     )
+    p.add_argument(
+        "--backend",
+        choices=["auto", "mlx-lm", "mlx-vlm"],
+        default=_env("BACKEND", "auto"),
+        help="Inference backend: 'auto' (default; text models -> mlx-lm, "
+             "multimodal models -> mlx-vlm), 'mlx-lm' (force text backend), or "
+             "'mlx-vlm' (force the mlx-vlm backend; REQUIRED for the MTP "
+             "--draft-model speculative stack). (env: SOLOHEAVEN_BACKEND)",
+    )
     # Sampling defaults use a None sentinel (NOT a hardcoded number) so that an
     # UNSET flag is distinguishable from an explicitly-set one. None means
     # "fall through to the model's generation_config.json (then to the built-in
@@ -181,8 +190,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--draft-model",
         default=_env("DRAFT_MODEL"),
-        help="Path to drafter MLX model directory (enables speculative decoding; "
-             "env: SOLOHEAVEN_DRAFT_MODEL)",
+        help="Path to drafter MLX model directory (enables MTP/DFlash "
+             "speculative decoding). The MTP drafter requires "
+             "`--backend mlx-vlm`; on the default mlx-lm backend use --pld "
+             "instead. (env: SOLOHEAVEN_DRAFT_MODEL)",
     )
     p.add_argument(
         "--draft-kind",

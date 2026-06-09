@@ -18,8 +18,12 @@ export SOLOHEAVEN_MODELS=""
 # DRAFT_ARGS=()
 DRAFT_ARGS=(--draft-model "$DRAFT_PATH" --draft-block-size 3)
 
+# --backend mlx-vlm: after the mlx-lm-default migration, MTP is an explicit
+#   mlx-vlm opt-in. Without this flag the new backend gate would load this
+#   (text) model via mlx-lm and the --draft-model guard would raise.
 mlx-soloheaven \
   --model "$MODEL_PATH" \
+  --backend mlx-vlm \
   "${DRAFT_ARGS[@]}" \
   --memory-budget-gb 20 \
   --gpu-keepalive \

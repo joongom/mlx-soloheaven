@@ -120,6 +120,9 @@ def create_app(cfg: Config) -> FastAPI:
             stream_coalesce_n=cfg.stream_coalesce_n,
             stream_coalesce_ms=cfg.stream_coalesce_ms,
             engine_mode="process",
+            # Carry the backend selection so the child engine's load_model gate
+            # routes mlx-lm vs mlx-vlm correctly (else it defaults to "auto").
+            backend=mcfg.backend,
         )
         engines[mcfg.model_id] = EngineProcessProxy(model_cfg)  # type: ignore[assignment]
         logger.info(
@@ -178,6 +181,9 @@ def create_app(cfg: Config) -> FastAPI:
                 draft_model=cfg.draft_model,
                 draft_kind=cfg.draft_kind,
                 draft_block_size=cfg.draft_block_size,
+                # Carry the backend selection so each per-model engine's
+                # load_model gate routes mlx-lm vs mlx-vlm correctly.
+                backend=mcfg.backend,
             )
             engine = MLXEngine(model_cfg)
             engines[mcfg.model_id] = engine

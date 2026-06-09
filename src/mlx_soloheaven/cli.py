@@ -135,6 +135,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="On-disk KV cache budget in GB (default: 100)",
     )
     p.add_argument(
+        "--mlx-cache-limit-gb",
+        type=float,
+        default=float(_env("MLX_CACHE_LIMIT_GB", "4")),
+        help="Upper bound for MLX's Metal buffer-reuse pool in GB, applied at "
+             "startup via mx.set_cache_limit (default: 4). "
+             "(env: SOLOHEAVEN_MLX_CACHE_LIMIT_GB)",
+    )
+    p.add_argument(
         "--max-checkpoints",
         type=int,
         default=int(_env("MAX_CHECKPOINTS", "50")),

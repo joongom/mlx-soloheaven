@@ -181,6 +181,10 @@ async def cache_overview():
             "session_count": ov.get("session_count", 0),
             "base_caches": ov.get("base_caches", []),
             "cache_manager": ov.get("cache_manager", {}),
+            # Resident KV / MLX process memory vs the configured budget, so the
+            # OOM-causing active-session memory is visible (active-session LRU
+            # eviction bounds it to memory_budget_gb).
+            "memory": ov.get("memory", {}),
         }
         for df in ov.get("disk_files", []):
             result["disk_files"].append({

@@ -1206,6 +1206,14 @@ class MLXEngine:
         self._dirty_sessions: set[str] = set()
         self._dirty_lock = threading.Lock()
 
+        # Sessions with an in-flight generation. Such sessions MUST NOT be
+        # evicted (their KV cache is being mutated in place). Generations are
+        # serialized by the shared GPU lock, but a session can be marked busy
+        # while another concurrent caller (e.g. an admin RPC) inspects state,
+        # so guard with a dedicated lock.
+        self._busy_sessions: set[str] = set()
+        self._busy_lock = threading.Lock()
+
         # PERF: deferred drafter-stats finalize. Set by ``_run_vlm`` when a
         # drafter is active so the per-token generator wrapper can be
         # removed from the hot path. ``_run``'s post-loop block invokes
@@ -1233,9 +1241,16 @@ class MLXEngine:
             max_workers=1, thread_name_prefix="mlx-vlm-worker"
         )
         self._vlm_worker_ready_event = threading.Event()
+        # Identity of the single _vlm_executor worker thread. Recorded so that
+        # code already executing ON the worker (e.g. post-generation eviction
+        # driven inside generate_stream's finally) can detect re-entrancy and
+        # run inline instead of self-submitting + blocking on .result(), which
+        # would deadlock the only worker against itself. See _save_session_to_disk.
+        self._vlm_worker_ident: int | None = None
 
         def _vlm_worker_init():
             # Runs on the dedicated worker thread.
+            self._vlm_worker_ident = threading.get_ident()
             #
             # Install a worker-thread-local `generation_stream` on
             # `mlx_vlm.generate` and warm the per-thread slot. mlx-vlm
@@ -1501,6 +1516,20 @@ class MLXEngine:
             max_rec = mx.device_info()["max_recommended_working_set_size"]
             mx.set_wired_limit(max_rec)
             logger.debug(f"Metal wired limit set to {max_rec / 1e9:.1f}GB")
+
+            # Bound the Metal buffer-reuse pool. The plain decode path never
+            # clears this pool, so without a cap it can grow to tens of GB and
+            # OOM the Mac. set_cache_limit returns the PREVIOUS limit. Process-
+            # mode safe: runs in whichever process owns the model. Overridable
+            # via Config.mlx_cache_limit_gb (CLI --mlx-cache-limit-gb / env
+            # SOLOHEAVEN_MLX_CACHE_LIMIT_GB); <=0 disables the cap.
+            limit_gb = getattr(self.cfg, "mlx_cache_limit_gb", 4.0)
+            if limit_gb and limit_gb > 0 and hasattr(mx, "set_cache_limit"):
+                prev = mx.set_cache_limit(int(limit_gb * 1e9))
+                logger.info(
+                    f"Metal cache limit set to {limit_gb:.1f}GB "
+                    f"(was {prev / 1e9:.1f}GB)"
+                )
 
             # Patch wired_limit in mlx_vlm: keep synchronize but skip set/reset cycle.
             # The set/reset cycle degrades Metal TTFT on repeated calls.
@@ -1827,17 +1856,28 @@ class MLXEngine:
                 # thread's stream slot. Materialize + serialize inline.
                 _do_save()
             elif getattr(self, "_use_vlm", False) and getattr(self, "_vlm_executor", None) is not None:
-                try:
-                    fut = self._vlm_executor.submit(_do_save)
-                except RuntimeError:
-                    # Executor already shut down (can happen during
-                    # _flush_all_on_shutdown). Best-effort inline save.
+                if threading.get_ident() == getattr(self, "_vlm_worker_ident", None):
+                    # RE-ENTRANCY: we are ALREADY running on the single
+                    # _vlm_executor worker thread (e.g. post-generation eviction
+                    # driven inside generate_stream's finally, which is itself
+                    # invoked on the worker). Submitting to the same one-worker
+                    # pool and blocking on fut.result() would deadlock against
+                    # ourselves for the full 60s timeout. The cache tensors are
+                    # already bound to THIS thread's generation_stream, so just
+                    # materialize + serialize inline.
                     _do_save()
                 else:
-                    # Exceptions raised inside _do_save propagate out of
-                    # .result(), so the surrounding except still classifies
-                    # them (empty-array permanent skip vs unexpected re-raise).
-                    fut.result(timeout=60)
+                    try:
+                        fut = self._vlm_executor.submit(_do_save)
+                    except RuntimeError:
+                        # Executor already shut down (can happen during
+                        # _flush_all_on_shutdown). Best-effort inline save.
+                        _do_save()
+                    else:
+                        # Exceptions raised inside _do_save propagate out of
+                        # .result(), so the surrounding except still classifies
+                        # them (empty-array permanent skip vs unexpected re-raise).
+                        fut.result(timeout=60)
             else:
                 _do_save()
         except Exception as e:
@@ -1922,6 +1962,198 @@ class MLXEngine:
             logger.info(
                 f"[Disk LRU] evicted {deleted} files, freed {freed/1e9:.2f} GB "
                 f"(total now {total_size/1e9:.2f}/{budget_bytes/1e9:.2f} GB)"
+            )
+
+    # --- Active-session memory bounding (LRU eviction) ----------------------
+
+    def _session_cache_bytes(self, session: "SessionState") -> int:
+        """Estimate the resident KV bytes held by a single session."""
+        cache = session.cache_state.cache if session.cache_state else None
+        if cache is None:
+            return 0
+        return self.cache_manager._estimate_cache_size(cache)
+
+    def _active_sessions_memory_gb(self) -> float:
+        """Total resident KV memory (GB) across all in-memory sessions.
+
+        This is the number that memory_budget_gb is supposed to bound but did
+        NOT before: idle-flush saves dirty sessions to disk yet leaves their KV
+        caches resident in self._sessions, so without active eviction they
+        accumulate until the Mac OOMs.
+        """
+        return sum(
+            self._session_cache_bytes(s) for s in self._sessions.values()
+        ) / 1e9
+
+    def _mark_session_busy(self, session_id: str | None):
+        if not session_id:
+            return
+        lock = getattr(self, "_busy_lock", None)
+        busy = getattr(self, "_busy_sessions", None)
+        if lock is None or busy is None:
+            return
+        with lock:
+            busy.add(session_id)
+
+    def _unmark_session_busy(self, session_id: str | None):
+        if not session_id:
+            return
+        lock = getattr(self, "_busy_lock", None)
+        busy = getattr(self, "_busy_sessions", None)
+        if lock is None or busy is None:
+            return
+        with lock:
+            busy.discard(session_id)
+
+    def _evict_active_sessions_if_needed(self, protect_session_id: str | None = None):
+        """Best-effort bound on total resident KV memory toward memory_budget_gb.
+
+        Active per-session KV caches (self._sessions) are the dominant memory
+        consumer but were previously unbounded — only delete_session removed
+        them. This evicts the LEAST-RECENTLY-USED idle session when the active
+        KV total PLUS the separate LRU prefix-reuse pool exceeds the budget:
+        the session is persisted to disk (so its next request transparently
+        reloads it) and then dropped from self._sessions so MLX frees the
+        buffers.
+
+        Never evicts:
+          - a session with an in-flight generation (_busy_sessions),
+          - the just-used session (protect_session_id),
+          - the single most-recently-used session (always keep one resident).
+
+        The bound is BEST-EFFORT, not hard: because the protected/MRU/last
+        session is always preserved, the sweep can legitimately exit still over
+        budget when that one un-evictable session alone exceeds the budget. In
+        that case it logs a WARNING and admin status reports
+        ``budget_unmet=True`` (see status_dict's ``memory`` block) — the caller
+        should raise memory_budget_gb or use fewer concurrent long sessions.
+
+        Caller MUST hold ``self._lock`` (it persists caches + mutates
+        self._sessions, exactly like _flush_dirty_sessions).
+        """
+        # Defensive: a partially-constructed shell engine (e.g. unit tests that
+        # build via __new__ and only set cfg + _lock) has no session/cache
+        # machinery — there is nothing to evict.
+        if getattr(self, "_sessions", None) is None or getattr(self, "cache_manager", None) is None:
+            return
+
+        budget_gb = float(getattr(self.cfg, "memory_budget_gb", 0) or 0)
+        if budget_gb <= 0:
+            return
+
+        pool_gb = self.cache_manager._memory_usage_gb()
+
+        def _total_gb() -> float:
+            return self._active_sessions_memory_gb() + pool_gb
+
+        if _total_gb() <= budget_gb:
+            return
+
+        with self._busy_lock:
+            busy = set(self._busy_sessions)
+
+        # Candidates = evictable session IDs, LRU first (oldest last_used
+        # first). Hold IDs only (not the SessionState objects) so that once a
+        # session is popped from _sessions nothing in this sweep keeps a strong
+        # reference to its KV cache — otherwise mx.clear_cache() below could not
+        # free the buffers while this list is still alive.
+        candidate_ids = [
+            sid
+            for sid, _ in sorted(
+                self._sessions.items(), key=lambda kv: kv[1].last_used
+            )
+        ]
+        # The single most-recently-used session is always kept resident.
+        keep_mru = candidate_ids[-1] if candidate_ids else None
+
+        evicted = 0
+        freed_bytes = 0
+        for sid in candidate_ids:
+            if _total_gb() <= budget_gb:
+                break
+            # len() check after each eviction so we never drop the last one.
+            if len(self._sessions) <= 1:
+                break
+            if sid in busy:
+                continue
+            if protect_session_id and sid == protect_session_id:
+                continue
+            if sid == keep_mru:
+                continue
+
+            session = self._sessions.get(sid)
+            if session is None:
+                continue
+            sess_bytes = self._session_cache_bytes(session)
+            try:
+                # Persist so the next request for this session reloads it from
+                # disk (see _generate_locked / truncate / branch disk-cache
+                # consult paths). save returning False = permanently unsaveable
+                # cache (e.g. GLM empty arrays) — it would never round-trip, so
+                # there is nothing on disk to reload either way.
+                saved = self._save_session_to_disk(sid, session)
+                save_error: Exception | None = None
+            except Exception as e:  # noqa: BLE001
+                # TRANSIENT failure (timeout, unexpected error). Do NOT drop the
+                # session: dropping it here would lose the KV cache with no disk
+                # copy to reload from, forcing a full from-scratch rebuild on the
+                # client's next request. Keep it resident and skip this sweep.
+                saved = False
+                save_error = e
+
+            if save_error is not None:
+                logger.warning(
+                    f"[Active LRU] session={sid} | SAVE FAILED, keeping resident "
+                    f"(no durable copy — would be a lossy rebuild) | {save_error}"
+                )
+                continue
+
+            # Persist-then-reload is only durable when the save actually
+            # succeeded. A returning-False save is a PERMANENT unsaveable cache:
+            # there is no disk copy to reload, but the session can rebuild from
+            # its `messages`, so evicting it to reclaim RAM is acceptable. Any
+            # other failure was already handled (continue) above.
+            self._sessions.pop(sid, None)
+            with self._dirty_lock:
+                self._dirty_sessions.discard(sid)
+            evicted += 1
+            freed_bytes += sess_bytes
+            if not saved:
+                logger.warning(
+                    f"[Active LRU] session={sid} | evicted WITHOUT disk save "
+                    f"(cache not serializable) — will rebuild from messages"
+                )
+            # Drop our only remaining strong ref to the evicted session (and its
+            # KV cache) so the buffers are unreferenced before clear_cache().
+            session = None
+
+        # The loop variable can still pin the last-inspected (possibly evicted)
+        # session — drop it before asking MLX to release buffers.
+        session = None
+
+        if evicted:
+            # Encourage MLX to release the now-unreferenced Metal buffers.
+            try:
+                if hasattr(mx, "clear_cache"):
+                    mx.clear_cache()
+            except Exception:  # noqa: BLE001
+                pass
+            logger.info(
+                f"[Active LRU] evicted {evicted} idle session(s), "
+                f"freed ~{freed_bytes / 1e9:.2f} GB | "
+                f"active KV now {self._active_sessions_memory_gb():.2f} GB "
+                f"+ pool {pool_gb:.2f} GB / budget {budget_gb:.1f} GB"
+            )
+
+        # Best-effort, not a hard cap: the protected / MRU / last-remaining
+        # session is never evicted. If that un-evictable residue alone still
+        # exceeds the budget, surface it loudly rather than silently lying.
+        if _total_gb() > budget_gb:
+            logger.warning(
+                f"[Active LRU] still OVER budget after sweep: resident "
+                f"{_total_gb():.2f} GB > budget {budget_gb:.1f} GB "
+                f"(protected/MRU/last session is un-evictable) — "
+                f"raise memory_budget_gb or reduce concurrent long sessions"
             )
 
     def _mark_dirty(self, session_id: str):
@@ -2692,21 +2924,35 @@ class MLXEngine:
             wait_ms = (time.perf_counter() - t_wait) * 1000
             logger.debug(f"[Queue] session={sid} | lock acquired | waited={wait_ms:.0f}ms")
             yield GenerationResult(status="generating")
-            yield from self._generate_locked(
-                messages,
-                max_tokens=max_tokens if max_tokens is not None else self.cfg.default_max_tokens,
-                temperature=temperature if temperature is not None else self.cfg.default_temperature,
-                top_p=top_p if top_p is not None else self.cfg.default_top_p,
-                min_p=min_p if min_p is not None else self.cfg.default_min_p,
-                top_k=top_k if top_k is not None else self.cfg.default_top_k,
-                repetition_penalty=repetition_penalty if repetition_penalty is not None else self.cfg.default_repetition_penalty,
-                session_id=session_id,
-                tools=tools,
-                cancel_event=cancel_event,
-                thinking=thinking,
-                thinking_budget=thinking_budget,
-                response_format=response_format,
-            )
+            # Mark the session in-flight so the post-generation eviction sweep
+            # (and any concurrent admin inspection) never evicts a cache that is
+            # being mutated. Unmarked + eviction run in finally so cancellation
+            # / errors still clean up and bound memory.
+            self._mark_session_busy(sid)
+            try:
+                yield from self._generate_locked(
+                    messages,
+                    max_tokens=max_tokens if max_tokens is not None else self.cfg.default_max_tokens,
+                    temperature=temperature if temperature is not None else self.cfg.default_temperature,
+                    top_p=top_p if top_p is not None else self.cfg.default_top_p,
+                    min_p=min_p if min_p is not None else self.cfg.default_min_p,
+                    top_k=top_k if top_k is not None else self.cfg.default_top_k,
+                    repetition_penalty=repetition_penalty if repetition_penalty is not None else self.cfg.default_repetition_penalty,
+                    session_id=session_id,
+                    tools=tools,
+                    cancel_event=cancel_event,
+                    thinking=thinking,
+                    thinking_budget=thinking_budget,
+                    response_format=response_format,
+                )
+            finally:
+                # Clear busy BEFORE eviction so this session is a normal LRU
+                # candidate; protect_session_id keeps the just-used one resident.
+                self._unmark_session_busy(sid)
+                try:
+                    self._evict_active_sessions_if_needed(protect_session_id=sid)
+                except Exception as e:  # noqa: BLE001 — never break generation
+                    logger.error(f"[Active LRU] post-generation eviction failed: {e}")
 
     def _generate_locked(
         self,
@@ -3879,6 +4125,9 @@ class MLXEngine:
 
             self._mark_dirty(session_id)
 
+            # New resident cache added — keep total under memory_budget_gb.
+            self._evict_active_sessions_if_needed(protect_session_id=session_id)
+
             return {
                 "session_id": session_id,
                 "status": "ok",
@@ -4212,6 +4461,13 @@ class MLXEngine:
     def prepare_regenerate(self, session_id: str) -> dict:
         """Remove last assistant message and restore cache."""
         session = self._sessions.get(session_id)
+        # An active-LRU-evicted session is no longer in _sessions but persisted
+        # to disk — reload it transparently (mirrors truncate_session /
+        # branch_from_turn) before inspecting its messages.
+        if not session and self._has_disk_cache(session_id):
+            session = self._load_session_from_disk(session_id)
+            if session:
+                self._sessions[session_id] = session
         if not session or len(session.messages) < 2:
             return {"error": "nothing to regenerate"}
 
@@ -4276,6 +4532,9 @@ class MLXEngine:
                 pending_build_time=elapsed,
             )
             self._mark_dirty(session_id)
+
+            # New resident cache added — keep total under memory_budget_gb.
+            self._evict_active_sessions_if_needed(protect_session_id=session_id)
 
         logger.info(
             f"[Rebuild] session={session_id} | "
@@ -4358,6 +4617,69 @@ class MLXEngine:
                         "size_mb": round(fsize / 1e6, 1),
                     })
 
+        # MLX process memory (Metal): live tensor working set + buffer-reuse
+        # pool. These are the numbers that actually grow during an OOM, so
+        # surface them next to the budget the user configured.
+        try:
+            mx_active_gb = round(mx.get_active_memory() / 1e9, 2)
+        except Exception:  # noqa: BLE001
+            mx_active_gb = None
+        try:
+            mx_cache_gb = round(mx.get_cache_memory() / 1e9, 2)
+        except Exception:  # noqa: BLE001
+            mx_cache_gb = None
+
+        active_sessions_kv_gb = round(total_memory_bytes / 1e9, 2)
+        pool_kv_gb = round(self.cache_manager._memory_usage_gb(), 2)
+        budget_gb = float(getattr(self.cfg, "memory_budget_gb", 0) or 0)
+
+        total_kv_gb = round(active_sessions_kv_gb + pool_kv_gb, 2)
+        # The active-session LRU never evicts the protected / MRU / last-
+        # remaining session, so the budget is BEST-EFFORT, not a hard cap. When
+        # the lone un-evictable session alone exceeds the budget, the sweep
+        # cannot bring us under it. Estimate that residue (largest single active
+        # session KV + the always-present prefix pool) so admins can tell a
+        # transient overage that the next sweep will fix apart from a structural
+        # one that no eviction can fix.
+        try:
+            largest_session_gb = round(
+                max(
+                    (self._session_cache_bytes(s) for s in self._sessions.values()),
+                    default=0,
+                )
+                / 1e9,
+                2,
+            )
+        except Exception:  # noqa: BLE001
+            largest_session_gb = 0.0
+        irreducible_kv_gb = round(largest_session_gb + pool_kv_gb, 2)
+        over_budget = total_kv_gb > budget_gb if budget_gb > 0 else False
+        budget_unmet = over_budget and irreducible_kv_gb > budget_gb
+
+        memory = {
+            # Active per-session KV caches — the previously-unbounded consumer
+            # that memory_budget_gb now bounds via active-session LRU eviction.
+            "active_sessions_kv_gb": active_sessions_kv_gb,
+            # Separate LRU prefix-reuse pool (cache_manager.memory_caches).
+            "prefix_pool_kv_gb": pool_kv_gb,
+            # What the eviction sweep compares against the budget.
+            "total_kv_gb": total_kv_gb,
+            "budget_gb": budget_gb,
+            # memory_budget_gb is a BEST-EFFORT target, not a hard cap: the
+            # protected/MRU/last session is never evicted.
+            "budget_best_effort": True,
+            # Currently above the target (a sweep may still bring this down).
+            "over_budget": over_budget,
+            # The target CANNOT be met by eviction: the lone un-evictable
+            # session alone exceeds it. Admins should raise memory_budget_gb.
+            "budget_unmet": budget_unmet,
+            "irreducible_kv_gb": irreducible_kv_gb,
+            # MLX/Metal process memory.
+            "mx_active_gb": mx_active_gb,
+            "mx_cache_gb": mx_cache_gb,
+            "mlx_cache_limit_gb": float(getattr(self.cfg, "mlx_cache_limit_gb", 0) or 0),
+        }
+
         return {
             "model_id": self.model_id,
             "enable_thinking": self.cfg.enable_thinking,
@@ -4368,6 +4690,7 @@ class MLXEngine:
             "disk_files": disk_files,
             "memory_bytes": total_memory_bytes,
             "disk_bytes": total_disk_bytes,
+            "memory": memory,
             "cache_dir": cache_dir,
         }
 

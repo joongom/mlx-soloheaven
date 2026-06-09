@@ -104,6 +104,11 @@ def create_app(cfg: Config) -> FastAPI:
             enable_thinking=mcfg.enable_thinking,
             memory_budget_gb=cfg.memory_budget_gb,
             disk_budget_gb=cfg.disk_budget_gb,
+            # Carry the MLX Metal buffer-reuse pool cap; process mode is the
+            # default for a single --model, so without this the child engine
+            # silently falls back to the dataclass default and ignores
+            # --mlx-cache-limit-gb / SOLOHEAVEN_MLX_CACHE_LIMIT_GB.
+            mlx_cache_limit_gb=cfg.mlx_cache_limit_gb,
             data_dir=cfg.data_dir,
             verbose=cfg.verbose,
             gpu_keepalive=cfg.gpu_keepalive,
@@ -163,6 +168,10 @@ def create_app(cfg: Config) -> FastAPI:
                 enable_thinking=mcfg.enable_thinking,
                 memory_budget_gb=cfg.memory_budget_gb,
                 disk_budget_gb=cfg.disk_budget_gb,
+                # Carry the MLX Metal buffer-reuse pool cap so each per-model
+                # engine honours --mlx-cache-limit-gb instead of the dataclass
+                # default.
+                mlx_cache_limit_gb=cfg.mlx_cache_limit_gb,
                 data_dir=cfg.data_dir,
                 verbose=cfg.verbose,
                 gpu_keepalive=cfg.gpu_keepalive,

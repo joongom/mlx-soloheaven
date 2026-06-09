@@ -111,6 +111,30 @@ def test_vlm_path_routes_save_through_executor(tmp_path, patched_save):
     assert "sid-vlm" in eng._disk_session_ids
 
 
+def test_reentrant_worker_save_runs_inline_no_self_submit(tmp_path, patched_save):
+    """Re-entrancy guard: when _save_session_to_disk is ALREADY executing on the
+    single _vlm_executor worker thread (e.g. post-generation eviction driven
+    inside generate_stream's finally), it must run the save INLINE and never
+    submit back to the one-worker pool — doing so would deadlock against itself
+    until the 60s .result() timeout. We simulate by setting _vlm_worker_ident to
+    the CURRENT thread's ident; submit() would record a call (and a real pool
+    would block), so we assert submit was NOT used."""
+    import threading
+
+    ex = _RecordingExecutor()
+    eng = _make_engine(tmp_path, use_vlm=True, executor=ex)
+    # Pretend THIS thread is the dedicated worker.
+    eng._vlm_worker_ident = threading.get_ident()
+
+    ok = eng._save_session_to_disk("sid-reentrant", _make_session())
+
+    assert ok is True
+    assert ex.submit_calls == 0, "re-entrant worker save must NOT self-submit (deadlock)"
+    assert patched_save.save == 1, "save must still happen inline"
+    assert patched_save.eval == 1
+    assert "sid-reentrant" in eng._disk_session_ids
+
+
 def test_legacy_path_does_not_use_executor(tmp_path, patched_save):
     ex = _RecordingExecutor()
     eng = _make_engine(tmp_path, use_vlm=False, executor=ex)

@@ -170,6 +170,11 @@ class Config:
     memory_budget_gb: float = 200.0
     disk_budget_gb: float = 100.0
 
+    # Upper bound (GB) for MLX's Metal buffer-reuse pool, applied at startup via
+    # mx.set_cache_limit. The plain decode path never clears this pool, so it can
+    # grow to tens of GB and OOM the Mac. A few GB is plenty for buffer reuse.
+    mlx_cache_limit_gb: float = 4.0
+
     # Branching: max DeltaNet checkpoints per session (0=unlimited)
     max_checkpoints: int = 50
 
@@ -287,6 +292,7 @@ class Config:
             stream_coalesce_ms=args.stream_coalesce_ms,
             memory_budget_gb=args.memory_budget_gb,
             disk_budget_gb=args.disk_budget_gb,
+            mlx_cache_limit_gb=getattr(args, "mlx_cache_limit_gb", 4.0),
             max_checkpoints=args.max_checkpoints,
             data_dir=args.data_dir,
             verbose=args.verbose,

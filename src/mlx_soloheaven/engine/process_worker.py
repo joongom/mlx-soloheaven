@@ -202,7 +202,8 @@ def _cfg_snapshot(cfg) -> dict:
         "default_temperature", "default_top_p", "default_min_p", "default_top_k",
         "default_repetition_penalty", "default_max_tokens", "thinking_budget",
         "enable_thinking", "think_end_token", "think_start_token",
-        "memory_budget_gb", "disk_budget_gb", "cache_dir", "model_path",
+        "memory_budget_gb", "disk_budget_gb", "mlx_cache_limit_gb",
+        "cache_dir", "model_path",
     )
     return {f: getattr(cfg, f, None) for f in fields}
 

@@ -1,15 +1,20 @@
 """
 MLX Engine — model loading and generation with KV cache reuse.
 
-mlx-lm-first for text; mlx-vlm for multimodal or `--backend mlx-vlm`.
-TEXT models (incl. gemma4) load via mlx-lm by default; mlx-vlm is used
-only for genuinely multimodal models (vision/audio/image_token in
-config.json) or when the caller passes `--backend mlx-vlm` explicitly.
-The mlx-vlm path remains the canonical (and drafter-ready / MTP)
-generation surface — it is the only backend that supports the
-`--draft-model` speculative MTP/DFlash stack — and stays load-bearing
-for that opt-in. The backend gate lives in `load_model` and keys off
-`cfg.backend` ∈ {auto, mlx-lm, mlx-vlm} plus `_is_multimodal()`.
+mlx-lm-first for text; mlx-vlm for the MTP/vision opt-in or types mlx-lm
+cannot load. soloheaven is a TEXT-only server, so under `--backend auto`
+the choice is mlx-lm-first BY SUPPORT, NOT by multimodal-ness: a
+`vision_config`/`audio_config`/`image_token_index` in config.json does
+NOT force mlx-vlm. gemma4 (a VLM family whose config always carries
+`vision_config`) loads via mlx-lm because mlx-lm supports `gemma4` and
+its output is byte-identical to LM Studio's. mlx-vlm is used only when
+`--backend mlx-vlm` is passed explicitly, or (under auto) for a
+model_type that mlx-lm lacks. The mlx-vlm path remains the canonical
+(and drafter-ready / MTP) generation surface — it is the only backend
+that supports the `--draft-model` speculative MTP/DFlash stack — and
+stays load-bearing for that opt-in. The backend gate lives in
+`_select_backend` and keys off `cfg.backend` ∈ {auto, mlx-lm, mlx-vlm}
+plus `_mlx_lm_supports()` (auto fall-to-vlm only for unsupported types).
 
 Session-based KV cache management is built on mlx-vlm's PromptCacheState
 which does prefix-matching on token IDs:
@@ -1335,10 +1340,12 @@ class MLXEngine:
         # resolve, raising `Stream(gpu, N) in current thread`. Pinning
         # load + inference to the same worker eliminates the hand-off.
         #
-        # mlx-lm-first gate: TEXT models default to mlx-lm. mlx-vlm is used
-        # only for genuinely multimodal configs (auto) or an explicit
-        # `--backend mlx-vlm` opt-in (e.g. the MTP drafter stack). When a vlm
-        # backend is requested but the model_type isn't in mlx-vlm's registry,
+        # mlx-lm-first gate: under `auto`, route to mlx-lm whenever mlx-lm
+        # supports the model_type (gemma4 included — vision_config does NOT
+        # force vlm; soloheaven is text-only). mlx-vlm is used only for an
+        # explicit `--backend mlx-vlm` opt-in (e.g. the MTP drafter stack) or,
+        # under auto, for a model_type mlx-lm cannot load. When a vlm backend
+        # is requested/needed but the model_type isn't in mlx-vlm's registry,
         # we warn and fall through to the mlx-lm branch below.
         self._use_vlm = False
         vlm_supported = self._select_backend(model_config)
@@ -1582,17 +1589,32 @@ class MLXEngine:
     def _select_backend(self, model_config: dict) -> bool:
         """Decide whether load_model should load via mlx-vlm vs mlx-lm.
 
-        Single source of truth for the mlx-lm-first backend gate (PR1). TEXT
-        models default to mlx-lm; mlx-vlm is used only for genuinely
-        multimodal configs (`backend=auto`) or an explicit `--backend mlx-vlm`
-        opt-in (e.g. the MTP drafter stack). When a vlm backend is *requested*
-        (`want_vlm`) but the model_type isn't in mlx-vlm's registry, we warn
-        and report mlx-lm so the caller falls through to the mlx-lm branch.
+        Single source of truth for the mlx-lm-first backend gate (PR1). The
+        criterion under `backend=auto` is **mlx-lm-first BY SUPPORT, not by
+        multimodal-ness**: soloheaven is a TEXT-only server, so a config that
+        merely carries `vision_config`/`audio_config`/`image_token_index` does
+        NOT force mlx-vlm. (Gemma 4 is a VLM family whose config ALWAYS has
+        `vision_config`, yet `mlx_lm.load()` loads its text checkpoint and its
+        greedy output is byte-identical to LM Studio's — so it must route to
+        mlx-lm.) mlx-vlm is reserved for the MTP/vision opt-in (`--backend
+        mlx-vlm`) or for model types mlx-lm simply cannot load.
+
+        Decision:
+            backend ∈ {auto, mlx-lm, mlx-vlm} (already validated/lowercased).
+            if   backend == "mlx-vlm": want_vlm = True   (explicit opt-in)
+            elif backend == "mlx-lm":  want_vlm = False  (force mlx-lm)
+            else (auto):               want_vlm = not _mlx_lm_supports(type)
+        When a vlm backend is *requested* (`want_vlm`) but the model_type isn't
+        in mlx-vlm's registry, we warn and report mlx-lm so the caller falls
+        through to the mlx-lm branch.
 
         Returns True iff load_model should load via mlx-vlm; False -> mlx-lm.
 
         load_model and tests/test_backend_selection.py both call this method
         so the gate decision is never duplicated.
+
+        (`model_config` is retained for the INFO log / signature stability; it
+        no longer influences the choice — vision_config does not force vlm.)
         """
         backend = (getattr(self.cfg, "backend", "auto") or "auto").lower()
         # Defense-in-depth: Config validates this at startup, but a programmatic
@@ -1603,42 +1625,51 @@ class MLXEngine:
                 f"invalid backend {backend!r}; "
                 f"choose one of auto/mlx-lm/mlx-vlm"
             )
-        want_vlm = backend == "mlx-vlm" or (
-            backend == "auto" and self._is_multimodal(model_config)
-        )
+        if backend == "mlx-vlm":
+            want_vlm = True   # explicit opt-in: MTP / vision
+        elif backend == "mlx-lm":
+            want_vlm = False  # force mlx-lm
+        else:  # auto: mlx-lm-first; only fall to vlm for types mlx-lm lacks
+            want_vlm = not self._mlx_lm_supports(self._model_type)
         vlm_supported = want_vlm and self._vlm_supports(self._model_type)
         if want_vlm and not vlm_supported:
             logger.warning(
-                f"[{self._model_type or 'unknown'}] backend={backend!r} requested "
-                f"mlx-vlm but model_type is not in mlx-vlm's registry — "
+                f"[{self._model_type or 'unknown'}] backend={backend!r} "
+                f"requested/needed mlx-vlm but mlx-vlm lacks this model_type — "
                 f"loading via mlx-lm instead."
             )
         return vlm_supported
 
     @staticmethod
-    def _is_multimodal(model_config: dict) -> bool:
-        """True if config.json describes a genuinely multimodal model.
+    def _mlx_lm_supports(model_type: str) -> bool:
+        """Check if mlx-lm can load this model_type.
 
-        Used by the mlx-lm-first backend gate (`_select_backend`): under
-        `backend=auto`, only a multimodal config routes to mlx-vlm; pure-text
-        models (incl. gemma4) load via mlx-lm. A model is multimodal if it
-        carries a truthy value for any recognized multimodal marker:
+        Mirrors `_vlm_supports`, but probes the mlx-lm registry the way
+        `mlx_lm.utils._get_classes` resolves a model module: the raw
+        `model_type` is first run through `MODEL_REMAPPING` (e.g.
+        `mistral`->`llama`), then `mlx_lm.models.{resolved}` is imported. So
+        gemma4 -> `mlx_lm.models.gemma4`, mistral -> `mlx_lm.models.llama`,
+        etc. A type mlx-lm has no module for (after remapping) returns False
+        and, under `backend=auto`, falls through to the mlx-vlm path.
 
-            - ``vision_config``      (image/vision tower present)
-            - ``audio_config``       (audio encoder present)
-            - ``image_token_index``  (multimodal placeholder token wired in)
-
-        These are the ONLY markers recognized today; new VLM/omni types must
-        be onboarded here deliberately (add the marker) so a config that lacks
-        all three keeps loading via mlx-lm by default.
+        Done BEFORE loading any weights (analogous to `_vlm_supports`).
+        Defensive: returns False on ImportError / any resolution failure.
         """
-        if not isinstance(model_config, dict):
+        if not model_type:
             return False
-        return bool(
-            model_config.get("vision_config")
-            or model_config.get("audio_config")
-            or model_config.get("image_token_index")
-        )
+        try:
+            import importlib
+
+            try:
+                from mlx_lm.utils import MODEL_REMAPPING
+                resolved = MODEL_REMAPPING.get(model_type, model_type)
+            except ImportError:
+                # MODEL_REMAPPING absent in this mlx_lm build: probe raw type.
+                resolved = model_type
+            importlib.import_module(f"mlx_lm.models.{resolved}")
+            return True
+        except ImportError:
+            return False
 
     @staticmethod
     def _vlm_supports(model_type: str) -> bool:

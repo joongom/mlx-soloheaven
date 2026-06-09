@@ -34,18 +34,22 @@ SoloHeaven turns your Mac into a personal AI server with sub-second response tim
 
 ## Supported Model Families
 
-With `--backend auto` (the default), SoloHeaven loads **pure-text models —
-including Gemma 4 — via `mlx-lm`**, and uses `mlx-vlm` only for genuinely
-multimodal configs (those carrying `vision_config`, `audio_config`, or
-`image_token_index`) or when you pass `--backend mlx-vlm` explicitly. This
-keeps text coverage on the faster mlx-lm path while preserving multimodal +
-opt-in MTP support through mlx-vlm. (`--backend mlx-lm` forces the text path
-even for multimodal configs; `--backend mlx-vlm` forces the vlm path and is
-required for the MTP `--draft-model` drafter.)
+With `--backend auto` (the default), SoloHeaven is **mlx-lm-first by support,
+not by multimodal-ness**: it loads via `mlx-lm` whenever mlx-lm supports the
+model's `model_type`, and only falls back to `mlx-vlm` for model types mlx-lm
+cannot load (or when you pass `--backend mlx-vlm` explicitly). SoloHeaven is a
+TEXT-only server, so a `vision_config`/`audio_config`/`image_token_index` in
+config.json does **not** force mlx-vlm. **Gemma 4 is a VLM family whose config
+always carries `vision_config`, yet it loads via `mlx-lm`** — mlx-lm supports
+the `gemma4` type and its output is byte-identical to LM Studio's. This keeps
+text coverage on the faster mlx-lm path while preserving opt-in MTP/vision
+support through mlx-vlm. (`--backend mlx-lm` forces the mlx-lm path;
+`--backend mlx-vlm` forces the vlm path and is required for the MTP
+`--draft-model` drafter.)
 
 | Model family | Backend (`--backend auto`) | Cache structure | Notes |
 |--------------|---------|-----------------|-------|
-| **Gemma 4** (`gemma4`, e.g. 31B/26B-A4B/E4B) | mlx-lm (text); mlx-vlm only for multimodal configs or `--backend mlx-vlm` | 50 `RotatingKVCache` (sliding window=1024) + 10 `KVCache` (full attn) | Pure-text gemma4 loads via mlx-lm by default. Multimodal (text/vision/audio) configs route to mlx-vlm. Uses `<\|channel>thought\|...\|<channel\|>` for reasoning. **MTP speculative decoding** (`--draft-model`, gemma4-only) requires `--backend mlx-vlm`; on the default mlx-lm path use `--pld`. Past 1024 cumulative tokens the sliding ring wraps — handled by append-only wrapped-cache reuse + the MTP B4 wrap fix (see notes below). |
+| **Gemma 4** (`gemma4`, e.g. 31B/26B-A4B/E4B) | mlx-lm (mlx-lm supports `gemma4`); mlx-vlm only via `--backend mlx-vlm` | 50 `RotatingKVCache` (sliding window=1024) + 10 `KVCache` (full attn) | gemma4 loads via mlx-lm by default **even though its config always carries `vision_config`** — vision_config does NOT force mlx-vlm (text-only server; output byte-identical to LM Studio). Uses `<\|channel>thought\|...\|<channel\|>` for reasoning. **MTP speculative decoding** (`--draft-model`, gemma4-only) requires `--backend mlx-vlm`; on the default mlx-lm path use `--pld`. Past 1024 cumulative tokens the sliding ring wraps — handled by append-only wrapped-cache reuse + the MTP B4 wrap fix (see notes below). |
 | **Qwen3.5 MoE** (`qwen3_5_moe`, e.g. 122B/397B) | mlx-lm | `ArraysCache` (DeltaNet linear) + `KVCache` (full attn every 4th) | Uses ChatML. **PLD not applicable** — DeltaNet state is not trimmable. **MTP not applicable** (drafter is gemma4-only). Use `--kv-bits 0` (quantization won't help; only 2 KV heads per layer). No sliding window — cache prefix reuse stays valid across long chats. |
 | **Qwen3.6-27B** (`qwen3_5`, dense-hybrid) | mlx-lm | `ArraysCache` (DeltaNet) + `KVCache` (full attn) | 64 layers: 48 Gated-DeltaNet + 16 full-attention, **no sliding window**. ChatML. **PLD not applicable** (DeltaNet ArraysCache not trimmable); **MTP not applicable** (gemma4-only). Dense → bandwidth-bound decode. |
 | **Qwen3.6-35B-A3B** (`qwen3_5_moe`, MoE) | mlx-lm | `ArraysCache` (DeltaNet) + `KVCache` (full attn) | 40 layers, 256 experts / 8 active (~3B active), **no sliding window**. ChatML. **PLD not applicable**; **MTP not applicable** (gemma4-only). MoE → fast decode, structurally stable multi-turn TTFT (no wrap). |
@@ -364,8 +368,10 @@ Options:
   --model, -m           Path to MLX model directory
   --models              Multiple models: 'path' or 'path:no_think_tag' (env: SOLOHEAVEN_MODELS, comma-separated)
   --backend             {auto,mlx-lm,mlx-vlm} inference backend (default: auto;
-                        text -> mlx-lm, multimodal -> mlx-vlm). 'mlx-vlm' is
-                        REQUIRED for the MTP --draft-model drafter (env: SOLOHEAVEN_BACKEND)
+                        mlx-lm-first BY SUPPORT — mlx-lm whenever it supports
+                        the model_type, incl. gemma4; falls to mlx-vlm only for
+                        types mlx-lm cannot load). 'mlx-vlm' is REQUIRED for the
+                        MTP --draft-model drafter (env: SOLOHEAVEN_BACKEND)
   --host                Bind address (default: 0.0.0.0)
   --port, -p            Listen port (default: 8000)
   --temperature         Default sampling temperature (default: 0.6)

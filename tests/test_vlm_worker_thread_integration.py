@@ -289,6 +289,7 @@ def test_sliding_window_vlm_worker_thread_cache_reuse(tmp_path):
 
     cfg = Config(
         model_path=SLIDING_VLM_PATH,
+        backend="mlx-vlm",  # force the mlx-vlm worker path under test (auto now routes gemma3 -> mlx-lm)
         memory_budget_gb=8,
         disk_budget_gb=8,
         data_dir=str(tmp_path),
@@ -364,6 +365,7 @@ def test_sliding_window_vlm_eval_cache_disabled_smoke(tmp_path, monkeypatch):
 
     cfg = Config(
         model_path=SLIDING_VLM_PATH,
+        backend="mlx-vlm",  # force the mlx-vlm worker path under test (auto now routes gemma3 -> mlx-lm)
         memory_budget_gb=8,
         disk_budget_gb=8,
         data_dir=str(tmp_path),
@@ -438,6 +440,7 @@ def test_f3_persistent_worker_thread_three_consecutive_requests(tmp_path):
 
     cfg = Config(
         model_path=SLIDING_VLM_PATH,
+        backend="mlx-vlm",  # force the mlx-vlm worker path under test (auto now routes gemma3 -> mlx-lm)
         memory_budget_gb=8,
         disk_budget_gb=8,
         data_dir=str(tmp_path),

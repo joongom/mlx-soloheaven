@@ -36,9 +36,11 @@ class ModelConfig:
     model_path: str
     alias: str = ""  # Short name for routing (e.g., "qwen3.5-122b")
 
-    # Inference backend: "auto" (text -> mlx-lm, multimodal -> mlx-vlm),
-    # "mlx-lm" (force text backend), or "mlx-vlm" (force mlx-vlm; required for
-    # the MTP --draft-model speculative stack). See MLXEngine.load_model gate.
+    # Inference backend: "auto" (mlx-lm-first BY SUPPORT — mlx-lm whenever it
+    # supports the model_type, incl. gemma4; falls to mlx-vlm only for types
+    # mlx-lm cannot load), "mlx-lm" (force mlx-lm), or "mlx-vlm" (force
+    # mlx-vlm; required for the MTP --draft-model speculative stack). See the
+    # MLXEngine._select_backend gate.
     backend: str = "auto"
 
     # Generation defaults (per-model override)
@@ -108,9 +110,11 @@ class Config:
     # --model (not --models).
     engine_mode: str = "process"
 
-    # Inference backend: "auto" (text -> mlx-lm, multimodal -> mlx-vlm),
-    # "mlx-lm" (force text backend), or "mlx-vlm" (force mlx-vlm; required for
-    # the MTP --draft-model speculative stack). See MLXEngine.load_model gate.
+    # Inference backend: "auto" (mlx-lm-first BY SUPPORT — mlx-lm whenever it
+    # supports the model_type, incl. gemma4; falls to mlx-vlm only for types
+    # mlx-lm cannot load), "mlx-lm" (force mlx-lm), or "mlx-vlm" (force
+    # mlx-vlm; required for the MTP --draft-model speculative stack). See the
+    # MLXEngine._select_backend gate.
     backend: str = "auto"
 
     # Generation defaults (used as fallback for models without override)

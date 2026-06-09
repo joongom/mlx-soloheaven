@@ -44,9 +44,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--backend",
         choices=["auto", "mlx-lm", "mlx-vlm"],
         default=_env("BACKEND", "auto"),
-        help="Inference backend: 'auto' (default; text models -> mlx-lm, "
-             "multimodal models -> mlx-vlm), 'mlx-lm' (force text backend), or "
-             "'mlx-vlm' (force the mlx-vlm backend; REQUIRED for the MTP "
+        help="Inference backend: 'auto' (default; mlx-lm-first BY SUPPORT — "
+             "mlx-lm whenever it supports the model_type, incl. gemma4; falls "
+             "to mlx-vlm only for types mlx-lm cannot load), 'mlx-lm' (force "
+             "mlx-lm), or 'mlx-vlm' (force mlx-vlm; REQUIRED for the MTP "
              "--draft-model speculative stack). (env: SOLOHEAVEN_BACKEND)",
     )
     # Sampling defaults use a None sentinel (NOT a hardcoded number) so that an

@@ -34,6 +34,7 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -47,7 +48,6 @@ import mlx.core as mx
 from mlx_lm import load as lm_load
 from mlx_lm import stream_generate as lm_stream_generate
 from mlx_lm.models.cache import make_prompt_cache, save_prompt_cache, load_prompt_cache
-from mlx_lm.sample_utils import make_sampler
 from mlx_vlm import load as vlm_load
 from mlx_vlm.generate import (
     stream_generate as vlm_stream_generate,
@@ -76,6 +76,143 @@ logger = logging.getLogger(__name__)
 # accepted). A mean below 0.5 means more than 75% of drafted tokens are
 # being rejected — at that rate the drafter is typically net negative.
 _DRAFTER_LOW_ACCEPT_THRESHOLD = 0.5
+
+
+# ---------------------------------------------------------------------------
+# Eager (thread-safe) sampler.
+#
+# ROOT CAUSE this replaces: ``mlx_lm.sample_utils.make_sampler`` builds its
+# categorical draw and its top_p/min_p/top_k filters with
+# ``@partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)``.
+# That random-state-bound compiled graph is the ONLY thing that advances the
+# global PRNG between decode steps, and it only advances on the thread it was
+# first bound to. SoloHeaven runs per-request generation on a non-main
+# (daemon) worker thread, so on that thread ``mx.random.state`` FREEZES: every
+# token samples with the same key -> the same token repeats -> degenerate
+# repetition loops. (Verified: main thread 30 draws ~12 unique tokens; daemon
+# thread = 1 unique token.) Greedy (temp==0) is unaffected because it
+# short-circuits to ``argmax`` with no RNG.
+#
+# FIX (mirrors LM Studio's bundled ``mlx_engine.utils.sampling.create_sampler``):
+# reimplement the filters locally with plain ``@mx.compile`` (NO random-state
+# binding) and do the FINAL categorical draw EAGERLY via
+# ``mx.random.categorical``. The eager draw advances the global PRNG correctly
+# on whatever thread it runs on. The filter MATH/op-order is identical to
+# upstream mlx_lm (top_p -> min_p -> top_k); only the RNG threading changes, so
+# the output distribution matches upstream.
+#
+# NOTE: do NOT call ``mx.random.seed`` inside a worker thread — it raises
+# "no Stream(gpu,0) in current thread". The eager categorical advances state
+# on its own without seeding.
+# ---------------------------------------------------------------------------
+
+
+@mx.compile
+def _eager_apply_top_k(logprobs: mx.array, top_k: int) -> mx.array:
+    """Keep only the top_k tokens by probability (mirror of mlx_lm.apply_top_k,
+    but without the ``inputs/outputs=mx.random.state`` binding)."""
+    vocab_size = logprobs.shape[-1]
+    if not isinstance(top_k, int) or not (0 < top_k < vocab_size):
+        raise ValueError(
+            f"`top_k` has to be an integer in the (0, {vocab_size}] interval,"
+            f" but is {top_k}."
+        )
+    mask_idx = mx.argpartition(-logprobs, kth=top_k - 1, axis=-1)[..., top_k:]
+    return mx.put_along_axis(
+        logprobs, mask_idx, mx.array(-float("inf"), logprobs.dtype), axis=-1
+    )
+
+
+@mx.compile
+def _eager_apply_min_p(
+    logprobs: mx.array,
+    min_p: float,
+    min_tokens_to_keep: int = 1,
+) -> mx.array:
+    """Min-p filter (mirror of mlx_lm.apply_min_p, no random-state binding)."""
+    if not (0 <= min_p <= 1.0):
+        raise ValueError(
+            f"`min_p` has to be a float in the [0, 1] interval, but is {min_p}"
+        )
+    if not isinstance(min_tokens_to_keep, int) or (min_tokens_to_keep < 1):
+        raise ValueError(
+            f"`min_tokens_to_keep` has to be a positive integer, but is "
+            f"{min_tokens_to_keep}"
+        )
+
+    top_logprobs = mx.max(logprobs, axis=-1, keepdims=True)
+    scaled_min_p = top_logprobs + math.log(min_p)
+    tokens_to_remove = logprobs < scaled_min_p
+
+    if min_tokens_to_keep > 1:
+        top_indices = mx.argpartition(logprobs, kth=-min_tokens_to_keep, axis=-1)
+        top_indices = top_indices[..., -min_tokens_to_keep:]
+        tokens_to_remove = mx.put_along_axis(
+            tokens_to_remove,
+            top_indices,
+            mx.array(False, tokens_to_remove.dtype),
+            axis=-1,
+        )
+
+    return mx.where(tokens_to_remove, -float("inf"), logprobs)
+
+
+@mx.compile
+def _eager_apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
+    """Top-p (nucleus) filter (mirror of mlx_lm.apply_top_p, no random-state
+    binding)."""
+    probs = mx.exp(logprobs)
+    sorted_indices = mx.argsort(logprobs, axis=-1)
+    sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
+
+    cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
+
+    inverse_indices = mx.put_along_axis(
+        mx.zeros_like(sorted_indices),
+        sorted_indices,
+        mx.arange(sorted_indices.shape[-1], dtype=sorted_indices.dtype),
+        axis=-1,
+    )
+    cumulative_probs = mx.take_along_axis(cumulative_probs, inverse_indices, axis=-1)
+
+    return mx.where(
+        cumulative_probs > 1 - top_p,
+        logprobs,
+        -float("inf"),
+    )
+
+
+def _make_eager_sampler(
+    temp: float = 0.0,
+    top_p: float = 0.0,
+    min_p: float = 0.0,
+    top_k: int = 0,
+    min_tokens_to_keep: int = 1,
+):
+    """Thread-safe drop-in replacement for ``mlx_lm.sample_utils.make_sampler``.
+
+    Filter math and op-order (top_p -> min_p -> top_k) are identical to
+    upstream mlx_lm; the only difference is that nothing binds
+    ``mx.random.state`` into a compiled graph, so the PRNG advances correctly
+    on non-main (daemon) worker threads. ``temp==0`` short-circuits to
+    ``argmax`` (byte-identical to upstream / LM Studio greedy).
+    """
+    if temp == 0:
+        return lambda logprobs: mx.argmax(logprobs, axis=-1)
+
+    inv_temp = 1.0 / temp
+
+    def sampler(logprobs):
+        if top_p > 0 and top_p < 1.0:
+            logprobs = _eager_apply_top_p(logprobs, top_p)
+        if min_p != 0.0:
+            logprobs = _eager_apply_min_p(logprobs, min_p, min_tokens_to_keep)
+        if top_k > 0:
+            logprobs = _eager_apply_top_k(logprobs, top_k)
+        # EAGER final draw — advances mx.random.state on the calling thread.
+        return mx.random.categorical(logprobs * inv_temp)
+
+    return sampler
 
 
 def _pld_response_adapter(pld_iter, tokenizer):
@@ -3184,7 +3321,13 @@ class MLXEngine:
         # consumes top_p/min_p/top_k/temp directly so it ignores `sampler`.
         # Constructing it unconditionally costs ~one closure allocation and
         # keeps the dispatcher signature uniform across paths.
-        sampler = make_sampler(temp=temperature, top_p=top_p, min_p=min_p, top_k=top_k)
+        # Use the local EAGER sampler instead of mlx_lm.make_sampler: the
+        # latter's compiled categorical/filters bind mx.random.state and freeze
+        # the PRNG on non-main worker threads, causing repetition loops. See
+        # _make_eager_sampler above for the full root-cause writeup.
+        sampler = _make_eager_sampler(
+            temp=temperature, top_p=top_p, min_p=min_p, top_k=top_k
+        )
 
         # Dispatch to the per-backend runner. The runner returns the
         # streaming generator AND (legacy path only) the local

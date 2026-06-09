@@ -1,9 +1,19 @@
 """Prompt Lookup Decoding (PLD) for MLX.
 
 Replaces the draft *model* in speculative decoding with an n-gram lookup over
-prompt + generated tokens. For RAG / long-context / agentic workloads the model
+the **prompt only**. For RAG / long-context / agentic workloads the model
 frequently copies spans from the prompt, so a cheap Rabin-Karp index yields
 high-quality drafts at effectively zero cost.
+
+Prompt-only lookup (codex fix C): the searchable index is built once from the
+prompt tokens and never grows with generated output. Generated tokens are still
+tracked (in ``self.tokens``) so they can form the *tail query* k-gram, but they
+are never inserted into the index and a drafted continuation is always copied
+from a prompt occurrence. This removes the generated-token self-match feedback
+loop that turns peaked distributions into verbatim line loops while preserving
+PLD's real benefit (accelerating copy of prompt / RAG / code / tool-output
+spans). The change is lossless: accepted tokens are unchanged — only which
+drafts are *attempted* differs.
 
 Exports ``PLDMatcher`` and ``pld_generate_step`` (drop-in replacement for
 ``mlx_lm.generate.speculative_generate_step`` with the draft model removed).
@@ -26,15 +36,21 @@ logger = logging.getLogger(__name__)
 
 
 class PLDMatcher:
-    """N-gram matcher for Prompt Lookup Decoding.
+    """N-gram matcher for Prompt Lookup Decoding (prompt-only lookup).
 
     Builds ``dict[tuple[int,...], list[int]]`` per k in ``1..max_k`` mapping
-    each k-gram to sorted end-positions. Append is O(max_k); match is O(1)
-    amortized (hash lookup + bounded self-match skip).
+    each prompt k-gram to its sorted end-positions. The index is built **once**
+    from the prompt and never grows: ``append()`` extends ``self.tokens`` (so
+    the decode tail can form a query k-gram) but does NOT insert generated
+    tokens into the index. ``match()`` therefore only ever returns continuations
+    copied from **prompt** positions — generated phrases are never drafted,
+    which breaks the verbatim self-match loop (codex fix C).
 
-    Selection heuristic: *most recent* match (iterate positions from tail);
-    falls back from the requested k down to 1 (mirrors the reference PLD impl
-    at https://github.com/apoorvumang/prompt-lookup-decoding).
+    Append is O(1); match is O(1) amortized (hash lookup + bounded skip).
+
+    Selection heuristic: *most recent* prompt match (iterate positions from
+    tail); falls back from the requested k down to 1 (mirrors the reference PLD
+    impl at https://github.com/apoorvumang/prompt-lookup-decoding).
 
     Usage::
 
@@ -45,48 +61,48 @@ class PLDMatcher:
 
     def __init__(self, prompt_tokens: Sequence[int], max_k: int = 3):
         self.max_k = max_k
+        # Full decode context (prompt + generated). Used ONLY to form the tail
+        # query k-gram; generated tokens are never added to ``self.index``.
         self.tokens: List[int] = list(prompt_tokens)
+        # Number of prompt tokens — the boundary past which the index is never
+        # populated. A drafted continuation must lie strictly inside the prompt
+        # (start .. < prompt_len), so it can only copy prompt spans.
+        self.prompt_len: int = len(self.tokens)
         self.index: List[defaultdict] = [defaultdict(list) for _ in range(max_k + 1)]
-        n = len(self.tokens)
+        n = self.prompt_len
         for k in range(1, max_k + 1):
             idx = self.index[k]
             for end in range(k - 1, n):
                 idx[tuple(self.tokens[end - k + 1 : end + 1])].append(end)
 
     def append(self, token: int) -> None:
-        """Register ``token`` as the new tail; O(max_k)."""
+        """Track ``token`` as the new tail; O(1).
+
+        Generated tokens are recorded in ``self.tokens`` so the next query
+        k-gram reflects the live decode tail, but they are deliberately NOT
+        inserted into ``self.index`` — drafting stays prompt-only.
+        """
         self.tokens.append(int(token))
-        end = len(self.tokens) - 1
-        for k in range(1, self.max_k + 1):
-            if end - k + 1 < 0:
-                break
-            self.index[k][tuple(self.tokens[end - k + 1 : end + 1])].append(end)
 
     def truncate(self, new_len: int) -> None:
-        """Roll back to ``new_len`` tokens (for rejected speculative drafts)."""
+        """Roll back the tracked tail to ``new_len`` tokens (for rejected
+        speculative drafts). The prompt index is immutable, so this only trims
+        ``self.tokens``; ``new_len`` should never drop below ``prompt_len``."""
         if new_len >= len(self.tokens):
             return
-        for k in range(1, self.max_k + 1):
-            idx = self.index[k]
-            for end in range(len(self.tokens) - 1, new_len - 1, -1):
-                if end - k + 1 < 0:
-                    continue
-                gram = tuple(self.tokens[end - k + 1 : end + 1])
-                lst = idx.get(gram)
-                if lst and lst[-1] == end:
-                    lst.pop()
-                    if not lst:
-                        del idx[gram]
         self.tokens = self.tokens[:new_len]
 
     def match(self, suffix: Sequence[int], k: int, n: int) -> List[int]:
-        """Return up to ``n`` tokens following the most-recent match of
-        ``suffix[-k:]``. Falls back k -> k-1 -> ... -> 1. Skips the tail
-        self-match (end == len(tokens) - 1)."""
+        """Return up to ``n`` tokens following the most-recent **prompt** match
+        of ``suffix[-k:]``. Falls back k -> k-1 -> ... -> 1.
+
+        Continuations are copied only from prompt positions (start strictly
+        inside ``[0, prompt_len)``), so a generated phrase — present only in the
+        generated tail, never in the index — is never drafted."""
         if not suffix or n <= 0:
             return []
         tokens = self.tokens
-        total = len(tokens)
+        limit = self.prompt_len  # never copy past the prompt boundary
         max_try = min(k, len(suffix), self.max_k)
         for kk in range(max_try, 0, -1):
             positions = self.index[kk].get(tuple(suffix[-kk:]))
@@ -94,9 +110,9 @@ class PLDMatcher:
                 continue
             for i in range(len(positions) - 1, -1, -1):
                 start = positions[i] + 1
-                if start >= total:
-                    continue  # self-match at current tail
-                return tokens[start : min(start + n, total)]
+                if start >= limit:
+                    continue  # match ends at the last prompt token: nothing to copy
+                return tokens[start : min(start + n, limit)]
         return []
 
 
@@ -256,16 +272,41 @@ if __name__ == "__main__":
     assert m.match([9, 9, 4], k=3, n=1) == [1]  # fallback to k=1 on trailing 4
     print("test 1 (basic match) ok")
 
-    # Test 2: incremental append + truncate
+    # Test 2: incremental append + truncate (prompt-only semantics).
     m2 = PLDMatcher([1, 2, 3, 4, 1, 2, 3, 5, 6, 7], max_k=3)
     for t in (9, 1, 2, 3):
         m2.append(t)
-    # Tail (1,2,3) at end 13 is self-match; most-recent prior at end 6 -> [5,6]
+    # Appended (9,1,2,3) is NOT indexed (prompt-only). The query tail (1,2,3)
+    # matches ONLY the two prompt occurrences; most-recent prompt match at
+    # end 6 -> continuation [5,6]. (Unchanged result vs the old self-indexing
+    # impl here because the prompt already contains 1,2,3 followed by 5,6.)
     assert m2.match([1, 2, 3], k=3, n=2) == [5, 6]
     m2.truncate(10)
     assert m2.tokens == [1, 2, 3, 4, 1, 2, 3, 5, 6, 7]
     assert m2.match([5, 6], k=2, n=1) == [7]
-    print("test 2 (incremental append + truncate) ok")
+    print("test 2 (incremental append + truncate, prompt-only) ok")
+
+    # Test 2b: anti-loop guard — a phrase that exists ONLY in generated output
+    # is NEVER drafted. Prompt has no internal repeats; we then "generate" a
+    # phrase twice. Under prompt-only lookup the second occurrence's tail must
+    # not self-match the first generated occurrence.
+    m2b = PLDMatcher([100, 101, 102], max_k=3)  # prompt: no repeats
+    for t in (7, 8, 9, 7, 8):  # generated; tail now (..7,8) repeats earlier (7,8)
+        m2b.append(t)
+    # Old (self-indexing) impl would draft [9] here (copy the generated 9 after
+    # the prior 7,8) -> seed of a verbatim loop. Prompt-only must refuse.
+    assert m2b.match([7, 8], k=3, n=5) == [], (
+        "anti-loop: generated phrase must not be drafted"
+    )
+    assert m2b.match([8, 9, 7, 8], k=3, n=5) == [], (
+        "anti-loop: longer generated tail must not be drafted"
+    )
+    # And a tail that matches the prompt still drafts from the prompt.
+    m2b.append(100)  # tail (..., 100) matches prompt position 0
+    assert m2b.match([100], k=1, n=2) == [101, 102], (
+        "copy-from-prompt benefit must be preserved"
+    )
+    print("test 2b (anti-loop guard + prompt-copy preserved) ok")
 
     # Test 3: pld_generate_step with a mocked model that always picks token 0.
     class _MockCache:

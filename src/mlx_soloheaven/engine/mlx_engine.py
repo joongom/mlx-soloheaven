@@ -40,6 +40,7 @@ import re
 import sys
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import AsyncGenerator, Generator, Optional
@@ -1362,6 +1363,15 @@ class MLXEngine:
         # Session-based cache: session_id -> SessionState
         self._sessions: dict[str, SessionState] = {}
 
+        # PROVENANCE of anon session ids: ids the ENGINE itself minted for
+        # session-less requests ("anon-<hex>" from
+        # _resolve_anon_session_id_locked, plus the legacy "anon" fallback in
+        # _generate_locked). The anon prefix-scan only considers sessions whose
+        # id is in this set — NOT name-based matching — so an EXPLICIT session
+        # a client happened to key as user="anon-..." can never be selected /
+        # mutated by an anonymous request. Mutated only under self._lock.
+        self._anon_minted_ids: set[str] = set()
+
         # Base cache pool: system_hash -> BaseCacheEntry
         self._base_caches: dict[str, BaseCacheEntry] = {}
 
@@ -2336,6 +2346,12 @@ class MLXEngine:
             self._sessions.pop(sid, None)
             with self._dirty_lock:
                 self._dirty_sessions.discard(sid)
+            # Anon-provenance hygiene: best-effort discard so the set tracks
+            # live sessions (a stale id would be harmless — the prefix scan
+            # iterates self._sessions — this just bounds growth).
+            anon_ids = getattr(self, "_anon_minted_ids", None)
+            if anon_ids is not None:
+                anon_ids.discard(sid)
             evicted += 1
             freed_bytes += sess_bytes
             if not saved:
@@ -2985,6 +3001,102 @@ class MLXEngine:
                 return False
         return True
 
+    def _resolve_anon_session_id_locked(self, messages: list[dict]) -> str:
+        """Resolve a session-less request onto a concrete per-conversation id.
+
+        Session-less requests (no OpenAI ``user`` field — e.g. OpenCode and
+        most agents) used to collapse onto the single shared ``"anon"`` key, so
+        any two interleaved conversations (agent A vs agent B, or a client
+        changing its system prompt mid-flow) thrashed the one slot: every
+        request from the *other* conversation was a MISS → full cold-fill.
+
+        Instead, scan the resident sessions for one whose stored
+        ``session.messages`` is a (proper or exact) prefix of the incoming
+        messages, reusing the exact same ``_messages_match`` logic the HIT path
+        uses, so selection and the subsequent cache decision can never
+        disagree. Pick the LONGEST matched message prefix; tie-break by
+        most-recently-used. An EXACT match (stored == incoming) is selected
+        too — _generate_locked then takes its existing "retry" path (same
+        messages re-sent → discard cache, re-process), unchanged.
+
+        If nothing matches, mint a NEW unique ``anon-<8 hex>`` id so each
+        session-less conversation owns its own cache entry. These sessions
+        live in ``self._sessions`` like any other, so the active-session LRU
+        eviction (memory_budget_gb) bounds them; busy-protection applies
+        because the caller busy-marks the id returned HERE.
+
+        Scope notes:
+        - Linear scan is fine: the session count is small and LRU-bounded by
+          _evict_active_sessions_if_needed; _messages_match early-outs on
+          length/role before any content comparison.
+        - In-memory candidates only. Enumerating disk-cached sessions would
+          need a safetensors metadata read PER candidate PER request just to
+          compare messages — an evicted anon conversation simply degrades to
+          one cold-fill (exactly today's behavior) and is resident again
+          afterwards.
+        - The legacy ``"anon"`` slot participates only when the ENGINE's own
+          fallback minted it (see _generate_locked): provenance, not name. A
+          pre-existing disk "anon" cache from before this feature simply stops
+          being reused by anonymous requests — one cold-fill, no migration.
+
+        Caller MUST hold ``self._lock`` (``self._sessions`` and
+        ``self._anon_minted_ids`` are mutated under it) and must busy-mark the
+        RETURNED id, not "anon".
+        """
+        # Defensive: partially-constructed shell engines (unit tests build via
+        # __new__) may lack _sessions / _anon_minted_ids — same pattern as the
+        # eviction sweep.
+        sessions = getattr(self, "_sessions", None) or {}
+        minted = getattr(self, "_anon_minted_ids", None)
+        if minted is None:
+            minted = set()
+        best_sid: str | None = None
+        best_len = -1
+        best_used = -1.0
+        for sid, session in sessions.items():
+            # PROVENANCE-based isolation: only sessions the engine itself
+            # minted for session-less requests are candidates. A name check
+            # (sid.startswith("anon-")) is NOT enough — ChatCompletionRequest
+            # .user is unrestricted and passed verbatim as session_id, so a
+            # client could create an EXPLICIT session keyed "anon-aaaaaaaa";
+            # it must never be selected — and then mutated — by an anonymous
+            # request, even on a perfect message-prefix match. Stale ids in
+            # the set (session since evicted/deleted) are harmless: the scan
+            # iterates self._sessions and merely checks membership; removal
+            # points additionally discard ids best-effort (see
+            # _evict_active_sessions_if_needed / delete_session /
+            # clear_caches).
+            if sid not in minted:
+                continue
+            stored = session.messages
+            # Empty stored messages would prefix-match ANYTHING — skip.
+            if not stored or len(stored) > len(messages):
+                continue
+            if not self._messages_match(stored, messages):
+                continue
+            n = len(stored)
+            if n > best_len or (n == best_len and session.last_used > best_used):
+                best_sid = sid
+                best_len = n
+                best_used = session.last_used
+        if best_sid is not None:
+            logger.info(
+                f"[KV Cache] anon request matched session={best_sid} "
+                f"(prefix {best_len}/{len(messages)} msgs)"
+            )
+            return best_sid
+        new_sid = f"anon-{uuid.uuid4().hex[:8]}"
+        # Record provenance AT MINT TIME so the next anonymous request can
+        # find this session (shell engines without the set just lose tracking,
+        # which only means no reuse — never cross-session mutation).
+        if getattr(self, "_anon_minted_ids", None) is not None:
+            self._anon_minted_ids.add(new_sid)
+        logger.info(
+            f"[KV Cache] anon request: no prefix match among "
+            f"{len(sessions)} sessions — new session={new_sid}"
+        )
+        return new_sid
+
     def _format_messages(self, messages: list[dict]) -> list[dict]:
         """Normalize messages for chat template: fix roles, flatten content."""
         formatted = []
@@ -3166,11 +3278,21 @@ class MLXEngine:
         response_format=None,
     ) -> Generator[GenerationResult, None, None]:
         """Generate with session-based KV cache reuse (holds lock)."""
-        sid = session_id or "anon"
         t_wait = time.perf_counter()
-        logger.debug(f"[Queue] session={sid} | waiting for lock | messages={len(messages)}")
+        logger.debug(
+            f"[Queue] session={session_id or 'anon?'} | waiting for lock | "
+            f"messages={len(messages)}"
+        )
         with self._lock:
             wait_ms = (time.perf_counter() - t_wait) * 1000
+            # Resolve session-less requests to a concrete anon-* session id
+            # ONCE, inside the lock and BEFORE busy-marking. The resolved id is
+            # what gets busy-protected, stored in self._sessions, logged, and
+            # evicted/saved — resolving later (inside _generate_locked) would
+            # busy-mark the wrong key and let the post-generation eviction
+            # sweep evict the cache mid-use. Explicit session_ids keep exact-key
+            # behavior unchanged (no prefix scanning).
+            sid = session_id or self._resolve_anon_session_id_locked(messages)
             logger.debug(f"[Queue] session={sid} | lock acquired | waited={wait_ms:.0f}ms")
             yield GenerationResult(status="generating")
             # Mark the session in-flight so the post-generation eviction sweep
@@ -3187,7 +3309,7 @@ class MLXEngine:
                     min_p=min_p if min_p is not None else self.cfg.default_min_p,
                     top_k=top_k if top_k is not None else self.cfg.default_top_k,
                     repetition_penalty=repetition_penalty if repetition_penalty is not None else self.cfg.default_repetition_penalty,
-                    session_id=session_id,
+                    session_id=sid,
                     tools=tools,
                     cancel_event=cancel_event,
                     thinking=thinking,
@@ -3230,8 +3352,18 @@ class MLXEngine:
         has_tools = bool(tools)
         use_thinking = thinking if thinking is not None else self.cfg.enable_thinking
 
+        # Defensive fallback only: generate_stream always passes a resolved id
+        # (explicit session_id, or an anon-* id from
+        # _resolve_anon_session_id_locked). This catches direct/legacy callers.
+        # The legacy "anon" slot is registered as engine-minted (provenance)
+        # so the anon prefix-scan can keep treating it as a candidate. Caveat:
+        # a client explicitly sending user="anon" would share this slot with
+        # direct/legacy callers — acceptable on a single-user server, and
+        # strictly no worse than the old shared-"anon" behavior.
         if not session_id:
             session_id = "anon"
+            if getattr(self, "_anon_minted_ids", None) is not None:
+                self._anon_minted_ids.add("anon")
         session = self._sessions.get(session_id)
 
         # Try loading from disk if not in memory
@@ -4767,6 +4899,9 @@ class MLXEngine:
             self._dirty_sessions.discard(session_id)
         if session_id in self._sessions:
             del self._sessions[session_id]
+        # Anon-provenance hygiene (best-effort; stale ids are harmless).
+        if hasattr(self, "_anon_minted_ids"):
+            self._anon_minted_ids.discard(session_id)
         path = self._session_cache_path(session_id)
         if os.path.exists(path):
             os.remove(path)
@@ -5298,6 +5433,9 @@ class MLXEngine:
 
         cleared["memory_sessions"] += len(self._sessions)
         self._sessions.clear()
+        # Anon-provenance hygiene: no sessions remain → no minted ids remain.
+        if hasattr(self, "_anon_minted_ids"):
+            self._anon_minted_ids.clear()
 
         cleared["base_caches"] += len(self._base_caches)
         self._base_caches.clear()

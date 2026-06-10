@@ -129,6 +129,90 @@ structurally stable TTFT, no wrap handling needed); **Gemma4-26B-A4B + MTP**
 is competitive on single long generations but relies on the sliding-window
 fixes; **Qwen3.6-27B** dense is decode-bound.
 
+### Qwen3.6-35B-A3B Best Practices (M5 Max 128GB)
+
+All numbers in this section were measured on a **MacBook Pro M5 Max 128GB**
+(mlx-lm path, `Qwen3.6-35B-A3B-MLX-8bit`). They are machine-specific guidance,
+not universals — every flag below is overridable at launch (trailing args) or
+per-request. Architecture background is in
+[Supported Model Families](#supported-model-families) and the
+[Hybrid Attention Architecture Note](#hybrid-attention-architecture-note).
+
+#### Recommended Launch
+
+```bash
+./start_qwen3.6_35b_a3b.sh        # plain decode — simplest recommended config
+./start_qwen3.6_35b_a3b_mtp.sh    # + native MTP head (block size 1) — a wash vs plain, safe
+```
+
+- **Plain decode is already fast.** The A3B MoE (~3B active params) decodes at
+  ~90–97 tok/s on this machine — `./start_qwen3.6_35b_a3b.sh` is the simplest
+  recommended config and leaves nothing meaningful on the table.
+- **The MTP script is safe but not a meaningful speedup here.** It uses the
+  model's **native `qwen3_5_mtp` head** (5-bit, ~0.6 GB) on the default mlx-lm
+  backend — this is *not* the gemma4 mlx-vlm drafter, and no `--backend` flag
+  is needed. After a block-size sweep (below) it defaults to
+  `--draft-block-size 1`, which is a **wash vs plain decode (mean 1.019x)**.
+  The head-config default of 3 was a measured **9–13% regression** and is
+  overridden.
+- **Sampling needs no flags.** The engine auto-applies the model's
+  `generation_config.json` (temp 1.0 / top_k 20 / top_p 0.95); the flags in
+  the start scripts only mirror it for visibility. Per-request override via
+  the OpenAI API works as usual.
+- **Anti-loop safety net.** Both start scripts set
+  `--thinking-budget 4096 --repetition-penalty 1.1` (overridable).
+- **`--pld` does not apply to this arch.** The Gated-DeltaNet `ArraysCache` is
+  untrimmable, which makes [PLD](#prompt-lookup-decoding-pld) incompatible —
+  the engine guards this automatically.
+- **Memory.** The 8-bit model is ~37 GB; `--memory-budget-gb` 20–30 is a good
+  setting on 128 GB machines. Active-session LRU eviction keeps RAM bounded.
+
+#### MTP Block-Size Sweep (2026-06)
+
+Production sampling (temp 1.0 / top_k 20 / top_p 0.95), 500 generated tokens
+per run; speedup is vs plain decode on the same prompt, acceptance rate in
+parentheses. This is the condensed view — the full table (raw tok/s, seed,
+greedy spot-check) lives as a comment in
+[`start_qwen3.6_35b_a3b_mtp.sh`](start_qwen3.6_35b_a3b_mtp.sh).
+
+| Block size | 152-tok prompt | 2,542-tok prompt | 9,989-tok prompt | Mean |
+|---|---|---|---|---|
+| no MTP | 1.000x | 1.000x | 1.000x | 1.000x |
+| **1 (script default)** | 1.07x (acc .86) | 0.97x (.78) | 1.02x (.83) | **1.019x** |
+| 2 | 1.07x (.75) | 0.99x (.71) | 0.98x (.70) | 1.010x |
+| 3 (head-config default) | 0.91x (.60) | 0.87x (.58) | 0.91x (.61) | 0.897x |
+| 4 | 0.77x (.46) | 0.84x (.55) | 0.69x (.45) | 0.766x |
+
+Key facts:
+
+- **10K context does not change the winner** — deep blocks get *worse* with
+  context, not better: every rejected round pays a 40-layer ArraysCache
+  restore + replay whose cost grows with KV size.
+- **Free-form / creative content is the worst case** for MTP (block 3 fell to
+  0.707x). Highly predictable content can still profit — isolated measurements
+  up to +26% at acceptance ~0.81, and ~2x on very short structured turns — so
+  it is content-dependent, and lossless either way (verify-then-accept keeps
+  output identical to plain decode).
+- **Contrast with gemma4:** dense Gemma4 is where MTP genuinely shines
+  (60 → 97.8 tok/s — see
+  [Speculative Decoding (MTP)](#speculative-decoding-mtp)). This A3B MoE
+  simply plain-decodes too fast for the head to pay off.
+
+#### Multi-Turn
+
+Session KV-cache reuse works **with MTP enabled** (lazy last-pair commit):
+measured turn-2 TTFT was **58 ms** (cache reuse) vs **407 ms** (cold-fill) at
+1.6K session tokens, and the gap grows with session length. Output is
+byte-identical with and without reuse.
+
+#### When to Use What
+
+- **Coding agent / structured output** → MTP block 1 is fine
+  (wash-to-slight-win), or just plain decode.
+- **Long free-form / creative / thinking-heavy** → plain decode (MTP off).
+- **Never** set `--draft-block-size` ≥ 3 on this model — a measured 10–23%
+  mean regression across all tested prompt lengths.
+
 ### Production Metrics (Qwen3.5-122B-A10B-bf16) *(historical, M3 Ultra 512GB)*
 
 | Metric | Without Cache | With Cache | Improvement |
@@ -524,6 +608,8 @@ A `SOLOHEAVEN_MTP_WRAP_GATE=1` env fallback can disable the drafter post-wrap
   [Future Directions](#future-directions) for native Qwen3.6 MTP / DFlash)
 - ❌ Combined with `--models` (multi-model) — drafter is single-`--model` only
 - Independent of PLD — MTP is a separate, model-specific path
+
+> **Qwen3.6-35B-A3B** ships a separate **native `qwen3_5_mtp` head** that runs on the default mlx-lm path (no mlx-vlm) — measured a wash vs plain decode; see [Qwen3.6-35B-A3B Best Practices](#qwen36-35b-a3b-best-practices-m5-max-128gb).
 
 ### Structured Output (`response_format`)
 

@@ -116,6 +116,54 @@ class PLDMatcher:
         return []
 
 
+def _wrapped_rotating_layers(cache: Sequence[Any]) -> List[Any]:
+    """Return the cache layers whose sliding-window ring buffer has wrapped.
+
+    A ``RotatingKVCache``-style layer (duck-typed: has a truthy ``max_size``
+    and an ``offset``) is PERMANENTLY untrimmable once ``offset >= max_size``
+    — ``is_trimmable()`` is ``offset < max_size`` and offsets only grow.
+    """
+    return [
+        c for c in cache
+        if getattr(c, "max_size", None)
+        and int(getattr(c, "offset", 0) or 0) >= int(c.max_size)
+    ]
+
+
+def _layer_offsets(cache: Sequence[Any]) -> List[Optional[int]]:
+    """Snapshot each layer's logical offset (``None`` for layers without one,
+    e.g. ArraysCache/MambaCache). Cheap: attribute reads only."""
+    return [
+        int(c.offset) if getattr(c, "offset", None) is not None else None
+        for c in cache
+    ]
+
+
+def _trim_shortfall_layers(
+    cache: Sequence[Any],
+    offsets_before: Sequence[Optional[int]],
+    requested: int,
+) -> List[Tuple[int, int, int]]:
+    """Post-condition check for ``trim_prompt_cache``: every offset-bearing
+    layer must have dropped by EXACTLY ``requested``.
+
+    Upstream ``trim_prompt_cache`` returns ONLY cache[0]'s trim count
+    (``[c.trim(n) for c in cache][0]``) and each layer's ``trim`` clamps to
+    ``min(offset, n)`` — if per-layer offsets already diverged, layer 0 can
+    trim fully while another layer silently under-trims. Returns
+    ``[(layer_idx, offset_before, offset_after), ...]`` for every layer that
+    did NOT land on ``offset_before - requested`` (empty list == clean trim).
+    """
+    bad: List[Tuple[int, int, int]] = []
+    for i, (c, before) in enumerate(zip(cache, offsets_before)):
+        if before is None:
+            continue
+        after = int(getattr(c, "offset", 0) or 0)
+        if after != before - requested:
+            bad.append((i, before, after))
+    return bad
+
+
 def pld_generate_step(
     prompt: mx.array,
     model: nn.Module,
@@ -130,6 +178,7 @@ def pld_generate_step(
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
     ngram_k: int = 3,
+    on_cache_corruption: Optional[Callable[[], None]] = None,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """PLD variant of ``speculative_generate_step``.
 
@@ -138,14 +187,44 @@ def pld_generate_step(
 
     If the cache is not trimmable the function logs a warning and falls back
     to single-token generation (``from_draft`` is always False).
+
+    Sliding-window safety (FIX-1, CRITICAL): models whose cache contains
+    ``RotatingKVCache``-style layers (e.g. gemma4's 25 sliding-window layers,
+    ``max_size=1024``) become PERMANENTLY untrimmable once a layer's
+    ``offset >= max_size`` (the ring buffer destructively evicts front
+    entries). Upstream ``trim_prompt_cache`` then silently no-ops the WHOLE
+    cache, so every partially-rejected draft would leave ghost tokens in all
+    layers -> RoPE/offset desync -> degenerate verbatim loops. Recovery after
+    the wrap is impossible, therefore drafting must stop BEFORE the wrap:
+
+    * Trimmability is (re-)evaluated AFTER ``_prefill`` — a long prompt that
+      wraps during prefill starts non-speculative.
+    * Per iteration, a draft of ``want`` tokens is only attempted when every
+      rotating layer will STILL satisfy ``offset < max_size`` after the
+      verify chunk. Once headroom is exhausted speculation is permanently
+      disabled for the rest of the generation (offsets are monotonic).
+
+    Fail-closed rewind (FIX-2, defense-in-depth): ``_rewind`` verifies that
+    ``trim_prompt_cache`` actually trimmed the requested amount — both its
+    return value (cache[0] only) AND every layer's offset, since a layer with
+    a diverged offset can under-trim while layer 0 trims fully. On any
+    mismatch it logs an ERROR, permanently disables speculation, and invokes
+    ``on_cache_corruption`` so the caller can INVALIDATE the session cache
+    instead of writing back a ghost-token cache. With the headroom gate this
+    should never fire.
+
+    Logits-processor history (FIX-4): the history fed to ``logits_processors``
+    is exactly ``prompt + emitted tokens``. During batched verify the
+    positions are processed one at a time with EARLY STOP at the first
+    rejected draft, so position ``i`` sees ``prompt + emitted +
+    accepted[0..i-1]`` and every processor call corresponds 1:1 to an emitted
+    token. Stateful processors (e.g. ``ThinkingBudgetProcessor``) therefore
+    stay exactly correct under speculation — no rejected-position calls, no
+    overcount, no rollback needed — so they do NOT require disabling
+    speculation.
     """
     y = prompt.astype(mx.uint32)
-    prev_tokens: Optional[mx.array] = None
     model_cache = prompt_cache if prompt_cache is not None else cache_mod.make_prompt_cache(model)
-    speculative = cache_mod.can_trim_prompt_cache(model_cache)
-    if not speculative:
-        logger.warning("pld_generate_step: prompt_cache is not trimmable; "
-                       "falling back to non-speculative generation.")
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
     quantize_cache_fn = functools.partial(
         maybe_quantize_kv_cache,
@@ -161,25 +240,11 @@ def pld_generate_step(
         lp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         return sampler(lp), lp
 
-    def _step(cache_, y_, n_predict: int = 1):
-        nonlocal prev_tokens
+    def _forward(y_, n_predict: int = 1):
         with mx.stream(generation_stream):
-            logits = model(y_[None], cache=cache_)[:, -n_predict:, :]
-            quantize_cache_fn(cache_)
-            if logits_processors:
-                out_y, out_lp = [], []
-                y_trim = y_[: -(n_predict - 1)] if n_predict > 1 else y_
-                for i in range(n_predict):
-                    prev_tokens = (
-                        mx.concatenate([prev_tokens, y_trim])
-                        if prev_tokens is not None else y_trim
-                    )
-                    yi, lpi = _process_and_sample(prev_tokens, logits[:, i, :])
-                    out_y.append(yi)
-                    out_lp.append(lpi)
-                    y_trim = yi
-                return mx.concatenate(out_y, axis=0), mx.concatenate(out_lp, axis=0)
-            return _process_and_sample(None, logits.squeeze(0))
+            logits = model(y_[None], cache=model_cache)[:, -n_predict:, :]
+            quantize_cache_fn(model_cache)
+            return logits
 
     def _prefill(cache_, y_):
         while y_.size > prefill_step_size:
@@ -190,13 +255,71 @@ def pld_generate_step(
             mx.clear_cache()
         return y_
 
+    speculative = False  # decided after prefill (see FIX-1 note above)
+
     def _rewind(nd, na):
-        if nd > na:
-            cache_mod.trim_prompt_cache(model_cache, nd - na)
+        # FIX-2: fail-closed — verify the trim actually happened. Upstream
+        # trim_prompt_cache is all-or-nothing: ANY untrimmable layer makes it
+        # return 0 as a silent whole-cache no-op, leaving nd-na ghost tokens
+        # in every layer. Its return value is also ONLY cache[0]'s trim count,
+        # so additionally verify PER LAYER that every offset dropped by
+        # exactly `requested` (a diverged layer can under-trim while layer 0
+        # trims fully — the shortfall would otherwise go undetected).
+        nonlocal speculative
+        if nd <= na:
+            return
+        requested = nd - na
+        offsets_before = _layer_offsets(model_cache)
+        trimmed = cache_mod.trim_prompt_cache(model_cache, requested)
+        shortfall = _trim_shortfall_layers(model_cache, offsets_before, requested)
+        if trimmed != requested or shortfall:
+            speculative = False
+            logger.error(
+                "PLD: cache rewind FAILED (requested trim=%d, trimmed=%r, "
+                "per-layer shortfall=%r) — ghost tokens remain in the KV "
+                "cache; speculation disabled and session-cache invalidation "
+                "signalled.",
+                requested, trimmed, shortfall[:8],
+            )
+            if on_cache_corruption is not None:
+                try:
+                    on_cache_corruption()
+                except Exception:  # noqa: BLE001 — never break the stream
+                    logger.exception("PLD: on_cache_corruption callback failed")
+
+    # FIX-4: authoritative processor history = prompt + emitted tokens.
+    # ``hist`` mirrors ``matcher.tokens`` as an mx.array (kept only when
+    # processors are present). It includes the FULL prompt — also the chunks
+    # consumed by _prefill, which the old ``prev_tokens`` bookkeeping missed.
+    hist: Optional[mx.array] = y if logits_processors else None
 
     matcher = PLDMatcher(prompt.tolist(), max_k=max(1, ngram_k))
     with mx.stream(generation_stream):
         y = _prefill(model_cache, y)
+
+    # FIX-1: evaluate trimmability AFTER prefill — a long prompt can wrap a
+    # sliding-window RotatingKVCache during prefill itself.
+    speculative = cache_mod.can_trim_prompt_cache(model_cache)
+    if not speculative:
+        if _wrapped_rotating_layers(model_cache):
+            logger.info(
+                "PLD: sliding-window wrap reached during prefill — "
+                "speculation disabled for this generation."
+            )
+        else:
+            logger.warning(
+                "pld_generate_step: prompt_cache is not trimmable; "
+                "falling back to non-speculative generation."
+            )
+
+    # Rotating-style layers: trimmability depends on offset vs max_size
+    # (duck-typed so hybrid mock caches are covered too). Non-rotating
+    # trimmable layers need no headroom check.
+    rotating_layers = [
+        c for c in model_cache
+        if getattr(c, "max_size", None) and hasattr(c, "offset")
+    ]
+    wrap_logged = False
 
     ntoks, num_draft, n = 0, 0, 0
     try:
@@ -208,15 +331,36 @@ def pld_generate_step(
             if speculative and num_draft_tokens > 0:
                 remaining = max_tokens - ntoks if max_tokens >= 0 else num_draft_tokens
                 want = min(num_draft_tokens, max(1, remaining) - 1)
-                if want > 0:
+                if want > 0 and rotating_layers:
+                    # FIX-1: per-draft headroom gate. The verify chunk feeds
+                    # y.size + want tokens; every rotating layer must STILL be
+                    # trimmable (offset < max_size) afterwards, or a partial
+                    # rejection could not be rewound. Offsets are monotonic,
+                    # so once headroom is gone it never comes back.
+                    step_len = int(y.size) + want
+                    for c in rotating_layers:
+                        if int(c.offset) + step_len >= int(c.max_size):
+                            speculative = False
+                            if not wrap_logged:
+                                wrap_logged = True
+                                logger.info(
+                                    "PLD: sliding-window wrap reached — "
+                                    "speculation disabled for the rest of "
+                                    "this generation"
+                                )
+                            break
+                if speculative and want > 0:
                     draft_list = matcher.match(matcher.tokens, k=ngram_k, n=want)
 
             if not draft_list:
                 # No draft available -> single-token step.
-                tok, lp = _step(model_cache, y, n_predict=1)
+                logits = _forward(y, n_predict=1)
+                tok, lp = _process_and_sample(hist, logits[:, 0, :])
                 mx.eval(tok)
                 tok_i = tok.tolist()[0] if hasattr(tok, "tolist") else int(tok)
                 matcher.append(tok_i)
+                if hist is not None:
+                    hist = mx.concatenate([hist, mx.array([tok_i], mx.uint32)])
                 ntoks += 1
                 num_draft, n = 0, 0
                 yield tok_i, lp, False
@@ -228,12 +372,33 @@ def pld_generate_step(
             # Verify draft.
             num_draft = len(draft_list)
             draft_arr = mx.array(draft_list, mx.uint32)
-            if prev_tokens is not None:
-                prev_tokens = prev_tokens[: prev_tokens.size - y.size - num_draft + 1]
             y = mx.concatenate([y, draft_arr])
-            tokens, logprobs = _step(model_cache, y, n_predict=num_draft + 1)
-            mx.eval(tokens)
-            tokens_l = tokens.tolist()
+            logits = _forward(y, n_predict=num_draft + 1)
+
+            if logits_processors:
+                # FIX-4: per-position processing with EARLY STOP at the first
+                # rejected draft. Position i's history is exactly
+                # prompt + emitted + accepted[0..i-1]; positions past the
+                # first rejection are NEVER processed, so stateful processors
+                # only ever see (and count) tokens that are actually emitted.
+                tokens_l: List[int] = []
+                lp_rows: list = []
+                for i in range(num_draft + 1):
+                    yi, lpi = _process_and_sample(hist, logits[:, i, :])
+                    mx.eval(yi)
+                    ti = int(yi.item())
+                    tokens_l.append(ti)
+                    lp_rows.append(lpi[0])
+                    if i >= num_draft or ti != draft_list[i]:
+                        break  # bonus position, or first rejected draft
+                    # Accepted: the next position's history extends by the
+                    # draft token (== ti, since it was accepted).
+                    hist = mx.concatenate([hist, mx.array([ti], mx.uint32)])
+            else:
+                toks, lp_all = _process_and_sample(None, logits.squeeze(0))
+                mx.eval(toks)
+                tokens_l = toks.tolist()
+                lp_rows = lp_all
 
             n = 0
             while n < num_draft:
@@ -241,23 +406,26 @@ def pld_generate_step(
                     break
                 ntoks += 1
                 matcher.append(tokens_l[n])
-                yield tokens_l[n], logprobs[n], True
+                # FIX-5: count the accepted token BEFORE yielding — a
+                # GeneratorExit thrown at this yield must not make the
+                # finally-rewind trim this (already delivered) token away.
                 n += 1
+                yield tokens_l[n - 1], lp_rows[n - 1], True
                 if ntoks == max_tokens:
                     break
 
             if ntoks < max_tokens:
                 bonus = tokens_l[n]
                 matcher.append(bonus)
+                if hist is not None:
+                    hist = mx.concatenate([hist, mx.array([bonus], mx.uint32)])
                 ntoks += 1
-                yield bonus, logprobs[n], False
+                yield bonus, lp_rows[n], False
 
             if ntoks == max_tokens:
                 break
 
             y = mx.array([tokens_l[n]], mx.uint32)
-            if prev_tokens is not None:
-                prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
             _rewind(num_draft, n)
             num_draft, n = 0, 0
     finally:
@@ -405,16 +573,15 @@ if __name__ == "__main__":
     assert rout == [6, 10, 11, 12], f"expected [6,10,11,12], got {rout}"
     assert len(rec.seen) > 0, "recorder saw no calls"
     lens = [len(s) for s in rec.seen]
-    expected_prefix = rprompt.tolist()
-    # Every call must include the full prompt as prefix; lengths may dip on
-    # rejection (prev_tokens trimmed) then resume, but max must exceed initial.
-    for s in rec.seen:
-        assert s[:len(expected_prefix)] == expected_prefix, "prompt prefix lost"
-    final = rec.seen[-1]
-    extension = final[len(expected_prefix):]
-    assert all(tok in rout for tok in extension), \
-        f"stray extension tokens {extension} vs output {rout}"
-    assert max(lens) > lens[0], f"recorder never grew: {lens}"
+    # FIX-4 semantics: every processor call corresponds 1:1 to an emitted
+    # token; call j's history is EXACTLY prompt + emitted[0:j] (no dips, no
+    # pre-trim, no rejected-position calls).
+    assert len(rec.seen) == len(rout), \
+        f"expected one processor call per emitted token, got {len(rec.seen)} vs {len(rout)}"
+    base = rprompt.tolist()
+    for j, s in enumerate(rec.seen):
+        assert s == base + rout[:j], \
+            f"call {j}: history {s} != prompt+emitted {base + rout[:j]}"
     print(f"test 5 (logits processor, {len(rec.seen)} calls, lens={lens}) ok")
 
     # Test 6: long-prompt smoke — init & match perf on 50K tokens.

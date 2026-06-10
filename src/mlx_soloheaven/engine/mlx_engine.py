@@ -47,7 +47,12 @@ from typing import AsyncGenerator, Generator, Optional
 import mlx.core as mx
 from mlx_lm import load as lm_load
 from mlx_lm import stream_generate as lm_stream_generate
-from mlx_lm.models.cache import make_prompt_cache, save_prompt_cache, load_prompt_cache
+from mlx_lm.models.cache import (
+    make_prompt_cache,
+    save_prompt_cache,
+    load_prompt_cache,
+    trim_prompt_cache,
+)
 from mlx_vlm import load as vlm_load
 from mlx_vlm.generate import (
     stream_generate as vlm_stream_generate,
@@ -1585,6 +1590,12 @@ class MLXEngine:
                 f"[{self.model_id}] Prefill step size: {self.cfg.prefill_step_size} "
                 f"(default 2048)"
             )
+        # FIX-7: kv_bits>0 on a rotating-cache model crashes MID-GENERATION
+        # (RotatingKVCache.to_quantized raises NotImplementedError once
+        # quantized_kv_start is reached; mlx-lm's maybe_quantize_kv_cache
+        # only gates on hasattr, which RotatingKVCache satisfies). Reject
+        # loudly at load instead.
+        self._reject_kv_bits_on_rotating_cache()
         if self.cfg.kv_bits and not self._use_vlm:
             logger.info(
                 f"[{self.model_id}] KV cache quantization: "
@@ -2585,7 +2596,8 @@ class MLXEngine:
 
         The danger is a RotatingKVCache (sliding-window attention, e.g.
         gemma4's 50 sliding layers) whose internal ring buffer has wrapped
-        (offset > max_size). Once wrapped the physical buffer holds only the
+        (offset >= max_size, the is_trimmable() boundary). Once wrapped the
+        physical buffer holds only the
         most-recent ``max_size`` tokens — it no longer corresponds to a
         contiguous *prefix* of the logical history, so prefix-trim based
         reuse on a DIVERGENT prompt (branch/edit past the wrap) would
@@ -2623,7 +2635,10 @@ class MLXEngine:
             offset = getattr(c, "offset", None)
             if max_size is None or offset is None:
                 return False
-            if offset > max_size:
+            # >= (not >): is_trimmable() is already False at offset ==
+            # max_size, so prefix-trim reuse is impossible there too
+            # (matches pld._wrapped_rotating_layers' boundary).
+            if offset >= max_size:
                 has_wrapped_rotating = True
 
         if not has_wrapped_rotating:
@@ -2652,6 +2667,31 @@ class MLXEngine:
                 )
                 return False
         return True
+
+    def _reject_kv_bits_on_rotating_cache(self) -> None:
+        """FIX-7: refuse ``--kv-bits`` for models whose cache contains
+        RotatingKVCache (sliding-window) layers.
+
+        ``mlx_lm.models.cache.RotatingKVCache.to_quantized`` raises
+        ``NotImplementedError`` ("RotatingKVCache Quantization NYI"), and
+        ``maybe_quantize_kv_cache`` gates only on ``hasattr(c, "to_quantized")``
+        — which RotatingKVCache satisfies — so kv_bits>0 would crash
+        MID-GENERATION as soon as ``quantized_kv_start`` is reached, instead
+        of failing at startup. (The session prefix-reuse path would also
+        break: ``QuantizedKVCache.keys`` is a list of arrays, not a tensor.)
+        """
+        if not self.cfg.kv_bits or self._use_vlm:
+            return
+        if getattr(self, "_has_rotating_cache", False):
+            raise ValueError(
+                f"[{self.model_id}] --kv-bits={self.cfg.kv_bits} is not "
+                f"supported for this model: its cache contains "
+                f"RotatingKVCache (sliding-window attention, window="
+                f"{getattr(self, '_sliding_window_size', '?')}) layers, and "
+                f"mlx-lm's RotatingKVCache does not implement KV quantization "
+                f"(to_quantized raises NotImplementedError). Remove --kv-bits "
+                f"(use bf16 KV cache) for this model."
+            )
 
     @staticmethod
     def _get_cache_offset(cache: list) -> int:
@@ -3235,17 +3275,17 @@ class MLXEngine:
             ))
         # Structured output (response_format) via FSM-based logits masking.
         # Works on both mlx-vlm and mlx-lm paths (same logits_processors contract).
-        # PLD is incompatible: speculative decoding advances multiple tokens
-        # per step, breaking the FSM's single-step advance assumption.
+        # PLD/speculative decoding is incompatible with the FSM's single-step
+        # advance assumption — but that is resolved PER REQUEST at the final
+        # use_pld decision (_run_lm_legacy / _run_vlm's drafter disable):
+        # structured output wins and speculation is disabled for the request.
+        # The FSM processor is therefore ALWAYS built here; disabling it based
+        # on cfg.pld_enabled alone used to silently produce UNCONSTRAINED
+        # output whenever PLD would not actually run (e.g. wrapped-cache
+        # gemma4 sessions where use_pld ends up False).
         structured_proc = None
         rf_type = getattr(response_format, "type", None) if response_format else None
-        if rf_type in ("json_schema", "json_object") and self.cfg.pld_enabled and not self._use_vlm:
-            logger.warning(
-                f"[Structured] response_format={rf_type} disabled: PLD is active "
-                f"(speculative decoding is incompatible with FSM-based constraints). "
-                f"Disable PLD to use structured output."
-            )
-        elif rf_type in ("json_schema", "json_object"):
+        if rf_type in ("json_schema", "json_object"):
             try:
                 from mlx_soloheaven.engine.structured import (
                     build_json_schema_processor,
@@ -3479,7 +3519,21 @@ class MLXEngine:
         # remaining `self._use_vlm` branch in this method's post-loop and
         # is kept because the two paths legitimately diverge in WHERE the
         # post-generation KV cache lives.
-        if prompt_cache is not None:
+        # FIX-2 (PLD fail-closed rewind): if pld_generate_step signalled a
+        # trim failure mid-stream, the local prompt_cache contains ghost
+        # tokens (RoPE/offset desync) — INVALIDATE the session cache instead
+        # of writing it back; the next turn cold-fills from scratch.
+        _pld_cache_invalid = bool(getattr(self, "_pld_cache_invalid", False))
+        self._pld_cache_invalid = False
+        if _pld_cache_invalid:
+            logger.error(
+                f"[KV Cache] session={session_id} | PLD cache rewind failed "
+                f"mid-stream — INVALIDATING session cache (next turn "
+                f"cold-fills)"
+            )
+            cache_state.cache = None
+            cache_state.token_ids = None
+        elif prompt_cache is not None:
             cache_state.cache = prompt_cache
         # Reconcile token_ids to the cache's TRUE offset. The MTP speculative
         # path's yielded-token count can drift ±1 from cache.offset (the bonus
@@ -3490,11 +3544,14 @@ class MLXEngine:
         # cache content; the dropped 1–2 tokens are reprocessed as part of the
         # next turn's suffix (cheap). Cache-ahead (offset > recorded) is left
         # as-is and cold-fills safely — we cannot recover the unrecorded token.
+        # (Skipped entirely when the PLD corruption signal invalidated the
+        # cache above — there is nothing consistent to reconcile against.)
         _actual_token_ids = full_prompt_token_ids + list(generated_token_ids)
         _cache_off = (
             self._get_cache_offset(cache_state.cache) if cache_state.cache else None
         )
-        cache_state.token_ids = _actual_token_ids
+        if not _pld_cache_invalid:
+            cache_state.token_ids = _actual_token_ids
         if _cache_off is not None and _cache_off > 0:
             if _cache_off < len(_actual_token_ids):
                 # Cache BEHIND recorded (a yielded token not yet forwarded —
@@ -3697,6 +3754,7 @@ class MLXEngine:
             max_tokens=max_tokens,
             sampler=sampler,
             logits_processors=logits_processors,
+            response_format=response_format,
         )
 
     def _run_vlm(
@@ -3963,6 +4021,7 @@ class MLXEngine:
         max_tokens,
         sampler,
         logits_processors,
+        response_format=None,
     ):
         """mlx-lm legacy path. Manages a local `prompt_cache` because
         mlx-lm mutates the cache list in place during prefix-trim +
@@ -3978,7 +4037,34 @@ class MLXEngine:
                 "on the default mlx-lm backend use --pld for speculative "
                 "decoding."
             )
+        # FIX-2: per-request PLD cache-corruption flag. pld_generate_step's
+        # fail-closed _rewind fires the callback when a trim silently no-ops;
+        # the callback INVALIDATES the session cache on the spot (robust to
+        # abandoned generators) and this flag tells the generate_stream
+        # post-loop to skip the ghost-token cache write-back. Single
+        # in-flight request per engine (same assumption as
+        # _pending_drafter_finalize).
+        self._pld_cache_invalid = False
+
         prompt_cache = cache_state.cache
+        # FIX-3 (CRITICAL-2): same wrapped-RotatingKVCache reuse gate as the
+        # vlm path (_run_vlm). Once a sliding-window ring buffer has wrapped,
+        # its physical buffer no longer corresponds to a contiguous logical
+        # PREFIX — prefix-trim reuse on a divergent prompt (branch/edit past
+        # the wrap) would mis-align rotated ring slots with prefix positions.
+        # Append-only reuse (no divergence) stays allowed, including
+        # post-wrap append-only (verified correct).
+        if prompt_cache is not None and not self._safe_to_reuse_cache(
+            cache_state, prompt_token_ids
+        ):
+            logger.warning(
+                f"[KV Cache] COLD-FILL (RotatingKVCache wrapped + prompt "
+                f"divergence) — dropping cache and re-prefilling full prompt "
+                f"({len(prompt_token_ids)} tokens)"
+            )
+            cache_state.cache = None
+            cache_state.token_ids = None
+            prompt_cache = None
         if prompt_cache is None:
             prompt_cache = make_prompt_cache(self._language_model)
         else:
@@ -3989,15 +4075,42 @@ class MLXEngine:
                 if stored_ids[j] != prompt_token_ids[j]:
                     break
                 prefix_len = j + 1
-            # Trim KV cache to prefix length
-            for c in prompt_cache:
-                if hasattr(c, "keys") and c.keys is not None:
-                    cached_len = c.keys.shape[2] if len(c.keys.shape) > 2 else 0
-                    if cached_len > prefix_len:
-                        c.keys = c.keys[..., :prefix_len, :]
-                        c.values = c.values[..., :prefix_len, :]
-                        if hasattr(c, "offset"):
-                            c.offset = prefix_len
+            # FIX-3: trim via the caches' own .trim() (keeps
+            # RotatingKVCache._idx bookkeeping consistent and supports
+            # QuantizedKVCache, whose .keys is a list — raw keys/values
+            # slicing crashed there and silently desynced _idx). The logical
+            # cached length comes from the cache offset, not buffer shapes.
+            cached_len = self._get_cache_offset(prompt_cache)
+            trim_needed = cached_len - prefix_len
+            if trim_needed > 0:
+                from mlx_soloheaven.engine.pld import _layer_offsets
+                trimmed = trim_prompt_cache(prompt_cache, trim_needed)
+                # Post-condition (cheap, offset reads only): EVERY
+                # offset-bearing layer must land EXACTLY on prefix_len.
+                # trim_prompt_cache's return is ONLY cache[0]'s trim count
+                # ([c.trim(n) for c in cache][0]); if per-layer offsets had
+                # already diverged, layer 0 can trim fully while another
+                # layer under-trims (trim clamps to min(offset, n)) — the
+                # shortfall would otherwise go undetected.
+                _bad_layers = [
+                    (i, off) for i, off in enumerate(_layer_offsets(prompt_cache))
+                    if off is not None and off != prefix_len
+                ]
+                if trimmed != trim_needed or _bad_layers:
+                    # Fail closed: an untrimmable layer (e.g. a wrapped
+                    # RotatingKVCache that slipped past the gate) no-ops the
+                    # whole trim, and a diverged layer under-trims — either
+                    # way cold-fill rather than reuse a mis-aligned cache.
+                    logger.warning(
+                        f"[KV Cache] prefix trim failed (requested "
+                        f"{trim_needed}, trimmed {trimmed}, layers not at "
+                        f"prefix_len={prefix_len}: {_bad_layers[:8]}) — "
+                        f"COLD-FILL"
+                    )
+                    cache_state.cache = None
+                    cache_state.token_ids = None
+                    prompt_cache = make_prompt_cache(self._language_model)
+                    prefix_len = 0
             # Only feed tokens after prefix
             prompt_token_ids = prompt_token_ids[prefix_len:]
 
@@ -4014,13 +4127,43 @@ class MLXEngine:
             lm_kwargs["quantized_kv_start"] = self.cfg.quantized_kv_start
 
         # PLD requires trimmable cache (for rollback on rejection).
-        # Models with ArraysCache layers (Qwen3.5 DeltaNet, etc.) are NOT
-        # trimmable — fall back to regular lm_stream_generate.
         use_pld = self.cfg.pld_enabled
+        # FIX-6: structured output (response_format) requires the FSM
+        # processor to advance EXACTLY one token per emitted position with
+        # no speculative multi-token rounds — disable PLD for THIS request
+        # and keep the FSM (mirrors the vlm path's drafter disable). This
+        # decision lives here, AFTER cache reuse/cold-fill resolution, so it
+        # reflects whether PLD would actually run.
+        # Gate on the SAME types that actually build an FSM in generate_stream
+        # (json_schema / json_object): {"type": "text"} and unknown types
+        # build NO processor and must KEEP PLD.
+        _rf_type = (
+            getattr(response_format, "type", None) if response_format else None
+        )
+        if use_pld and _rf_type in ("json_schema", "json_object"):
+            logger.info(
+                f"[Structured] PLD disabled for this request: response_format="
+                f"{_rf_type!r} (structured output requires single-step FSM "
+                f"advance; the FSM processor stays active)"
+            )
+            use_pld = False
         if use_pld:
             from mlx_lm.models.cache import can_trim_prompt_cache
             if not can_trim_prompt_cache(prompt_cache):
-                if not getattr(self, "_pld_incompat_warned", False):
+                from mlx_soloheaven.engine.pld import _wrapped_rotating_layers
+                # FIX-8: name the ACTUAL cause. For gemma4 the untrimmable
+                # layer is a wrapped RotatingKVCache (sliding-window ring,
+                # offset >= max_size — permanent for this session), NOT
+                # ArraysCache/DeltaNet.
+                if _wrapped_rotating_layers(prompt_cache):
+                    logger.info(
+                        f"[{self.model_id}] PLD disabled for this request: "
+                        f"RotatingKVCache sliding-window has wrapped "
+                        f"(offset >= max_size) — the cache is permanently "
+                        f"untrimmable past the wrap. Falling back to "
+                        f"standard generation."
+                    )
+                elif not getattr(self, "_pld_incompat_warned", False):
                     logger.warning(
                         f"[{self.model_id}] PLD disabled: model uses "
                         f"non-trimmable cache (e.g. ArraysCache/DeltaNet). "
@@ -4031,6 +4174,20 @@ class MLXEngine:
 
         if use_pld:
             from mlx_soloheaven.engine.pld import pld_generate_step
+
+            def _on_pld_cache_corruption():
+                # FIX-2: surfaced by pld_generate_step's fail-closed rewind.
+                # Invalidate the session cache IMMEDIATELY (here, not only in
+                # generate_stream's post-loop): an abandoned generator (client
+                # disconnect that never drives the stream to completion) never
+                # reaches the post-loop, and the ghost-token cache must not
+                # survive into the next turn. The flag is still consumed by
+                # the post-loop — when it DOES run — to skip the prompt_cache
+                # write-back / token_ids reconcile and log the event.
+                self._pld_cache_invalid = True
+                cache_state.cache = None
+                cache_state.token_ids = None
+
             gen_iter = _pld_response_adapter(
                 pld_generate_step(
                     prompt=mx.array(prompt_token_ids),
@@ -4045,6 +4202,7 @@ class MLXEngine:
                     kv_group_size=self.cfg.kv_group_size,
                     quantized_kv_start=self.cfg.quantized_kv_start,
                     ngram_k=self.cfg.pld_ngram_k,
+                    on_cache_corruption=_on_pld_cache_corruption,
                 ),
                 tokenizer=self.tokenizer,
             )

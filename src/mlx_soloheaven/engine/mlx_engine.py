@@ -317,10 +317,22 @@ def _pld_response_adapter(pld_iter, tokenizer, label: str = "PLD"):
         else:
             text = tokenizer.decode([token])
 
-        if not text:
-            # Partial UTF-8 — buffered, wait for next token
-            continue
-
+        # ACCOUNTING CONTRACT: yield a frame for EVERY token pulled from the
+        # runner — INCLUDING tokens whose detok segment is empty (partial
+        # UTF-8 bytes, or a BPE space held back until the next token) —
+        # exactly mirroring mlx-lm's stream_generate, which yields a
+        # GenerationResponse per token regardless of segment emptiness. The
+        # engine's post-loop records resp.token of every frame into
+        # cache_state.token_ids, and the QwenMTP runner commits every
+        # DELIVERED token into the target cache (finalize forwards the
+        # pending one), so dropping a frame here leaks a committed-but-
+        # unrecorded token: at reconcile the cache lands AHEAD of
+        # len(token_ids) and the hybrid (untrimmable ArraysCache) branch can
+        # only INVALIDATE — every server turn cold-fills. (Production
+        # signature: "cache ahead of recorded ids by N"; the leaked ids
+        # decoded to BPE-held ' ' tokens inside markdown thinking lists.)
+        # The buffered text is not lost — the detokenizer attaches it to a
+        # later frame's segment.
         yield SimpleNamespace(
             text=text, token=token,
             prompt_tps=0.0, generation_tps=tps,

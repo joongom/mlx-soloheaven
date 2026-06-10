@@ -1067,17 +1067,32 @@ def _drive_cancelled(eng, messages, *, cancel_after=2, max_tokens=8):
     return chunks
 
 
-def _assert_no_desynced_cache(cache_state):
+def _assert_no_desynced_cache(cache_state, *, mtp_head_trailing=False):
     """The reconcile contract: the surviving cache (if any) has EVERY
     offset-bearing layer exactly at len(token_ids); otherwise everything —
-    cache, token_ids, MTP finalize-hidden stash — was invalidated."""
+    cache, token_ids, MTP finalize-hidden stash — was invalidated.
+
+    ``mtp_head_trailing=True`` encodes the FINALIZED QwenMTP healthy-end
+    layout (f372f2b lazy last-pair commit): the LAST cache entry is the MTP
+    head whose offset trails the target by EXACTLY one — its lazy last-slot
+    pair commits at next-turn resume. This is the state the engine reconcile
+    deliberately tolerates (``_get_cache_offset`` reads the first
+    offset-bearing TARGET layer, never the head) and the state
+    ``validate_mtp_cache_reuse`` REQUIRES (``head == target - 1``)."""
     if cache_state.cache is None:
         assert cache_state.token_ids is None
         assert getattr(cache_state, "mtp_last_hidden", None) is None
         assert getattr(cache_state, "mtp_hidden_offset", None) is None
     else:
         n = len(cache_state.token_ids)
-        offs = [c.offset for c in cache_state.cache if hasattr(c, "offset")]
+        layers = list(cache_state.cache)
+        if mtp_head_trailing:
+            head = layers.pop()
+            assert getattr(head, "offset", None) == n - 1, (
+                f"MTP head offset {getattr(head, 'offset', None)} != "
+                f"token_ids len {n} - 1 (lazy last slot)"
+            )
+        offs = [c.offset for c in layers if hasattr(c, "offset")]
         assert offs and all(o == n for o in offs), (
             f"desynced cache survived: offsets {offs} != token_ids len {n}"
         )
@@ -1268,3 +1283,209 @@ def test_generate_locked_cancel_honest_trim_survives_verified(monkeypatch):
     for c in cache:
         assert c.offset == len(cs.token_ids)
     _assert_no_desynced_cache(cs)
+
+
+# ---------------------------------------------------------------------------
+# Server-path accounting leak: buffered (empty-segment) tokens must still be
+# yielded to the engine — committed-but-unrecorded tokens otherwise leave the
+# cache AHEAD of token_ids at reconcile and the hybrid cache INVALIDATES on
+# every healthy stream (production: "cache ahead of recorded ids by N").
+# ---------------------------------------------------------------------------
+
+
+def test_response_adapter_yields_frame_for_buffered_empty_segments():
+    """THE PRODUCTION LEAK SHAPE: tokens whose detok segment is empty (BPE-
+    held spaces like id 220, partial UTF-8 multi-byte sequences) used to be
+    swallowed by the adapter (`continue`), so the runner committed them into
+    the target cache but the engine never recorded them into token_ids. The
+    adapter must yield EXACTLY one frame per pulled token — mlx-lm
+    stream_generate parity — empty text included."""
+    from mlx_soloheaven.engine.mlx_engine import _pld_response_adapter
+
+    SPACE = 220
+    tok = SimpleNamespace(
+        eos_token_ids=[9],
+        decode=lambda ids: "" if ids == [SPACE] else "x",
+    )
+    runner = iter(
+        [
+            (5, None, False),
+            (SPACE, None, True),   # buffered: empty segment, MUST still frame
+            (SPACE, None, False),
+            (6, None, True),
+            (9, None, False),      # EOS — terminal frame
+        ]
+    )
+    frames = list(_pld_response_adapter(runner, tok, label="T"))
+    # 1:1 frame-per-token — the engine records every committed token id.
+    assert [f.token for f in frames] == [5, SPACE, SPACE, 6, 9]
+    assert [f.text for f in frames] == ["x", "", "", "x", ""]
+    assert [f.from_draft for f in frames] == [False, True, False, True, False]
+
+
+def test_generate_locked_healthy_eos_midround_exact_accounting(monkeypatch):
+    """ENGINE-LEVEL regression for the server-only accounting leak: a
+    HEALTHY stream (natural EOS mid-round, no cancel) whose output contains
+    buffered empty-segment tokens. Pre-fix the adapter dropped those frames:
+    committed > recorded -> cache AHEAD at reconcile -> untrimmable
+    (ArraysCache) branch INVALIDATED the session cache on EVERY turn (the
+    user's 'reuse never happens' complaint). Post-fix the accounting is
+    EXACT: offset == len(token_ids), no invalidation, the finalize-hidden
+    stash survives, and the next append-only turn passes the MTP reuse
+    gate."""
+    from mlx_soloheaven.engine import qwen_mtp as qwen_mtp_mod
+
+    STOP, SPACE = 7, 23  # SPACE: mid-stream token whose decode is ""
+    chain = {21: 22, 22: SPACE, SPACE: STOP}
+    next_map = lambda t: chain.get(t, (t + 1) % 50)
+    stored = [1, 2, 3, 4, 90]
+    suffix = [40, 20, 21]
+
+    cache = [
+        MockArrays(), MockArrays(), MockKV(), MockArrays(), MockKV(), MockKV(),
+    ]
+    for c in cache:
+        if hasattr(c, "offset"):
+            c.offset = len(stored)
+    cache[5].offset = len(stored) - 1
+    for i in (0, 1, 3):
+        cache[i].cache = [tuple(stored)]
+
+    eng, cs, messages = _generate_engine(cache, stored, mtp=True, suffix=suffix)
+    # EOS detection + one empty-segment (buffered) token mid-stream.
+    eng.tokenizer = SimpleNamespace(
+        decode=lambda ids: "" if ids == [SPACE] else "x",
+        eos_token_ids=[STOP],
+    )
+    cs.mtp_last_hidden = mx.array([[[90.0]]])
+    cs.mtp_hidden_offset = len(stored)
+
+    def fake_step(prompt, model, head, **kwargs):
+        return qwen_mtp_generate_step(
+            prompt, model=None, head=None,
+            ops=MockOps(next_map, next_map), **kwargs,
+        )
+
+    monkeypatch.setattr(qwen_mtp_mod, "qwen_mtp_generate_step", fake_step)
+
+    chunks = list(
+        eng._generate_locked(
+            messages,
+            max_tokens=16,
+            temperature=0.0,
+            session_id="s",
+            tools=None,
+            cancel_event=None,
+            thinking=False,
+            thinking_budget=0,
+            top_p=1.0,
+            min_p=0.0,
+            top_k=0,
+            repetition_penalty=1.0,
+            response_format=None,
+        )
+    )
+
+    token_frames = [c for c in chunks if c.finish_reason is None]
+    assert [c.token for c in token_frames] == [22, SPACE, STOP]
+    # The buffered token's text is empty, but its ID was recorded.
+    assert [c.text for c in token_frames] == ["x", "", ""]
+    assert chunks[-1].finish_reason == "stop"
+
+    # EXACT accounting: the cache SURVIVED reconcile (no invalidation) and
+    # every offset-bearing layer sits at len(token_ids); the recurrent
+    # (ArraysCache) history equals the recorded ids exactly (no ghost
+    # tokens from the rolled-back post-EOS round tail).
+    expected_ids = stored + suffix + [22, SPACE, STOP]
+    assert cs.cache is cache
+    assert cs.token_ids == expected_ids
+    for i in (2, 4):
+        assert cache[i].offset == len(expected_ids)
+    for i in (0, 1, 3):
+        assert cache[i].cache[0] == tuple(expected_ids)
+    assert cache[5].offset == len(expected_ids) - 1  # lazy last slot
+    _assert_no_desynced_cache(cs, mtp_head_trailing=True)
+
+    # The finalize-hidden stash survived (offset-tagged to the live cache)
+    # and the next append-only turn passes the MTP reuse gate -> HIT.
+    assert cs.mtp_last_hidden is not None
+    assert cs.mtp_hidden_offset == len(expected_ids)
+    ok, why = validate_mtp_cache_reuse(
+        cache, cs.token_ids, expected_ids + [40, 50, 51], 5, 1,
+        cs.mtp_last_hidden,
+    )
+    assert ok, why
+
+
+def test_generate_locked_healthy_length_stop_exact_accounting(monkeypatch):
+    """Length-stop variant of the leak shape: no EOS — the runner stops at
+    max_tokens with buffered empty-segment tokens in the output. Accounting
+    must be exact (offset == len(token_ids)), no invalidation."""
+    from mlx_soloheaven.engine import qwen_mtp as qwen_mtp_mod
+
+    SPACE = 23  # decode("") -> buffered/empty segment
+    next_map = lambda t: (t + 1) % 50
+    stored = [1, 2, 3, 4, 90]
+    suffix = [40, 20, 21]
+
+    cache = [
+        MockArrays(), MockArrays(), MockKV(), MockArrays(), MockKV(), MockKV(),
+    ]
+    for c in cache:
+        if hasattr(c, "offset"):
+            c.offset = len(stored)
+    cache[5].offset = len(stored) - 1
+    for i in (0, 1, 3):
+        cache[i].cache = [tuple(stored)]
+
+    eng, cs, messages = _generate_engine(cache, stored, mtp=True, suffix=suffix)
+    eng.tokenizer = SimpleNamespace(
+        decode=lambda ids: "" if ids == [SPACE] else "x",
+        eos_token_ids=[],
+    )
+    cs.mtp_last_hidden = mx.array([[[90.0]]])
+    cs.mtp_hidden_offset = len(stored)
+
+    def fake_step(prompt, model, head, **kwargs):
+        return qwen_mtp_generate_step(
+            prompt, model=None, head=None,
+            ops=MockOps(next_map, next_map), **kwargs,
+        )
+
+    monkeypatch.setattr(qwen_mtp_mod, "qwen_mtp_generate_step", fake_step)
+
+    chunks = list(
+        eng._generate_locked(
+            messages,
+            max_tokens=4,
+            temperature=0.0,
+            session_id="s",
+            tools=None,
+            cancel_event=None,
+            thinking=False,
+            thinking_budget=0,
+            top_p=1.0,
+            min_p=0.0,
+            top_k=0,
+            repetition_penalty=1.0,
+            response_format=None,
+        )
+    )
+
+    token_frames = [c for c in chunks if c.finish_reason is None]
+    assert [c.token for c in token_frames] == [22, SPACE, 24, 25]
+
+    expected_ids = stored + suffix + [22, SPACE, 24, 25]
+    assert cs.cache is cache
+    assert cs.token_ids == expected_ids
+    for i in (2, 4):
+        assert cache[i].offset == len(expected_ids)
+    for i in (0, 1, 3):
+        assert cache[i].cache[0] == tuple(expected_ids)
+    assert cache[5].offset == len(expected_ids) - 1
+    _assert_no_desynced_cache(cs, mtp_head_trailing=True)
+    ok, why = validate_mtp_cache_reuse(
+        cache, cs.token_ids, expected_ids + [40, 50, 51], 5, 1,
+        cs.mtp_last_hidden,
+    )
+    assert ok, why

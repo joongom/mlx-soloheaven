@@ -284,19 +284,27 @@ def _pld_response_adapter(pld_iter, tokenizer, label: str = "PLD"):
 
         # Stop on EOS BEFORE emitting the EOS token's (often empty) text
         if token in eos_ids:
-            # Flush any remaining buffered segment first
+            # Flush any remaining buffered segment, then ALWAYS emit a
+            # terminal frame carrying the EOS token id — mirroring mlx-lm's
+            # stream_generate, whose final GenerationResponse carries
+            # token=eos. The engine's post-loop records that id into
+            # cache_state.token_ids; the QwenMTP finalize forwards the stop
+            # token through the target, so stored ids MUST include it for
+            # offset == len(token_ids) to hold (multi-turn cache reuse).
+            # Paths whose cache does NOT contain the stop (e.g. PLD) are
+            # reconciled by the post-loop offset truncation as before.
+            remaining = ""
             if detok is not None:
                 try:
                     detok.finalize()
-                    remaining = detok.last_segment
-                    if remaining:
-                        yield SimpleNamespace(
-                            text=remaining, token=token,
-                            prompt_tps=0.0, generation_tps=tps,
-                            from_draft=from_draft,
-                        )
+                    remaining = detok.last_segment or ""
                 except Exception:
-                    pass
+                    remaining = ""
+            yield SimpleNamespace(
+                text=remaining, token=token,
+                prompt_tps=0.0, generation_tps=tps,
+                from_draft=from_draft,
+            )
             break
 
         if detok is not None:
@@ -3524,6 +3532,19 @@ class MLXEngine:
                 )
 
         finally:
+            # Deterministically close the backend stream BEFORE the post-loop
+            # reads cache offsets. The QwenMTP runner settles + finalizes its
+            # caches in the generator's own ``finally``; on the cancel/EOS
+            # break paths nothing else closes gen_iter until GC, so without
+            # this the reconcile below could read MID-ROUND offsets and the
+            # finalize would mutate the cache AFTER token_ids were already
+            # reconciled (stale bookkeeping -> spurious cold-fills).
+            try:
+                _close = getattr(gen_iter, "close", None)
+                if _close is not None:
+                    _close()
+            except Exception:  # noqa: BLE001 — teardown must never break the stream
+                logger.exception("[Generate] gen_iter.close() failed")
             # CORRECTION 4: clear the per-request MTP stash once the stream
             # is fully driven — on normal completion, the cancel/EOS break
             # ABOVE, AND any exception / GeneratorExit propagating through a
@@ -3587,15 +3608,19 @@ class MLXEngine:
             cache_state.token_ids = None
         elif prompt_cache is not None:
             cache_state.cache = prompt_cache
-        # Reconcile token_ids to the cache's TRUE offset. The MTP speculative
-        # path's yielded-token count can drift ±1 from cache.offset (the bonus
-        # is yielded before it is forwarded; EOS/partial-block edges). If
-        # token_ids != cache logical length, next turn's wrapped-cache reuse
-        # cold-fills (offset != prefix_len → full re-prefill, multi-second
-        # TTFT). Trim any un-forwarded tail so token_ids EXACTLY matches the
-        # cache content; the dropped 1–2 tokens are reprocessed as part of the
-        # next turn's suffix (cheap). Cache-ahead (offset > recorded) is left
-        # as-is and cold-fills safely — we cannot recover the unrecorded token.
+        # Reconcile token_ids to the cache's TRUE offset. Speculative paths
+        # can drift from cache.offset (PLD never forwards the final token;
+        # the gemma4 vlm MTP terminating block forwards past the recorded
+        # tail; cancellation drops in-flight tokens). The QwenMTP path now
+        # finalizes to EXACT equality — its finalize forwards the pending
+        # stop token through the target (mirroring plain mlx-lm's lookahead)
+        # and gen_iter.close() above runs that finalize deterministically —
+        # so on that path this is a no-op except after cancellation. If
+        # token_ids != cache logical length, next turn's reuse cold-fills
+        # (offset != prefix_len → full re-prefill, multi-second TTFT). Trim
+        # any un-forwarded tail so token_ids EXACTLY matches the cache
+        # content; the dropped 1–2 tokens are reprocessed as part of the
+        # next turn's suffix (cheap).
         # (Skipped entirely when the PLD corruption signal invalidated the
         # cache above — there is nothing consistent to reconcile against.)
         _actual_token_ids = full_prompt_token_ids + list(generated_token_ids)
@@ -3614,19 +3639,77 @@ class MLXEngine:
                 # Cache AHEAD of recorded (speculative tail forwarded past
                 # the last RECORDED token — e.g. the terminating block
                 # forwards b but its only output is the stop token, which
-                # stream_generate drops before the engine records it). Trim
-                # the cache back so cache.offset == len(token_ids); the few
-                # trimmed positions are reprocessed in next turn's suffix.
-                # Without this, offset>prefix_len → wrapped reuse COLD-FILLs.
+                # stream_generate drops before the engine records it; or a
+                # cancelled QwenMTP stream whose finalize forwarded tokens
+                # the cancel-break dropped). Trim the cache back so
+                # cache.offset == len(token_ids); the few trimmed positions
+                # are reprocessed in next turn's suffix. Without this,
+                # offset>prefix_len → wrapped reuse COLD-FILLs.
+                # FAIL-CLOSED guard: trimming requires EVERY layer to be
+                # trimmable. A hybrid cache (qwen3.5: ArraysCache recurrent
+                # layers have no .trim) would desync — KV layers rewound,
+                # recurrent state still containing the trimmed tokens (ghost
+                # tokens on the next forward) — so INVALIDATE instead.
                 _over = _cache_off - len(_actual_token_ids)
-                for _c in cache_state.cache:
-                    if hasattr(_c, "trim"):
+                if all(hasattr(_c, "trim") for _c in cache_state.cache):
+                    # FAIL-CLOSED trim-back (mirrors the 8491f1d prefix-trim
+                    # post-condition): a trim() exception OR any offset-
+                    # bearing layer NOT landing exactly on len(token_ids)
+                    # leaves a PARTIALLY-trimmed cache (some layers rewound,
+                    # others not — e.g. a wrapped RotatingKVCache whose trim
+                    # silently no-ops, or a mid-list layer that raised) while
+                    # token_ids above was already reconciled to the shorter
+                    # history. That desynced cache must never survive into
+                    # next turn's reuse — verify every layer and INVALIDATE
+                    # on any shortfall. (The qwen MTP head entry trails the
+                    # target by one BY DESIGN after finalize, so a head-
+                    # bearing cache that lands here also invalidates — the
+                    # post-trim stash offset tag is stale anyway, so MTP
+                    # resume was already off; a cold-fill is the only safe
+                    # outcome.)
+                    from mlx_soloheaven.engine.pld import _layer_offsets
+                    _trim_exc = False
+                    for _c in cache_state.cache:
                         try:
                             _c.trim(_over)
                         except Exception:  # noqa: BLE001
+                            _trim_exc = True
                             logger.exception(
                                 "[KV Cache] offset>len cache trim failed"
                             )
+                    _bad_layers = [
+                        (i, off)
+                        for i, off in enumerate(_layer_offsets(cache_state.cache))
+                        if off is not None and off != len(_actual_token_ids)
+                    ]
+                    if _trim_exc or _bad_layers:
+                        logger.warning(
+                            f"[KV Cache] session={session_id} | post-stream "
+                            f"trim-back to {len(_actual_token_ids)} failed "
+                            f"(exception={_trim_exc}, layers off target: "
+                            f"{_bad_layers[:8]}) — INVALIDATING session "
+                            f"cache (next turn cold-fills)"
+                        )
+                        cache_state.cache = None
+                        cache_state.token_ids = None
+                        # The MTP finalize-hidden stash is offset-tagged
+                        # against the now-discarded cache — clear it so a
+                        # later turn can never pair a stale hidden with a
+                        # rebuilt cache.
+                        cache_state.mtp_last_hidden = None
+                        cache_state.mtp_hidden_offset = None
+                else:
+                    logger.warning(
+                        f"[KV Cache] session={session_id} | cache ahead of "
+                        f"recorded ids by {_over} but the cache has "
+                        f"untrimmable (recurrent) layers — INVALIDATING "
+                        f"session cache (next turn cold-fills)"
+                    )
+                    cache_state.cache = None
+                    cache_state.token_ids = None
+                    # Same stash hygiene as the verified-trim branch above.
+                    cache_state.mtp_last_hidden = None
+                    cache_state.mtp_hidden_offset = None
 
         # WHY: F3 pins every mlx-vlm call to one persistent _vlm_executor
         # worker thread (model + drafter + generation_stream all bound to
@@ -4156,25 +4239,41 @@ class MLXEngine:
             prompt_cache = None
         # QwenMTP cache-reuse gate (fail-closed, BEFORE the prefix-trim):
         # the MTP runner needs the 40 target entries + the head's KV entries
-        # with head_offset == target_offset (finalized), a PURE-APPEND prompt
-        # (the 30 ArraysCache layers cannot trim, so divergence can never be
-        # rewound), and the head's last committed pair token must byte-match
-        # the first suffix token (head slot i pairs with token i+1 — a stale
-        # pair would silently skew every draft; mlx-lm issue #1292 class).
-        # Any miss -> COLD-FILL once; afterwards the session carries the
-        # 41-entry layout and stays MTP-reusable across appends.
+        # in the FINALIZED shape — every target offset == len(stored ids)
+        # (stored ids include the natural stop token; finalize forwards it
+        # through the target, matching the plain path's lookahead), head
+        # offset == target - 1 (the head's last slot pairs with THIS turn's
+        # first suffix token and is committed lazily at resume from the
+        # stashed finalize hidden) — and a PURE-APPEND prompt (the 30
+        # ArraysCache layers cannot trim, so divergence can never be
+        # rewound). Any miss -> COLD-FILL once; afterwards the session
+        # carries the 41-entry layout and stays MTP-reusable across appends.
+        _mtp_resume_hidden = None
         if use_mtp:
             from mlx_soloheaven.engine import qwen_mtp as qwen_mtp_mod
             _n_target = len(self._language_model.layers)
             _n_head = max(1, len(getattr(_drafter, "layers", [])) or 1)
             if prompt_cache is not None:
+                # Consume the finalize-hidden stash up front (single-use): a
+                # failed/aborted stream must never resurrect a stale one.
+                _mtp_resume_hidden = getattr(cache_state, "mtp_last_hidden", None)
+                _mtp_hidden_off = getattr(cache_state, "mtp_hidden_offset", None)
+                cache_state.mtp_last_hidden = None
+                cache_state.mtp_hidden_offset = None
+                if (
+                    _mtp_resume_hidden is not None
+                    and _mtp_hidden_off != self._get_cache_offset(prompt_cache)
+                ):
+                    # Stash predates a cache mutation (e.g. an intervening
+                    # non-MTP request advanced this session) — fail closed.
+                    _mtp_resume_hidden = None
                 _ok, _why = qwen_mtp_mod.validate_mtp_cache_reuse(
                     prompt_cache,
                     cache_state.token_ids or [],
                     prompt_token_ids,
                     _n_target,
                     _n_head,
-                    getattr(cache_state, "mtp_pending_token", None),
+                    _mtp_resume_hidden,
                 )
                 if not _ok:
                     logger.info(
@@ -4184,6 +4283,7 @@ class MLXEngine:
                     cache_state.cache = None
                     cache_state.token_ids = None
                     prompt_cache = None
+                    _mtp_resume_hidden = None
         if prompt_cache is None:
             prompt_cache = make_prompt_cache(self._language_model)
         else:
@@ -4249,12 +4349,28 @@ class MLXEngine:
                 self._pld_cache_invalid = True
                 cache_state.cache = None
                 cache_state.token_ids = None
+                cache_state.mtp_last_hidden = None
+                cache_state.mtp_hidden_offset = None
 
-            def _on_mtp_finalize(pending_token):
-                # Record the token of the head's finalize-committed pending
-                # pair; next turn's reuse gate verifies the first suffix
-                # token byte-matches it (fail-closed -> cold-fill).
-                cache_state.mtp_pending_token = pending_token
+            def _on_mtp_finalize(final_token, final_hidden):
+                # Stash the finalize hidden (h at the LAST target position):
+                # next turn's reuse gate requires it so the runner can
+                # lazily commit the head's last slot pair
+                # (final_hidden, first_suffix_token) — works for ANY
+                # continuation, including the chat-template "\n" glue after
+                # a natural stop token. Tagged with the cache offset so a
+                # stash that predates any later cache mutation is detected
+                # and dropped (fail-closed -> cold-fill). In-memory only
+                # (not persisted to disk; a disk-reloaded session cold-fills
+                # its first MTP turn, then becomes reusable again).
+                if final_hidden is None:
+                    cache_state.mtp_last_hidden = None
+                    cache_state.mtp_hidden_offset = None
+                else:
+                    cache_state.mtp_last_hidden = final_hidden
+                    cache_state.mtp_hidden_offset = self._get_cache_offset(
+                        prompt_cache
+                    )
 
             gen_iter = _pld_response_adapter(
                 qwen_mtp_mod.qwen_mtp_generate_step(
@@ -4272,6 +4388,7 @@ class MLXEngine:
                     prefill_step_size=self.cfg.prefill_step_size,
                     on_cache_corruption=_on_mtp_cache_corruption,
                     on_finalize=_on_mtp_finalize,
+                    resume_hidden=_mtp_resume_hidden,
                 ),
                 tokenizer=self.tokenizer,
                 label="QwenMTP",

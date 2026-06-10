@@ -16,17 +16,28 @@ Covers:
     on_cache_corruption and permanently disables speculation, stream alive;
   * logits-processor history — exactly one call per emitted token, history
     == suffix + emitted (PLD FIX-4 contract);
-  * finalize/pending — head_offset == target_offset after the stream and
-    append-only multi-turn reuse through validate_mtp_cache_reuse;
+  * finalize/resume — finalize forwards the final (stop) token through the
+    TARGET (stored ids include it, matching the plain mlx-lm lookahead
+    path) and leaves head_offset == target_offset - 1 with the last slot
+    committed LAZILY at resume; append-only multi-turn reuse — including
+    the natural-EOS + "\n"-template-glue production scenario — through
+    validate_mtp_cache_reuse + the runner's lazy last-slot commit;
   * engine wiring — _run_lm_legacy dispatches qwen_mtp, appends head cache
     entries, keeps the mlx-vlm raise for other drafter kinds, and disables
-    MTP for structured-output requests.
+    MTP for structured-output requests;
+  * post-stream AHEAD reconcile (client-cancel path) — when the cache ends
+    AHEAD of the recorded token_ids (cancel drops the in-flight frame but
+    gen_iter.close() still runs the finalize), the reconcile must either
+    trim back cleanly (verified per-layer) or INVALIDATE — a lying or
+    throwing trim must never leave a partially-trimmed (desynced) cache
+    live; the MTP finalize-hidden stash is cleared with the cache.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import threading
 from types import SimpleNamespace
 from typing import List
 
@@ -223,6 +234,9 @@ class MockOps:
         self.next_map = next_map
         self.head_map = head_map
         self.vocab = vocab
+        # Every head forward as (hidden-position tokens, pair tokens) —
+        # lets tests assert the lazy last-slot commit pairing exactly.
+        self.head_calls: List[tuple] = []
 
     def _hid(self, toks):
         return mx.array([[[float(t)] for t in toks]])
@@ -252,6 +266,9 @@ class MockOps:
 
     def head_hidden(self, hidden, next_ids, mtp_cache):
         toks = [int(t) for t in next_ids[0].tolist()]
+        self.head_calls.append(
+            ([int(round(v[0])) for v in hidden[0].tolist()], toks)
+        )
         for c in mtp_cache:
             c.offset += len(toks)
         return self._hid(toks)
@@ -286,17 +303,20 @@ def _run(
     cache=None,
     processors=None,
     callbacks=None,
+    resume_hidden=None,
 ):
     cache = cache if cache is not None else _mk_caches()
-    fired = {"corruption": 0, "pending": "UNSET"}
+    fired = {"corruption": 0, "pending": "UNSET", "hidden": "UNSET"}
 
     def on_corruption():
         fired["corruption"] += 1
 
-    def on_finalize(tok):
+    def on_finalize(tok, hid):
         fired["pending"] = tok
+        fired["hidden"] = hid
 
     ops = MockOps(next_map, head_map)
+    fired["ops"] = ops
     gen = qwen_mtp_generate_step(
         mx.array(suffix, mx.uint32),
         model=None,
@@ -309,6 +329,7 @@ def _run(
         n_target_layers=5,
         on_cache_corruption=on_corruption,
         on_finalize=on_finalize,
+        resume_hidden=resume_hidden,
         ops=ops,
     )
     out = [(t, fd) for t, _lp, fd in gen]
@@ -334,21 +355,24 @@ def test_greedy_identity_with_partial_rejections():
     assert any(flags), "expected at least one accepted draft"
     assert not all(flags), "expected at least one non-draft token"
 
-    # ROLLBACK EXACTNESS: the ArraysCache history must be exactly the
-    # consumed tokens (suffix + emitted[:-1]); any rejected-draft ghost
-    # token would appear here.
-    consumed = tuple(suffix + out[:-1])
+    # ROLLBACK EXACTNESS: the ArraysCache history must be exactly suffix +
+    # ALL emitted tokens (finalize forwards the final one through the
+    # target, plain-path parity); any rejected-draft ghost token would
+    # appear here.
+    final_state = tuple(suffix + out)
     for i in (0, 1, 3):
-        assert cache[i].cache[0] == consumed, (
+        assert cache[i].cache[0] == final_state, (
             f"layer {i} recurrent history has ghost tokens:\n"
-            f"  got      {cache[i].cache[0]}\n  expected {consumed}"
+            f"  got      {cache[i].cache[0]}\n  expected {final_state}"
         )
-    # KV offsets settled to exactly the consumed length.
+    # KV offsets settled to exactly suffix + emitted (stop included).
     for i in (2, 4):
-        assert cache[i].offset == len(consumed)
-    # Finalize: head committed the pending pair -> head == target offset.
-    assert cache[5].offset == len(consumed)
+        assert cache[i].offset == len(final_state)
+    # Finalize: pending pair committed, head ONE behind target (the lazy
+    # last slot pairs with next turn's first token).
+    assert cache[5].offset == len(final_state) - 1
     assert fired["pending"] == out[-1]
+    assert fired["hidden"] is not None
     assert fired["corruption"] == 0
 
 
@@ -362,9 +386,11 @@ def test_greedy_identity_full_accept():
     # Perfect head: every non-bonus round token came from a draft.
     assert sum(flags) >= 6
     assert fired["pending"] == out[-1]
-    consumed = tuple([5, 6] + out[:-1])
-    assert cache[0].cache[0] == consumed
-    assert cache[5].offset == cache[2].offset == len(consumed)
+    assert fired["hidden"] is not None
+    final_state = tuple([5, 6] + out)
+    assert cache[0].cache[0] == final_state
+    assert cache[2].offset == len(final_state)
+    assert cache[5].offset == len(final_state) - 1
 
 
 def test_lying_cache_fires_fail_closed():
@@ -382,8 +408,10 @@ def test_lying_cache_fires_fail_closed():
     # After the trip, no draft is ever accepted again (plain decode).
     first_true = next((i for i, f in enumerate(flags) if f), None)
     assert first_true is None, "no draft should be accepted (head always wrong)"
-    # Broken stream must NOT report a pending finalize (head desynced).
+    # Broken stream must NOT finalize (head desynced): no pending token,
+    # no resume hidden -> next turn's gate cold-fills.
     assert fired["pending"] is None
+    assert fired["hidden"] is None
 
 
 def test_restore_is_reference_exact():
@@ -394,7 +422,7 @@ def test_restore_is_reference_exact():
     suffix = [4, 5]
     out, _flags, cache, _f = _run(suffix, next_map, head_map, max_tokens=6)
     assert out == _chain(5, 6, next_map)
-    assert cache[0].cache[0] == tuple(suffix + out[:-1])
+    assert cache[0].cache[0] == tuple(suffix + out)
 
 
 class _Recorder:
@@ -446,8 +474,9 @@ def test_processor_history_full_accept():
 
 def test_early_close_settles_exactly():
     """Consumer break (EOS path: the adapter closes the generator at a
-    mid-round yield) — finally must settle to exactly prompt + yielded - 1
-    and finalize the pending pair."""
+    mid-round yield) — finally must settle to exactly prompt + yielded - 1,
+    then finalize: pending pair into the head + pending token through the
+    TARGET (so every yielded token is in the cache), head == target - 1."""
     next_map = lambda t: (t + 1) % 50
     suffix = [1, 2, 3]
     cache = _mk_caches()
@@ -465,7 +494,7 @@ def test_early_close_settles_exactly():
         prompt_cache=cache,
         n_target_layers=5,
         on_cache_corruption=lambda: fired.__setitem__("corruption", True),
-        on_finalize=lambda tok: fired.__setitem__("pending", tok),
+        on_finalize=lambda tok, hid: fired.update(pending=tok, hidden=hid),
         ops=MockOps(next_map, next_map),
     )
     for t, _lp, _fd in gen:
@@ -475,86 +504,194 @@ def test_early_close_settles_exactly():
     gen.close()
 
     assert got == _chain(3, 3, next_map)
-    consumed = tuple(suffix + got[:-1])
+    final_state = tuple(suffix + got)
     for i in (0, 1, 3):
-        assert cache[i].cache[0] == consumed, (
+        assert cache[i].cache[0] == final_state, (
             f"layer {i}: early-close left ghost tokens: {cache[i].cache[0]} "
-            f"!= {consumed}"
+            f"!= {final_state}"
         )
     for i in (2, 4):
-        assert cache[i].offset == len(consumed)
-    assert cache[5].offset == len(consumed)  # finalize ran
+        assert cache[i].offset == len(final_state)
+    assert cache[5].offset == len(final_state) - 1  # finalize ran, lazy slot open
     assert fired.get("pending") == got[-1]
+    assert fired.get("hidden") is not None
     assert "corruption" not in fired
 
 
-def test_multiturn_append_reuse():
-    """Turn 2 reuses the finalized cache: validate_mtp_cache_reuse accepts
-    the append-only prompt + matching pending token, and the second run is
-    byte-exact from the committed state."""
+def test_multiturn_append_reuse_length_stop():
+    """Turn 1 ends by max_tokens; turn 2 appends ANY continuation (no
+    byte-match requirement). The gate accepts and the resume path commits
+    the head's lazy last pair from the finalize hidden."""
     next_map = lambda t: (t + 1) % 50
     head_map = lambda t: (t + 1) % 50 if t % 3 else 63
     suffix1 = [1, 2, 3]
     out1, _fl, cache, fired = _run(
         suffix1, next_map, head_map, max_tokens=8
     )
-    pending = fired["pending"]
-    assert pending == out1[-1]
-    stored_ids = suffix1 + out1[:-1]  # what the engine reconcile records
+    assert fired["pending"] == out1[-1]
+    stored_ids = suffix1 + out1  # the engine records ALL yielded tokens
     assert cache[2].offset == len(stored_ids)
+    assert cache[5].offset == len(stored_ids) - 1
 
-    # Next turn: append-only prompt = stored + pending + new user tokens.
-    new_prompt = stored_ids + [pending, 20, 21]
-    ok, why = validate_mtp_cache_reuse(cache, stored_ids, new_prompt, 5, 1, pending)
+    # Next turn: append-only prompt = stored + new user tokens.
+    new_prompt = stored_ids + [20, 21]
+    ok, why = validate_mtp_cache_reuse(
+        cache, stored_ids, new_prompt, 5, 1, fired["hidden"]
+    )
     assert ok, why
 
     suffix2 = new_prompt[len(stored_ids):]
     out2, _fl2, cache, fired2 = _run(
-        suffix2, next_map, head_map, max_tokens=6, cache=cache
+        suffix2, next_map, head_map, max_tokens=6, cache=cache,
+        resume_hidden=fired["hidden"],
     )
+    # The FIRST head call of turn 2 is the lazy last-slot commit:
+    # pair (h_{N-1} == hidden of stored_ids[-1], first suffix token).
+    assert fired2["ops"].head_calls[0] == ([stored_ids[-1]], [20])
     assert out2 == _chain(21, 6, next_map)
-    consumed = tuple(stored_ids + suffix2 + out2[:-1])
-    assert cache[0].cache[0] == consumed
-    assert cache[5].offset == cache[2].offset == len(consumed)
+    final_state = tuple(stored_ids + suffix2 + out2)
+    assert cache[0].cache[0] == final_state
+    assert cache[2].offset == len(final_state)
+    assert cache[5].offset == len(final_state) - 1
     assert fired2["pending"] == out2[-1]
+
+
+def test_multiturn_natural_eos_append_reuse():
+    """THE OBSERVED PRODUCTION SCENARIO (turn-2 permanent cold-fill bug):
+    turn 1 ends at a natural stop token — the adapter breaks at the stop
+    yield and closes the generator; the engine records ALL yielded tokens
+    (stop included, the 248046-like id) into stored token_ids. Turn 2's
+    prompt is stored_ids + chat-template glue ("\\n<|im_start|>user..." —
+    starts with a 198-like "\\n" token, NEVER re-sends the stop). The
+    finalized cache must be reusable: gate OK (no first-token byte-match),
+    resume commits the head's lazy last pair (h_{N-1}, first_suffix_token),
+    and turn 2's output is byte-exact."""
+    STOP, NL = 7, 40
+    next_map = lambda t: 11 if t == STOP else (t + 1) % 50
+    suffix1 = [1, 2, 3]
+    cache = _mk_caches()
+    fired = {}
+    got: List[int] = []
+    ops1 = MockOps(next_map, next_map)
+
+    gen = qwen_mtp_generate_step(
+        mx.array(suffix1, mx.uint32),
+        model=None,
+        head=None,
+        block_size=3,
+        max_tokens=100,
+        sampler=None,
+        logits_processors=None,
+        prompt_cache=cache,
+        n_target_layers=5,
+        on_cache_corruption=lambda: fired.__setitem__("corruption", True),
+        on_finalize=lambda tok, hid: fired.update(pending=tok, hidden=hid),
+        ops=ops1,
+    )
+    for t, _lp, _fd in gen:
+        got.append(t)
+        if t == STOP:
+            break  # exactly what _pld_response_adapter does on EOS
+    gen.close()
+
+    assert got == [4, 5, 6, STOP]
+    stored_ids = suffix1 + got  # engine stores ALL yielded incl. the stop
+    # Finalize forwarded the stop through the TARGET (plain-path parity)...
+    assert cache[2].offset == cache[4].offset == len(stored_ids)
+    for i in (0, 1, 3):
+        assert cache[i].cache[0] == tuple(stored_ids)
+    # ...and left the head ONE behind: its last slot pairs with turn 2's
+    # first token, unknowable at finalize time.
+    assert cache[5].offset == len(stored_ids) - 1
+    assert fired["pending"] == STOP
+    assert fired["hidden"] is not None
+    assert "corruption" not in fired
+
+    # Turn 2: template glue then user tokens — the stop is NOT re-sent.
+    new_prompt = stored_ids + [NL, 20, 21]
+    ok, why = validate_mtp_cache_reuse(
+        cache, stored_ids, new_prompt, 5, 1, fired["hidden"]
+    )
+    # Pre-fix this failed with "pending pair token 7 != first suffix token 40".
+    assert ok, why
+
+    suffix2 = new_prompt[len(stored_ids):]
+    out2, _fl2, cache, fired2 = _run(
+        suffix2, next_map, next_map, max_tokens=5, cache=cache,
+        resume_hidden=fired["hidden"],
+    )
+    # The FIRST head call of turn 2 must be the lazy last-slot commit:
+    # pair (h_{N-1} == hidden of STOP, first suffix token NL).
+    assert fired2["ops"].head_calls[0] == ([STOP], [NL])
+    assert out2 == _chain(21, 5, next_map)
+    final_state = tuple(stored_ids + suffix2 + out2)
+    assert cache[0].cache[0] == final_state
+    assert cache[2].offset == len(final_state)
+    assert cache[5].offset == len(final_state) - 1
+    assert fired2["pending"] == out2[-1]
+
+
+def test_mid_stream_abort_cold_fills():
+    """A broken (fail-closed) stream never finalizes: on_finalize(None,
+    None), head/target left desynced — next turn's gate must cold-fill."""
+    next_map = lambda t: (t + 1) % 50
+    head_map = lambda t: 63  # always wrong
+    cache = _mk_caches(kv_cls=LyingKV)
+    cache[5] = MockKV()
+    out, _fl, cache, fired = _run(
+        [1, 2, 3], next_map, head_map, max_tokens=8, cache=cache
+    )
+    assert fired["corruption"] >= 1
+    assert fired["pending"] is None
+    assert fired["hidden"] is None
+    stored = [1, 2, 3] + out
+    ok, why = validate_mtp_cache_reuse(
+        cache, stored, stored + [30], 5, 1, fired["hidden"]
+    )
+    assert not ok
 
 
 def test_validate_mtp_cache_reuse_fail_closed():
     next_map = lambda t: (t + 1) % 50
     out, _fl, cache, fired = _run([1, 2, 3], next_map, next_map, max_tokens=6)
-    stored = [1, 2, 3] + out[:-1]
-    pend = fired["pending"]
-    good = stored + [pend, 30]
+    stored = [1, 2, 3] + out  # ALL yielded tokens are stored (stop included)
+    hidden = fired["hidden"]
+    good = stored + [30, 31]  # any continuation — no byte-match requirement
 
-    ok, _ = validate_mtp_cache_reuse(cache, stored, good, 5, 1, pend)
+    ok, _ = validate_mtp_cache_reuse(cache, stored, good, 5, 1, hidden)
     assert ok
     # layout: missing head entry
-    ok, why = validate_mtp_cache_reuse(cache[:5], stored, good, 5, 1, pend)
+    ok, why = validate_mtp_cache_reuse(cache[:5], stored, good, 5, 1, hidden)
     assert not ok and "layout" in why
-    # head offset desync
-    cache[5].offset -= 1
-    ok, why = validate_mtp_cache_reuse(cache, stored, good, 5, 1, pend)
+    # head == target: stale pre-fix shape (lazy slot filled with an unknown
+    # pair) -> must cold-fill
+    cache[5].offset += 1
+    ok, why = validate_mtp_cache_reuse(cache, stored, good, 5, 1, hidden)
+    assert not ok and "head offset" in why
+    # head == target - 2: mid-stream shape (finalize never ran)
+    cache[5].offset -= 2
+    ok, why = validate_mtp_cache_reuse(cache, stored, good, 5, 1, hidden)
     assert not ok and "head offset" in why
     cache[5].offset += 1
     # divergence (ArraysCache untrimmable -> must cold-fill)
-    diverged = stored[:-1] + [49, pend, 30]
-    ok, why = validate_mtp_cache_reuse(cache, stored, diverged, 5, 1, pend)
+    diverged = stored[:-1] + [49, 30]
+    ok, why = validate_mtp_cache_reuse(cache, stored, diverged, 5, 1, hidden)
     assert not ok and "divergence" in why
-    # pending-pair token mismatch (stale head slot)
-    bad_pend = stored + [(pend + 1) % 50, 30]
-    ok, why = validate_mtp_cache_reuse(cache, stored, bad_pend, 5, 1, pend)
-    assert not ok and "pending" in why
-    # unknown pending (e.g. session reloaded from disk) -> fail closed
+    # missing resume hidden (mid-stream abort / disk reload / stale stash)
     ok, why = validate_mtp_cache_reuse(cache, stored, good, 5, 1, None)
-    assert not ok and "pending" in why
+    assert not ok and "hidden" in why
     # no new suffix
-    ok, why = validate_mtp_cache_reuse(cache, stored, list(stored), 5, 1, pend)
+    ok, why = validate_mtp_cache_reuse(cache, stored, list(stored), 5, 1, hidden)
     assert not ok
     # target offset != stored ids
     cache[2].offset += 1
-    ok, why = validate_mtp_cache_reuse(cache, stored, good, 5, 1, pend)
+    ok, why = validate_mtp_cache_reuse(cache, stored, good, 5, 1, hidden)
     assert not ok
     cache[2].offset -= 1
+    # fresh-shaped cache (just cold-filled) is trivially reusable
+    fresh = _mk_caches()
+    ok, _ = validate_mtp_cache_reuse(fresh, [], good, 5, 1, None)
+    assert ok
 
 
 def test_classify_cache():
@@ -572,10 +709,12 @@ def test_max_tokens_one_no_round():
     out, flags, cache, fired = _run([1, 2], next_map, next_map, max_tokens=1)
     assert out == [next_map(2)] == [3]
     assert flags == [False]
-    # Target consumed exactly the suffix; head finalized to match.
-    assert cache[2].offset == 2
+    # Finalize forwarded the single emitted token through the target too
+    # (suffix + 1); the head trails by the lazy last slot.
+    assert cache[2].offset == 3
     assert cache[5].offset == 2
     assert fired["pending"] == 3
+    assert fired["hidden"] is not None
 
 
 # ---------------------------------------------------------------------------
@@ -634,6 +773,8 @@ def test_run_lm_legacy_dispatches_qwen_mtp(monkeypatch):
     # Head KV entries appended after the 5 target entries.
     assert len(prompt_cache) == 6
     assert captured["prompt_cache"] is prompt_cache
+    # Fresh cache: no lazy last-slot commit to perform.
+    assert captured["resume_hidden"] is None
 
 
 def test_run_lm_legacy_qwen_mtp_structured_falls_back(monkeypatch):
@@ -709,6 +850,117 @@ def test_run_lm_legacy_qwen_mtp_cold_fills_unreusable_cache(monkeypatch):
     assert captured["prompt_len"] == 5
 
 
+def _finalized_cache_state(stored, hidden):
+    """A PromptCacheState in the finalized MTP shape: 6-entry cache with
+    target offsets == len(stored), head == len(stored) - 1, plus the
+    finalize-hidden stash tagged with the cache offset."""
+    from mlx_vlm.generate import PromptCacheState
+
+    cache = [MockArrays(), MockArrays(), MockKV(), MockArrays(), MockKV(), MockKV()]
+    for c in cache:
+        if hasattr(c, "offset"):
+            c.offset = len(stored)
+    cache[5].offset = len(stored) - 1
+    cs = PromptCacheState()
+    cs.cache = cache
+    cs.token_ids = list(stored)
+    cs.mtp_last_hidden = hidden
+    cs.mtp_hidden_offset = len(stored)
+    return cs, cache
+
+
+def test_run_lm_legacy_mtp_reuses_finalized_eos_cache(monkeypatch):
+    """ENGINE-LEVEL regression for the observed bug: stored token_ids end
+    with the stop token (248046-like) and the next prompt's suffix starts
+    with template glue (198-like "\\n") — the gate must PASS (no cold-fill),
+    slice the prompt to the 3-token suffix, hand the runner the stashed
+    finalize hidden, and consume the single-use stash."""
+    from mlx_soloheaven.engine import qwen_mtp as qwen_mtp_mod
+
+    captured = {}
+
+    def fake_step(prompt, model, head, **kwargs):
+        captured.update(kwargs)
+        captured["prompt_len"] = int(prompt.size)
+        return iter(())
+
+    monkeypatch.setattr(qwen_mtp_mod, "qwen_mtp_generate_step", fake_step)
+
+    eng = _mtp_engine()
+    STOP, NL = 90, 91  # stand-ins for 248046 (<|im_end|>) and 198 ("\n")
+    stored = [1, 2, 3, 4, STOP]
+    hidden = mx.zeros((1, 1, 4))
+    cache_state, cache = _finalized_cache_state(stored, hidden)
+
+    gen_iter, prompt_cache = eng._run_lm_legacy(
+        cache_state=cache_state,
+        prompt_token_ids=stored + [NL, 50, 51],
+        max_tokens=8,
+        sampler=lambda lp: mx.argmax(lp, axis=-1),
+        logits_processors=None,
+    )
+    list(gen_iter)
+    assert prompt_cache is cache  # NO cold-fill
+    assert captured["prompt_len"] == 3  # only the new suffix prefilled
+    assert captured["resume_hidden"] is hidden
+    # Single-use stash consumed (a failed stream can't resurrect it).
+    assert cache_state.mtp_last_hidden is None
+    assert cache_state.mtp_hidden_offset is None
+
+
+def test_run_lm_legacy_mtp_stale_hidden_cold_fills(monkeypatch):
+    """A finalize-hidden stash whose offset tag no longer matches the cache
+    (e.g. an intervening non-MTP request advanced the session) must be
+    dropped -> gate fails -> cold-fill with a fresh 6-entry layout."""
+    from mlx_soloheaven.engine import qwen_mtp as qwen_mtp_mod
+
+    captured = {}
+
+    def fake_step(prompt, model, head, **kwargs):
+        captured.update(kwargs)
+        captured["prompt_len"] = int(prompt.size)
+        return iter(())
+
+    monkeypatch.setattr(qwen_mtp_mod, "qwen_mtp_generate_step", fake_step)
+
+    eng = _mtp_engine()
+    stored = [1, 2, 3, 4, 90]
+    cache_state, cache = _finalized_cache_state(stored, mx.zeros((1, 1, 4)))
+    cache_state.mtp_hidden_offset = len(stored) - 2  # stale tag
+
+    gen_iter, prompt_cache = eng._run_lm_legacy(
+        cache_state=cache_state,
+        prompt_token_ids=stored + [91, 50, 51],
+        max_tokens=8,
+        sampler=lambda lp: mx.argmax(lp, axis=-1),
+        logits_processors=None,
+    )
+    list(gen_iter)
+    assert prompt_cache is not cache  # cold-filled
+    assert len(prompt_cache) == 6
+    assert captured["prompt_len"] == 8  # full prompt re-prefilled
+    assert captured["resume_hidden"] is None
+    assert cache_state.mtp_last_hidden is None
+
+
+def test_response_adapter_always_emits_terminal_eos_frame():
+    """The adapter must mirror mlx-lm's stream_generate: the terminal frame
+    carries the EOS token id even with no buffered text left — the engine's
+    post-loop records it into token_ids (the MTP finalize forwards the stop
+    through the target, so stored ids must include it for offset ==
+    len(token_ids) to hold)."""
+    from mlx_soloheaven.engine.mlx_engine import _pld_response_adapter
+
+    tok = SimpleNamespace(eos_token_ids=[9], decode=lambda ids: "x")
+    frames = list(
+        _pld_response_adapter(
+            iter([(5, None, False), (9, None, False)]), tok, label="T"
+        )
+    )
+    assert [f.token for f in frames] == [5, 9]
+    assert frames[-1].text == ""
+
+
 def test_run_lm_legacy_still_rejects_vlm_drafter_kinds():
     from mlx_vlm.generate import PromptCacheState
 
@@ -725,3 +977,294 @@ def test_run_lm_legacy_still_rejects_vlm_drafter_kinds():
     msg = str(exc.value)
     assert "--backend mlx-vlm" in msg
     assert "qwen3_5_mtp" in msg
+
+
+# ---------------------------------------------------------------------------
+# Post-stream AHEAD reconcile (client-cancel path) — fail-closed trim-back
+# ---------------------------------------------------------------------------
+
+
+class ThrowingKV(MockKV):
+    """trim() raises mid-reconcile — earlier layers in the list have already
+    been rewound, so failing open here leaves a PARTIALLY-trimmed cache."""
+
+    def trim(self, n):
+        raise RuntimeError("trim exploded")
+
+
+def _generate_engine(cache, stored, *, mtp, suffix):
+    """An MLXEngine stub that can drive ``_generate_locked`` end-to-end on
+    the mlx-lm path with a PRE-SEEDED cache-hit session. The session's
+    cache_state object is mutated in place by the post-loop reconcile, so a
+    cancelled stream's outcome (clean trim vs invalidation) is observable
+    even though cancellation skips the session save. No real model."""
+    from mlx_soloheaven.engine.mlx_engine import SessionState
+    from mlx_vlm.generate import PromptCacheState
+
+    eng = _mtp_engine()
+    if not mtp:
+        eng._drafter = None
+        eng._draft_kind = None
+    eng.cfg.enable_thinking = False
+    eng.cfg.think_end_token = -1
+    eng.cfg.pld_enabled = False
+    eng.cfg.kv_bits = 0
+    eng._sessions = {}
+    eng._touch_gpu = lambda: None
+    eng._has_disk_cache = lambda sid: False
+    eng._find_base_cache = lambda messages, tools=None: None
+    eng._maybe_register_base_cache = lambda *a, **k: None
+    eng._has_rotating_cache = False
+    eng._sliding_window_size = 0
+    eng.model_family = "chatml"
+    # decode must be non-empty so the response adapter emits one frame per
+    # token (empty text would be buffered as a partial-UTF8 segment).
+    eng.tokenizer = SimpleNamespace(decode=lambda ids: "x", eos_token_ids=[])
+    eng._messages_match = lambda stored_msgs, incoming: True
+    eng._suffix_tokens = lambda msgs, thinking=True: list(suffix)
+
+    cs = PromptCacheState()
+    cs.cache = cache
+    cs.token_ids = list(stored)
+    sess_messages = [
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+    ]
+    eng._sessions["s"] = SessionState(
+        cache_state=cs,
+        messages=sess_messages,
+        total_cache_tokens=len(stored),
+    )
+    messages = sess_messages + [{"role": "user", "content": "u2"}]
+    return eng, cs, messages
+
+
+def _drive_cancelled(eng, messages, *, cancel_after=2, max_tokens=8):
+    """Consume ``_generate_locked`` and set cancel_event after
+    ``cancel_after`` yielded tokens. The engine's stream loop checks the
+    event AFTER pulling the next frame from gen_iter and BEFORE recording
+    it — exactly the 'yielded but never recorded' client-cancel gap."""
+    cancel = threading.Event()
+    chunks = []
+    for ch in eng._generate_locked(
+        messages,
+        max_tokens=max_tokens,
+        temperature=0.0,
+        session_id="s",
+        tools=None,
+        cancel_event=cancel,
+        thinking=False,
+        thinking_budget=0,
+        top_p=1.0,
+        min_p=0.0,
+        top_k=0,
+        repetition_penalty=1.0,
+        response_format=None,
+    ):
+        chunks.append(ch)
+        if len(chunks) == cancel_after:
+            cancel.set()
+    return chunks
+
+
+def _assert_no_desynced_cache(cache_state):
+    """The reconcile contract: the surviving cache (if any) has EVERY
+    offset-bearing layer exactly at len(token_ids); otherwise everything —
+    cache, token_ids, MTP finalize-hidden stash — was invalidated."""
+    if cache_state.cache is None:
+        assert cache_state.token_ids is None
+        assert getattr(cache_state, "mtp_last_hidden", None) is None
+        assert getattr(cache_state, "mtp_hidden_offset", None) is None
+    else:
+        n = len(cache_state.token_ids)
+        offs = [c.offset for c in cache_state.cache if hasattr(c, "offset")]
+        assert offs and all(o == n for o in offs), (
+            f"desynced cache survived: offsets {offs} != token_ids len {n}"
+        )
+
+
+def test_generate_locked_client_cancel_mtp_invalidates_desynced_cache(
+    monkeypatch,
+):
+    """ENGINE-LEVEL client-cancel on the QwenMTP path: cancel_event trips
+    between a yielded frame and its recording, then gen_iter.close() runs
+    the runner finalize — which forwards the pending token through the
+    TARGET — so the cache lands AHEAD of the recorded token_ids. The hybrid
+    cache (untrimmable ArraysCache layers) can never be rewound: the
+    post-loop reconcile must INVALIDATE the session cache AND clear the
+    finalize-hidden stash (which on_finalize re-set during close). No
+    desynced cache survives."""
+    from mlx_soloheaven.engine import qwen_mtp as qwen_mtp_mod
+
+    STOP = 7
+    next_map = lambda t: (t + 1) % 50
+    stored = [1, 2, 3, 4, STOP]
+    suffix = [40, 20, 21]  # template glue + user tokens
+
+    # Finalized hybrid cache: targets at len(stored), head one behind.
+    cache = [
+        MockArrays(), MockArrays(), MockKV(), MockArrays(), MockKV(), MockKV(),
+    ]
+    for c in cache:
+        if hasattr(c, "offset"):
+            c.offset = len(stored)
+    cache[5].offset = len(stored) - 1
+    for i in (0, 1, 3):
+        cache[i].cache = [tuple(stored)]
+
+    eng, cs, messages = _generate_engine(cache, stored, mtp=True, suffix=suffix)
+    cs.mtp_last_hidden = mx.array([[[float(STOP)]]])
+    cs.mtp_hidden_offset = len(stored)
+
+    runner_yielded: List[int] = []
+
+    def fake_step(prompt, model, head, **kwargs):
+        inner = qwen_mtp_generate_step(
+            prompt, model=None, head=None,
+            ops=MockOps(next_map, next_map), **kwargs,
+        )
+
+        def spy():
+            try:
+                for item in inner:
+                    runner_yielded.append(int(item[0]))
+                    yield item
+            finally:
+                inner.close()
+
+        return spy()
+
+    monkeypatch.setattr(qwen_mtp_mod, "qwen_mtp_generate_step", fake_step)
+
+    chunks = _drive_cancelled(eng, messages, cancel_after=2)
+
+    # The cancel dropped exactly the in-flight frame: the runner yielded one
+    # more token than the engine recorded.
+    assert len(chunks) == 2
+    assert len(runner_yielded) == 3
+    assert [c.token for c in chunks] == runner_yielded[:2]
+    # Reconcile invalidated everything (pre-fix the untrimmable branch
+    # nulled the cache but LEAKED the stash that on_finalize set at close).
+    assert cs.cache is None
+    assert cs.token_ids is None
+    assert cs.mtp_last_hidden is None
+    assert cs.mtp_hidden_offset is None
+    _assert_no_desynced_cache(cs)
+
+
+def test_generate_locked_cancel_lying_trim_invalidates(monkeypatch):
+    """AHEAD reconcile, trimmable branch, LYING trim: every layer's trim()
+    returns without raising but never rewinds. Pre-fix this failed OPEN —
+    the desynced cache stayed live while token_ids was already reconciled
+    to the shorter history. The per-layer post-trim verification must
+    INVALIDATE."""
+    from mlx_soloheaven.engine import mlx_engine as mlx_engine_module
+
+    stored = [1, 2, 3, 4, 5]
+    suffix = [40, 20, 21]
+    cache = [LyingKV() for _ in range(5)]
+    for c in cache:
+        c.offset = len(stored)
+    eng, cs, messages = _generate_engine(cache, stored, mtp=False, suffix=suffix)
+
+    def fake_lm_stream(model, tokenizer, prompt, **kwargs):
+        prompt_cache = kwargs["prompt_cache"]
+
+        def gen():
+            for c in prompt_cache:  # prefill the suffix
+                c.offset += len(prompt)
+            for tid in (101, 102, 103, 104):
+                for c in prompt_cache:  # one decode step per token
+                    c.offset += 1
+                yield SimpleNamespace(
+                    text="x", token=tid, prompt_tps=1.0, generation_tps=1.0,
+                )
+
+        return gen()
+
+    monkeypatch.setattr(mlx_engine_module, "lm_stream_generate", fake_lm_stream)
+
+    chunks = _drive_cancelled(eng, messages, cancel_after=2)
+    assert len(chunks) == 2  # third frame pulled but dropped -> cache AHEAD
+    assert cs.cache is None
+    assert cs.token_ids is None
+    _assert_no_desynced_cache(cs)
+
+
+def test_generate_locked_cancel_throwing_trim_invalidates(monkeypatch):
+    """AHEAD reconcile, trimmable branch, THROWING trim: one mid-list layer
+    raises after its neighbours already rewound — a partially-trimmed cache.
+    Pre-fix the exception was only logged and the desynced cache survived;
+    now ANY trim exception invalidates."""
+    from mlx_soloheaven.engine import mlx_engine as mlx_engine_module
+
+    stored = [1, 2, 3, 4, 5]
+    suffix = [40, 20, 21]
+    cache = [MockKV(), ThrowingKV(), MockKV(), MockKV(), MockKV()]
+    for c in cache:
+        c.offset = len(stored)
+    eng, cs, messages = _generate_engine(cache, stored, mtp=False, suffix=suffix)
+
+    def fake_lm_stream(model, tokenizer, prompt, **kwargs):
+        prompt_cache = kwargs["prompt_cache"]
+
+        def gen():
+            for c in prompt_cache:
+                c.offset += len(prompt)
+            for tid in (101, 102, 103, 104):
+                for c in prompt_cache:
+                    c.offset += 1
+                yield SimpleNamespace(
+                    text="x", token=tid, prompt_tps=1.0, generation_tps=1.0,
+                )
+
+        return gen()
+
+    monkeypatch.setattr(mlx_engine_module, "lm_stream_generate", fake_lm_stream)
+
+    chunks = _drive_cancelled(eng, messages, cancel_after=2)
+    assert len(chunks) == 2
+    assert cs.cache is None
+    assert cs.token_ids is None
+    _assert_no_desynced_cache(cs)
+
+
+def test_generate_locked_cancel_honest_trim_survives_verified(monkeypatch):
+    """Positive control: with honest trimmable layers the cancel-path
+    reconcile trims the cache back to EXACTLY len(token_ids) (verified
+    per-layer) and the cache survives — the fail-closed guard must not
+    degrade the legitimate trim-back into a blanket cold-fill."""
+    from mlx_soloheaven.engine import mlx_engine as mlx_engine_module
+
+    stored = [1, 2, 3, 4, 5]
+    suffix = [40, 20, 21]
+    cache = [MockKV() for _ in range(5)]
+    for c in cache:
+        c.offset = len(stored)
+    eng, cs, messages = _generate_engine(cache, stored, mtp=False, suffix=suffix)
+
+    def fake_lm_stream(model, tokenizer, prompt, **kwargs):
+        prompt_cache = kwargs["prompt_cache"]
+
+        def gen():
+            for c in prompt_cache:
+                c.offset += len(prompt)
+            for tid in (101, 102, 103, 104):
+                for c in prompt_cache:
+                    c.offset += 1
+                yield SimpleNamespace(
+                    text="x", token=tid, prompt_tps=1.0, generation_tps=1.0,
+                )
+
+        return gen()
+
+    monkeypatch.setattr(mlx_engine_module, "lm_stream_generate", fake_lm_stream)
+
+    chunks = _drive_cancelled(eng, messages, cancel_after=2)
+    assert len(chunks) == 2
+    # Cache survived, trimmed back to exactly the recorded history.
+    assert cs.cache is cache
+    assert cs.token_ids == stored + suffix + [101, 102]
+    for c in cache:
+        assert c.offset == len(cs.token_ids)
+    _assert_no_desynced_cache(cs)

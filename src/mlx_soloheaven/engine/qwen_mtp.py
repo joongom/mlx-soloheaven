@@ -48,12 +48,24 @@ stream + ``on_cache_corruption`` invalidates the session cache.
 Head-cache pairing convention: head KV slot ``i`` = pair
 ``(h_i, embed(y_{i+1}))`` at absolute position ``i``. During decode the head
 offset is ``target_offset - 1`` (the pending token's pair is written by the
-next round's first draft step). At stream end the pending pair IS committed
-(``finalize``) so a persisted cache satisfies ``head_offset ==
-target_offset`` — the entry invariant for append-only multi-turn reuse. The
-pending token id is surfaced via ``on_finalize`` so the engine can verify
-next turn's first suffix token matches the committed pair (fail-closed:
-mismatch -> cold-fill; see mlx-lm issue #1292 for the failure class).
+next round's first draft step). At stream end ``finalize`` (1) commits the
+pending pair into the head AND (2) forwards the pending token through the
+TARGET — exactly what plain mlx-lm's lookahead ``generate_step`` does — so
+the persisted target cache contains EVERY emitted token (the natural stop
+token included) and ``target_offset == len(stored_token_ids)`` keeps the
+same meaning on the MTP and non-MTP paths (the engine's chat-template
+suffix builder relies on stored ids ending WITH the stop token; the next
+turn's suffix starts with template glue like ``"\n"`` and never re-sends
+the stop). The head therefore lands at ``target_offset - 1``: its LAST
+slot would pair with the NEXT turn's first token, which is unknowable at
+finalize time, so that slot is committed LAZILY at resume.
+``on_finalize(final_token, final_hidden)`` surfaces the final pre-norm
+hidden (h at the last target position); the engine stashes it, next
+turn's reuse gate (``validate_mtp_cache_reuse``) requires ``head_offset ==
+target_offset - 1`` plus a stashed hidden, and the runner entry commits
+``(final_hidden, first_suffix_token)`` through the head once before
+prefill. Fail-closed: missing hidden / any offset mismatch -> cold-fill
+(mlx-lm issue #1292 failure class).
 """
 
 from __future__ import annotations
@@ -352,20 +364,29 @@ def validate_mtp_cache_reuse(
     prompt_token_ids: Sequence[int],
     n_target_layers: int,
     n_head_layers: int,
-    pending_token: Optional[int],
+    resume_hidden: Optional[Any],
 ) -> Tuple[bool, str]:
     """Decide whether a REUSED session cache is safe for the MTP runner.
+
+    Finalized-cache contract (see the module docstring + the finalize block
+    in ``qwen_mtp_generate_step``): stored_ids include EVERY emitted token
+    — the natural stop token too (finalize forwards it through the target,
+    mirroring plain mlx-lm's lookahead ``generate_step``); the head sits at
+    ``target_offset - 1`` with slots ``0..N-2`` committed as pairs
+    ``(h_i, stored_ids[i+1])``; the LAST slot's pair token is next turn's
+    first suffix token, committed lazily at resume from ``resume_hidden``
+    (= h_{N-1}, surfaced by ``on_finalize``).
 
     Fail-closed requirements (any miss -> caller cold-fills):
       * layout: exactly n_target + n_head entries,
       * every offset-bearing target layer at ONE offset == len(stored_ids),
-      * every head entry at the SAME offset (the finalize commit ran),
+      * every head entry at offset == target_offset - 1 (finalize ran; the
+        lazy last slot is still open),
       * pure append: the entire stored history is a strict prefix of the new
         prompt (the target's ArraysCache layers cannot trim, so divergence
-        can never be rewound),
-      * the head's last committed pair used the PENDING token — it must
-        byte-match the first suffix token (head slot i depends on y_{i+1};
-        a stale pair would silently skew every subsequent draft).
+        can never be rewound) with >= 1 new suffix token,
+      * ``resume_hidden`` present (a mid-stream abort, disk reload, or a
+        stale stash leaves it None — the lazy pair cannot be committed).
     """
     if len(prompt_cache) != n_target_layers + n_head_layers:
         return False, (
@@ -382,10 +403,16 @@ def validate_mtp_cache_reuse(
         return False, f"target offsets diverged: {sorted(t_offs)[:4]}"
     t_off = t_offs.pop()
     h_offs = {int(getattr(c, "offset", -1)) for c in head}
-    if h_offs != {t_off}:
-        return False, f"head offset {sorted(h_offs)} != target {t_off}"
     if t_off == 0 and not stored_ids:
-        return True, ""  # fresh-shaped 41-entry cache
+        # fresh-shaped 41-entry cache (head trivially in lockstep at 0)
+        if h_offs != {0}:
+            return False, f"fresh cache head offset {sorted(h_offs)} != 0"
+        return True, ""
+    if h_offs != {t_off - 1}:
+        return False, (
+            f"head offset {sorted(h_offs)} != target {t_off} - 1 "
+            f"(finalized head trails by the lazy last slot)"
+        )
     if t_off != len(stored_ids):
         return False, f"offset {t_off} != stored ids {len(stored_ids)}"
     prefix_len = 0
@@ -397,10 +424,10 @@ def validate_mtp_cache_reuse(
         return False, f"divergence at {prefix_len} (ArraysCache untrimmable)"
     if prefix_len >= len(prompt_token_ids):
         return False, "no new suffix tokens"
-    if pending_token is None or int(pending_token) != int(prompt_token_ids[prefix_len]):
+    if resume_hidden is None:
         return False, (
-            f"pending pair token {pending_token!r} != first suffix token "
-            f"{int(prompt_token_ids[prefix_len])}"
+            "resume hidden missing (mid-stream abort, disk reload, or stale "
+            "stash) — the head's lazy last-slot pair cannot be committed"
         )
     return True, ""
 
@@ -441,7 +468,8 @@ def qwen_mtp_generate_step(
     n_target_layers: int,
     prefill_step_size: int = 2048,
     on_cache_corruption: Optional[Callable[[], None]] = None,
-    on_finalize: Optional[Callable[[Optional[int]], None]] = None,
+    on_finalize: Optional[Callable[[Optional[int], Optional[mx.array]], None]] = None,
+    resume_hidden: Optional[mx.array] = None,
     ops: Optional[Any] = None,
 ) -> Generator[Tuple[int, Any, bool], None, None]:
     """MTP speculative decoding round loop. Yields ``(token, logprobs,
@@ -450,8 +478,14 @@ def qwen_mtp_generate_step(
 
     ``prompt`` is the post-prefix-trim SUFFIX (>= 1 token). ``prompt_cache``
     must hold the target's ``n_target_layers`` entries followed by the head's
-    KV entries, with head offset == target offset on entry (fresh 0/0, or a
-    finalized reused cache — validated by ``validate_mtp_cache_reuse``).
+    KV entries, in one of two entry shapes (validated by
+    ``validate_mtp_cache_reuse``):
+      * fresh: head offset == target offset == 0;
+      * resumed finalized cache: head offset == target offset - 1 with the
+        head's LAST slot uncommitted — ``resume_hidden`` (the previous
+        stream's finalize hidden, h at the last target position) is then
+        REQUIRED, and the entry commits the lazy pair
+        ``(resume_hidden, suffix[0])`` through the head before prefill.
 
     Round shape (probe-validated): draft ``block_size`` tokens recursively on
     the head -> ONE target verify forward over [pending, drafts] -> accept
@@ -466,10 +500,14 @@ def qwen_mtp_generate_step(
     Fail-closed: every restore/trim is verified per-layer; any mismatch
     raises internally -> speculation disabled for the rest of the stream +
     ``on_cache_corruption`` (caller invalidates the session cache). The
-    ``finally`` settles the cache to exactly prompt + yielded - 1 tokens and
-    commits the pending head pair so head_offset == target_offset persists
-    (multi-turn append reuse); ``on_finalize(pending_token)`` lets the
-    caller record the committed pair's token for next-turn verification.
+    ``finally`` settles the cache to exactly prompt + yielded - 1 tokens,
+    then FINALIZES: commits the pending head pair AND forwards the pending
+    (final/stop) token through the target — mirroring plain mlx-lm's
+    lookahead ``generate_step`` — so the persisted cache contains every
+    yielded token and lands at head_offset == target_offset - 1 (the lazy
+    last slot). ``on_finalize(final_token, final_hidden)`` hands the caller
+    the hidden needed for next turn's lazy commit (None/None on a broken or
+    empty stream -> next turn cold-fills).
     """
     if prompt_cache is None or n_target_layers <= 0:
         raise ValueError("qwen_mtp_generate_step requires an explicit prompt_cache")
@@ -500,14 +538,41 @@ def qwen_mtp_generate_step(
     def _h_off() -> int:
         return int(mtp_cache[0].offset)
 
+    def _fire_corruption():
+        if on_cache_corruption is not None:
+            try:
+                on_cache_corruption()
+            except Exception:  # noqa: BLE001 — never break the stream
+                logger.exception("[QwenMTP] on_cache_corruption callback failed")
+
     y = prompt.astype(mx.uint32)
     if int(y.size) < 1:
         raise ValueError("qwen_mtp_generate_step: empty prompt suffix")
     T0 = _t_off()
-    if _h_off() != T0:
-        # Entry invariant (callers validate first — defensive, pre-mutation).
+    # Entry invariant (callers validate first — defensive). Two legal shapes:
+    #   * fresh cache: head == target == 0;
+    #   * resumed finalized cache: head == target - 1 — the head's LAST slot
+    #     was left uncommitted at finalize (its pair token is THIS suffix's
+    #     first token); commit the lazy pair (resume_hidden, suffix[0]) now.
+    if T0 > 0 and _h_off() == T0 - 1:
+        if resume_hidden is None:
+            # No mutation yet — a plain caller-contract violation.
+            raise MTPCacheCorruption(
+                f"resumed cache (head {T0 - 1} == target {T0} - 1) without "
+                f"resume_hidden — the lazy last-slot pair cannot be committed"
+            )
+        with mx.stream(generation_stream):
+            ops.head_hidden(resume_hidden, y[:1][None], mtp_cache)
+        if _h_off() != T0:
+            # Head mutated but did not land — nothing downstream can trust it.
+            _fire_corruption()
+            raise MTPCacheCorruption(
+                f"lazy last-slot commit shortfall: head {_h_off()} != {T0}"
+            )
+    elif _h_off() != T0 or T0 != 0:
         raise MTPCacheCorruption(
-            f"entry invariant violated: head offset {_h_off()} != target {T0}"
+            f"entry invariant violated: head {_h_off()} / target {T0} "
+            f"(want fresh 0/0, or finalized head == target - 1)"
         )
 
     hist: Optional[mx.array] = y if logits_processors else None
@@ -518,13 +583,6 @@ def qwen_mtp_generate_step(
                 logits = p(toks, logits)
         lp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         return sampler(lp), lp
-
-    def _fire_corruption():
-        if on_cache_corruption is not None:
-            try:
-                on_cache_corruption()
-            except Exception:  # noqa: BLE001 — never break the stream
-                logger.exception("[QwenMTP] on_cache_corruption callback failed")
 
     def _snapshot():
         # ArraysCache entries are replaced functionally by GatedDeltaNet
@@ -799,28 +857,43 @@ def qwen_mtp_generate_step(
                 _fire_corruption()
             try:
                 if not broken and cur_hid is not None and cur_b is not None:
-                    # Finalize: commit the pending pair so the persisted
-                    # cache satisfies head_offset == target_offset (the
-                    # append-only multi-turn reuse entry invariant).
+                    # Finalize: (1) commit the pending pair into the head,
+                    # (2) forward the pending (final/stop) token through the
+                    # TARGET — mirroring plain mlx-lm's lookahead
+                    # generate_step — so the persisted cache + the engine's
+                    # stored token_ids INCLUDE every yielded token and
+                    # target_offset == len(stored_ids) means the same thing
+                    # on the MTP and non-MTP paths (the chat-template suffix
+                    # builder relies on stored ids ending WITH the stop
+                    # token; next turn's suffix starts with "\n"-style glue,
+                    # never the stop). The head lands one behind: its last
+                    # slot pairs with NEXT turn's first token and is
+                    # committed lazily at resume from the hidden surfaced
+                    # via ``on_finalize(final_token, final_hidden)``.
                     with mx.stream(generation_stream):
                         ops.head_hidden(
                             cur_hid, mx.array([[cur_b]], mx.uint32), mtp_cache
                         )
-                    if _h_off() != _t_off():
-                        raise MTPCacheCorruption(
-                            f"finalize: head {_h_off()} != target {_t_off()}"
+                        hid_final = ops.target_hidden(
+                            mx.array([[cur_b]], mx.uint32), target_cache
                         )
+                    if _h_off() != _t_off() - 1:
+                        raise MTPCacheCorruption(
+                            f"finalize: head {_h_off()} != target {_t_off()} - 1"
+                        )
+                    hid_final = hid_final[:, -1:, :]
                     _eval_cache_states(prompt_cache)
+                    mx.eval(hid_final)
                     if on_finalize is not None:
-                        on_finalize(int(cur_b))
+                        on_finalize(int(cur_b), hid_final)
                 elif on_finalize is not None:
-                    on_finalize(None)
+                    on_finalize(None, None)
             except Exception:  # noqa: BLE001
                 logger.exception("[QwenMTP] finalize failed")
                 _fire_corruption()
                 if on_finalize is not None:
                     try:
-                        on_finalize(None)
+                        on_finalize(None, None)
                     except Exception:  # noqa: BLE001
                         pass
         if stats["rounds"] > 0:

@@ -49,9 +49,14 @@ from mlx.utils import tree_flatten
 from mlx_soloheaven.engine.qwen_mtp import (
     MTPCacheCorruption,
     QwenMTPHead,
+    REUSE_COLD_FILL,
+    REUSE_FALLBACK_PLAIN,
+    REUSE_FALLBACK_STRIP_HEAD,
+    REUSE_MTP,
     classify_cache,
     load_qwen_mtp_head,
     make_head_cache,
+    plan_mtp_cache_reuse,
     qwen_mtp_generate_step,
     read_model_type,
     validate_mtp_cache_reuse,
@@ -694,6 +699,65 @@ def test_validate_mtp_cache_reuse_fail_closed():
     assert ok
 
 
+def test_plan_mtp_cache_reuse_categories():
+    """FEATURE A decision matrix: the plan wraps validate and maps each
+    failure mode to MTP-reuse / plain-fallback / strip-head / cold-fill."""
+    next_map = lambda t: (t + 1) % 50
+    out, _fl, cache, fired = _run([1, 2, 3], next_map, next_map, max_tokens=6)
+    stored = [1, 2, 3] + out
+    hidden = fired["hidden"]
+    good = stored + [30, 31]
+
+    # Finalized 6-entry cache + hidden -> run MTP.
+    action, why = plan_mtp_cache_reuse(cache, stored, good, 5, 1, hidden)
+    assert action == REUSE_MTP and why == ""
+
+    # Head-less 5-entry layout, target pure-append-consistent -> plain
+    # fallback keeping the cache.
+    action, why = plan_mtp_cache_reuse(cache[:5], stored, good, 5, 1, hidden)
+    assert action == REUSE_FALLBACK_PLAIN and "layout" in why
+
+    # 6-entry layout, resume hidden missing -> strip head, plain fallback.
+    action, why = plan_mtp_cache_reuse(cache, stored, good, 5, 1, None)
+    assert action == REUSE_FALLBACK_STRIP_HEAD and "hidden" in why
+
+    # 6-entry layout, head offset stale (== target) -> strip head.
+    cache[5].offset += 1
+    action, why = plan_mtp_cache_reuse(cache, stored, good, 5, 1, hidden)
+    assert action == REUSE_FALLBACK_STRIP_HEAD and "head offset" in why
+    cache[5].offset -= 1
+
+    # Divergence -> cold-fill (ArraysCache untrimmable), with or without head.
+    diverged = stored[:-1] + [49, 30]
+    action, why = plan_mtp_cache_reuse(cache, stored, diverged, 5, 1, hidden)
+    assert action == REUSE_COLD_FILL and "divergence" in why
+    action, _ = plan_mtp_cache_reuse(cache[:5], stored, diverged, 5, 1, hidden)
+    assert action == REUSE_COLD_FILL
+
+    # No new suffix tokens -> cold-fill (nothing for the runner to chew).
+    action, _ = plan_mtp_cache_reuse(cache, stored, list(stored), 5, 1, hidden)
+    assert action == REUSE_COLD_FILL
+
+    # Target offsets desynced from stored ids -> cold-fill, never fallback.
+    cache[2].offset += 1
+    action, _ = plan_mtp_cache_reuse(cache, stored, good, 5, 1, hidden)
+    assert action == REUSE_COLD_FILL
+    action, _ = plan_mtp_cache_reuse(cache[:5], stored, good, 5, 1, hidden)
+    assert action == REUSE_COLD_FILL
+    cache[2].offset -= 1
+
+    # Nothing cached (empty stored ids on a populated layout) -> cold-fill;
+    # a fallback here would silently disable MTP on a free cold start.
+    fresh5 = [MockArrays(), MockArrays(), MockKV(), MockArrays(), MockKV()]
+    action, _ = plan_mtp_cache_reuse(fresh5, [], good, 5, 1, None)
+    assert action == REUSE_COLD_FILL
+
+    # Fresh-shaped 6-entry cache stays MTP-reusable (validate's fresh branch).
+    fresh = _mk_caches()
+    action, why = plan_mtp_cache_reuse(fresh, [], good, 5, 1, None)
+    assert action == REUSE_MTP, why
+
+
 def test_classify_cache():
     cache = _mk_caches()
     arrays_idx, kv_idx, other_idx = classify_cache(cache[:5])
@@ -812,20 +876,28 @@ def test_run_lm_legacy_qwen_mtp_structured_falls_back(monkeypatch):
     assert len(prompt_cache) == 5  # NO head entries for the non-MTP path
 
 
-def test_run_lm_legacy_qwen_mtp_cold_fills_unreusable_cache(monkeypatch):
-    """A reused 5-entry (head-less) cache with offset>0 must COLD-FILL into
-    a fresh 6-entry layout (fail-closed gate)."""
+def test_run_lm_legacy_mtp_target_only_cache_plain_fallback(monkeypatch):
+    """FEATURE A case 1: a reused 5-entry (head-less) pure-append cache —
+    e.g. a plain base cache or a session written by a non-MTP server — must
+    NOT cold-fill: MTP is disabled for the request, the cache is KEPT, and
+    only the suffix is fed down the plain path."""
+    from mlx_soloheaven.engine import mlx_engine as mlx_engine_module
     from mlx_soloheaven.engine import qwen_mtp as qwen_mtp_mod
     from mlx_vlm.generate import PromptCacheState
 
-    captured = {}
+    def boom(*a, **k):
+        raise AssertionError("qwen_mtp_generate_step must not run on fallback")
 
-    def fake_step(prompt, model, head, **kwargs):
-        captured.update(kwargs)
-        captured["prompt_len"] = int(prompt.size)
+    monkeypatch.setattr(qwen_mtp_mod, "qwen_mtp_generate_step", boom)
+
+    plain = {}
+
+    def fake_lm_stream(model, tokenizer, prompt, **kwargs):
+        plain["prompt"] = list(prompt)
+        plain.update(kwargs)
         return iter(())
 
-    monkeypatch.setattr(qwen_mtp_mod, "qwen_mtp_generate_step", fake_step)
+    monkeypatch.setattr(mlx_engine_module, "lm_stream_generate", fake_lm_stream)
 
     eng = _mtp_engine()
     old_cache = eng._language_model.make_cache()
@@ -844,10 +916,48 @@ def test_run_lm_legacy_qwen_mtp_cold_fills_unreusable_cache(monkeypatch):
         logits_processors=None,
     )
     list(gen_iter)
-    assert prompt_cache is not old_cache
+    # The cache survived (no cold-fill, no head extend) and only the
+    # 2-token suffix was fed to the plain runner.
+    assert prompt_cache is old_cache
+    assert cache_state.cache is old_cache
+    assert len(prompt_cache) == 5
+    assert plain["prompt"] == [4, 5]
+    assert plain["prompt_cache"] is old_cache
+
+
+def test_run_lm_legacy_mtp_divergence_still_cold_fills(monkeypatch):
+    """FEATURE A case 3 (regression of today's fail-closed): a diverged
+    prompt can never be rewound on the untrimmable hybrid — the gate must
+    keep COLD-FILLING with MTP, never plain-fallback onto a diverged
+    cache."""
+    from mlx_soloheaven.engine import qwen_mtp as qwen_mtp_mod
+
+    captured = {}
+
+    def fake_step(prompt, model, head, **kwargs):
+        captured.update(kwargs)
+        captured["prompt_len"] = int(prompt.size)
+        return iter(())
+
+    monkeypatch.setattr(qwen_mtp_mod, "qwen_mtp_generate_step", fake_step)
+
+    eng = _mtp_engine()
+    stored = [1, 2, 3, 4, 90]
+    cache_state, cache = _finalized_cache_state(stored, mx.zeros((1, 1, 4)))
+
+    gen_iter, prompt_cache = eng._run_lm_legacy(
+        cache_state=cache_state,
+        prompt_token_ids=stored[:-1] + [77, 50, 51],  # diverges at stored[-1]
+        max_tokens=8,
+        sampler=lambda lp: mx.argmax(lp, axis=-1),
+        logits_processors=None,
+    )
+    list(gen_iter)
+    assert prompt_cache is not cache  # cold-filled
     assert len(prompt_cache) == 6
-    # Full prompt re-prefilled (no stale prefix slicing).
-    assert captured["prompt_len"] == 5
+    assert captured["prompt_len"] == 7  # full prompt re-prefilled
+    assert captured["resume_hidden"] is None
+    assert cache_state.cache is prompt_cache or cache_state.cache is None
 
 
 def _finalized_cache_state(stored, hidden):
@@ -908,20 +1018,29 @@ def test_run_lm_legacy_mtp_reuses_finalized_eos_cache(monkeypatch):
     assert cache_state.mtp_hidden_offset is None
 
 
-def test_run_lm_legacy_mtp_stale_hidden_cold_fills(monkeypatch):
-    """A finalize-hidden stash whose offset tag no longer matches the cache
-    (e.g. an intervening non-MTP request advanced the session) must be
-    dropped -> gate fails -> cold-fill with a fresh 6-entry layout."""
+def test_run_lm_legacy_mtp_stale_hidden_strips_head_plain_fallback(monkeypatch):
+    """FEATURE A case 2: a finalize-hidden stash whose offset tag no longer
+    matches the cache (e.g. an intervening non-MTP request advanced the
+    session) is dropped — but the target side is pure-append-consistent, so
+    instead of cold-filling the head entry is STRIPPED and the request runs
+    plain, reusing the target cache. The session continues as a plain
+    5-entry session."""
+    from mlx_soloheaven.engine import mlx_engine as mlx_engine_module
     from mlx_soloheaven.engine import qwen_mtp as qwen_mtp_mod
 
-    captured = {}
+    def boom(*a, **k):
+        raise AssertionError("qwen_mtp_generate_step must not run on fallback")
 
-    def fake_step(prompt, model, head, **kwargs):
-        captured.update(kwargs)
-        captured["prompt_len"] = int(prompt.size)
+    monkeypatch.setattr(qwen_mtp_mod, "qwen_mtp_generate_step", boom)
+
+    plain = {}
+
+    def fake_lm_stream(model, tokenizer, prompt, **kwargs):
+        plain["prompt"] = list(prompt)
+        plain.update(kwargs)
         return iter(())
 
-    monkeypatch.setattr(qwen_mtp_mod, "qwen_mtp_generate_step", fake_step)
+    monkeypatch.setattr(mlx_engine_module, "lm_stream_generate", fake_lm_stream)
 
     eng = _mtp_engine()
     stored = [1, 2, 3, 4, 90]
@@ -936,11 +1055,69 @@ def test_run_lm_legacy_mtp_stale_hidden_cold_fills(monkeypatch):
         logits_processors=None,
     )
     list(gen_iter)
-    assert prompt_cache is not cache  # cold-filled
-    assert len(prompt_cache) == 6
-    assert captured["prompt_len"] == 8  # full prompt re-prefilled
-    assert captured["resume_hidden"] is None
+    # Head stripped IN PLACE (cache_state.cache aliases the list), target
+    # side reused: only the 3-token suffix goes to the plain runner.
+    assert prompt_cache is cache
+    assert cache_state.cache is cache
+    assert len(prompt_cache) == 5
+    assert plain["prompt"] == [91, 50, 51]
+    assert plain["prompt_cache"] is cache
+    # Single-use stash consumed; nothing MTP survives the request.
     assert cache_state.mtp_last_hidden is None
+    assert cache_state.mtp_hidden_offset is None
+
+
+def test_run_lm_legacy_pre_gate_disable_strips_head_and_stash(monkeypatch):
+    """FINDING-1 invariant: a per-request MTP disable that fires BEFORE the
+    reuse gate (response_format json_object -> use_mtp=False at the FSM
+    check) skips the gate entirely — the 6-entry MTP-finalized session
+    cache must STILL be stripped to the 5-entry target layout IN PLACE
+    before plain generation, the single-use finalize-hidden stash cleared,
+    and accounting stay consistent (prefix-trim sees a target-only layout,
+    only the suffix reaches the plain runner)."""
+    from mlx_soloheaven.engine import mlx_engine as mlx_engine_module
+    from mlx_soloheaven.engine import qwen_mtp as qwen_mtp_mod
+
+    def boom(*a, **k):
+        raise AssertionError("qwen_mtp_generate_step must not run for FSM")
+
+    monkeypatch.setattr(qwen_mtp_mod, "qwen_mtp_generate_step", boom)
+
+    plain = {}
+
+    def fake_lm_stream(model, tokenizer, prompt, **kwargs):
+        plain["prompt"] = list(prompt)
+        plain.update(kwargs)
+        return iter(())
+
+    monkeypatch.setattr(mlx_engine_module, "lm_stream_generate", fake_lm_stream)
+
+    eng = _mtp_engine()
+    stored = [1, 2, 3, 4, 90]
+    cache_state, cache = _finalized_cache_state(stored, mx.zeros((1, 1, 4)))
+
+    gen_iter, prompt_cache = eng._run_lm_legacy(
+        cache_state=cache_state,
+        prompt_token_ids=stored + [91, 50, 51],
+        max_tokens=8,
+        sampler=lambda lp: mx.argmax(lp, axis=-1),
+        logits_processors=None,
+        response_format=SimpleNamespace(type="json_object"),
+    )
+    list(gen_iter)
+    # Head stripped IN PLACE before generation; the cache itself is KEPT
+    # (no cold-fill) and cache_state.cache still aliases the same list.
+    assert prompt_cache is cache
+    assert cache_state.cache is cache
+    assert len(prompt_cache) == 5
+    # Accounting consistent: only the 3-token suffix went to the plain
+    # runner, on the kept (stripped) cache.
+    assert plain["prompt"] == [91, 50, 51]
+    assert plain["prompt_cache"] is cache
+    # The stale single-use stash must not survive a plain turn it didn't
+    # belong to.
+    assert cache_state.mtp_last_hidden is None
+    assert cache_state.mtp_hidden_offset is None
 
 
 def test_response_adapter_always_emits_terminal_eos_frame():
@@ -1415,6 +1592,88 @@ def test_generate_locked_healthy_eos_midround_exact_accounting(monkeypatch):
         cs.mtp_last_hidden,
     )
     assert ok, why
+
+
+def test_generate_locked_plain_fallback_keeps_session_reusable(monkeypatch):
+    """FEATURE A end-to-end: a cache-HIT session carrying a head-less
+    5-entry hybrid cache on an MTP server takes the plain-decode fallback —
+    the runner never fires, the cache is reused (suffix-only prefill) — and
+    the post-loop leaves offsets == len(token_ids) so the NEXT turn falls
+    back again (still reusable, never a cold-fill cascade)."""
+    from mlx_soloheaven.engine import mlx_engine as mlx_engine_module
+    from mlx_soloheaven.engine import qwen_mtp as qwen_mtp_mod
+
+    def boom(*a, **k):
+        raise AssertionError("qwen_mtp_generate_step must not run on fallback")
+
+    monkeypatch.setattr(qwen_mtp_mod, "qwen_mtp_generate_step", boom)
+
+    stored = [1, 2, 3, 4, 5]
+    suffix = [40, 20, 21]
+    cache = [MockArrays(), MockArrays(), MockKV(), MockArrays(), MockKV()]
+    for c in cache:
+        if hasattr(c, "offset"):
+            c.offset = len(stored)
+    for i in (0, 1, 3):
+        cache[i].cache = [tuple(stored)]
+    eng, cs, messages = _generate_engine(cache, stored, mtp=True, suffix=suffix)
+
+    def fake_lm_stream(model, tokenizer, prompt, **kwargs):
+        prompt_cache = kwargs["prompt_cache"]
+        assert prompt_cache is cache  # reuse, no cold-fill
+        assert list(prompt) == suffix  # suffix-only prefill
+
+        def gen():
+            # Plain mlx-lm contract: prefill + per-token lookahead advance.
+            for c in prompt_cache:
+                if hasattr(c, "offset"):
+                    c.offset += len(prompt)
+            for tid in (101, 102, 103):
+                for c in prompt_cache:
+                    if hasattr(c, "offset"):
+                        c.offset += 1
+                yield SimpleNamespace(
+                    text="x", token=tid, prompt_tps=1.0, generation_tps=1.0,
+                )
+
+        return gen()
+
+    monkeypatch.setattr(mlx_engine_module, "lm_stream_generate", fake_lm_stream)
+
+    chunks = list(
+        eng._generate_locked(
+            messages,
+            max_tokens=3,
+            temperature=0.0,
+            session_id="s",
+            tools=None,
+            cancel_event=None,
+            thinking=False,
+            thinking_budget=0,
+            top_p=1.0,
+            min_p=0.0,
+            top_k=0,
+            repetition_penalty=1.0,
+            response_format=None,
+        )
+    )
+
+    token_frames = [c for c in chunks if c.finish_reason is None]
+    assert [c.token for c in token_frames] == [101, 102, 103]
+
+    # The session survived reconcile: cache kept, offsets == len(token_ids).
+    expected_ids = stored + suffix + [101, 102, 103]
+    assert cs.cache is cache
+    assert cs.token_ids == expected_ids
+    for i in (2, 4):
+        assert cache[i].offset == len(expected_ids)
+    _assert_no_desynced_cache(cs)
+
+    # Next turn: the gate falls back to plain AGAIN (reuse, not cold-fill).
+    action, _why = plan_mtp_cache_reuse(
+        cache, cs.token_ids, expected_ids + [40, 50], 5, 1, None
+    )
+    assert action == REUSE_FALLBACK_PLAIN
 
 
 def test_generate_locked_healthy_length_stop_exact_accounting(monkeypatch):

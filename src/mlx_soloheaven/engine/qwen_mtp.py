@@ -385,8 +385,12 @@ def validate_mtp_cache_reuse(
       * pure append: the entire stored history is a strict prefix of the new
         prompt (the target's ArraysCache layers cannot trim, so divergence
         can never be rewound) with >= 1 new suffix token,
-      * ``resume_hidden`` present (a mid-stream abort, disk reload, or a
-        stale stash leaves it None — the lazy pair cannot be committed).
+      * ``resume_hidden`` present (a mid-stream abort or a stale stash
+        leaves it None — the lazy pair cannot be committed). Disk reloads
+        never reach this check in the head-carrying layout: the session
+        loader strips the trailing head entries on load (the stash is never
+        persisted), so a reloaded session arrives head-less and takes the
+        plain-fallback plan instead.
     """
     if len(prompt_cache) != n_target_layers + n_head_layers:
         return False, (
@@ -432,6 +436,106 @@ def validate_mtp_cache_reuse(
     return True, ""
 
 
+# Reuse-plan actions (consumed by the engine's MTP gate). The fail-closed
+# default is COLD_FILL; the two FALLBACK actions keep the cache but run the
+# request on the PLAIN decode path. Falling back is ONE-WAY for the session:
+# the head entries are only ever rebuilt by a cold-fill (which the engine
+# never forces), so every later append-only turn re-plans FALLBACK_PLAIN —
+# the right trade on the target (Qwen3.6 A3B MoE: measured MTP block1
+# speedup 1.019x ≈ a wash vs plain decode, so reuse always beats
+# re-speculation).
+REUSE_MTP = "reuse_mtp"
+REUSE_FALLBACK_PLAIN = "fallback_plain"
+REUSE_FALLBACK_STRIP_HEAD = "fallback_strip_head"
+REUSE_COLD_FILL = "cold_fill"
+
+
+def _plain_append_consistent(
+    target_entries: Sequence[Any],
+    stored_ids: Sequence[int],
+    prompt_token_ids: Sequence[int],
+) -> bool:
+    """Target-side eligibility for the plain-decode fallback: something IS
+    cached, every offset-bearing entry sits at ONE offset == len(stored_ids),
+    and the stored history is a strict prefix of the new prompt with >= 1
+    suffix token. Mirrors ``validate_mtp_cache_reuse``'s target/append
+    checks minus the head/hidden requirements — the plain path needs only
+    these (pure-append reuse never trims, so the untrimmable ArraysCache
+    layers are safe)."""
+    if not stored_ids:
+        # Nothing cached to reuse — a cold-fill costs nothing extra and
+        # keeps MTP on (a fallback here would silently disable MTP on
+        # every fresh-but-seen cache shape).
+        return False
+    offs = {
+        int(c.offset)
+        for c in target_entries
+        if getattr(c, "offset", None) is not None
+    }
+    if offs != {len(stored_ids)}:
+        return False
+    if len(prompt_token_ids) <= len(stored_ids):
+        return False
+    for a, b in zip(stored_ids, prompt_token_ids):
+        if a != b:
+            return False
+    return True
+
+
+def plan_mtp_cache_reuse(
+    prompt_cache: Sequence[Any],
+    stored_ids: Sequence[int],
+    prompt_token_ids: Sequence[int],
+    n_target_layers: int,
+    n_head_layers: int,
+    resume_hidden: Optional[Any],
+) -> Tuple[str, str]:
+    """Decision matrix for a reused session cache under the MTP runner.
+
+    Wraps ``validate_mtp_cache_reuse`` (unchanged contract) and, on failure,
+    decides whether the cache is still PLAIN-reusable instead of always
+    cold-filling — a cold-fill of a long history sacrifices cache reuse to
+    keep MTP; reuse wins when the target side is provably consistent.
+
+    Returns ``(action, why)``:
+      * REUSE_MTP — validate passed; run the MTP runner on the cache.
+      * REUSE_FALLBACK_PLAIN — head-less ``n_target`` layout (e.g. a plain
+        base cache, a disk-reloaded session — the loader strips the head on
+        load — or a session written by a non-MTP server) whose target side
+        is pure-append-consistent: keep the cache, decode plain.
+      * REUSE_FALLBACK_STRIP_HEAD — full ``n_target + n_head`` layout whose
+        ONLY failure is head-side (stale head offset, or a missing/stale
+        resume hidden) while the target side is pure-append-consistent:
+        drop the head entries, keep the target, decode plain. The session
+        then continues as a plain ``n_target``-entry session.
+      * REUSE_COLD_FILL — anything else (divergence, desynced target
+        offsets, no suffix, nothing cached): fail closed exactly as before
+        — the untrimmable ArraysCache layers can never rewind divergence.
+    """
+    ok, why = validate_mtp_cache_reuse(
+        prompt_cache,
+        stored_ids,
+        prompt_token_ids,
+        n_target_layers,
+        n_head_layers,
+        resume_hidden,
+    )
+    if ok:
+        return REUSE_MTP, ""
+    n = len(prompt_cache)
+    if n == n_target_layers and _plain_append_consistent(
+        prompt_cache, stored_ids, prompt_token_ids
+    ):
+        return REUSE_FALLBACK_PLAIN, why
+    if n == n_target_layers + n_head_layers and _plain_append_consistent(
+        prompt_cache[:n_target_layers], stored_ids, prompt_token_ids
+    ):
+        # Layout + target offsets + pure-append all hold, so by elimination
+        # the validate failure is head-side (head offset / resume hidden).
+        return REUSE_FALLBACK_STRIP_HEAD, why
+    return REUSE_COLD_FILL, why
+
+
 def _eval_cache_states(cache: Sequence[Any]) -> None:
     """Best-effort materialization of lazy cache tensors (guards empty
     KVCache whose ``.state`` property raises when keys is None)."""
@@ -448,6 +552,81 @@ def _eval_cache_states(cache: Sequence[Any]) -> None:
             arrays.extend(a for a in cl if isinstance(a, mx.array))
     if arrays:
         mx.eval(*arrays)
+
+
+def mtp_prefill_base(
+    tokens: Sequence[int],
+    *,
+    model: Any,
+    head: Any,
+    prompt_cache: List[Any],
+    n_target_layers: int,
+    prefill_step_size: int = 2048,
+    ops: Optional[Any] = None,
+) -> mx.array:
+    """Prefill a FRESH ``n_target + n_head``-entry cache over ``tokens``
+    into the FINALIZED shape and return the boundary hidden.
+
+    Replicates the generate-step prompt prefill exactly: the target consumes
+    ``tokens[:-1]`` in chunks while the head consumes the SAME hiddens paired
+    with ``tokens[1:]`` (slot i = (h_i, tokens[i+1])); the held-out LAST
+    token is then forwarded through the TARGET ONLY — landing precisely on
+    the finalized contract ``validate_mtp_cache_reuse`` expects:
+    ``target_offset == len(tokens)``, ``head_offset == len(tokens) - 1``
+    (lazy last slot open), plus the returned ``h_{N-1}`` (1, 1, H) pre-final-
+    norm hidden that pairs with the NEXT request's first suffix token.
+
+    Used by the engine to build MTP-reusable BASE caches (shared system
+    prefixes) outside generation. Per-chunk eval + clear_cache bound memory
+    on long prefixes; everything runs on ``generation_stream``.
+    """
+    if prompt_cache is None or n_target_layers <= 0:
+        raise ValueError("mtp_prefill_base requires an explicit prompt_cache")
+    target_cache = prompt_cache[:n_target_layers]
+    mtp_cache = prompt_cache[n_target_layers:]
+    if not mtp_cache:
+        raise ValueError("mtp_prefill_base: head cache entries missing")
+    if not tokens:
+        raise ValueError("mtp_prefill_base: empty token list")
+    if ops is None:
+        ops = QwenMTPOps(model, head)
+    _, kv_idx, _ = classify_cache(target_cache)
+    if not kv_idx:
+        raise ValueError("mtp_prefill_base: no offset-bearing target layer")
+
+    rem = mx.array(list(tokens), mx.uint32)
+    with mx.stream(generation_stream):
+        while int(rem.size) > 1:
+            n = min(prefill_step_size, int(rem.size) - 1)
+            chunk = rem[:n]
+            hid_chunk = ops.target_hidden(chunk[None], target_cache)
+            ops.head_hidden(hid_chunk, rem[1 : n + 1][None], mtp_cache)
+            _eval_cache_states(prompt_cache)
+            rem = rem[n:]
+            mx.clear_cache()
+        hid_last = ops.target_hidden(rem[None], target_cache)
+    hid = hid_last[:, -1:, :]
+    _eval_cache_states(prompt_cache)
+    mx.eval(hid)
+    # Post-condition (fail-closed): the finalized shape, verified per-layer.
+    n_tok = len(tokens)
+    bad_t = [
+        (i, int(target_cache[i].offset))
+        for i in kv_idx
+        if int(target_cache[i].offset) != n_tok
+    ]
+    bad_h = [
+        (i, int(getattr(c, "offset", -1)))
+        for i, c in enumerate(mtp_cache)
+        if int(getattr(c, "offset", -1)) != n_tok - 1
+    ]
+    if bad_t or bad_h:
+        raise MTPCacheCorruption(
+            f"mtp_prefill_base: cache did not land on the finalized shape "
+            f"(want target {n_tok} / head {n_tok - 1}; bad target layers "
+            f"{bad_t[:8]}, bad head layers {bad_h[:8]})"
+        )
+    return hid
 
 
 # ---------------------------------------------------------------------------

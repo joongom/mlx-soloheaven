@@ -1299,6 +1299,14 @@ class BaseCacheEntry:
     token_count: int
     created: float = field(default_factory=time.time)
     hit_count: int = 0
+    # MTP-finalized layout marker (qwen_mtp servers only): the cache holds
+    # n_target + n_head entries with the head trailing by the lazy last
+    # slot (head_offset == token_count - 1), and mtp_resume_hidden is the
+    # boundary hidden h_{N-1} (1, 1, H) that validate_mtp_cache_reuse
+    # requires to commit the head's last-slot pair at resume. Plain bases
+    # keep the historical 40-entry shape (False/None).
+    mtp_layout: bool = False
+    mtp_resume_hidden: object | None = None
 
 
 # Precompiled regexes used by message-normalization / cache-match hot path.
@@ -2457,24 +2465,109 @@ class MLXEngine:
             last_used = float(metadata.get("last_used", "0"))
             token_ids = json.loads(metadata.get("token_ids", "[]"))
 
-            # Verify loaded cache matches model structure
+            # Verify loaded cache matches model structure (leading slice).
+            # MTP-finalized sessions (qwen_mtp) persist n_target + n_head
+            # entries, but the finalize hidden the MTP gate would need is an
+            # in-memory stash that is never written to disk — MTP reuse is
+            # impossible after a restart regardless. Plain reuse of the full
+            # token history is what matters: accept the load and STRIP the
+            # extra trailing (head) entries, so the next turn plans
+            # REUSE_FALLBACK_PLAIN over the whole history instead of
+            # cold-filling. Stripping is gated to EXACTLY the qwen_mtp
+            # finalized layout (engine mtp-capable + n_extra == head layer
+            # count + trailing entries are KVCache heads at
+            # len(token_ids) - 1); any other oversized layout is rejected.
             model_cache = make_prompt_cache(self._language_model)
-            if len(cache) != len(model_cache):
+            n_model = len(model_cache)
+            if len(cache) < n_model:
                 logger.error(
                     f"[KV Cache] session={session_id} | DISK LOAD FAILED | "
-                    f"layer count mismatch: {len(cache)} vs {len(model_cache)}"
+                    f"layer count mismatch: {len(cache)} vs {n_model}"
                 )
                 return None
 
             type_ok = all(
                 type(c).__name__ == type(m).__name__
-                for c, m in zip(cache, model_cache)
+                for c, m in zip(cache[:n_model], model_cache)
             )
             if not type_ok:
                 logger.error(
                     f"[KV Cache] session={session_id} | DISK LOAD FAILED | cache type mismatch"
                 )
                 return None
+
+            if len(cache) > n_model:
+                # Fail-closed strip — tightened contract: extra trailing
+                # entries are ONLY strippable when they are exactly THIS
+                # server's qwen_mtp finalized layout, i.e. ALL of:
+                #   (a) the engine is qwen-mtp-capable right now
+                #       (_mtp_base_caches_active: mlx-lm backend, qwen_mtp
+                #       drafter loaded, no --kv-bits),
+                #   (b) n_extra == the drafter's head layer count (the same
+                #       count make_head_cache was sized with at save time),
+                #   (c) every trailing extra is a head entry of the exact
+                #       type make_head_cache produces (KVCache), sitting at
+                #       the finalized lazy-last-slot offset
+                #       len(token_ids) - 1 (head trails the target by one),
+                #   (d) after dropping them, EVERY offset-bearing target
+                #       layer sits exactly at len(token_ids).
+                # Anything else — a foreign cache with extra target layers,
+                # a same-type larger layout, a plain/non-MTP server reading
+                # a head-carrying file — is a layout we don't understand:
+                # reject the whole load (as before the strip feature).
+                from mlx_soloheaven.engine.pld import _layer_offsets
+                from mlx_soloheaven.engine import qwen_mtp as qwen_mtp_mod
+                n_extra = len(cache) - n_model
+                if not self._mtp_base_caches_active():
+                    logger.error(
+                        f"[KV Cache] session={session_id} | DISK LOAD FAILED | "
+                        f"{n_extra} extra trailing entries but this engine is "
+                        f"not qwen-mtp-capable — refusing to strip an unknown "
+                        f"layout"
+                    )
+                    return None
+                _n_head = max(1, len(getattr(self._drafter, "layers", [])) or 1)
+                if n_extra != _n_head:
+                    logger.error(
+                        f"[KV Cache] session={session_id} | DISK LOAD FAILED | "
+                        f"{n_extra} extra trailing entries != drafter head "
+                        f"layer count {_n_head} — not the MTP-finalized layout"
+                    )
+                    return None
+                _head_type = type(qwen_mtp_mod.make_head_cache(1)[0])
+                _head_off = len(token_ids) - 1
+                _bad_head = [
+                    (n_model + i, type(c).__name__, getattr(c, "offset", None))
+                    for i, c in enumerate(cache[n_model:])
+                    if type(c) is not _head_type
+                    or getattr(c, "offset", None) != _head_off
+                ]
+                if _bad_head:
+                    logger.error(
+                        f"[KV Cache] session={session_id} | DISK LOAD FAILED | "
+                        f"trailing entries are not finalized MTP head entries "
+                        f"(need {_head_type.__name__} at offset {_head_off}): "
+                        f"{_bad_head[:8]}"
+                    )
+                    return None
+                cache = cache[:n_model]
+                _bad = [
+                    (i, off)
+                    for i, off in enumerate(_layer_offsets(cache))
+                    if off is not None and off != len(token_ids)
+                ]
+                if _bad:
+                    logger.error(
+                        f"[KV Cache] session={session_id} | DISK LOAD FAILED | "
+                        f"stripped {n_extra} trailing entries but target "
+                        f"offsets != {len(token_ids)} stored ids: {_bad[:8]}"
+                    )
+                    return None
+                logger.info(
+                    f"[KV Cache] session={session_id} | DISK LOAD | stripped "
+                    f"{n_extra} trailing MTP head entries ({n_model}-layer "
+                    f"target) — session continues via plain-fallback reuse"
+                )
 
             loaded_offset = self._get_cache_offset(cache)
             elapsed = time.perf_counter() - t0
@@ -2603,10 +2696,15 @@ class MLXEngine:
         return None
 
     def _register_base_cache(
-        self, messages: list[dict], cache: list, system_tokens: list[int], tools: list | None = None
+        self, messages: list[dict], cache: list, system_tokens: list[int],
+        tools: list | None = None, mtp_resume_hidden=None,
     ):
         """Register a base cache from the system prompt portion of a processed cache."""
         h = self._system_hash(messages, tools=tools)
+        # Existing entries are kept (skip, never overwrite) — a stale plain
+        # 40-entry base under an MTP server still seeds sessions correctly:
+        # the MTP gate takes the plain-decode fallback instead of
+        # cold-filling, so reuse is preserved either way.
         if not h or h in self._base_caches:
             return
         # Deep copy the cache at current state (after system prompt processing)
@@ -2618,11 +2716,13 @@ class MLXEngine:
             cache=base_snapshot,
             tokens=system_tokens,
             token_count=len(system_tokens),
+            mtp_layout=mtp_resume_hidden is not None,
+            mtp_resume_hidden=mtp_resume_hidden,
         )
         self._base_caches[h] = entry
         logger.debug(
             f"[Base Cache] REGISTERED | hash={h} | {len(system_tokens)} tokens | "
-            f"pool_size={len(self._base_caches)}"
+            f"mtp={entry.mtp_layout} | pool_size={len(self._base_caches)}"
         )
 
     def _clone_base_cache(self, base: BaseCacheEntry) -> list:
@@ -2646,6 +2746,7 @@ class MLXEngine:
                 "token_count": e.token_count,
                 "hit_count": e.hit_count,
                 "created": e.created,
+                "mtp": e.mtp_layout,
             }
             for e in self._base_caches.values()
         ]
@@ -3417,6 +3518,16 @@ class MLXEngine:
             if base:
                 cache_state.cache = self._clone_base_cache(base)
                 cache_state.token_ids = list(base.tokens)
+                if base.mtp_resume_hidden is not None:
+                    # MTP-finalized base (head entries trail by the lazy
+                    # last slot): hand the boundary hidden + its offset tag
+                    # to the gate so the seeded clone passes
+                    # validate_mtp_cache_reuse instead of cold-filling.
+                    # mx.arrays are immutable — sharing one hidden across
+                    # clones is safe (the stash consume only drops the
+                    # cache_state reference, never the pool's).
+                    cache_state.mtp_last_hidden = base.mtp_resume_hidden
+                    cache_state.mtp_hidden_offset = base.token_count
                 cache_mode = "base_hit"
                 logger.info(
                     f"[KV Cache] session={session_id} | BASE HIT | "
@@ -4317,6 +4428,11 @@ class MLXEngine:
         use_mtp = _drafter is not None and (
             getattr(self, "_draft_kind", None) == "qwen_mtp"
         )
+        # qwen-mtp-capable engines are the ONLY source of trailing head
+        # cache entries / the finalize-hidden stash; remember capability
+        # before per-request disables so the plain-dispatch hygiene
+        # invariant below knows whether enforcement applies at all.
+        _qwen_mtp_capable = use_mtp
         if _drafter is not None and not use_mtp:
             raise RuntimeError(
                 "MTP drafter (--draft-model) requires --backend mlx-vlm for "
@@ -4390,8 +4506,11 @@ class MLXEngine:
         # first suffix token and is committed lazily at resume from the
         # stashed finalize hidden) — and a PURE-APPEND prompt (the 30
         # ArraysCache layers cannot trim, so divergence can never be
-        # rewound). Any miss -> COLD-FILL once; afterwards the session
-        # carries the 41-entry layout and stays MTP-reusable across appends.
+        # rewound). Divergence/target-desync misses -> COLD-FILL once;
+        # afterwards the session carries the target+head layout and stays
+        # MTP-reusable across appends. Head-side-only misses and head-less
+        # layouts keep the cache and fall back to PLAIN decode (see
+        # plan_mtp_cache_reuse and the branch comments below).
         _mtp_resume_hidden = None
         if use_mtp:
             from mlx_soloheaven.engine import qwen_mtp as qwen_mtp_mod
@@ -4411,7 +4530,7 @@ class MLXEngine:
                     # Stash predates a cache mutation (e.g. an intervening
                     # non-MTP request advanced this session) — fail closed.
                     _mtp_resume_hidden = None
-                _ok, _why = qwen_mtp_mod.validate_mtp_cache_reuse(
+                _action, _why = qwen_mtp_mod.plan_mtp_cache_reuse(
                     prompt_cache,
                     cache_state.token_ids or [],
                     prompt_token_ids,
@@ -4419,7 +4538,46 @@ class MLXEngine:
                     _n_head,
                     _mtp_resume_hidden,
                 )
-                if not _ok:
+                if _action == qwen_mtp_mod.REUSE_FALLBACK_PLAIN:
+                    # Head-less target-only layout (plain base cache, a
+                    # disk-reloaded session — the loader strips the head —
+                    # or a session written by a non-MTP server) whose target
+                    # side is pure-append-consistent: keep the cache, decode
+                    # plain. POLICY: falling back is ONE-WAY — the session
+                    # stays a head-less plain session for its remaining
+                    # append-only lifetime (every later turn re-plans
+                    # FALLBACK_PLAIN; head entries are only rebuilt by a
+                    # cold-fill, which we deliberately never force). Right
+                    # trade on this target: Qwen3.6 A3B MoE measured MTP
+                    # block1 speedup 1.019x ≈ a wash vs plain decode, so
+                    # reusing the history always beats re-speculating it —
+                    # NO cold-fill-to-restore-MTP threshold.
+                    logger.info(
+                        f"[QwenMTP] cache not MTP-reusable ({_why}) — "
+                        f"plain-decode fallback (reusing "
+                        f"{len(cache_state.token_ids or [])} tokens)"
+                    )
+                    use_mtp = False
+                    _mtp_resume_hidden = None
+                elif _action == qwen_mtp_mod.REUSE_FALLBACK_STRIP_HEAD:
+                    # Head-side-only failure (stale head offset, missing or
+                    # stale resume hidden) with a consistent target: keep
+                    # the target entries, decode plain. The actual head
+                    # strip happens in the plain-dispatch invariant right
+                    # below (every non-MTP route runs it), IN PLACE —
+                    # cache_state.cache aliases this list. Same one-way
+                    # policy as FALLBACK_PLAIN above.
+                    logger.info(
+                        f"[QwenMTP] cache not MTP-reusable ({_why}) — "
+                        f"head stripped, plain-decode fallback (reusing "
+                        f"{len(cache_state.token_ids or [])} tokens)"
+                    )
+                    use_mtp = False
+                    _mtp_resume_hidden = None
+                elif _action != qwen_mtp_mod.REUSE_MTP:
+                    # Divergence / desynced target offsets / nothing cached:
+                    # the untrimmable ArraysCache layers can never rewind —
+                    # fail closed (cold-fill, MTP stays on).
                     logger.info(
                         f"[QwenMTP] cache not MTP-reusable ({_why}) — "
                         f"COLD-FILL ({len(prompt_token_ids)} tokens)"
@@ -4428,6 +4586,21 @@ class MLXEngine:
                     cache_state.token_ids = None
                     prompt_cache = None
                     _mtp_resume_hidden = None
+        if _qwen_mtp_capable and not use_mtp:
+            # INVARIANT (enforced on EVERY plain dispatch route of a
+            # qwen-mtp-capable engine, BEFORE the prefix-trim and
+            # generation): the cache handed to plain generation never
+            # carries more entries than the target has layers, and the
+            # single-use finalize-hidden stash never survives a plain turn
+            # it didn't belong to. This covers MTP disables that fire
+            # BEFORE the reuse gate (response_format FSM, --kv-bits) — which
+            # would otherwise hand a 41-entry MTP-finalized session or a
+            # base-seeded 41-entry clone to plain stream_generate intact —
+            # as well as the gate's own fallback branches (where it
+            # performs STRIP_HEAD's strip). Non-qwen-mtp engines have no
+            # source of head entries (the disk loader strips them on load),
+            # so enforcement is scoped to where the invariant can break.
+            self._strip_mtp_head_for_plain_dispatch(cache_state, prompt_cache)
         if prompt_cache is None:
             prompt_cache = make_prompt_cache(self._language_model)
         else:
@@ -4504,9 +4677,11 @@ class MLXEngine:
                 # continuation, including the chat-template "\n" glue after
                 # a natural stop token. Tagged with the cache offset so a
                 # stash that predates any later cache mutation is detected
-                # and dropped (fail-closed -> cold-fill). In-memory only
-                # (not persisted to disk; a disk-reloaded session cold-fills
-                # its first MTP turn, then becomes reusable again).
+                # and dropped (fail-closed -> cold-fill). In-memory only —
+                # never persisted: on disk reload the session loader strips
+                # the trailing head entries, so a reloaded session reuses
+                # its full history via the plain fallback
+                # (REUSE_FALLBACK_PLAIN), not via MTP.
                 if final_hidden is None:
                     cache_state.mtp_last_hidden = None
                     cache_state.mtp_hidden_offset = None
@@ -4662,6 +4837,49 @@ class MLXEngine:
             return prefix + accumulated_text
         return accumulated_text
 
+    def _strip_mtp_head_for_plain_dispatch(self, cache_state, prompt_cache):
+        """Hygiene invariant for every plain (non-MTP) dispatch route.
+
+        Strips trailing MTP head entries IN PLACE (cache_state.cache aliases
+        the list) when the cache carries more entries than the target has
+        layers, and drops the single-use finalize-hidden stash. mlx-lm
+        0.31.x would silently ignore the extra entries (zip(layers, cache)),
+        so output stays correct without this — but the head entries would
+        silently go stale (their offsets stop tracking the target's) and
+        every downstream offset/trim post-condition assumes a target-only
+        layout. Once stripped, the session continues plain for its
+        append-only lifetime (see the FALLBACK_PLAIN policy in the MTP
+        gate).
+
+        Duck-typed: a model without an introspectable ``.layers`` (hermetic
+        test stubs) skips the strip — every real mlx-lm model exposes it,
+        and the MTP gate that creates head entries requires it anyway."""
+        n_target = len(getattr(self._language_model, "layers", None) or [])
+        if n_target and prompt_cache is not None and len(prompt_cache) > n_target:
+            n_extra = len(prompt_cache) - n_target
+            del prompt_cache[n_target:]
+            logger.info(
+                f"[QwenMTP] plain dispatch: stripped {n_extra} trailing MTP "
+                f"head entries ({n_target}-layer target)"
+            )
+        # Single-use stash: must not survive a plain turn it didn't belong
+        # to (the MTP gate consumes it; pre-gate disables skip the gate).
+        cache_state.mtp_last_hidden = None
+        cache_state.mtp_hidden_offset = None
+
+    def _mtp_base_caches_active(self) -> bool:
+        """True iff base caches must be built in the MTP-finalized layout —
+        the qwen_mtp drafter actually runs on this server's decode path
+        (mlx-lm backend, no --kv-bits, which disables MTP globally). All
+        other configurations (plain, gemma4/mlx-vlm, PLD) keep the
+        historical target-only layout untouched."""
+        return (
+            not self._use_vlm
+            and getattr(self, "_drafter", None) is not None
+            and getattr(self, "_draft_kind", None) == "qwen_mtp"
+            and not self.cfg.kv_bits
+        )
+
     def _maybe_register_base_cache(
         self,
         messages: list[dict],
@@ -4677,6 +4895,9 @@ class MLXEngine:
         if not has_system_or_rotating:
             return
         sys_hash = self._system_hash(messages, tools=tools)
+        # Skip if present, even when the pooled entry predates the MTP
+        # layout (plain 40-entry under an MTP server): base_hit on such an
+        # entry takes the gate's plain-decode fallback, so reuse still wins.
         if not sys_hash or sys_hash in self._base_caches:
             return
         system_tokens = self._extract_system_tokens(
@@ -4685,9 +4906,33 @@ class MLXEngine:
         if system_tokens and len(system_tokens) < len(prompt_tokens):
             try:
                 base_cache = make_prompt_cache(self._language_model)
-                self._prefill_cache(base_cache, system_tokens)
+                mtp_hidden = None
+                if self._mtp_base_caches_active():
+                    # MTP-finalized base: target + head entries prefilled
+                    # over the system tokens with the head fed its
+                    # (hidden_i, tok_{i+1}) pairs — same machinery as the
+                    # runner's prompt prefill — so a seeded clone PASSES
+                    # validate_mtp_cache_reuse (41-entry layout, head
+                    # trailing by one, boundary hidden) instead of
+                    # cold-filling the whole prompt.
+                    from mlx_soloheaven.engine import qwen_mtp as qwen_mtp_mod
+                    _n_head = max(
+                        1, len(getattr(self._drafter, "layers", [])) or 1
+                    )
+                    base_cache.extend(qwen_mtp_mod.make_head_cache(_n_head))
+                    mtp_hidden = qwen_mtp_mod.mtp_prefill_base(
+                        system_tokens,
+                        model=self._language_model,
+                        head=self._drafter,
+                        prompt_cache=base_cache,
+                        n_target_layers=len(self._language_model.layers),
+                        prefill_step_size=self.cfg.prefill_step_size,
+                    )
+                else:
+                    self._prefill_cache(base_cache, system_tokens)
                 self._register_base_cache(
                     messages, base_cache, system_tokens, tools=tools,
+                    mtp_resume_hidden=mtp_hidden,
                 )
             except Exception as e:
                 logger.warning(f"[Base Cache] registration failed: {e}")

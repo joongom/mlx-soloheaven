@@ -36,7 +36,7 @@ mlx-soloheaven \
   --memory-budget-gb 20 \
   --gpu-keepalive \
   --prefill-step-size 2048 \
-  --temperature 1.0 \
+  --temperature 0.6 \
   --top-k 20 \
   --top-p 0.95 \
   --thinking-budget 4096 \

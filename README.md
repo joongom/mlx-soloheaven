@@ -213,6 +213,32 @@ byte-identical with and without reuse.
 - **Never** set `--draft-block-size` ≥ 3 on this model — a measured 10–23%
   mean regression across all tested prompt lengths.
 
+### Qwen3.6-27B Dense MTP (M5 Max 128GB)
+
+The dense-hybrid sibling (`Qwen3.6-27B-MLX-8bit`, 64 layers = 48 DeltaNet +
+16 full-attention, no MoE) is the **opposite case from the 35B MoE**: plain
+decode is only ~17 tok/s (all ~27B params active per token), so its native
+`qwen3_5_mtp` head (`Qwen3.6-27B-MTP-bf16`, 1 dense layer, ~0.8 GB) genuinely
+pays — **+25–37%** vs the 35B's 1.019x wash, directionally matching dense
+Gemma4 (60 → 97.8). The head loads strict on the default mlx-lm path with no
+flags beyond `--draft-model <head> --draft-block-size 1`
+([`start_qwen3.6_27b_mtp.sh`](start_qwen3.6_27b_mtp.sh)).
+
+Block-size sweep (production sampling temp 0.6 / top_k 20 / top_p 0.95 /
+rep_pen 1.1, 500 generated tokens, 2-run avg, decode tok/s):
+
+| Block size | 153-tok prompt | 2,541-tok prompt |
+|---|---|---|
+| no MTP | 17.3 (1.00x) | 17.0 (1.00x) |
+| **1 (script default)** | **21.6 (1.25x)**, acc 0.76/1 | **23.3 (1.37x)**, acc 0.81/1 |
+| 2 | 19.9 (1.15x), acc 1.22/2 | 21.2 (1.24x), acc 1.42/2 |
+| 3 (head-config default) | 18.7 (1.08x), acc 1.59/3 | 19.5 (1.14x), acc 1.81/3 |
+
+**Block 1 wins at both sizes, strictly monotonically** (1 > 2 > 3): deeper
+blocks raise tokens-accepted-per-round, but each round's dense verify forward
+over k+1 tokens costs more than the extra acceptance buys back. Don't use the
+head-config default of 3 here either.
+
 ### Production Metrics (Qwen3.5-122B-A10B-bf16) *(historical, M3 Ultra 512GB)*
 
 | Metric | Without Cache | With Cache | Improvement |
@@ -609,7 +635,7 @@ A `SOLOHEAVEN_MTP_WRAP_GATE=1` env fallback can disable the drafter post-wrap
 - ❌ Combined with `--models` (multi-model) — drafter is single-`--model` only
 - Independent of PLD — MTP is a separate, model-specific path
 
-> **Qwen3.6-35B-A3B** ships a separate **native `qwen3_5_mtp` head** that runs on the default mlx-lm path (no mlx-vlm) — measured a wash vs plain decode; see [Qwen3.6-35B-A3B Best Practices](#qwen36-35b-a3b-best-practices-m5-max-128gb).
+> **Qwen3.6-35B-A3B and Qwen3.6-27B** each ship a separate **native `qwen3_5_mtp` head** that runs on the default mlx-lm path (no mlx-vlm) — measured a wash on the 35B MoE (1.019x) but **+25–37% on the 27B dense** (plain decode ~17 tok/s); see [Qwen3.6-35B-A3B Best Practices](#qwen36-35b-a3b-best-practices-m5-max-128gb) and [Qwen3.6-27B Dense MTP](#qwen36-27b-dense-mtp-m5-max-128gb).
 
 ### Structured Output (`response_format`)
 

@@ -152,10 +152,15 @@ class Config:
     pld_num_draft_tokens: int = 10         # Max draft tokens per step
     pld_ngram_k: int = 3                   # N-gram size for matching
 
-    # Speculative decoding via the mlx-vlm drafter (MTP / DFlash). Requires the
-    # mlx-vlm backend: set `backend="mlx-vlm"` (CLI `--backend mlx-vlm`). After
-    # the mlx-lm-first migration the drafter is an explicit mlx-vlm opt-in; on
-    # the default mlx-lm backend use PLD (pld_enabled) for speculative decoding.
+    # Speculative decoding via a drafter model (--draft-model), dispatched by
+    # the DRAFTER's model_type:
+    #   * qwen3_5_mtp (Qwen3.5/3.6 MTP head): runs NATIVELY on the default
+    #     mlx-lm backend (engine/qwen_mtp.py; draft_kind resolves to
+    #     "qwen_mtp"). Do NOT set backend="mlx-vlm" for these heads.
+    #   * gemma4_assistant / other mlx-vlm drafters (MTP / DFlash): require
+    #     the mlx-vlm backend (CLI `--backend mlx-vlm`).
+    # On the mlx-lm backend without a drafter, PLD (pld_enabled) is the
+    # other speculative option.
     draft_model: str | None = None
     draft_kind: str | None = None
     draft_block_size: int | None = None

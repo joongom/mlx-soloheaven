@@ -220,9 +220,10 @@ def _make_eager_sampler(
     return sampler
 
 
-def _pld_response_adapter(pld_iter, tokenizer):
-    """Adapt pld_generate_step's (token, logprobs, from_draft) tuples to
-    mimic lm_stream_generate's GenerationResponse objects.
+def _pld_response_adapter(pld_iter, tokenizer, label: str = "PLD"):
+    """Adapt (token, logprobs, from_draft) tuples (pld_generate_step or
+    qwen_mtp_generate_step — same contract) to mimic lm_stream_generate's
+    GenerationResponse objects. ``label`` tags the acceptance log line.
 
     - Uses mlx-lm's StreamingDetokenizer (buffers partial UTF-8 byte
       sequences so multi-byte characters like CJK aren't emitted as
@@ -320,7 +321,7 @@ def _pld_response_adapter(pld_iter, tokenizer):
 
     if count > 0:
         logger.info(
-            f"[PLD] accepted {from_draft_count}/{count} draft tokens "
+            f"[{label}] accepted {from_draft_count}/{count} draft tokens "
             f"({100*from_draft_count/count:.1f}% acceptance rate)"
         )
 
@@ -1620,10 +1621,17 @@ class MLXEngine:
                     f"num_draft={self.cfg.pld_num_draft_tokens}, k={self.cfg.pld_ngram_k}"
                 )
 
-        # Drafter weight is cached on ``self._drafter`` for per-request reuse;
-        # mlx-lm legacy path has no drafter integration so we refuse loudly.
+        # Drafter weight is cached on ``self._drafter`` for per-request reuse.
+        # Dispatch by the DRAFTER's model_type:
+        #   * qwen3_5_mtp     -> native mlx-lm MTP head (engine/qwen_mtp.py);
+        #                        loaded inline on this thread, _draft_kind
+        #                        "qwen_mtp" routes _run_lm_legacy through
+        #                        qwen_mtp_generate_step.
+        #   * everything else -> mlx-vlm drafter stack (gemma4_assistant MTP /
+        #                        DFlash), --backend mlx-vlm required; the
+        #                        mlx-lm path refuses loudly.
         #
-        # F3-LOAD: the drafter is loaded **on the dedicated VLM worker
+        # F3-LOAD (vlm drafters only): the drafter is loaded **on the dedicated VLM worker
         # thread**. mlx-vlm 0.5.0 schedules drafter ops via the same
         # `mx.async_eval(...)` outside-of-with-block calls in
         # `generate_step` that previously raised the user's:
@@ -1638,26 +1646,70 @@ class MLXEngine:
         # Loading on the worker eliminates the cross-thread hand-off.
         self._drafter = None
         self._draft_kind = None
+        self._mtp_block_size = None
         if self.cfg.draft_model:
-            if not self._use_vlm:
+            from mlx_soloheaven.engine import qwen_mtp as qwen_mtp_mod
+
+            _draft_type = qwen_mtp_mod.read_model_type(self.cfg.draft_model)
+            if _draft_type == qwen_mtp_mod.QWEN_MTP_MODEL_TYPE:
+                # Qwen3.5/3.6 MTP head — runs NATIVELY on the mlx-lm path
+                # (no mlx-vlm; the installed mlx-vlm has no qwen3_5_mtp
+                # drafter). Loaded inline like the target weights: lm-path
+                # generation runs on the calling thread (process mode owns
+                # the child main thread), so there is no worker hand-off.
+                if self._use_vlm:
+                    raise RuntimeError(
+                        "qwen3_5_mtp MTP head (--draft-model) runs natively "
+                        "on the mlx-lm path; remove --backend mlx-vlm (the "
+                        "installed mlx-vlm has no qwen3_5_mtp drafter)."
+                    )
+                t0_drafter = time.perf_counter()
+                _head, _info = qwen_mtp_mod.load_qwen_mtp_head(
+                    self.cfg.draft_model
+                )
+                # Fail-closed at load: the head borrows the target's
+                # embeddings + lm_head, and the manual pre-final-norm layer
+                # loop must reproduce model() logits exactly.
+                qwen_mtp_mod.assert_head_target_compat(
+                    _info, self._language_model
+                )
+                qwen_mtp_mod.verify_layer_loop_parity(self._language_model)
+                self._drafter = _head
+                self._draft_kind = "qwen_mtp"
+                self._mtp_block_size = int(
+                    self.cfg.draft_block_size or _info["block_size"] or 3
+                )
+                logger.info(
+                    f"[Drafter] loaded {self.cfg.draft_model} kind=qwen_mtp "
+                    f"block_size={self._mtp_block_size} "
+                    f"num_head_layers={_info['num_layers']} "
+                    f"weights={_info['num_weights']} (strict) in "
+                    f"{time.perf_counter() - t0_drafter:.1f}s — "
+                    f"MTP speculative decoding active on the mlx-lm path"
+                )
+            elif not self._use_vlm:
                 raise RuntimeError(
-                    "MTP drafter (--draft-model) requires --backend mlx-vlm; "
-                    "on the default mlx-lm backend use --pld for speculative "
-                    f"decoding. (model_type={self._model_type!r})"
+                    f"MTP drafter (--draft-model) with drafter model_type="
+                    f"{_draft_type!r} requires --backend mlx-vlm "
+                    f"(gemma4_assistant MTP/DFlash run on mlx-vlm). Only "
+                    f"qwen3_5_mtp heads run natively on the default mlx-lm "
+                    f"backend; alternatively use --pld for speculative "
+                    f"decoding. (target model_type={self._model_type!r})"
                 )
-
-            def _load_drafter_on_worker():
-                return _maybe_load_drafter(
-                    self.cfg.draft_model,
-                    kind=self.cfg.draft_kind,
-                )
-
-            if self.execution_mode == "main_thread":
-                self._drafter, self._draft_kind = _load_drafter_on_worker()
             else:
-                self._drafter, self._draft_kind = self._vlm_executor.submit(
-                    _load_drafter_on_worker
-                ).result()
+
+                def _load_drafter_on_worker():
+                    return _maybe_load_drafter(
+                        self.cfg.draft_model,
+                        kind=self.cfg.draft_kind,
+                    )
+
+                if self.execution_mode == "main_thread":
+                    self._drafter, self._draft_kind = _load_drafter_on_worker()
+                else:
+                    self._drafter, self._draft_kind = self._vlm_executor.submit(
+                        _load_drafter_on_worker
+                    ).result()
 
         # Set wired limit once at startup
         if mx.metal.is_available():
@@ -4030,12 +4082,49 @@ class MLXEngine:
 
         Returns `(gen_iter, prompt_cache)`.
         """
-        # Drafter is only wired on the mlx-vlm path; fail loud if reached here.
-        if getattr(self, "_drafter", None) is not None:
+        # Drafter dispatch by kind: qwen3_5_mtp heads ("qwen_mtp") run
+        # NATIVELY on this mlx-lm path (engine/qwen_mtp.py); every other
+        # drafter kind (gemma4_assistant MTP / DFlash) is mlx-vlm only —
+        # fail loud if reached here.
+        _drafter = getattr(self, "_drafter", None)
+        use_mtp = _drafter is not None and (
+            getattr(self, "_draft_kind", None) == "qwen_mtp"
+        )
+        if _drafter is not None and not use_mtp:
             raise RuntimeError(
-                "MTP drafter (--draft-model) requires --backend mlx-vlm; "
-                "on the default mlx-lm backend use --pld for speculative "
-                "decoding."
+                "MTP drafter (--draft-model) requires --backend mlx-vlm for "
+                f"this drafter kind ({getattr(self, '_draft_kind', None)!r}); "
+                "only qwen3_5_mtp heads run natively on the mlx-lm backend. "
+                "Alternatively use --pld for speculative decoding."
+            )
+        # FIX-6 mirror: structured output (response_format json_schema /
+        # json_object) requires the FSM processor to advance EXACTLY one
+        # token per emitted position — disable MTP for THIS request (the FSM
+        # processor stays active; same rule as the PLD/vlm-drafter gates).
+        _rf_type = (
+            getattr(response_format, "type", None) if response_format else None
+        )
+        if use_mtp and _rf_type in ("json_schema", "json_object"):
+            logger.info(
+                f"[Structured] QwenMTP disabled for this request: "
+                f"response_format={_rf_type!r} (single-step FSM advance)"
+            )
+            use_mtp = False
+        # KV-quantized caches interact badly with the MTP trim/rollback
+        # boundary (and bf16 KV measured optimal for this family anyway).
+        if use_mtp and self.cfg.kv_bits:
+            if not getattr(self, "_mtp_kv_bits_warned", False):
+                self._mtp_kv_bits_warned = True
+                logger.warning(
+                    f"[{self.model_id}] QwenMTP disabled: --kv-bits="
+                    f"{self.cfg.kv_bits} is incompatible with MTP rollback "
+                    f"(keep the bf16 KV cache on this path)."
+                )
+            use_mtp = False
+        if use_mtp and self.cfg.pld_enabled:
+            logger.info(
+                f"[{self.model_id}] both --draft-model (qwen_mtp) and --pld "
+                f"set — MTP takes precedence; PLD skipped."
             )
         # FIX-2: per-request PLD cache-corruption flag. pld_generate_step's
         # fail-closed _rewind fires the callback when a trim silently no-ops;
@@ -4065,6 +4154,36 @@ class MLXEngine:
             cache_state.cache = None
             cache_state.token_ids = None
             prompt_cache = None
+        # QwenMTP cache-reuse gate (fail-closed, BEFORE the prefix-trim):
+        # the MTP runner needs the 40 target entries + the head's KV entries
+        # with head_offset == target_offset (finalized), a PURE-APPEND prompt
+        # (the 30 ArraysCache layers cannot trim, so divergence can never be
+        # rewound), and the head's last committed pair token must byte-match
+        # the first suffix token (head slot i pairs with token i+1 — a stale
+        # pair would silently skew every draft; mlx-lm issue #1292 class).
+        # Any miss -> COLD-FILL once; afterwards the session carries the
+        # 41-entry layout and stays MTP-reusable across appends.
+        if use_mtp:
+            from mlx_soloheaven.engine import qwen_mtp as qwen_mtp_mod
+            _n_target = len(self._language_model.layers)
+            _n_head = max(1, len(getattr(_drafter, "layers", [])) or 1)
+            if prompt_cache is not None:
+                _ok, _why = qwen_mtp_mod.validate_mtp_cache_reuse(
+                    prompt_cache,
+                    cache_state.token_ids or [],
+                    prompt_token_ids,
+                    _n_target,
+                    _n_head,
+                    getattr(cache_state, "mtp_pending_token", None),
+                )
+                if not _ok:
+                    logger.info(
+                        f"[QwenMTP] cache not MTP-reusable ({_why}) — "
+                        f"COLD-FILL ({len(prompt_token_ids)} tokens)"
+                    )
+                    cache_state.cache = None
+                    cache_state.token_ids = None
+                    prompt_cache = None
         if prompt_cache is None:
             prompt_cache = make_prompt_cache(self._language_model)
         else:
@@ -4113,6 +4232,51 @@ class MLXEngine:
                     prefix_len = 0
             # Only feed tokens after prefix
             prompt_token_ids = prompt_token_ids[prefix_len:]
+
+        # --- QwenMTP dispatch (native mlx-lm MTP speculative decoding) ---
+        if use_mtp:
+            # Fresh / cold-filled cache: append the head's KV entries after
+            # the target's (PR #990 layout convention). The SAME list object
+            # is written back to cache_state.cache post-stream, so the head
+            # entries persist for append-only multi-turn reuse.
+            if len(prompt_cache) == _n_target:
+                prompt_cache.extend(qwen_mtp_mod.make_head_cache(_n_head))
+
+            def _on_mtp_cache_corruption():
+                # Same contract as _on_pld_cache_corruption: invalidate the
+                # session cache IMMEDIATELY (abandoned generators never reach
+                # the post-loop) and flag the post-loop to skip write-back.
+                self._pld_cache_invalid = True
+                cache_state.cache = None
+                cache_state.token_ids = None
+
+            def _on_mtp_finalize(pending_token):
+                # Record the token of the head's finalize-committed pending
+                # pair; next turn's reuse gate verifies the first suffix
+                # token byte-matches it (fail-closed -> cold-fill).
+                cache_state.mtp_pending_token = pending_token
+
+            gen_iter = _pld_response_adapter(
+                qwen_mtp_mod.qwen_mtp_generate_step(
+                    prompt=mx.array(prompt_token_ids),
+                    model=self._language_model,
+                    head=_drafter,
+                    block_size=getattr(self, "_mtp_block_size", None) or 3,
+                    max_tokens=max_tokens,
+                    sampler=sampler,
+                    logits_processors=(
+                        logits_processors if logits_processors else None
+                    ),
+                    prompt_cache=prompt_cache,
+                    n_target_layers=_n_target,
+                    prefill_step_size=self.cfg.prefill_step_size,
+                    on_cache_corruption=_on_mtp_cache_corruption,
+                    on_finalize=_on_mtp_finalize,
+                ),
+                tokenizer=self.tokenizer,
+                label="QwenMTP",
+            )
+            return gen_iter, prompt_cache
 
         lm_kwargs = {
             "max_tokens": max_tokens,

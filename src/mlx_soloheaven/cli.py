@@ -195,21 +195,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=int(_env("PREFILL_STEP_SIZE", "2048")),
         help="Prefill chunk size (default: 2048). Try 4096/8192 for long-prompt speedup (env: SOLOHEAVEN_PREFILL_STEP_SIZE)",
     )
-    # Speculative decoding via mlx-vlm drafter (MTP / DFlash).
+    # Speculative decoding via a drafter model (MTP / DFlash), dispatched by
+    # the drafter's model_type.
     p.add_argument(
         "--draft-model",
         default=_env("DRAFT_MODEL"),
         help="Path to drafter MLX model directory (enables MTP/DFlash "
-             "speculative decoding). The MTP drafter requires "
-             "`--backend mlx-vlm`; on the default mlx-lm backend use --pld "
-             "instead. (env: SOLOHEAVEN_DRAFT_MODEL)",
+             "speculative decoding). qwen3_5_mtp heads (Qwen3.5/3.6 MTP) run "
+             "NATIVELY on the default mlx-lm backend; gemma4_assistant MTP / "
+             "DFlash drafters require `--backend mlx-vlm`. Without a drafter "
+             "the mlx-lm backend can use --pld instead. "
+             "(env: SOLOHEAVEN_DRAFT_MODEL)",
     )
     p.add_argument(
         "--draft-kind",
         choices=["mtp", "dflash"],
         default=_env("DRAFT_KIND"),
-        help="Drafter kind: 'mtp' (Gemma 4) or 'dflash' (Qwen3). "
-             "Default: auto-detect from drafter's model_type.",
+        help="mlx-vlm drafter kind override: 'mtp' (Gemma 4) or 'dflash' "
+             "(Qwen3). Default: auto-detect from drafter's model_type "
+             "(qwen3_5_mtp heads ignore this and resolve to 'qwen_mtp').",
     )
     p.add_argument(
         "--draft-block-size",

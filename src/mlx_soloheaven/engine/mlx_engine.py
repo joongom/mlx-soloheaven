@@ -1789,6 +1789,13 @@ class MLXEngine:
 
         self._build_disk_index()
         self._touch_gpu()  # Mark GPU active after model load
+        # Persist-on-stop is MODE-AGNOSTIC: register the shutdown flush for
+        # every execution mode. It was previously registered only inside
+        # _start_gpu_keepalive, which is skipped in main_thread/process mode
+        # (and when --gpu-keepalive is off) — so a normal server stop never
+        # flushed dirty sessions to disk in the production-default process
+        # mode. Keepalive below remains thread-mode-only.
+        self._register_shutdown_flush()
         if self.cfg.gpu_keepalive and self.execution_mode != "main_thread":
             self._start_gpu_keepalive()
             logger.info(f"[{self.model_id}] GPU keepalive enabled (interval={self.GPU_KEEPALIVE_INTERVAL}s)")
@@ -2019,36 +2026,118 @@ class MLXEngine:
 
         self._keepalive_thread = threading.Thread(target=_keepalive_loop, daemon=True)
         self._keepalive_thread.start()
+        # NOTE: the shutdown flush (atexit + SIGINT/SIGTERM) used to be
+        # registered HERE, which silently skipped it for main_thread/process
+        # mode and for --gpu-keepalive off. It now lives in
+        # _register_shutdown_flush(), called unconditionally from load_model.
 
-        # Register shutdown handler to stop keepalive cleanly
+    # --- Shutdown flush registration (mode-agnostic) -----------------------
+
+    # Class-level once-guards: registration and the flush-run marker. Exposed
+    # as class attrs (not closure state) so tests can reset/inspect them and
+    # so the process worker can reuse the same handler.
+    _shutdown_flush_registered = False
+    _shutdown_flush_fn = None  # the registered flush callable (for tests/worker)
+
+    def _register_shutdown_flush(self):
+        """Register atexit + SIGINT/SIGTERM handlers that persist dirty
+        sessions on a normal stop. MODE-AGNOSTIC and idempotent (class-level
+        once); called from load_model for every execution mode.
+
+        OWNERSHIP CONTRACT: in server mode UVICORN OWNS PROCESS LIFETIME —
+        its SIGINT/SIGTERM handlers drive the graceful stop (serve loop
+        winds down → lifespan shutdown → server.py's shutdown hook flushes
+        again, idempotently). Our handler only PREPENDS a flush and then
+        CHAINS to whatever handler was installed before us; it must never
+        force process termination itself when someone else manages it. Only
+        when the previous disposition was the OS default (bare scripts,
+        tests) do we re-deliver the signal with SIG_DFL so the process still
+        dies of it (correct exit status for supervisors).
+
+        Per-mode safety contract:
+          - thread mode ("worker"): generation runs on the _vlm_executor
+            thread, so a main-thread handler can safely block (bounded) on
+            the engine lock until an in-flight generation finishes.
+          - main_thread mode (non-process): that mode's contract is
+            main-thread-only MLX, and Python signal handlers run on the main
+            thread, so flushing inline from the handler is allowed. If the
+            signal interrupted an in-flight generation (which holds the
+            NON-reentrant engine lock on this same thread), the bounded
+            acquire in _flush_all_on_shutdown skips the flush, re-marks the
+            ids dirty, and the retry happens downstream: the chained Uvicorn
+            handler unwinds the generation (releasing the lock), then the
+            lifespan shutdown hook and/or the atexit backstop re-run the
+            flush against the LIVE dirty set.
+          - process mode: the CHILD's worker loop REPLACES these signal
+            handlers with a flag+sentinel pair (see process_worker.py) so
+            the flush runs from the loop's finally, never inside a signal
+            handler; the atexit hook registered here remains as a
+            last-resort backstop (idempotent — the first flush drains the
+            dirty set, so a second run is a no-op).
+        """
+        if MLXEngine._shutdown_flush_registered:
+            return
+        MLXEngine._shutdown_flush_registered = True
+
         import atexit
         import signal
 
-        _shutdown_done = False
-
         def _shutdown(*args):
-            nonlocal _shutdown_done
-            if _shutdown_done:
-                return
-            _shutdown_done = True
+            # NO once-guard here, deliberately: _flush_all_on_shutdown
+            # re-reads the LIVE dirty set on every call, so a repeat run is
+            # a cheap no-op when the first flush drained it — and a REAL
+            # retry when a timed-out bounded lock acquire re-marked ids
+            # dirty. The atexit backstop below relies on that retry.
             MLXEngine._global_keepalive_stop.set()
             logger.info("[Shutdown] Flushing dirty sessions...")
-            MLXEngine._flush_all_on_shutdown()
+            try:
+                MLXEngine._flush_all_on_shutdown()
+            except Exception as e:  # noqa: BLE001 — never block/corrupt shutdown
+                logger.error(f"[Shutdown] flush failed (continuing): {e}")
             logger.info("[Shutdown] Complete")
 
+        MLXEngine._shutdown_flush_fn = _shutdown
+        # atexit is the UNIVERSAL backstop: it runs on every interpreter
+        # exit (normal stop, Uvicorn graceful shutdown, sys.exit) and
+        # retries anything a timed-out flush re-marked dirty.
         atexit.register(_shutdown)
-        # Handle SIGINT/SIGTERM so Ctrl+C stops keepalive immediately
-        prev_sigint = signal.getsignal(signal.SIGINT)
-        prev_sigterm = signal.getsignal(signal.SIGTERM)
+
+        # Capture the handlers installed BEFORE us (Uvicorn's, when
+        # load_model runs inside server startup) so we can chain instead of
+        # clobbering them.
+        prev_handlers: dict = {}
 
         def _signal_handler(signum, frame):
             _shutdown()
-            # Restore default handler so next Ctrl+C forces quit
+            prev = prev_handlers.get(signum, signal.SIG_DFL)
+            if callable(prev):
+                # Chain: Uvicorn (or another wrapper) installed a handler
+                # before us — hand the signal over so its graceful shutdown
+                # still runs (lifespan shutdown → server.py hook → second
+                # flush is an idempotent no-op / retry).
+                prev(signum, frame)
+                return
+            if prev is signal.SIG_IGN:
+                # The signal was being ignored before we registered — keep
+                # ignoring it after our flush.
+                return
+            # SIG_DFL (or None — handler installed by non-Python code, which
+            # we cannot invoke): restore the default disposition and
+            # re-deliver so the process still dies of the signal.
             signal.signal(signum, signal.SIG_DFL)
             os.kill(os.getpid(), signum)
 
-        signal.signal(signal.SIGINT, _signal_handler)
-        signal.signal(signal.SIGTERM, _signal_handler)
+        try:
+            for _sig in (signal.SIGINT, signal.SIGTERM):
+                prev_handlers[_sig] = signal.getsignal(_sig)
+                signal.signal(_sig, _signal_handler)
+        except ValueError:
+            # signal.signal only works on the main thread (e.g. load_model
+            # driven from a worker thread in tests) — atexit-only fallback.
+            logger.debug(
+                "[Shutdown] signal handlers not installed (non-main thread); "
+                "atexit flush still registered"
+            )
 
     def _touch_gpu(self):
         """Mark GPU as recently active (resets keepalive timer)."""
@@ -2434,23 +2523,53 @@ class MLXEngine:
             logger.info(f"[Idle Flush] saved {saved}/{len(to_save)} dirty sessions")
 
     @classmethod
-    def _flush_all_on_shutdown(cls):
-        """Save all dirty sessions across all engines on shutdown."""
+    def _flush_all_on_shutdown(cls, lock_timeout: float = 10.0):
+        """Save all dirty sessions across all engines on shutdown.
+
+        IDEMPOTENT: each engine's dirty set is drained up front, so a second
+        call (worker-loop flush followed by the atexit backstop, or atexit
+        after a signal handler) is a cheap no-op.
+
+        FAIL-CLOSED: the engine lock is acquired with a BOUNDED wait. In
+        main_thread mode a signal handler runs on the same thread as an
+        in-flight generation that holds the non-reentrant lock — a blocking
+        acquire there would self-deadlock shutdown forever. On timeout the
+        ids are re-marked dirty (so a later flush attempt can retry) and the
+        engine is skipped with a warning. Per-session and per-engine save
+        failures are logged and never propagate.
+        """
         for engine in cls._all_engines:
-            with engine._dirty_lock:
-                to_save = engine._dirty_sessions.copy()
-                engine._dirty_sessions.clear()
-            if not to_save:
-                continue
-            logger.info(f"[Shutdown] Flushing {len(to_save)} dirty sessions for {engine.model_id}")
-            with engine._lock:
-                for sid in to_save:
-                    session = engine._sessions.get(sid)
-                    if session:
-                        try:
-                            engine._save_session_to_disk(sid, session)
-                        except Exception as e:
-                            logger.error(f"[Shutdown] Failed to save session {sid}: {e}")
+            try:
+                with engine._dirty_lock:
+                    to_save = engine._dirty_sessions.copy()
+                    engine._dirty_sessions.clear()
+                if not to_save:
+                    continue
+                logger.info(f"[Shutdown] Flushing {len(to_save)} dirty sessions for {engine.model_id}")
+                if not engine._lock.acquire(timeout=lock_timeout):
+                    with engine._dirty_lock:
+                        engine._dirty_sessions |= to_save
+                    logger.warning(
+                        f"[Shutdown] engine lock not acquired within "
+                        f"{lock_timeout}s (in-flight generation?) — skipping "
+                        f"flush for {engine.model_id}"
+                    )
+                    continue
+                try:
+                    for sid in to_save:
+                        session = engine._sessions.get(sid)
+                        if session:
+                            try:
+                                engine._save_session_to_disk(sid, session)
+                            except Exception as e:
+                                logger.error(f"[Shutdown] Failed to save session {sid}: {e}")
+                finally:
+                    engine._lock.release()
+            except Exception as e:  # noqa: BLE001 — never block shutdown
+                logger.error(
+                    f"[Shutdown] flush failed for engine "
+                    f"{getattr(engine, 'model_id', '?')}: {e}"
+                )
 
     def _load_session_from_disk(self, session_id: str) -> Optional[SessionState]:
         """Load session's KV cache + token history from disk."""

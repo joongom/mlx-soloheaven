@@ -126,6 +126,7 @@ class EngineProcessProxy:
 
         self._ready_event = threading.Event()
         self._reader_thread = None
+        self._closed = False
 
     # --- lifecycle --------------------------------------------------------
 
@@ -157,16 +158,33 @@ class EngineProcessProxy:
             f"family={self.model_family} thinking={self.enable_thinking}"
         )
 
-    def close(self):
+    def close(self, join_timeout: float = 10.0):
+        """Graceful child stop. Idempotent.
+
+        Sends the 'shutdown' op and WAITS (bounded) so the child's main loop
+        can flush dirty sessions to disk before exiting — measured DISK SAVE
+        cost is ~0.01s per session, so seconds-scale is generous. A wedged
+        child (e.g. mid-generation past the timeout) is terminate()d; its
+        SIGTERM handler still attempts the same graceful flush on the way
+        out, so we join briefly once more to let that finish."""
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
         try:
             with self._cmd_send_lock:
                 self._cmd_parent.send({"op": "shutdown"})
         except Exception:  # noqa: BLE001
             pass
         if self._proc is not None:
-            self._proc.join(timeout=10)
+            self._proc.join(timeout=join_timeout)
             if self._proc.is_alive():
+                logger.warning(
+                    f"[ProcessProxy] child did not exit within {join_timeout}s "
+                    f"after 'shutdown' — sending SIGTERM (child's handler "
+                    f"still flushes)"
+                )
                 self._proc.terminate()
+                self._proc.join(timeout=join_timeout)
 
     # --- reader thread ----------------------------------------------------
 

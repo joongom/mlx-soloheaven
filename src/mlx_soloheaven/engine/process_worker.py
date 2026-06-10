@@ -16,11 +16,83 @@ imported in the parent for symbol access without pulling in MLX.
 """
 
 import logging
+import signal
 import threading
 import time
 import traceback
 
 from mlx_soloheaven.engine import process_protocol as proto
+
+logger = logging.getLogger(__name__)
+
+# Periodic idle flush (process-mode stand-in for thread mode's GPU-keepalive
+# idle flush, which never runs in main_thread mode): the main loop waits on
+# the cmd pipe with a bounded poll() instead of a blocking recv(), and flushes
+# dirty sessions once the pipe has been quiet for IDLE_FLUSH_AFTER_S.
+IDLE_FLUSH_POLL_S = 5.0
+IDLE_FLUSH_AFTER_S = 60.0
+
+
+class _GracefulShutdown(BaseException):
+    """Sentinel raised by the worker's SIGTERM/SIGINT handler to unwind the
+    main loop. Derives from BaseException (NOT Exception) so the per-request
+    ``except Exception`` blocks in the loop can never swallow it — it always
+    reaches the loop's own handler, whose ``finally`` runs the shutdown
+    flush."""
+
+
+def _flush_engine_for_shutdown(engine, shutdown_flag=None):
+    """Persist all dirty sessions before the child exits.
+
+    SERIALIZATION: called only from the worker MAIN loop (shutdown op /
+    sentinel unwind / pipe EOF), and that loop runs every generation to
+    completion inline before recv()ing the next command — so this can never
+    be concurrent with an active generation. The engine lock is still taken
+    (bounded) inside _flush_all_on_shutdown for defense in depth: if the
+    SIGTERM sentinel unwound a generation mid-flight, the lock is released
+    by generate_stream's ``with self._lock`` on the way out, before we get
+    here.
+
+    SIGNAL-SAFE: ``shutdown_flag`` (the worker's shutdown Event) is set as
+    the FIRST statement, unconditionally. On non-signal exit paths
+    ('shutdown' op, None cmd, pipe EOF, unexpected loop error) the flag was
+    never set by the signal handler — without this, a SIGTERM landing while
+    this flush runs (e.g. the parent's close() join timeout firing
+    terminate()) would look like a FIRST signal and raise the sentinel,
+    aborting _flush_all_on_shutdown AFTER it already drained the dirty set;
+    the atexit backstop would then no-op and the sessions would be lost.
+    With the flag set, any signal arriving during the final flush takes the
+    handler's 'already unwinding → return silently' path.
+
+    FAIL-CLOSED: a failed flush logs and continues — it must never block or
+    corrupt shutdown. Idempotent with the engine's own atexit backstop (the
+    first flush drains the dirty set).
+    """
+    if shutdown_flag is not None:
+        shutdown_flag.set()
+    try:
+        engine._flush_all_on_shutdown()
+    except Exception:  # noqa: BLE001
+        logger.exception("[child] shutdown flush failed (continuing)")
+
+
+def _idle_flush(engine):
+    """Periodic dirty-session flush on the child MAIN thread.
+
+    Runs only between commands (the loop is the sole generation driver), so
+    the engine lock should be free; acquire it non-blocking and bail rather
+    than ever stalling the command loop. Fail-closed: errors are logged,
+    never raised.
+    """
+    try:
+        if not engine._lock.acquire(blocking=False):
+            return
+        try:
+            engine._flush_dirty_sessions()
+        finally:
+            engine._lock.release()
+    except Exception:  # noqa: BLE001
+        logger.exception("[child] idle flush failed (ignored)")
 
 
 def worker_main(cfg_dict, cmd_conn, resp_conn, ctrl_conn):
@@ -76,6 +148,36 @@ def worker_main(cfg_dict, cmd_conn, resp_conn, ctrl_conn):
 
     threading.Thread(target=_ctrl_loop, daemon=True, name="proc-ctrl").start()
 
+    # --- graceful-shutdown signal wiring -----------------------------------
+    # engine.load_model() registered direct-flush SIGTERM/SIGINT handlers
+    # (MLXEngine._register_shutdown_flush). In the CHILD we REPLACE them with
+    # a flag+sentinel pair: NO MLX work may run inside a signal handler here,
+    # because the handler executes on this same main thread and could
+    # interrupt an in-flight generation that holds the non-reentrant engine
+    # lock (flushing from the handler would self-deadlock or touch tensors
+    # mid-mutation). The handler only sets a flag and raises the sentinel;
+    # the actual flush runs in the loop's ``finally`` below, on the main
+    # thread, after the generation unwound and released the lock. The atexit
+    # hook the engine registered stays as a last-resort backstop (safe: the
+    # process is single-threaded-for-MLX at interpreter exit, and the flush
+    # is idempotent).
+    shutdown_requested = threading.Event()
+
+    def _graceful_signal_handler(signum, frame):
+        if shutdown_requested.is_set():
+            # Second signal while already unwinding/flushing (e.g. parent
+            # terminate() after its join timeout): do NOT raise again — it
+            # would abort the in-progress flush. Let the first unwind finish.
+            return
+        shutdown_requested.set()
+        raise _GracefulShutdown(signum)
+
+    try:
+        signal.signal(signal.SIGTERM, _graceful_signal_handler)
+        signal.signal(signal.SIGINT, _graceful_signal_handler)
+    except ValueError:  # pragma: no cover — worker_main runs on the main thread
+        logger.warning("[child] signal handlers not installed (non-main thread)")
+
     # Signal readiness with model metadata the parent proxy exposes. The cfg
     # snapshot carries the read-only fields the API reads (default_*, thinking,
     # token IDs, budgets, cache_dir) AFTER the child's load-time detection
@@ -94,58 +196,88 @@ def worker_main(cfg_dict, cmd_conn, resp_conn, ctrl_conn):
     coalesce_ms = getattr(cfg, "stream_coalesce_ms", 30)
     coalescing = coalesce_n > 1
 
-    while True:
-        try:
-            cmd = cmd_conn.recv()
-        except (EOFError, OSError):
-            break
-        if cmd is None:
-            break
-        if not isinstance(cmd, dict):
-            continue
-        op = cmd.get("op")
-        if op == "shutdown":
-            break
-
-        # --- generic synchronous RPC (Stage 2) ---
-        if op == "rpc":
-            rid = cmd.get("id", "")
-            method = cmd.get("method", "")
-            args = cmd.get("args", []) or []
-            kwargs = cmd.get("kwargs", {}) or {}
+    # MAIN LOOP. Ops are strictly SERIAL: each generation runs to completion
+    # inline before the next recv(), so a 'shutdown' op (or the sentinel /
+    # pipe EOF) is never processed concurrently with an active generation —
+    # the shutdown flush in the ``finally`` below therefore never races MLX
+    # work. The only other threads are proc-ctrl (no MLX) and the engine's
+    # disk-index helpers (none in main_thread mode).
+    last_activity = time.monotonic()
+    try:
+        while not shutdown_requested.is_set():
             try:
-                _run_rpc(engine, rid, method, args, kwargs, resp_conn)
+                # Bounded wait instead of a blocking recv so the loop can run
+                # the periodic idle flush while the server sits quiet.
+                if not cmd_conn.poll(IDLE_FLUSH_POLL_S):
+                    if time.monotonic() - last_activity >= IDLE_FLUSH_AFTER_S:
+                        _idle_flush(engine)
+                        last_activity = time.monotonic()
+                    continue
+                cmd = cmd_conn.recv()
+            except (EOFError, OSError):
+                break
+            last_activity = time.monotonic()
+            if cmd is None:
+                break
+            if not isinstance(cmd, dict):
+                continue
+            op = cmd.get("op")
+            if op == "shutdown":
+                # Graceful stop requested by the parent (proxy.close()).
+                # Break — the ``finally`` below flushes dirty sessions to
+                # disk BEFORE the process exits.
+                break
+
+            # --- generic synchronous RPC (Stage 2) ---
+            if op == "rpc":
+                rid = cmd.get("id", "")
+                method = cmd.get("method", "")
+                args = cmd.get("args", []) or []
+                kwargs = cmd.get("kwargs", {}) or {}
+                try:
+                    _run_rpc(engine, rid, method, args, kwargs, resp_conn)
+                except Exception as e:  # noqa: BLE001
+                    resp_conn.send(proto.make_error(rid, str(e), traceback.format_exc()))
+                continue
+
+            if op not in ("generate", "generate_scalar"):
+                # Unknown op — report loudly against its id if present.
+                resp_conn.send(proto.make_error(
+                    cmd.get("id", ""), f"unknown op {op!r}", ""
+                ))
+                continue
+
+            rid = cmd["id"]
+            payload = cmd.get("payload", {})
+            messages = payload.get("messages", [])
+            params = dict(payload.get("params", {}))
+            scalar = (op == "generate_scalar")
+
+            cancel_event = threading.Event()
+            with active_lock:
+                active[rid] = cancel_event
+
+            try:
+                _run_generate(
+                    engine, rid, messages, params, cancel_event, resp_conn,
+                    coalesce_n, coalesce_ms, coalescing, scalar=scalar,
+                )
             except Exception as e:  # noqa: BLE001
                 resp_conn.send(proto.make_error(rid, str(e), traceback.format_exc()))
-            continue
-
-        if op not in ("generate", "generate_scalar"):
-            # Unknown op — report loudly against its id if present.
-            resp_conn.send(proto.make_error(
-                cmd.get("id", ""), f"unknown op {op!r}", ""
-            ))
-            continue
-
-        rid = cmd["id"]
-        payload = cmd.get("payload", {})
-        messages = payload.get("messages", [])
-        params = dict(payload.get("params", {}))
-        scalar = (op == "generate_scalar")
-
-        cancel_event = threading.Event()
-        with active_lock:
-            active[rid] = cancel_event
-
-        try:
-            _run_generate(
-                engine, rid, messages, params, cancel_event, resp_conn,
-                coalesce_n, coalesce_ms, coalescing, scalar=scalar,
-            )
-        except Exception as e:  # noqa: BLE001
-            resp_conn.send(proto.make_error(rid, str(e), traceback.format_exc()))
-        finally:
-            with active_lock:
-                active.pop(rid, None)
+            finally:
+                with active_lock:
+                    active.pop(rid, None)
+    except _GracefulShutdown:
+        logger.info("[child] SIGTERM/SIGINT received — graceful shutdown")
+    finally:
+        # Runs for EVERY exit path: 'shutdown' op, None/pipe EOF (parent
+        # died), the SIGTERM/SIGINT sentinel, or an unexpected error.
+        # Fail-closed inside (_flush_engine_for_shutdown never raises), and
+        # it sets shutdown_requested FIRST so a signal landing mid-flush
+        # (parent terminate() after its join timeout) is treated as
+        # 'already unwinding' instead of raising the sentinel and aborting
+        # the flush after the dirty set was drained.
+        _flush_engine_for_shutdown(engine, shutdown_requested)
 
 
 def _run_rpc(engine, rid, method, args, kwargs, resp_conn):

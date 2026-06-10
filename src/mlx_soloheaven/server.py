@@ -243,6 +243,49 @@ def create_app(cfg: Config) -> FastAPI:
             f"  Cache budget: {cfg.memory_budget_gb}GB memory, {cfg.disk_budget_gb}GB disk"
         )
 
+    @app.on_event("shutdown")
+    async def shutdown():
+        """Persist session state on a normal server stop (uvicorn lifespan
+        shutdown — runs on SIGTERM/SIGINT graceful stop).
+
+        OWNERSHIP CONTRACT: Uvicorn owns process lifetime in server mode.
+        The engine-level SIGINT/SIGTERM handler installed by
+        MLXEngine._register_shutdown_flush only PREPENDS a flush and then
+        CHAINS to the previously-installed (Uvicorn) handler — so Uvicorn's
+        graceful shutdown still runs and THIS hook is reliably reached for
+        in-process/main_thread engines too. The flush here is then an
+        idempotent no-op if the chained handler already drained the dirty
+        set, or a real RETRY if that earlier flush timed out on the engine
+        lock and re-marked the ids dirty.
+
+        Process mode (production default): proxy.close() sends the 'shutdown'
+        op and waits (bounded) while the CHILD flushes dirty sessions to disk
+        before exiting. Without this hook nothing ever told the child to stop
+        gracefully — the daemon child was simply terminated at parent exit and
+        process mode never persisted anything on a normal stop.
+
+        In-process mode: flush directly here while the engine's executor is
+        still alive; the engine's own atexit/SIGTERM registration remains the
+        backstop (the flush re-reads the live dirty set on every call).
+
+        Fail-closed: a failed flush logs and continues — it must never block
+        or corrupt server shutdown.
+        """
+        for model_id, engine in engines.items():
+            try:
+                if hasattr(engine, "load_model"):
+                    # In-process MLXEngine (classmethod via the instance's
+                    # type — keeps this module mlx-import-free at top level).
+                    type(engine)._flush_all_on_shutdown()
+                else:
+                    # Process-mode proxy: graceful child stop (child flushes).
+                    engine.close()
+                logger.info(f"[Shutdown] engine {model_id} stopped cleanly")
+            except Exception:  # noqa: BLE001 — never block server shutdown
+                logger.exception(
+                    f"[Shutdown] engine {model_id} flush failed (continuing)"
+                )
+
     @app.get("/health")
     async def health():
         return {

@@ -18,6 +18,7 @@ from pydantic import BaseModel
 
 from mlx_soloheaven.storage import database as db
 from mlx_soloheaven.engine.compaction import CompactionEngine, COMPACTION_SUMMARY_PREFIX, SUMMARIZATION_PROMPT
+from mlx_soloheaven.engine.process_client import EngineRestartingError
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
@@ -50,6 +51,14 @@ async def compact_session(session_id: str, req: CompactionRequest):
     if not engine:
         raise HTTPException(500, "Engine not initialized")
 
+    # Fail FAST while the process-mode child worker is dead/respawning:
+    # raising HERE (before StreamingResponse is returned) lets the server's
+    # EngineRestartingError handler answer a real HTTP 503 instead of a 200
+    # with a dead stream. In-process engines have no ensure_available.
+    ensure_available = getattr(engine, "ensure_available", None)
+    if ensure_available is not None:
+        ensure_available()
+
     return StreamingResponse(
         _stream_compact(session_id, session, req),
         media_type="text/event-stream",
@@ -58,6 +67,35 @@ async def compact_session(session_id: str, req: CompactionRequest):
 
 
 async def _stream_compact(
+    session_id: str, session: dict, req: CompactionRequest
+) -> AsyncGenerator[str, None]:
+    """SSE stream for compaction.
+
+    Thin wrapper over ``_stream_compact_body``: once the SSE response
+    started, a 503 can no longer be sent — if the process-mode child worker
+    dies mid-stream (EngineRestartingError from the summary generation or
+    the compact_session RPC), emit an in-band error event then terminate,
+    mirroring the openai_compat/chat stream wrappers."""
+    try:
+        async for chunk in _stream_compact_body(session_id, session, req):
+            yield chunk
+    except EngineRestartingError as exc:
+        logger.error(
+            f"[Compaction] session={session_id} | engine unavailable "
+            f"mid-stream: {exc}"
+        )
+        event = json.dumps(
+            {
+                "type": "error",
+                "error": "engine restarting, retry shortly",
+                "detail": str(exc),
+            },
+            ensure_ascii=False,
+        )
+        yield f"data: {event}\n\n"
+
+
+async def _stream_compact_body(
     session_id: str, session: dict, req: CompactionRequest
 ) -> AsyncGenerator[str, None]:
     """SSE stream for compaction: streams summary generation, then finalizes."""
@@ -102,7 +140,15 @@ async def _stream_compact(
         elif event["type"] == "result":
             summary = event["summary"]
 
-    # Finalize: insert compaction message + rebuild cache
+    # Finalize: insert compaction message + rebuild cache.
+    # ORDERING NOTE: the summary DB insert intentionally precedes the
+    # compact_session RPC — build_post_compaction_messages must read the
+    # freshly inserted summary from the DB to assemble the message set the
+    # engine rebuilds its cache from, so the two cannot be safely reordered.
+    # If the engine dies between the insert and the RPC, the summary message
+    # persists (the compacted history is already the DB truth and the next
+    # chat turn rebuilds the KV cache from it lazily); the wrapper above
+    # turns the failed RPC into an in-band error frame.
     wrapped_summary = CompactionEngine.wrap_summary(summary, keep_recent=keep_recent)
     await db.add_message(session_id, "user", content=wrapped_summary, token_count=0)
 

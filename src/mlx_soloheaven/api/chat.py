@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from mlx_soloheaven.engine.process_client import EngineRestartingError
 from mlx_soloheaven.engine.tool_parser import (
     CHANNEL_REASONING,
     ThinkingRouter,
@@ -154,6 +155,21 @@ async def chat(session_id: str, req: SendMessageRequest):
     if not session:
         raise HTTPException(404, "Session not found")
 
+    # Resolve engine + availability preflight BEFORE any session mutation:
+    # persisting the user message first and 503-ing afterwards would leave the
+    # message in the DB, so the client's retry duplicates it. Raising HERE
+    # (before StreamingResponse is returned) lets the server's
+    # EngineRestartingError handler answer a real HTTP 503 instead of a 200
+    # with a dead stream. In-process engines have no ensure_available.
+    # NOTE: a mid-generation death window remains — if the child dies AFTER
+    # this preflight but before/while generating, the user message is already
+    # persisted and the stream ends with an in-band error frame; full
+    # transactional rollback is out of scope.
+    use_engine = _get_engine(req.model)
+    ensure_available = getattr(use_engine, "ensure_available", None)
+    if ensure_available is not None:
+        ensure_available()
+
     # Add user message
     await db.add_message(session_id, "user", content=req.content)
 
@@ -174,7 +190,7 @@ async def chat(session_id: str, req: SendMessageRequest):
             # Perform auto-compaction
             from mlx_soloheaven.engine.compaction import CompactionEngine, CompactionStrategy
             
-            compaction_engine = CompactionEngine(_get_engine(req.model))
+            compaction_engine = CompactionEngine(use_engine)
             strategy_str = session.get("compaction_strategy", "summarize")
             strategy = CompactionStrategy(strategy_str)
             
@@ -210,8 +226,8 @@ async def chat(session_id: str, req: SendMessageRequest):
             logger.error(f"[Compaction] Auto-compaction failed: {e}")
             # Continue with original messages even if compaction fails
 
-    # Get generation parameters from session
-    use_engine = _get_engine(req.model)
+    # Get generation parameters from session (engine resolved + availability
+    # preflighted above, BEFORE the user message was persisted).
     temperature = session.get("temperature", use_engine.cfg.default_temperature)
     top_p = session.get("top_p", use_engine.cfg.default_top_p)
     min_p = session.get("min_p", use_engine.cfg.default_min_p)
@@ -244,6 +260,51 @@ async def chat(session_id: str, req: SendMessageRequest):
 
 
 async def _stream_chat(
+    session_id: str,
+    messages: list[dict],
+    eng: "MLXEngine | None" = None,
+    temperature: float = 0.6,
+    top_p: float = 1.0,
+    min_p: float = 0.0,
+    top_k: int = 0,
+    repetition_penalty: float = 1.0,
+    thinking_budget: int = 8192,
+    max_tokens: int = 32768,
+) -> AsyncGenerator[str, None]:
+    """Stream chat response with real-time stats.
+
+    Thin wrapper over ``_stream_chat_body``: once the SSE response started, a
+    503 can no longer be sent — if the process-mode child worker dies
+    mid-stream (EngineRestartingError), emit an in-band error event so the
+    web client terminates with a clear message instead of a dead stream."""
+    try:
+        async for chunk in _stream_chat_body(
+            session_id, messages, eng,
+            temperature=temperature,
+            top_p=top_p,
+            min_p=min_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            thinking_budget=thinking_budget,
+            max_tokens=max_tokens,
+        ):
+            yield chunk
+    except EngineRestartingError as exc:
+        logger.error(
+            f"[Stream] session={session_id} | engine unavailable mid-stream: {exc}"
+        )
+        event = json.dumps(
+            {
+                "type": "error",
+                "error": "engine restarting, retry shortly",
+                "detail": str(exc),
+            },
+            ensure_ascii=False,
+        )
+        yield f"data: {event}\n\n"
+
+
+async def _stream_chat_body(
     session_id: str,
     messages: list[dict],
     eng: "MLXEngine | None" = None,
@@ -634,6 +695,16 @@ async def branch_session(session_id: str, req: BranchRequest):
     if not source:
         raise HTTPException(404, "Session not found")
 
+    # Availability preflight BEFORE any DB mutation: creating the branch
+    # session + copying its messages, then failing the engine branch RPC with
+    # a 503, would leave a half-built orphan session behind. (A death AFTER
+    # this preflight can still orphan the copy — mid-flight death rollback is
+    # out of scope; the preflight closes the common already-dead case.)
+    eng = _get_engine(None)
+    ensure_available = getattr(eng, "ensure_available", None)
+    if ensure_available is not None:
+        ensure_available()
+
     source_messages = await db.get_messages(session_id)
     branch_messages = source_messages[:req.turn]
 
@@ -673,7 +744,8 @@ async def branch_session(session_id: str, req: BranchRequest):
         engine_msgs.append(m)
 
     # Engine branch: checkpoint restore (fast) or build from scratch (slow)
-    eng = _get_engine(None)
+    # (engine resolved + availability preflighted at the top, before the DB
+    # mutations above)
     engine_turn = len(engine_msgs)
     result = eng.branch_from_turn(session_id, new_id, engine_turn, branch_messages=engine_msgs)
 
@@ -692,6 +764,15 @@ async def delete_last_turn(session_id: str):
     messages = await db.get_messages(session_id)
     if not messages:
         raise HTTPException(400, "No messages to delete")
+
+    # Availability preflight BEFORE deleting DB messages: mutating the DB and
+    # then 503-ing on the engine truncate RPC would desync DB vs engine cache
+    # (and a client retry would delete a SECOND turn). Mid-flight death after
+    # this preflight remains possible; rollback is out of scope.
+    eng = _get_engine(None)
+    ensure_available = getattr(eng, "ensure_available", None)
+    if ensure_available is not None:
+        ensure_available()
 
     last_content = messages[-1].get("content", "") or ""
     is_compaction = last_content.startswith("The conversation history before this point was compacted")
@@ -723,8 +804,7 @@ async def delete_last_turn(session_id: str):
             m["tool_call_id"] = msg["tool_call_id"]
         engine_msgs.append(m)
 
-    # Truncate engine session
-    eng = _get_engine(None)
+    # Truncate engine session (engine resolved + preflighted at the top)
     result = eng.truncate_session(session_id, len(engine_msgs))
 
     return {
@@ -741,11 +821,20 @@ async def regenerate_session(session_id: str):
     if not messages or messages[-1]["role"] != "assistant":
         raise HTTPException(400, "Nothing to regenerate")
 
+    # Availability preflight BEFORE deleting DB messages: deleting the
+    # assistant message and then 503-ing on the engine RPC would strand the
+    # session with a dangling user turn (and a retry deletes yet more).
+    # Mid-flight death after this preflight remains possible; rollback is
+    # out of scope.
+    eng = _get_engine(None)
+    ensure_available = getattr(eng, "ensure_available", None)
+    if ensure_available is not None:
+        ensure_available()
+
     # Delete assistant message
     await db.delete_last_message(session_id)
 
     # Restore engine cache
-    eng = _get_engine(None)
     result = eng.prepare_regenerate(session_id)
 
     # Delete user message (frontend will re-send it)

@@ -3126,7 +3126,11 @@ class MLXEngine:
         for i, s_msg in enumerate(stored):
             i_msg = incoming[i]
             if s_msg.get("role") != i_msg.get("role"):
-                logger.info(
+                # DEBUG (not INFO): _messages_match runs PER CANDIDATE session
+                # in the anon prefix scan, so per-candidate FAILs are expected
+                # noise; the aggregate "no prefix match among N sessions" line
+                # stays at INFO.
+                logger.debug(
                     f"[Match] FAIL at msg[{i}]: role {s_msg.get('role')!r} != {i_msg.get('role')!r}"
                 )
                 return False
@@ -3212,7 +3216,9 @@ class MLXEngine:
                 )
                 s_ctx = s_norm[max(0, diff_pos-30):diff_pos+70].replace('\n', '\\n')
                 i_ctx = i_norm[max(0, diff_pos-30):diff_pos+70].replace('\n', '\\n')
-                logger.info(
+                # DEBUG (not INFO): per-candidate diagnostic — see the role
+                # FAIL above; aggregate summaries stay at INFO.
+                logger.debug(
                     f"[Match] FAIL at msg[{i}] role={role}: "
                     f"stored_len={len(s_content)} vs incoming_len={len(i_content)} | "
                     f"diff at char {diff_pos} | "

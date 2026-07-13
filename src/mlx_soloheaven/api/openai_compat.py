@@ -31,6 +31,7 @@ from mlx_soloheaven.api.schemas import (
     FunctionCall,
     UsageInfo,
 )
+from mlx_soloheaven.engine.process_client import EngineRestartingError
 from mlx_soloheaven.engine.tool_parser import (
     CHANNEL_REASONING,
     ThinkingRouter,
@@ -108,6 +109,14 @@ class _Gemma4ThinkingStripper:
 @router.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     engine = _get_engine(request.model)
+
+    # Fail FAST while the process-mode child worker is dead/respawning:
+    # raising HERE (before StreamingResponse is returned) lets the server's
+    # EngineRestartingError handler answer a real HTTP 503 instead of a 200
+    # with a dead stream. In-process engines have no ensure_available.
+    ensure_available = getattr(engine, "ensure_available", None)
+    if ensure_available is not None:
+        ensure_available()
 
     # Validate response_format.json_schema early — return 400 on malformed
     # schemas (matches OpenAI's behavior; avoids silent fallback to
@@ -256,6 +265,36 @@ def _sync_completion(request: ChatCompletionRequest, engine: "MLXEngine") -> Cha
 
 
 async def _stream_completion(
+    request: ChatCompletionRequest,
+    engine: "MLXEngine",
+) -> AsyncGenerator[str, None]:
+    """Streaming SSE completion with tool call detection.
+
+    Thin wrapper over ``_stream_completion_body``: once the SSE response has
+    started, a 503 can no longer be sent — if the process-mode child worker
+    dies mid-stream (EngineRestartingError), emit a proper in-band error
+    frame and a terminating [DONE] so the client sees a clean, explained
+    close instead of a silently-dead stream."""
+    try:
+        async for chunk in _stream_completion_body(request, engine):
+            yield chunk
+    except EngineRestartingError as exc:
+        logger.error(
+            f"[Stream] user={request.user!r} | engine unavailable mid-stream: {exc}"
+        )
+        err = {
+            "error": {
+                "message": "engine restarting, retry shortly",
+                "type": "engine_restarting",
+                "code": 503,
+                "detail": str(exc),
+            }
+        }
+        yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+
+
+async def _stream_completion_body(
     request: ChatCompletionRequest,
     engine: "MLXEngine",
 ) -> AsyncGenerator[str, None]:

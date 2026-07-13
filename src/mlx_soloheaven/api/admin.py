@@ -126,10 +126,25 @@ async def recent_logs(limit: int = 200):
 
 @router.get("/models")
 async def models_overview():
-    """List loaded models with their default parameters."""
+    """List loaded models with their default parameters.
+
+    Includes the process-mode proxy's liveness snapshot (alive / respawning /
+    respawn attempts) so a dead or restarting child worker is visible in the
+    admin UI. session_stats is an RPC to the child in process mode — guard it
+    so this overview still renders while the child is dead/respawning."""
     models = []
     for model_id, engine in _engines.items():
         cfg = engine.cfg
+        liveness = None
+        if hasattr(engine, "liveness"):
+            try:
+                liveness = engine.liveness()
+            except Exception:  # noqa: BLE001
+                liveness = None
+        try:
+            sessions = engine.session_stats().get("active_sessions", 0)
+        except Exception:  # noqa: BLE001 — dead child: keep the page alive
+            sessions = None
         models.append({
             "model_id": engine.model_id,
             "model_path": cfg.model_path,
@@ -151,7 +166,10 @@ async def models_overview():
                 "memory_gb": cfg.memory_budget_gb,
                 "disk_gb": cfg.disk_budget_gb,
             },
-            "sessions": engine.session_stats().get("active_sessions", 0),
+            "sessions": sessions,
+            # Worker liveness (process mode): alive/respawning/attempts.
+            # None for in-process engines (no child worker to die).
+            "engine": liveness,
         })
     return {"models": models}
 

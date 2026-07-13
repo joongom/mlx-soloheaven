@@ -11,8 +11,6 @@ mode — WITHOUT spawning a child process.
 
 from __future__ import annotations
 
-import threading
-
 from mlx_soloheaven.config import Config
 from mlx_soloheaven.engine.process_client import EngineProcessProxy
 from mlx_soloheaven.engine.process_worker import _cfg_snapshot
@@ -36,11 +34,11 @@ def test_cfg_snapshot_includes_all_four_sampling_fields():
 def test_apply_ready_copies_genconfig_derived_values_to_parent():
     """The parent proxy's cfg picks up the child's (genconfig-derived) defaults
     from the ready snapshot, so per-request None resolution sees them."""
-    # Parent starts with plain fallback defaults...
+    # Parent starts with plain fallback defaults... (real __init__ — cheap,
+    # pipes/process live in _spawn — so _state_lock/_ready_event exist for
+    # _apply_ready's single-critical-section publication).
     parent_cfg = Config(model_path="/tmp/x")
-    proxy = EngineProcessProxy.__new__(EngineProcessProxy)
-    proxy.cfg = parent_cfg
-    proxy._ready_event = threading.Event()
+    proxy = EngineProcessProxy(parent_cfg)
 
     # ...child reports genconfig-derived defaults via the ready frame.
     child_cfg = Config(
@@ -69,9 +67,7 @@ def test_apply_ready_top_k_zero_not_dropped_as_none():
     """top_k=0 is a real value (disabled), distinct from None — the snapshot
     carries it and _apply_ready must NOT skip it as 'unset'."""
     parent_cfg = Config(model_path="/tmp/x", default_top_k=64)
-    proxy = EngineProcessProxy.__new__(EngineProcessProxy)
-    proxy.cfg = parent_cfg
-    proxy._ready_event = threading.Event()
+    proxy = EngineProcessProxy(parent_cfg)
 
     child_cfg = Config(model_path="/tmp/x", default_top_k=0)
     frame = {"cfg": _cfg_snapshot(child_cfg)}

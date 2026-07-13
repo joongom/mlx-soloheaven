@@ -24,6 +24,43 @@ logging.basicConfig(
 logger = logging.getLogger("soloheaven")
 
 
+def engine_unavailable_response(exc: Exception):
+    """503 body for a dead/respawning process-mode engine.
+
+    Module-level (and dependency-light) so it is hermetically testable and
+    reusable by any router. The SSE paths can't use this (headers already
+    sent) — they emit an in-band error frame instead (see openai_compat/chat).
+    """
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(
+        status_code=503,
+        content={"error": {
+            "message": "engine restarting, retry shortly",
+            "type": "engine_restarting",
+            "detail": str(exc),
+        }},
+        headers={"Retry-After": "30"},
+    )
+
+
+def register_engine_error_handlers(app: FastAPI):
+    """Map EngineRestartingError -> HTTP 503 for all non-streaming endpoints.
+
+    The process-mode proxy fails FAST with EngineRestartingError while its
+    child worker is dead or respawning (Metal GPU aborts kill the child
+    uncatchably; model reload takes ~1-3 min). process_client is mlx-free, so
+    importing it here keeps the parent clean under --engine-mode process."""
+    from mlx_soloheaven.engine.process_client import EngineRestartingError
+
+    @app.exception_handler(EngineRestartingError)
+    async def _engine_restarting_handler(request, exc):
+        logger.warning(
+            f"[503] {request.method} {request.url.path} — engine unavailable: {exc}"
+        )
+        return engine_unavailable_response(exc)
+
+
 def create_app(cfg: Config) -> FastAPI:
     """Build the FastAPI application with all routes and middleware."""
     # NOTE: do NOT import mlx_engine (or anything pulling in mlx.core/mlx_vlm)
@@ -73,6 +110,9 @@ def create_app(cfg: Config) -> FastAPI:
             status_code=422,
             content={"detail": exc.errors()},
         )
+
+    # Dead/respawning process-mode child -> 503 with a JSON error body.
+    register_engine_error_handlers(app)
 
     # Build per-model configs and engines. Annotated as the union of the
     # in-process engine and its process-mode proxy; kept as a string so this

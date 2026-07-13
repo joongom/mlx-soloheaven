@@ -42,8 +42,11 @@ SNAPSHOT/RESTORE (reference copies; mlx-lm's GatedDeltaNet replaces
 then a REPLAY forward of the accepted tokens (replay logits verified == 0.0
 diff vs the verify forward locally). Every restore is verified per-layer
 fail-closed (commit 8491f1d philosophy): on any offset mismatch the round
-raises ``MTPCacheCorruption`` -> speculation disabled for the rest of the
-stream + ``on_cache_corruption`` invalidates the session cache.
+raises ``MTPCacheCorruption`` -> the stream TERMINATES at the corruption
+point (U6 — the target cache is unverifiable, so post-corruption plain
+decoding would emit untrustworthy tokens) + ``on_cache_corruption``
+invalidates the session cache; the engine surfaces an "error" terminal
+frame and the next turn takes an honest MISS.
 
 Head-cache pairing convention: head KV slot ``i`` = pair
 ``(h_i, embed(y_{i+1}))`` at absolute position ``i``. During decode the head
@@ -90,7 +93,7 @@ QWEN_MTP_MODEL_TYPE = "qwen3_5_mtp"
 class MTPCacheCorruption(RuntimeError):
     """Fail-closed signal: a snapshot/restore/trim did not land exactly on
     the expected per-layer offsets (or a round invariant broke). The runner
-    disables speculation for the rest of the stream and fires
+    TERMINATES the stream at the corruption point (U6) and fires
     ``on_cache_corruption`` so the caller invalidates the session cache."""
 
 
@@ -677,8 +680,12 @@ def qwen_mtp_generate_step(
     (call:emit is exactly 1:1; stateful processors stay correct).
 
     Fail-closed: every restore/trim is verified per-layer; any mismatch
-    raises internally -> speculation disabled for the rest of the stream +
-    ``on_cache_corruption`` (caller invalidates the session cache). The
+    raises internally -> the stream TERMINATES at the corruption point (U6:
+    the target cache is unverifiable, so continuing — even with plain
+    single-token decoding — would generate from possibly corrupted state) +
+    ``on_cache_corruption`` (caller invalidates the session cache; its
+    engine terminal frame reports finish_reason="error" and the client's
+    retry cold-fills). The
     ``finally`` settles the cache to exactly prompt + yielded - 1 tokens,
     then FINALIZES: commits the pending head pair AND forwards the pending
     (final/stop) token through the target — mirroring plain mlx-lm's
@@ -733,26 +740,51 @@ def qwen_mtp_generate_step(
     #   * resumed finalized cache: head == target - 1 — the head's LAST slot
     #     was left uncommitted at finalize (its pair token is THIS suffix's
     #     first token); commit the lazy pair (resume_hidden, suffix[0]) now.
-    if T0 > 0 and _h_off() == T0 - 1:
-        if resume_hidden is None:
-            # No mutation yet — a plain caller-contract violation.
+    #
+    # U6/F6: this initialization/resume validation runs BEFORE the main
+    # try below, so a raise here would ESCAPE the generator instead of
+    # taking the corruption-terminal path (the engine would see an
+    # exception, not the "error" terminal frame, and invalidation could
+    # double-fire). Extend the corruption-handling boundary over it: any
+    # MTPCacheCorruption here TERMINATES the (empty) stream with exactly
+    # one on_cache_corruption invalidation — same broken/terminate
+    # semantics as the mid-stream handlers.
+    try:
+        if T0 > 0 and _h_off() == T0 - 1:
+            if resume_hidden is None:
+                # No mutation yet — a caller-contract violation, but the
+                # session cache still cannot be trusted for MTP resume:
+                # terminate + invalidate (cold-fill) rather than raise.
+                raise MTPCacheCorruption(
+                    f"resumed cache (head {T0 - 1} == target {T0} - 1) without "
+                    f"resume_hidden — the lazy last-slot pair cannot be committed"
+                )
+            with mx.stream(generation_stream):
+                ops.head_hidden(resume_hidden, y[:1][None], mtp_cache)
+            if _h_off() != T0:
+                # Head mutated but did not land — nothing downstream can
+                # trust it.
+                raise MTPCacheCorruption(
+                    f"lazy last-slot commit shortfall: head {_h_off()} != {T0}"
+                )
+        elif _h_off() != T0 or T0 != 0:
             raise MTPCacheCorruption(
-                f"resumed cache (head {T0 - 1} == target {T0} - 1) without "
-                f"resume_hidden — the lazy last-slot pair cannot be committed"
+                f"entry invariant violated: head {_h_off()} / target {T0} "
+                f"(want fresh 0/0, or finalized head == target - 1)"
             )
-        with mx.stream(generation_stream):
-            ops.head_hidden(resume_hidden, y[:1][None], mtp_cache)
-        if _h_off() != T0:
-            # Head mutated but did not land — nothing downstream can trust it.
-            _fire_corruption()
-            raise MTPCacheCorruption(
-                f"lazy last-slot commit shortfall: head {_h_off()} != {T0}"
-            )
-    elif _h_off() != T0 or T0 != 0:
-        raise MTPCacheCorruption(
-            f"entry invariant violated: head {_h_off()} / target {T0} "
-            f"(want fresh 0/0, or finalized head == target - 1)"
+    except MTPCacheCorruption as e:
+        logger.error(
+            "[QwenMTP] FAIL-CLOSED (resume/entry validation): %s — "
+            "TERMINATING stream, invalidating session cache",
+            e,
         )
+        _fire_corruption()
+        # No token was yielded and the main try/finally was never entered:
+        # returning here ends the stream with ZERO frames; the engine's
+        # corruption flag (set by the callback) drives its "error" terminal
+        # and the next turn cold-fills. on_finalize is intentionally not
+        # called — the corruption callback already cleared the resume stash.
+        return
 
     hist: Optional[mx.array] = y if logits_processors else None
 
@@ -940,14 +972,23 @@ def qwen_mtp_generate_step(
                     vlogits = ops.target_logits(vhid)  # (1, k+1, V)
                 _check_kv_offsets(T + 1 + k, "verify")
             except MTPCacheCorruption as e:
+                # U6: TERMINATE the stream — do NOT fall back to plain
+                # decoding. The target cache is in an unverifiable state
+                # (possibly advanced/rolled-back mid-round), so every token
+                # generated from it after this point would be untrustworthy.
+                # ``broken`` makes the ``finally`` skip settle/finalize and
+                # report on_finalize(None, None); the corruption callback has
+                # already invalidated the session cache, so the engine ends
+                # the stream with an error terminal and the next turn takes
+                # an honest MISS (client retries).
                 logger.error(
-                    "[QwenMTP] FAIL-CLOSED (draft/verify): %s — disabling "
-                    "speculation for this stream, invalidating session cache",
+                    "[QwenMTP] FAIL-CLOSED (draft/verify): %s — TERMINATING "
+                    "stream, invalidating session cache",
                     e,
                 )
                 broken = True
                 _fire_corruption()
-                continue
+                return
 
             # ---- acceptance walk (PLD FIX-4: per-position processors with
             # early stop; accept rule = sampled-token equality) ----
@@ -1005,16 +1046,21 @@ def qwen_mtp_generate_step(
                 cur_hid, cur_b = _settle_round(round_ctx)
                 round_ctx = None
             except MTPCacheCorruption as e:
+                # U6: TERMINATE (see the draft/verify handler). The tokens
+                # already yielded this round were computed by a verified
+                # target forward from the pre-round state and remain
+                # trustworthy; it is the CACHE that failed to settle, so
+                # continuing to generate from it — even plain — would emit
+                # tokens conditioned on corrupted state.
                 logger.error(
-                    "[QwenMTP] FAIL-CLOSED (settle): %s — disabling "
-                    "speculation, invalidating session cache",
+                    "[QwenMTP] FAIL-CLOSED (settle): %s — TERMINATING "
+                    "stream, invalidating session cache",
                     e,
                 )
                 round_ctx = None
                 broken = True
                 _fire_corruption()
-                # cur_hid/cur_b stay at the last good pre-round state; the
-                # session cache is invalidated so nothing stale persists.
+                return
             if stats["rounds"] % 64 == 0:
                 mx.clear_cache()
     except GeneratorExit:

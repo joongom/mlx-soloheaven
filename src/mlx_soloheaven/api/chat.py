@@ -424,6 +424,9 @@ async def _stream_chat_body(
     # after reasoning carries "thinking_done":True. The concatenation of all
     # emitted reasoning+content equals the routed split of the raw output.
     finished = False
+    # U6/F1: engine terminal reason; "error" diverts to an error frame and
+    # suppresses DB/session persistence of the truncated text.
+    final_finish_reason = None
     # Router active when thinking is enabled for this model. Pass-through
     # (all content) otherwise, so the non-thinking path is unchanged.
     router = ThinkingRouter(active=enable_thinking, model_family=model_family)
@@ -478,6 +481,10 @@ async def _stream_chat_body(
                     continue
 
                 if result.finish_reason is not None:
+                    # U6/F1: keep the terminal reason — an "error"
+                    # (cache-corruption) terminal must not be persisted /
+                    # reported as a normal completion below.
+                    final_finish_reason = result.finish_reason
                     prompt_tokens = result.prompt_tokens
                     completion_tokens = result.completion_tokens
                     gen_tps = result.generation_tps
@@ -564,6 +571,30 @@ async def _stream_chat_body(
                 if signal:
                     thinking_done_signaled = True
                 yield _content_frame(seg_text, gen_tps, thinking_done=signal)
+
+    # U6/F1: corruption-terminated stream — the partial text is unreliable
+    # and must NOT be persisted to the DB / session (the engine has already
+    # invalidated the session cache and skipped its own save). Tell the
+    # client explicitly instead of sending a normal "done".
+    if final_finish_reason == "error":
+        logger.error(
+            f"[Stream] session={session_id} | generation terminated by "
+            f"cache corruption after {token_count} tokens — nothing persisted"
+        )
+        if not client_disconnected:
+            error_event = json.dumps(
+                {
+                    "type": "error",
+                    "error": (
+                        "generation terminated: session cache corruption "
+                        "detected mid-stream; partial output was not saved — "
+                        "please retry"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+            yield f"data: {error_event}\n\n"
+        return
 
     t_end = time.perf_counter()
     engine_ttft = (t_first_token - (t_gen_actual or t_gen_start)) if t_first_token else 0
@@ -660,6 +691,13 @@ async def _sync_chat(session_id: str, messages: list[dict], eng: "MLXEngine | No
     """Non-streaming chat response."""
     eng = eng or engine
     result = eng.complete(messages, session_id=session_id)
+
+    # U6/F1: corruption-terminated — return an error, persist nothing.
+    if result.finish_reason == "error":
+        return {"error": (
+            "generation terminated: session cache corruption detected; "
+            "partial output was not saved — please retry"
+        )}
 
     await db.add_message(
         session_id,

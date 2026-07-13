@@ -417,6 +417,10 @@ def test_greedy_identity_full_accept():
 
 
 def test_lying_cache_fires_fail_closed():
+    """U6 contract: cache corruption TERMINATES the stream at the corruption
+    point — it must NOT fall back to plain decoding from the unverifiable
+    target cache (pre-U6 the stream stayed alive to max_tokens, generating
+    every remaining token from possibly corrupted state)."""
     next_map = lambda t: (t + 1) % 50
     head_map = lambda t: 63  # always wrong -> first round must roll back
     cache = _mk_caches(kv_cls=LyingKV)
@@ -424,13 +428,13 @@ def test_lying_cache_fires_fail_closed():
     out, flags, cache, fired = _run(
         [1, 2, 3], next_map, head_map, max_tokens=8, cache=cache
     )
-    # Fail-closed fired: corruption callback + speculation disabled.
+    # Fail-closed fired: corruption callback + stream TERMINATED.
     assert fired["corruption"] >= 1
-    # Stream stayed alive to max_tokens.
-    assert len(out) == 8
-    # After the trip, no draft is ever accepted again (plain decode).
-    first_true = next((i for i, f in enumerate(flags) if f), None)
-    assert first_true is None, "no draft should be accepted (head always wrong)"
+    # Only the tokens yielded BEFORE the corrupt round's settle survive
+    # (bootstrap + the round's bonus token) — nothing generated after.
+    assert len(out) == 2, f"stream must terminate at corruption, got {out}"
+    # The corrupt round's drafts were all wrong — nothing accepted.
+    assert not any(flags), "no draft should be accepted (head always wrong)"
     # Broken stream must NOT finalize (head desynced): no pending token,
     # no resume hidden -> next turn's gate cold-fills.
     assert fired["pending"] is None
@@ -672,6 +676,93 @@ def test_mid_stream_abort_cold_fills():
         cache, stored, stored + [30], 5, 1, fired["hidden"]
     )
     assert not ok
+
+
+def _resumed_cache(stored_len=5, head_offset=None):
+    """Finalized-resume cache shape: targets at stored_len, head one behind
+    (or at an explicit bogus offset for the invariant-violation case)."""
+    cache = _mk_caches()
+    for c in cache:
+        if hasattr(c, "offset"):
+            c.offset = stored_len
+    cache[5].offset = stored_len - 1 if head_offset is None else head_offset
+    for i in (0, 1, 3):
+        cache[i].cache = [tuple(range(1, stored_len + 1))]
+    return cache
+
+
+def test_resume_validation_missing_hidden_terminates_not_raises():
+    """F6: a resumed-shape cache (head == target - 1) WITHOUT resume_hidden
+    used to raise MTPCacheCorruption OUT of the generator (the validation
+    runs before the main try) — the engine saw an exception instead of the
+    error terminal. Now it TERMINATES the (empty) stream and fires the
+    invalidation exactly once."""
+    next_map = lambda t: (t + 1) % 50
+    cache = _resumed_cache()
+    out, flags, cache, fired = _run(
+        [9, 10], next_map, next_map, max_tokens=4, cache=cache,
+        resume_hidden=None,
+    )
+    assert out == [] and flags == []          # no exception, zero frames
+    assert fired["corruption"] == 1           # invalidation happens ONCE
+    assert fired["pending"] == "UNSET"        # finalize never ran
+
+
+def test_resume_entry_invariant_violation_terminates_not_raises():
+    """F6: an entry-invariant violation (head neither fresh 0/0 nor
+    target-1) terminates with one invalidation instead of raising."""
+    next_map = lambda t: (t + 1) % 50
+    cache = _resumed_cache(head_offset=3)  # head == target - 2: illegal
+    out, flags, cache, fired = _run(
+        [9, 10], next_map, next_map, max_tokens=4, cache=cache,
+        resume_hidden=mx.array([[[5.0]]]),
+    )
+    assert out == [] and flags == []
+    assert fired["corruption"] == 1
+    assert fired["pending"] == "UNSET"
+
+
+def test_resume_lazy_commit_shortfall_terminates_not_raises():
+    """F6 (the codex-cited path): the lazy last-slot commit mutates the head
+    but does not land on the target offset — pre-fix this fired the
+    invalidation AND THEN raised out of the generator (double signalling,
+    no error terminal). Now: terminate, exactly one invalidation."""
+    next_map = lambda t: (t + 1) % 50
+
+    class _StuckHeadOps(MockOps):
+        """head_hidden never advances the head cache offsets — the lazy
+        commit therefore cannot land on T0."""
+
+        def head_hidden(self, hidden, next_ids, mtp_cache):
+            toks = [int(t) for t in next_ids[0].tolist()]
+            self.head_calls.append(
+                ([int(round(v[0])) for v in hidden[0].tolist()], toks)
+            )
+            return self._hid(toks)
+
+    cache = _resumed_cache()
+    fired = {"corruption": 0, "pending": "UNSET"}
+    gen = qwen_mtp_generate_step(
+        mx.array([9, 10], mx.uint32),
+        model=None,
+        head=None,
+        block_size=3,
+        max_tokens=4,
+        sampler=None,
+        logits_processors=None,
+        prompt_cache=cache,
+        n_target_layers=5,
+        on_cache_corruption=lambda: fired.__setitem__(
+            "corruption", fired["corruption"] + 1
+        ),
+        on_finalize=lambda tok, hid: fired.__setitem__("pending", tok),
+        resume_hidden=mx.array([[[5.0]]]),
+        ops=_StuckHeadOps(next_map, next_map),
+    )
+    out = list(gen)  # must NOT raise
+    assert out == []
+    assert fired["corruption"] == 1
+    assert fired["pending"] == "UNSET"
 
 
 def test_validate_mtp_cache_reuse_fail_closed():
@@ -1195,7 +1286,7 @@ def _generate_engine(cache, stored, *, mtp, suffix):
     directly on it; since the C1 fix, cancellation additionally COMMITS the
     session (messages + total_cache_tokens) instead of skipping the save.
     No real model."""
-    from mlx_soloheaven.engine.mlx_engine import SessionState
+    from mlx_soloheaven.engine.mlx_engine import MLXEngine, SessionState
     from mlx_vlm.generate import PromptCacheState
 
     eng = _mtp_engine()
@@ -1231,9 +1322,28 @@ def _generate_engine(cache, stored, *, mtp, suffix):
         cache_state=cs,
         messages=sess_messages,
         total_cache_tokens=len(stored),
+        # U21/F5: stamp the contract the drives use (tools=None,
+        # thinking=False) — a legacy fp=None session now always takes a
+        # cold rebuild (never a lenient HIT), so a HIT-path harness must
+        # look like a session the new engine built.
+        tools=None,
+        thinking=False,
+        prompt_fingerprint=MLXEngine._prompt_fingerprint(None, False),
     )
     messages = sess_messages + [{"role": "user", "content": "u2"}]
     return eng, cs, messages
+
+
+def _restamp_contract(eng, *, thinking, tools=None, sid="s"):
+    """Re-stamp the harness session's prompt contract for drives that use a
+    non-default thinking flag / tools (U21: the HIT gate refuses a
+    fingerprint mismatch, and F5 refuses fp=None outright)."""
+    from mlx_soloheaven.engine.mlx_engine import MLXEngine
+
+    s = eng._sessions[sid]
+    s.tools = tools
+    s.thinking = thinking
+    s.prompt_fingerprint = MLXEngine._prompt_fingerprint(tools, thinking)
 
 
 def _drive_cancelled(eng, messages, *, cancel_after=2, max_tokens=8):
@@ -2037,7 +2147,11 @@ def test_generate_locked_cancel_commit_template_closes_chatml(monkeypatch):
         assert c.offset == len(cs.token_ids)
     _assert_no_desynced_cache(cs)
     sess = eng._sessions["s"]
-    assert sess.messages[-1] == {"role": "assistant", "content": "xx"}
+    assert sess.messages[-1] == {
+        "role": "assistant",
+        "content": "xx",
+        "interrupted": True,  # U1: C1-committed turns carry the marker
+    }
     assert sess.total_cache_tokens == len(cs.token_ids)
 
     # Next turn extends the template-valid sequence with u3's suffix only.
@@ -2069,6 +2183,7 @@ def test_generate_locked_empty_response_hit_commits_consistent(monkeypatch):
     eng, cs, messages = _generate_engine(cache, stored, mtp=False, suffix=[])
     _use_real_messages_match(eng)
     _content_token_suffix(eng)
+    _restamp_contract(eng, thinking=True)  # this test drives thinking=True
     # The terminal frame's token IS an end-of-turn token: natural EOS shape.
     eng.tokenizer = SimpleNamespace(decode=lambda ids: "x", eos_token_ids=[302])
 
@@ -2090,6 +2205,7 @@ def test_generate_locked_empty_response_hit_commits_consistent(monkeypatch):
     assert sess.messages[-1] == {
         "role": "assistant",
         "content": "<think>\npondering</think>",
+        "interrupted": True,  # U1: C1-committed turns carry the marker
     }
     assert cs.token_ids == stored + [52, 99] + [301, 302]
     assert sess.total_cache_tokens == len(cs.token_ids)
@@ -2463,6 +2579,7 @@ def test_generate_locked_empty_response_exhaustion_closes_chatml(monkeypatch):
     eng, cs, messages = _generate_engine(cache, stored, mtp=False, suffix=[])
     _use_real_messages_match(eng)
     _content_token_suffix(eng)
+    _restamp_contract(eng, thinking=True)  # this test drives thinking=True
     eng._language_model = _CallableTargetModel()
     eng.tokenizer = SimpleNamespace(
         decode=lambda ids: "x",
@@ -2487,6 +2604,7 @@ def test_generate_locked_empty_response_exhaustion_closes_chatml(monkeypatch):
     assert sess.messages[-1] == {
         "role": "assistant",
         "content": "<think>\npondering</think>",
+        "interrupted": True,  # U1: C1-committed turns carry the marker
     }
     assert cs.token_ids == stored + [52, 99] + [301, 302, EOT]
     assert sess.total_cache_tokens == len(cs.token_ids)
@@ -2518,6 +2636,7 @@ def test_generate_locked_empty_response_exhaustion_close_unavailable_invalidates
     eng, cs, messages = _generate_engine(cache, stored, mtp=False, suffix=[])
     _use_real_messages_match(eng)
     _content_token_suffix(eng)
+    _restamp_contract(eng, thinking=True)  # this test drives thinking=True
 
     prompts_seen: list = []
     _scripted_lm_stream(
@@ -2607,7 +2726,11 @@ def test_generate_locked_generator_exit_mid_stream_commits_consistent(
     assert sess is not orig_sess
     assert sess.cache_state is cs
     assert cs.token_ids == stored + [52, 99] + [101, 102, EOT]
-    assert sess.messages[-1] == {"role": "assistant", "content": "xx"}
+    assert sess.messages[-1] == {
+        "role": "assistant",
+        "content": "xx",
+        "interrupted": True,  # U1: C1-committed turns carry the marker
+    }
     assert sess.total_cache_tokens == len(cs.token_ids)
     for c in cache:
         assert c.offset == len(cs.token_ids)

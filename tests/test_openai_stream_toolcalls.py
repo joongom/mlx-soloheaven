@@ -519,3 +519,123 @@ async def test_partial_tool_start_at_stream_end_flushed_as_content():
         if choice.get("delta", {}).get("content")
     )
     assert content == "answer text <too"  # nothing dropped
+
+
+# ---------- U6/F1: corruption-terminated stream -> in-band error envelope ----------
+
+
+class ErrorTerminalStubEngine(StubEngine):
+    """Stub whose stream ends with the engine-internal 'error' terminal
+    (fail-closed cache corruption) and which records persistence calls."""
+
+    def __init__(self, model_family: str, token_stream: list[str]):
+        super().__init__(model_family, token_stream)
+        self.persist_calls: list = []
+
+    def _iter_results(self):
+        for tok in self._stream:
+            yield StubResult(text=tok)
+        yield StubResult(
+            text="",
+            finish_reason="error",
+            prompt_tokens=10,
+            completion_tokens=len(self._stream),
+        )
+
+    def update_session_messages(self, *args, **kwargs):
+        self.persist_calls.append((args, kwargs))
+
+
+@pytest.mark.asyncio
+async def test_error_terminal_emits_error_envelope_not_completion():
+    """U6/F1: a corruption-terminated stream must NOT be dressed up as a
+    normal completion. The adapter emits the in-band error envelope
+    (data:{"error":{...}} then [DONE]) — 'error' is not a valid OpenAI
+    finish_reason — and suppresses (a) the best-effort truncated tool-call
+    emission and (b) session persistence of the truncated text."""
+    # Stream dies inside a tool_call block, before the name is complete.
+    tokens = ["Partial answer ", "<tool_call>", "<function=web_se"]
+    engine = ErrorTerminalStubEngine("chatml", tokens)
+    req = ChatCompletionRequest(
+        model="test-chatml",
+        messages=[ChatMessage(role="user", content="search please")],
+        tools=[ToolDef(function=FunctionDef(name="web_search", parameters={}))],
+        stream=True,
+        thinking=False,
+        user="sess-err",  # persistence WOULD run on the normal path
+    )
+    from mlx_soloheaven.api.openai_compat import _stream_completion as _sc
+    lines = [line async for line in _sc(req, engine)]
+
+    # Terminal shape: error envelope followed by [DONE], nothing after.
+    assert lines[-1] == "data: [DONE]\n\n"
+    err = json.loads(lines[-2][len("data: "):])
+    assert "error" in err
+    assert err["error"]["type"] == "server_error"
+
+    # No tool_call chunk (not even the truncated best-effort one) and no
+    # normal finish_reason frame anywhere in the stream.
+    payloads = []
+    for line in lines:
+        line = line.strip()
+        if line.startswith("data: ") and line != "data: [DONE]":
+            payloads.append(json.loads(line[len("data: "):]))
+    for ev in payloads:
+        for choice in ev.get("choices", []):
+            assert not choice.get("delta", {}).get("tool_calls")
+            assert choice.get("finish_reason") is None
+
+    # Nothing persisted.
+    assert engine.persist_calls == []
+
+
+@pytest.mark.asyncio
+async def test_error_terminal_never_synthesizes_toolcalls_finish():
+    """Even when a COMPLETE tool_call block streamed before the corruption
+    terminal, the stream must end with the error envelope — never a
+    finish_reason='tool_calls' completion frame."""
+    engine = ErrorTerminalStubEngine("chatml", QWEN_TOKENS)
+    req = _build_request("chatml")
+    events = await _collect(engine, req)
+    assert _final_finish_reason(events) is None  # no completion frame at all
+    assert any("error" in ev for ev in events)
+    assert engine.persist_calls == []
+
+
+def test_sync_completion_error_returns_500_not_toolcalls():
+    """U6/F1 non-streaming: an 'error' CompletionResult becomes a 500 error
+    object — never a completion (and never tool_calls), and nothing is
+    persisted."""
+    from types import SimpleNamespace
+
+    from fastapi.responses import JSONResponse
+
+    from mlx_soloheaven.api.openai_compat import _sync_completion
+    from mlx_soloheaven.engine.types import CompletionResult
+
+    class _Eng:
+        model_family = "chatml"
+        model_id = "test-model"
+        cfg = SimpleNamespace(enable_thinking=False)
+
+        def complete(self, *args, **kwargs):
+            return CompletionResult(
+                content="<tool_call>\n<function=hack>\n</function>\n</tool_call>",
+                finish_reason="error",
+            )
+
+        def update_session_messages(self, *args, **kwargs):
+            raise AssertionError("must not persist on the error path")
+
+    req = ChatCompletionRequest(
+        model="test-model",
+        messages=[ChatMessage(role="user", content="hi")],
+        stream=False,
+        thinking=False,
+        user="sess-err",
+    )
+    resp = _sync_completion(req, _Eng())
+    assert isinstance(resp, JSONResponse)
+    assert resp.status_code == 500
+    body = json.loads(resp.body)
+    assert body["error"]["type"] == "server_error"

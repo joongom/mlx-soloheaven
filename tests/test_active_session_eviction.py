@@ -292,9 +292,10 @@ def test_prepare_regenerate_resumes_evicted_session(monkeypatch):
     reloaded = _evict_then_setup_disk_reload(eng, monkeypatch)
 
     # _rebuild_session needs the model; mock it to a success + record the call.
+    # (U3: the rebuild now receives the session's prompt contract too.)
     rebuilt: list[tuple[str, list]] = []
 
-    def _fake_rebuild(session_id, messages):
+    def _fake_rebuild(session_id, messages, tools=None, thinking=True):
         rebuilt.append((session_id, list(messages)))
         eng._sessions[session_id] = reloaded  # rebuilt session is resident
         return {"status": "ok", "cached_tokens": 1}
@@ -334,7 +335,8 @@ def test_truncate_session_resumes_evicted_session(monkeypatch):
 
     rebuilt: list[tuple[str, list]] = []
 
-    def _fake_rebuild(session_id, messages):
+    # U3: the rebuild now receives the session's prompt contract too.
+    def _fake_rebuild(session_id, messages, tools=None, thinking=True):
         rebuilt.append((session_id, list(messages)))
         eng._sessions[session_id] = reloaded
         return {"status": "ok", "cached_tokens": 1}

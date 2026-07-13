@@ -177,8 +177,12 @@ async def chat_completions(request: ChatCompletionRequest):
         return _sync_completion(request, engine)
 
 
-def _sync_completion(request: ChatCompletionRequest, engine: "MLXEngine") -> ChatCompletionResponse:
-    """Non-streaming completion."""
+def _sync_completion(request: ChatCompletionRequest, engine: "MLXEngine"):
+    """Non-streaming completion.
+
+    Returns a ChatCompletionResponse, or a 500 JSONResponse error object
+    when the engine terminated the stream fail-closed (U6/F1: 'error' is an
+    engine-internal reason, never a valid OpenAI finish_reason)."""
     # FIX 3: pass model_family so Gemma 4 <|channel>thought...<channel|> spans
     # in the INPUT history are actually stripped (the default "chatml" left
     # them — and degenerate trailing reasoning — to replay raw into the prompt).
@@ -219,6 +223,28 @@ def _sync_completion(request: ChatCompletionRequest, engine: "MLXEngine") -> Cha
         thinking_budget=request.thinking_budget,
         response_format=response_format,
     )
+
+    # U6/F1: corruption-terminated generation — return an error response,
+    # never a completion (and never tool_calls parsed from truncated text).
+    # Nothing is persisted: the engine already skipped its session save and
+    # invalidated the cache, so the retry takes an honest MISS.
+    if result.finish_reason == "error":
+        logger.error(
+            f"[Request] user={request.user!r} | generation terminated by "
+            f"cache corruption — returning 500 error object"
+        )
+        return JSONResponse(
+            status_code=500,
+            content={"error": {
+                "message": (
+                    "generation terminated: session cache corruption "
+                    "detected; partial output is unreliable and was not "
+                    "persisted — retry the request"
+                ),
+                "type": "server_error",
+                "code": 500,
+            }},
+        )
 
     msg = ResponseMessage(content=result.content)
     # Expose the model's thinking as a SEPARATE reasoning channel (matches LM
@@ -392,6 +418,10 @@ async def _stream_completion_body(
     #    tool_calls is byte-identical to the prior per-token behavior; only the
     #    BATCHING of the content deltas changes.
     finished = False
+    # U6/F1: the engine's terminal reason. "error" (fail-closed cache
+    # corruption) diverts to the in-band error envelope below instead of a
+    # normal completion frame.
+    final_finish_reason: Optional[str] = None
     try:
         async for batch in engine.generate_stream_batches_async(
             messages,
@@ -411,6 +441,10 @@ async def _stream_completion_body(
             chunk_text_parts: list[str] = []
             for result in batch:
                 if result.finish_reason is not None:
+                    # U6/F1: keep the engine's terminal reason — an "error"
+                    # (cache-corruption) terminal must not be dressed up as
+                    # a normal stop/tool_calls completion below.
+                    final_finish_reason = result.finish_reason
                     final_prompt_tokens = result.prompt_tokens
                     final_completion_tokens = result.completion_tokens
                     final_cache_info = result.cache_info
@@ -583,6 +617,36 @@ async def _stream_completion_body(
             f"tail={tail!r}"
         )
         raise
+
+    # U6/F1: corruption-terminated stream. "error" is NOT a valid OpenAI
+    # finish_reason, and the already-streamed text is truncated at an
+    # arbitrary point — synthesizing stop/tool_calls here (or best-effort
+    # emitting a truncated tool call below) would hand the client corrupt
+    # partial output as a successful completion. Emit the same in-band error
+    # envelope shape the liveness work uses (data:{"error":{...}} then
+    # [DONE]) and SUPPRESS tool-call parsing and session persistence of the
+    # truncated text. The engine has already invalidated the session cache;
+    # the client's retry takes an honest MISS.
+    if final_finish_reason == "error":
+        logger.error(
+            f"[Stream] user={request.user!r} | generation terminated by "
+            f"cache corruption after {token_count} tokens — emitting error "
+            f"envelope (no tool_calls, nothing persisted)"
+        )
+        err = {
+            "error": {
+                "message": (
+                    "generation terminated: session cache corruption "
+                    "detected mid-stream; partial output is unreliable and "
+                    "was not persisted — retry the request"
+                ),
+                "type": "server_error",
+                "code": 500,
+            }
+        }
+        yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
 
     # Flush the router's held tail. A partial-opener prefix held back as a
     # possible split marker is real content/reasoning at stream end and must be

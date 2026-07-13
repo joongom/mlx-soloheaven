@@ -70,6 +70,7 @@ from mlx_soloheaven.engine.thinking import (
     force_end_from_state,
 )
 from mlx_soloheaven.engine.tool_parser import (
+    _parse_glm_tool_calls,
     get_tool_markers,
     parse_tool_calls,
     split_thinking_and_content,
@@ -379,6 +380,23 @@ class SessionState:
 
     # Cache build time from last truncate/rebuild (seconds, consumed once)
     pending_build_time: float = 0.0
+
+    # --- Prompt contract (U3/U21) -------------------------------------------
+    # Everything that shapes the tokenized prompt PREFIX besides the messages
+    # themselves. ``tools`` is the CANONICAL serialization (plain dicts via
+    # model_dump — JSON round-trippable for disk persistence) of the tool
+    # schema the session's cache was built with; ``thinking`` is the
+    # enable_thinking flag in effect. ``prompt_fingerprint`` is the
+    # _prompt_fingerprint hash over both — compared on every HIT so a client
+    # changing tools (or the thinking flag) mid-session takes an honest MISS
+    # rebuild instead of silently answering with the stale schema, and
+    # threaded through every rebuild path (compact / truncate / regenerate /
+    # branch) so rebuilds re-tokenize WITH the session's tools. All three
+    # round-trip disk save/load; ``None`` fingerprint marks a legacy /
+    # pre-upgrade session (see the HIT gate's legacy rule).
+    tools: list | None = None
+    thinking: bool = True
+    prompt_fingerprint: str | None = None
 
     # Cumulative drafter acceptance stats across all requests in this session.
     # None until the first drafter-enabled request completes. Shape:
@@ -2219,12 +2237,18 @@ class MLXEngine:
         t0 = time.perf_counter()
         os.makedirs(self.cfg.cache_dir, exist_ok=True)
         path = self._session_cache_path(session_id)
+        _sess_tools = getattr(session, "tools", None)
         metadata = {
             "session_id": session_id,
             "messages": json.dumps(session.messages, ensure_ascii=False),
             "total_cache_tokens": str(session.total_cache_tokens),
             "last_used": str(session.last_used),
             "token_ids": json.dumps(session.cache_state.token_ids or []),
+            # Prompt contract (U3/U21) — must survive a restart so rebuilds
+            # keep the tool schema and the HIT gate can verify it.
+            "tools": json.dumps(_sess_tools, ensure_ascii=False) if _sess_tools else "",
+            "thinking": "1" if getattr(session, "thinking", True) else "0",
+            "prompt_fingerprint": getattr(session, "prompt_fingerprint", None) or "",
         }
         def _do_save():
             # WHY: VLM KV-cache tensors are lazy and bound to the
@@ -2644,6 +2668,14 @@ class MLXEngine:
             total_tokens = int(metadata.get("total_cache_tokens", "0"))
             last_used = float(metadata.get("last_used", "0"))
             token_ids = json.loads(metadata.get("token_ids", "[]"))
+            # Prompt contract (U3/U21). Legacy files (pre-fingerprint) load
+            # as tools=None / fingerprint=None — the HIT gate then takes ONE
+            # unconditional cold rebuild that stamps the fingerprint (F5:
+            # never a lenient HIT; the legacy contract is unknowable).
+            _tools_meta = metadata.get("tools", "")
+            sess_tools = json.loads(_tools_meta) if _tools_meta else None
+            sess_thinking = metadata.get("thinking", "1") != "0"
+            sess_fp = metadata.get("prompt_fingerprint") or None
 
             # Verify loaded cache matches model structure (leading slice).
             # MTP-finalized sessions (qwen_mtp) persist n_target + n_head
@@ -2762,6 +2794,9 @@ class MLXEngine:
                 messages=messages,
                 total_cache_tokens=loaded_offset,
                 last_used=last_used,
+                tools=sess_tools,
+                thinking=sess_thinking,
+                prompt_fingerprint=sess_fp,
             )
 
             fsize = os.path.getsize(path) / 1e6
@@ -2796,6 +2831,33 @@ class MLXEngine:
 
     def _has_disk_cache(self, session_id: str) -> bool:
         return hasattr(self, "_disk_session_ids") and session_id in self._disk_session_ids
+
+    # --- Prompt contract (U3/U21) ----------------------------------------
+
+    @staticmethod
+    def _canonical_tools(tools: list | None) -> list | None:
+        """Canonical (JSON-serializable) form of a request's tool schema.
+
+        Pydantic models are dumped to plain dicts so the result can be
+        stored on SessionState, persisted in safetensors metadata, and
+        hashed deterministically. ``None``/empty → ``None`` (toolless)."""
+        if not tools:
+            return None
+        return [t.model_dump() if hasattr(t, "model_dump") else t for t in tools]
+
+    @staticmethod
+    def _prompt_fingerprint(tools_canonical: list | None, thinking: bool) -> str:
+        """Hash of everything that alters the tokenized prompt prefix
+        OUTSIDE the messages: the canonical tool schema + the thinking flag.
+        Compared on every HIT (U21) — a mismatch means the cached prefix was
+        built under a different contract and reuse would silently keep the
+        stale schema in context, so the turn takes an honest MISS instead."""
+        payload = json.dumps(
+            {"tools": tools_canonical, "thinking": bool(thinking)},
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
     # --- Base cache pool ---
 
@@ -3177,8 +3239,288 @@ class MLXEngine:
             content = _NORMALIZE_RE_TOOL_CALL_XML.sub("", content)
         return content.strip()
 
-    def _messages_match(self, stored: list[dict], incoming: list[dict]) -> bool:
-        """Check if incoming messages start with the stored conversation."""
+    @staticmethod
+    def _canonicalize_calls(calls: list) -> list:
+        """Canonical ``[(name, canonical-args-json), ...]`` form of a list
+        of OpenAI-shaped tool-call dicts. JSON-string arguments are parsed
+        so a re-serialized resend (key order / whitespace) still compares
+        equal. Call ids are deliberately EXCLUDED: XML-parsed calls get
+        fresh random ids, and the tool ROLE's tool_call_id comparison
+        already pins the id chain; name + canonical arguments are what make
+        two calls "the same call" for cache validity."""
+        out: list = []
+        for tc in calls:
+            fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+            args = fn.get("arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            out.append((
+                fn.get("name") or "",
+                json.dumps(args, sort_keys=True, ensure_ascii=False, default=str),
+            ))
+        return out
+
+    @staticmethod
+    def _content_xml_calls_for_match(
+        raw_content: str, model_family: str,
+    ) -> list:
+        """Canonical calls parsed from tool-call XML embedded in RAW content
+        (legacy engine-stored turns kept the template XML in content) —
+        empty list when no start marker is present or nothing parses.
+
+        This is THE content-side parse chain, shared by
+        _tool_calls_for_match (legacy fallback), _has_residual_tool_markers
+        (N3) and _structured_content_call_conflict (round 4): the family
+        parser first, then the N2 bare-name GLM canonicalization for a
+        COMPLETE block the family parser could not read
+        (``<tool_call>name[<arg_key>..</arg_value>]</tool_call>`` — a shape
+        some clients replay verbatim), so a legitimate bare-name turn
+        compares STRUCTURALLY instead of hitting the one-sided FAIL. A
+        PARTIAL block (no end marker after the start) stays unparseable on
+        purpose: against a side with >=1 canonical call it is mismatch
+        evidence, not indeterminate.
+
+        Round 5: matching requires CLOSED blocks. The GLM parser
+        intentionally tolerates a MISSING ``</tool_call>`` closer (the
+        ``\\Z`` alternate — generation-time robustness for a stream cut
+        mid-block), so an UNCLOSED trailing GLM block canonicalized exactly
+        like the closed one — equal to the structured call it mirrors — and
+        sailed past the one-sided (N2), residual-marker (N3) AND
+        structured-content conflict (round 4) checks straight into the
+        marker-strip/wildcard acceptance, despite the tokenized prompts
+        differing. The parser's leniency is deliberately untouched (do not
+        change generation-time parsing); at MATCH time the lenient parse is
+        DISCOUNTED: at most one call can come from an unclosed block (only
+        the final ``\\Z``-terminated match) and it is always the LAST parsed
+        call, so when more calls parsed than CLOSED
+        ``<tool_call>...</tool_call>`` spans exist the trailing call is
+        dropped. The dropped call then surfaces through the existing checks
+        (one-sided / residual marker / self-conflict). A spurious drop can
+        only reject (honest MISS), never produce a wrong HIT."""
+        start_tag, end_tag = get_tool_markers(model_family)
+        if not raw_content or start_tag not in raw_content:
+            return []
+        _, calls = parse_tool_calls(raw_content, model_family=model_family)
+        if (
+            not calls
+            and start_tag == "<tool_call>"
+            and end_tag in raw_content[raw_content.find(start_tag):]
+        ):
+            _, calls = _parse_glm_tool_calls(raw_content)
+        if calls and start_tag == "<tool_call>":
+            # Round 5 closed-block discount (see docstring). The closed-span
+            # count uses the same non-greedy left-to-right scan as the GLM
+            # block pattern, so an orphan closer BEFORE the first start
+            # marker cannot masquerade as a closer for a trailing unclosed
+            # block (a naive closers-vs-starts count would miss that).
+            closed = sum(
+                1 for _ in _NORMALIZE_RE_TOOL_CALL_XML.finditer(raw_content)
+            )
+            if len(calls) > closed:
+                calls = calls[:-1]
+        return MLXEngine._canonicalize_calls(calls)
+
+    @staticmethod
+    def _tool_calls_for_match(
+        msg: dict, raw_content: str, model_family: str,
+    ) -> list | None:
+        """F3: canonical, comparable form of an assistant message's tool
+        calls — ``[(name, canonical-args-json), ...]`` or ``None`` when no
+        call is extractable.
+
+        Sources, in order:
+        - the structured ``tool_calls`` field (OpenAI clients / the engine's
+          normal save);
+        - tool-call XML embedded in the RAW content (legacy engine-stored
+          turns kept the template XML in content) via
+          _content_xml_calls_for_match.
+
+        When the structured field is present it WINS and content XML is not
+        consulted here — _structured_content_call_conflict (round 4) is the
+        companion check that rejects a message whose content XML DISAGREES
+        with its structured list."""
+        out = MLXEngine._canonicalize_calls(msg.get("tool_calls") or [])
+        if out:
+            return out
+        # Fall back to tool-call XML in the raw content (legacy stored shape).
+        return (
+            MLXEngine._content_xml_calls_for_match(raw_content, model_family)
+            or None
+        )
+
+    @staticmethod
+    def _structured_content_call_conflict(
+        msg: dict, raw_content: str, model_family: str,
+    ) -> bool:
+        """Round 4: True when a message carries BOTH tool-call
+        representations — a structured ``tool_calls`` field AND tool-call
+        start markers in its RAW content — and they do NOT agree
+        canonically.
+
+        _tool_calls_for_match returns the STRUCTURED list as soon as it is
+        non-empty, ignoring content entirely, so a side holding the same
+        structured call but content that ALSO embeds a fully parseable
+        ``<tool_call>`` block for a DIFFERENT call (e.g. delete_files)
+        compared canonically EQUAL to a side with just the structured call;
+        _has_residual_tool_markers stayed False (every marker parses) and
+        the marker-strip content shortcut in _messages_match then accepted
+        the message on both the strict and the lenient path — despite the
+        tokenized prompts differing.
+
+        When both representations exist they must agree: the canonical
+        SEQUENCE of content-XML calls must equal the canonical structured
+        list. A start marker whose block fails to parse counts as
+        disagreement (same rule as the one-sided garbled block, N2). A
+        self-consistent turn — the same call(s) rendered both ways, or
+        either representation alone — never trips this; a false positive
+        (a literal marker inside prose next to a structured call) degrades
+        to an honest MISS, never a wrong HIT."""
+        structured = MLXEngine._canonicalize_calls(msg.get("tool_calls") or [])
+        if not structured:
+            return False
+        start_tag, _ = get_tool_markers(model_family)
+        if not raw_content or start_tag not in raw_content:
+            return False
+        return (
+            MLXEngine._content_xml_calls_for_match(raw_content, model_family)
+            != structured
+        )
+
+    @staticmethod
+    def _has_residual_tool_markers(raw_content: str, model_family: str) -> bool:
+        """Round 3 (N3): True when ``raw_content`` holds tool-call START
+        markers the family parse chain does NOT consume into canonical calls
+        (a partial/garbled block trailing — or preceding — valid blocks).
+
+        _tool_calls_for_match returns only the calls that PARSE, so a side
+        with one valid block plus a residual ``<tool_call>`` fragment compares
+        canonically EQUAL to a side with just the valid block — and the
+        marker-strip content shortcut in _messages_match then accepts the
+        message on both the strict and the lenient path. Residual markers are
+        mismatch evidence (same rule as the one-sided garbled block, N2).
+
+        Detection mirrors _tool_calls_for_match's exact parse chain (family
+        parser, then the N2 bare-name GLM fallback) and compares the number
+        of canonical calls against the number of start-marker occurrences.
+        Counting the WHOLE content is consistent with existing semantics: the
+        family parsers scan the full text (a marker inside a code fence /
+        quote is already treated as tool-call territory by parse_tool_calls),
+        and each parsed block consumes exactly one start marker. A false
+        positive (e.g. a parameter VALUE containing the literal marker)
+        degrades to an honest MISS, never a wrong HIT — and only when the two
+        sides' raw contents already differ (byte-identical sides skip this
+        check entirely)."""
+        start_tag, _ = get_tool_markers(model_family)
+        if not raw_content or start_tag not in raw_content:
+            return False
+        calls = MLXEngine._content_xml_calls_for_match(raw_content, model_family)
+        return len(calls) < raw_content.count(start_tag)
+
+    def _interrupted_resend_equiv(
+        self, s_content: str, i_norm: str, *, exact: bool = False,
+    ) -> bool:
+        """U1 narrow equivalence for a C1-committed INTERRUPTED assistant turn.
+
+        The stored message (marked ``interrupted=True`` by
+        _commit_interrupted_hit_turn) holds the engine-side content INCLUDING
+        thinking; the client resends only what it received on the wire —
+        the content channel (thinking stripped), possibly TRUNCATED at the
+        cancel point, or the thinking reconstructed as plain text.
+
+        ``exact=False`` (EXPLICIT session ids only — F2): accept exactly
+        these shapes and nothing else:
+
+        - incoming (normalized) is a PREFIX of the stored CONTENT channel
+          (includes the empty resend — a cancel before any content frame);
+        - incoming (normalized) is a PREFIX of
+          ``{stored thinking}\\n\\n{stored content}`` — the client replayed
+          the (possibly truncated) thinking as plain content.
+
+        ``exact=True`` (the ANON resolver / strict path — F2): prefix
+        equivalence is FORGEABLE for session-less requests (an empty resend
+        would match every interrupted turn, and any shared prefix could
+        select another conversation's session), so anon resolution requires
+        EXACT content-channel equality after thinking-strip normalization —
+        an empty resend matches ONLY an empty stored content channel.
+
+        Arbitrary divergence — anything that is not (a prefix of, or under
+        ``exact`` equal to) what was actually streamed — does NOT match
+        (honest MISS / new anon session), unlike the old
+        last-stored-assistant wildcard this replaces."""
+        s_content = s_content or ""
+        started = s_content.lstrip().startswith("<think>")
+        thinking, content = split_thinking_and_content(
+            s_content,
+            model_family=getattr(self, "model_family", "chatml"),
+            started_in_thinking=started,
+        )
+        c_norm = self._normalize_for_match(content or "", "assistant")
+        if exact:
+            return c_norm == i_norm
+        if c_norm.startswith(i_norm):
+            return True
+        if thinking:
+            t_norm = thinking.strip()
+            combo = f"{t_norm}\n\n{c_norm}".strip() if c_norm else t_norm
+            if combo.startswith(i_norm):
+                return True
+        return False
+
+    def _messages_match(
+        self,
+        stored: list[dict],
+        incoming: list[dict],
+        *,
+        last_assistant_wildcard: bool = True,
+    ) -> bool:
+        """Check if incoming messages start with the stored conversation.
+
+        ``last_assistant_wildcard`` (U1/F2): when True (explicit-session HIT
+        path — the historical behavior), a content mismatch on the LAST
+        stored assistant message is tolerated wholesale (client may hold a
+        truncated/reformatted view of the reply), interrupted turns get the
+        NARROW prefix equivalence, and the thinking-prepend suffix leniency
+        applies. The anon prefix RESOLVER passes False — STRICT mode: for
+        session-less requests every one of those leniencies is a forgery
+        vector (a DIFFERENT anonymous conversation — prefix-equal except an
+        assistant turn — could hijack another conversation's session and
+        cache), so anon resolution requires EXACT normalized assistant
+        content; an interrupted turn matches only on exact content-channel
+        equality (empty resend == empty stored content only) and the
+        generic suffix equivalence is bypassed entirely.
+
+        Structured fields (F3) are compared on BOTH paths whenever present:
+        assistant ``tool_calls`` (canonically serialized name+arguments,
+        incl. legacy XML-in-content stored turns) and the tool role's
+        ``tool_call_id`` — two turns with identical (even empty) content but
+        different calls are different conversations.
+
+        Round-2 hardening (N1/N2):
+        - N1: the compacted/cleared tool-result equivalence ("[cleared]" /
+          "[compacted:…]" placeholders) applies to EXPLICIT sessions only —
+          in strict (anon) mode a placeholder would match ANY stored tool
+          result, so exact tool-result content is required.
+        - N2: when tool calls are extractable on exactly ONE side, the
+          message FAILS on both paths — merely containing a start marker no
+          longer defers to the content rules (the marker-strip shortcut
+          could accept a valid stored call against a partial/different
+          block). Complete bare-name blocks are canonicalized first (see
+          _tool_calls_for_match), so only genuine parse failures reject.
+
+        Round-3 hardening (N3): RESIDUAL unparsed tool-call start markers
+        (a valid call followed by a partial/different block — canonically
+        equal to the valid call alone) are mismatch evidence when the two
+        sides' raw contents differ: FAIL on both paths (see
+        _has_residual_tool_markers).
+
+        Round-4 hardening: a message carrying BOTH representations —
+        structured ``tool_calls`` AND tool-call XML in content — must agree
+        with itself; a conflicting side (the structured comparison prefers
+        the field, so content XML for a DIFFERENT call was invisible) FAILS
+        on both paths (see _structured_content_call_conflict)."""
         if len(incoming) < len(stored):
             logger.debug(
                 f"[Match] FAIL: incoming({len(incoming)}) < stored({len(stored)})"
@@ -3198,6 +3540,107 @@ class MLXEngine:
             s_content = self._flatten_multipart(s_msg.get("content"))
             i_content = self._flatten_multipart(i_msg.get("content"))
             role = s_msg.get("role", "")
+
+            # F3: structured fields participate in matching on ALL paths —
+            # content comparison alone lets two assistant turns with equal
+            # (often empty) content but DIFFERENT tool calls match, poisoning
+            # context across conversations (A's cached call + B's tool
+            # result). Compared via MLXEngine directly so lightweight test
+            # stubs without the helper bound still work.
+            family = getattr(self, "model_family", "chatml")
+            if role == "assistant":
+                s_calls = MLXEngine._tool_calls_for_match(s_msg, s_content, family)
+                i_calls = MLXEngine._tool_calls_for_match(i_msg, i_content, family)
+                if s_calls is not None and i_calls is not None:
+                    if s_calls != i_calls:
+                        logger.debug(
+                            f"[Match] FAIL at msg[{i}]: assistant tool_calls "
+                            f"differ ({s_calls} != {i_calls})"
+                        )
+                        return False
+                elif s_calls != i_calls:
+                    # Exactly one side carries extractable calls (a non-None
+                    # result always holds >=1 canonical call) — FAIL on BOTH
+                    # paths (N2). This is mismatch evidence, never
+                    # indeterminate:
+                    # - the bare side shows NO tool-call evidence at all (no
+                    #   structured field, no start marker) — structurally
+                    #   different conversations (the historical rule); or
+                    # - it carries a start marker whose block FAILS to parse
+                    #   (even after the bare-name canonicalization fallback
+                    #   in _tool_calls_for_match) against >=1 canonical call
+                    #   on the other side. Pre-fix, merely containing the
+                    #   marker fell through and the marker-strip shortcut
+                    #   below accepted a VALID stored call against an
+                    #   arbitrary partial/different <tool_call> block — a
+                    #   session-forgery vector on the STRICT (anon) path and
+                    #   cross-conversation poisoning on the lenient one. A
+                    #   legitimate resend that still fails to canonicalize
+                    #   degrades to an honest MISS, never a wrong HIT.
+                    logger.debug(
+                        f"[Match] FAIL at msg[{i}]: tool_calls extractable on "
+                        f"one side only (stored="
+                        f"{'yes' if s_calls is not None else 'no'}, incoming="
+                        f"{'yes' if i_calls is not None else 'no'})"
+                    )
+                    return False
+                # N3 (round 3): RESIDUAL unparsed tool-call start markers.
+                # _tool_calls_for_match returns only the calls that PARSE, so
+                # a side with one VALID call plus a trailing partial/different
+                # <tool_call> fragment compared canonically EQUAL to a side
+                # with just the valid call — and the marker-strip shortcut
+                # below then accepted on BOTH the strict and the lenient
+                # path. A residual marker on a side whose raw content differs
+                # from the other side is mismatch evidence (same rule as the
+                # one-sided garbled block above): FAIL on both paths.
+                # Byte-identical contents carry no divergence to hide, so
+                # verbatim replays of a degenerate turn still match.
+                if s_content != i_content and (
+                    MLXEngine._has_residual_tool_markers(s_content, family)
+                    or MLXEngine._has_residual_tool_markers(i_content, family)
+                ):
+                    logger.debug(
+                        f"[Match] FAIL at msg[{i}]: residual unparsed "
+                        f"tool-call marker(s) on a differing side "
+                        f"(stored_len={len(s_content)}, "
+                        f"incoming_len={len(i_content)})"
+                    )
+                    return False
+                # Round 4: a side carrying BOTH representations (structured
+                # tool_calls AND tool-call XML in content) must agree with
+                # ITSELF. The canonical comparison above prefers the
+                # structured field, so a side whose content ALSO holds a
+                # fully parseable block for a DIFFERENT call (no residual —
+                # every marker parses) compared EQUAL, and the marker-strip
+                # shortcut below then accepted it on the strict AND the
+                # lenient path despite the tokenized prompts differing. A
+                # self-conflicting side is mismatch evidence on BOTH paths;
+                # content XML that canonically AGREES with the structured
+                # list (the same call rendered both ways) never trips this.
+                if (
+                    MLXEngine._structured_content_call_conflict(
+                        s_msg, s_content, family,
+                    )
+                    or MLXEngine._structured_content_call_conflict(
+                        i_msg, i_content, family,
+                    )
+                ):
+                    logger.debug(
+                        f"[Match] FAIL at msg[{i}]: structured tool_calls "
+                        f"conflict with tool-call XML in content on at "
+                        f"least one side (stored_len={len(s_content)}, "
+                        f"incoming_len={len(i_content)})"
+                    )
+                    return False
+            elif role == "tool":
+                s_tcid = s_msg.get("tool_call_id") or ""
+                i_tcid = i_msg.get("tool_call_id") or ""
+                if (s_tcid or i_tcid) and s_tcid != i_tcid:
+                    logger.debug(
+                        f"[Match] FAIL at msg[{i}]: tool_call_id "
+                        f"{s_tcid!r} != {i_tcid!r}"
+                    )
+                    return False
 
             # Assistant tool_call messages: OpenCode strips <tool_call> from content
             # and moves it to tool_calls field. Handle all cases:
@@ -3219,30 +3662,70 @@ class MLXEngine:
             if s_norm != i_norm:
                 # Tool content compacted/cleared by client (either direction)
                 # KV cache still valid — the tokens were already processed.
-                if role == "tool" and self._is_compacted_tool(s_content, i_content):
+                # N1: EXPLICIT sessions only (last_assistant_wildcard=True).
+                # On the STRICT anon path a "[cleared]"/"[compacted:…]"
+                # placeholder is equivalent to EVERY stored tool result, so
+                # with this leniency active two anonymous conversations
+                # sharing a call chain (same tool_call_ids) could resolve
+                # onto each other's session — anon resolution requires EXACT
+                # tool-result content.
+                if (
+                    role == "tool"
+                    and last_assistant_wildcard
+                    and self._is_compacted_tool(s_content, i_content)
+                ):
                     logger.debug(
                         f"[Match] msg[{i}] tool content compacted — "
                         f"accepting (stored={len(s_content)}, incoming={len(i_content)})"
                     )
                     continue
 
-                # Last stored assistant message: tolerate content difference.
-                # Client may have received truncated/reformatted response
-                # (disconnect, streaming, client-side processing).
-                # KV cache is still valid because it was saved from full generation.
-                if role == "assistant" and i == len(stored) - 1:
-                    logger.debug(
-                        f"[Match] msg[{i}] assistant content mismatch at last stored msg — "
-                        f"accepting (stored={len(s_content)}, incoming={len(i_content)})"
-                    )
-                    continue
+                # U1/F2: last-stored-assistant tolerance is CONDITIONAL now.
+                # - C1-committed interrupted turns (any position): the NARROW
+                #   prefix equivalence (thinking-channel stripping /
+                #   wire-truncation shapes) is reserved for EXPLICIT session
+                #   ids (last_assistant_wildcard=True). The anon resolver
+                #   (False) requires EXACT content-channel equality — prefix
+                #   shapes are forgeable for session-less requests (an empty
+                #   resend would match every interrupted turn).
+                # - Otherwise, the historical last-stored-assistant wildcard
+                #   applies ONLY when the caller allows it (explicit-session
+                #   HIT keeps current behavior; the anon resolver disables it
+                #   — the hijack vector).
+                if role == "assistant":
+                    if s_msg.get("interrupted"):
+                        if self._interrupted_resend_equiv(
+                            s_content, i_norm,
+                            exact=not last_assistant_wildcard,
+                        ):
+                            logger.debug(
+                                f"[Match] msg[{i}] interrupted-turn "
+                                f"{'narrow' if last_assistant_wildcard else 'exact'} "
+                                f"equivalence — accepting (stored="
+                                f"{len(s_content)}, incoming={len(i_content)})"
+                            )
+                            continue
+                        # Narrow/exact rule failed: fall through to the
+                        # generic leniencies below, then the FAIL log — an
+                        # interrupted turn never gets the wildcard.
+                    elif i == len(stored) - 1 and last_assistant_wildcard:
+                        logger.debug(
+                            f"[Match] msg[{i}] assistant content mismatch at last stored msg — "
+                            f"accepting (stored={len(s_content)}, incoming={len(i_content)})"
+                        )
+                        continue
 
                 # Client may reconstruct assistant content as "{thinking}\n\n{final}"
                 # without <think> tags. Stored normalized is just "{final}"; incoming
                 # normalized is "{thinking}\n\n{final}". KV cache reflects what the
                 # model actually processed (stored), so if the final answer matches
                 # as a suffix of the incoming, the cache is still valid.
-                if role == "assistant" and s_norm and len(s_norm) >= 8 and (
+                # F2: explicit sessions only — for the anon resolver this
+                # generic suffix equivalence accepts non-prefix values and is
+                # therefore forgeable; strict mode bypasses it.
+                if role == "assistant" and last_assistant_wildcard and (
+                    s_norm and len(s_norm) >= 8
+                ) and (
                     i_norm.endswith(s_norm) or s_norm.endswith(i_norm)
                 ):
                     logger.debug(
@@ -3257,6 +3740,10 @@ class MLXEngine:
                 # call to tool_calls[] and may reconstruct the thinking as plain
                 # text in content (no <think> tags). KV cache is still valid —
                 # it reflects the tokens the model actually emitted.
+                # (Safe on BOTH paths since F3: when calls are extractable on
+                # both sides the structured comparison above has already
+                # verified they are the SAME calls — this leniency only
+                # bridges the content-channel reconstruction.)
                 if (
                     role == "assistant"
                     and not s_norm
@@ -3288,7 +3775,9 @@ class MLXEngine:
                 return False
         return True
 
-    def _resolve_anon_session_id_locked(self, messages: list[dict]) -> str:
+    def _resolve_anon_session_id_locked(
+        self, messages: list[dict], prompt_fingerprint: str | None = None,
+    ) -> str:
         """Resolve a session-less request onto a concrete per-conversation id.
 
         Session-less requests (no OpenAI ``user`` field — e.g. OpenCode and
@@ -3299,12 +3788,27 @@ class MLXEngine:
 
         Instead, scan the resident sessions for one whose stored
         ``session.messages`` is a (proper or exact) prefix of the incoming
-        messages, reusing the exact same ``_messages_match`` logic the HIT path
-        uses, so selection and the subsequent cache decision can never
-        disagree. Pick the LONGEST matched message prefix; tie-break by
-        most-recently-used. An EXACT match (stored == incoming) is selected
-        too — _generate_locked then takes its existing "retry" path (same
-        messages re-sent → discard cache, re-process), unchanged.
+        messages, reusing the same ``_messages_match`` logic the HIT path
+        uses — but with ``last_assistant_wildcard=False`` (U1): the HIT
+        path's last-stored-assistant content wildcard would let a DIFFERENT
+        anonymous conversation, prefix-equal except its last assistant turn,
+        hijack this conversation's session + cache (cross-conversation
+        pollution). Candidate selection is therefore STRICT content
+        matching; the only divergence tolerated is the narrow
+        interrupted-turn equivalence (see _interrupted_resend_equiv), which
+        applies identically on the HIT path, so selection and the subsequent
+        cache decision still cannot disagree. Pick the LONGEST matched
+        message prefix; tie-break by most-recently-used. An EXACT match
+        (stored == incoming) is selected too — _generate_locked then takes
+        its existing "retry" path (same messages re-sent → discard cache,
+        re-process), unchanged.
+
+        ``prompt_fingerprint`` (U21 interplay): when both sides carry a
+        fingerprint, a mismatching candidate is skipped — two conversations
+        with identical message prefixes but different tool schemas are
+        DIFFERENT conversations and must not share a session slot. A
+        ``None`` on either side (legacy session / direct caller) skips the
+        filter; the HIT gate still applies the contract check downstream.
 
         If nothing matches, mint a NEW unique ``anon-<8 hex>`` id so each
         session-less conversation owns its own cache entry. These sessions
@@ -3359,7 +3863,19 @@ class MLXEngine:
             # Empty stored messages would prefix-match ANYTHING — skip.
             if not stored or len(stored) > len(messages):
                 continue
-            if not self._messages_match(stored, messages):
+            # U21: different tool contract → different conversation, even on
+            # a perfect message-prefix match (None on either side = legacy /
+            # unknown → filter skipped, HIT gate decides downstream).
+            _sess_fp = getattr(session, "prompt_fingerprint", None)
+            if (
+                prompt_fingerprint is not None
+                and _sess_fp is not None
+                and _sess_fp != prompt_fingerprint
+            ):
+                continue
+            if not self._messages_match(
+                stored, messages, last_assistant_wildcard=False,
+            ):
                 continue
             n = len(stored)
             if n > best_len or (n == best_len and session.last_used > best_used):
@@ -3458,6 +3974,36 @@ class MLXEngine:
             return list(result.input_ids)
         return list(result)
 
+    def _suffix_blocking_assistants(self, new_messages: list[dict]) -> int:
+        """U4 gate: count assistant messages in ``new_messages`` that the
+        suffix path cannot represent — ANY non-resident assistant blocks.
+
+        An assistant message past the stored prefix is by definition NOT
+        cache-resident (the stored messages are the authoritative record of
+        what was generated into the KV — the shape arises from crash
+        recovery, where the disk-persisted session lags the conversation the
+        client resends). Skipping it — the builders' historical behavior —
+        silently drops the model's own prior reply from its context.
+
+        Policy (F4, per review): on EVERY template a non-resident assistant
+        turn routes to divergence → honest MISS (full re-tokenization). A
+        manual splice is NOT token-exact against apply_chat_template — e.g.
+        the Qwen3.6 ChatML template emits a '<think>\\n\\n</think>\\n\\n'
+        prefix inside past assistant turns when thinking is disabled, and
+        trims message content, while a naive
+        '\\n<|im_start|>assistant\\n{content}<|im_end|>' splice preserves
+        boundary whitespace — a cache-poisoning risk (spliced tokens != what
+        full tokenization would produce, silently corrupting every later
+        turn built on the cache). A cold-fill is cheap and always correct.
+
+        NOTE for a future splice attempt: it must be proven by a REAL-TOKEN
+        differential test — token ids of (cached-prefix + spliced suffix)
+        compared against tokenizer.apply_chat_template over the full
+        message list, on the actual installed template(s) — not by a
+        fabricated encoded-string assertion.
+        """
+        return sum(1 for m in new_messages if m.get("role") == "assistant")
+
     def _suffix_tokens(
         self, new_messages: list[dict], thinking: bool = True,
     ) -> list[int]:
@@ -3465,6 +4011,12 @@ class MLXEngine:
 
         This avoids full re-tokenization (which breaks special token round-trip)
         by directly encoding only the new message suffix in model-specific format.
+
+        Assistant messages never appear in ``new_messages`` here: a
+        non-resident assistant (crash-recovery resend) is routed to an
+        honest MISS by the U4 gate in _generate_locked
+        (_suffix_blocking_assistants) on ALL templates — a manual splice is
+        not token-exact against apply_chat_template (F4).
         """
         if self.model_family == "gemma4":
             return self._suffix_tokens_gemma4(new_messages, thinking)
@@ -3486,7 +4038,12 @@ class MLXEngine:
                     for p in content
                 )
             if role == "assistant":
-                continue  # already in cache
+                # U4: only reachable for cache-resident turns — the engine's
+                # _suffix_blocking_assistants gate routes any NON-resident
+                # assistant (crash-recovery resend) to an honest MISS before
+                # this builder runs, because splicing model turns through
+                # gemma4's special-token round-trip is template-risky.
+                continue
             elif role == "tool":
                 parts.append(
                     f"\n<|turn>user\n<|tool_response>\n"
@@ -3501,7 +4058,15 @@ class MLXEngine:
     def _suffix_tokens_chatml(
         self, new_messages: list[dict], thinking: bool,
     ) -> list[int]:
-        """ChatML suffix: \\n<|im_start|>user\\n{content}<|im_end|>\\n<|im_start|>assistant\\n<think>\\n"""
+        """ChatML suffix: \\n<|im_start|>user\\n{content}<|im_end|>\\n<|im_start|>assistant\\n<think>\\n
+
+        U4/F4: only reachable for cache-resident turns — a NON-resident
+        assistant (crash-recovery resend) was routed to an honest MISS by
+        the _suffix_blocking_assistants gate. A manual assistant splice is
+        NOT token-exact vs apply_chat_template (e.g. Qwen3.6 renders a
+        '<think>\\n\\n</think>\\n\\n' prefix into past assistant turns when
+        thinking is disabled, and trims content) — see the gate's docstring
+        for the differential-test requirement before ever splicing here."""
         parts = []
         for msg in new_messages:
             role = msg.get("role", "user")
@@ -3538,6 +4103,10 @@ class MLXEngine:
                     for p in content
                 )
             if role == "assistant":
+                # U4: only reachable for cache-resident turns — non-resident
+                # assistants were routed to an honest MISS by the
+                # _suffix_blocking_assistants gate (GLM's <think> handling
+                # makes spliced model turns template-risky).
                 continue
             elif role == "tool":
                 parts.append(f"<|user|><tool_response>\n{content}\n</tool_response>")
@@ -3578,8 +4147,17 @@ class MLXEngine:
             # evicted/saved — resolving later (inside _generate_locked) would
             # busy-mark the wrong key and let the post-generation eviction
             # sweep evict the cache mid-use. Explicit session_ids keep exact-key
-            # behavior unchanged (no prefix scanning).
-            sid = session_id or self._resolve_anon_session_id_locked(messages)
+            # behavior unchanged (no prefix scanning). The resolver gets the
+            # request's prompt-contract fingerprint (U21) so two anon
+            # conversations with identical message prefixes but different
+            # tool schemas never share a slot.
+            sid = session_id or self._resolve_anon_session_id_locked(
+                messages,
+                prompt_fingerprint=self._prompt_fingerprint(
+                    self._canonical_tools(tools),
+                    thinking if thinking is not None else self.cfg.enable_thinking,
+                ),
+            )
             logger.debug(f"[Queue] session={sid} | lock acquired | waited={wait_ms:.0f}ms")
             yield GenerationResult(status="generating")
             # Mark the session in-flight so the post-generation eviction sweep
@@ -3675,13 +4253,62 @@ class MLXEngine:
         new_messages: list[dict] = []
         _hit_prior_len = 0
 
-        if (
-            session
+        # --- Cache-reuse contract (U1/U21/U4, one consistent gate) ---------
+        # A stored session may be reused only when ALL of:
+        #   1. its cache is live;
+        #   2. its prompt contract (tools + thinking fingerprint, U21)
+        #      matches the request — a mismatch means the cached prefix was
+        #      rendered under a different tool schema, so reuse would keep
+        #      answering with the STALE schema: honest MISS instead;
+        #   3. its stored messages prefix-match the incoming ones (U1 rules
+        #      inside _messages_match); and
+        #   4. the message suffix past the stored prefix is representable by
+        #      the suffix builder (U4): an assistant message in new_messages
+        #      is NOT cache-resident (stored messages are the authoritative
+        #      record of what the KV contains — e.g. crash recovery where
+        #      disk lagged the conversation), and manual assistant splices
+        #      are not token-exact vs apply_chat_template (F4) → the shape
+        #      is a divergence → honest MISS on ALL templates.
+        _tools_canonical = self._canonical_tools(tools)
+        _incoming_fp = self._prompt_fingerprint(_tools_canonical, use_thinking)
+        _reusable = (
+            session is not None
             and session.cache_state is not None
             and session.cache_state.cache is not None
-            and self._messages_match(session.messages, messages)
-        ):
+        )
+        if _reusable:
+            _stored_fp = getattr(session, "prompt_fingerprint", None)
+            # F5: a legacy session (fp=None — pre-fingerprint disk file or
+            # hand-built state) was built under an UNKNOWN contract: it may
+            # carry tools or a different thinking flag in its cached prefix,
+            # so ANY reuse (even toolless) would be fail-open. It takes ONE
+            # unconditional cold rebuild — an honest MISS whose save stamps
+            # the request's fingerprint — never a lenient HIT.
+            _contract_ok = _stored_fp is not None and _stored_fp == _incoming_fp
+            if not _contract_ok:
+                logger.info(
+                    f"[KV Cache] session={session_id} | prompt contract "
+                    f"{'unknown (legacy, no fingerprint)' if _stored_fp is None else 'changed'} "
+                    f"({_stored_fp or 'legacy'} -> {_incoming_fp}) — treating "
+                    f"as divergence (honest MISS rebuild stamps the contract)"
+                )
+                _reusable = False
+        if _reusable:
+            _reusable = self._messages_match(session.messages, messages)
+        if _reusable:
             new_messages = messages[len(session.messages):]
+            _blocked_asst = self._suffix_blocking_assistants(new_messages)
+            if _blocked_asst:
+                logger.info(
+                    f"[KV Cache] session={session_id} | suffix contains "
+                    f"{_blocked_asst} non-cache-resident assistant turn(s) "
+                    f"this template cannot splice — treating as divergence "
+                    f"(honest MISS)"
+                )
+                _reusable = False
+                new_messages = []
+
+        if _reusable:
             if not new_messages:
                 # Retry: discard cache, start fresh
                 cache_mode = "retry"
@@ -3939,6 +4566,14 @@ class MLXEngine:
         # rescue invalidates the session cache fail-closed.
         _turn_committed = False    # a consistent terminal was reached
         _stream_reconciled = False  # post-stream reconcile ran (idempotence)
+        # U6: True when the runner signalled fail-closed cache corruption
+        # (PLD rewind failure / MTPCacheCorruption). The QwenMTP runner now
+        # TERMINATES its stream at the corruption point, so this drives the
+        # terminal frame's finish_reason ("error") — the client sees an
+        # explicit abnormal finish instead of a silent truncation, retries,
+        # and the next turn takes an honest MISS (the corruption callback
+        # already invalidated the session cache).
+        _cache_corrupted = False
 
         def _reconcile_stream_end():
             """Post-stream reconcile: join text, drafter finalize, write back
@@ -3946,7 +4581,7 @@ class MLXEngine:
             Idempotent (guarded by _stream_reconciled) and yield-free — safe
             to run from the normal post-loop path AND from the GeneratorExit
             rescue handler."""
-            nonlocal accumulated_text, _stream_reconciled
+            nonlocal accumulated_text, _stream_reconciled, _cache_corrupted
             if _stream_reconciled:
                 return
             _stream_reconciled = True
@@ -3985,6 +4620,7 @@ class MLXEngine:
             _pld_cache_invalid = bool(getattr(self, "_pld_cache_invalid", False))
             self._pld_cache_invalid = False
             if _pld_cache_invalid:
+                _cache_corrupted = True
                 logger.error(
                     f"[KV Cache] session={session_id} | PLD cache rewind failed "
                     f"mid-stream — INVALIDATING session cache (next turn "
@@ -4158,6 +4794,8 @@ class MLXEngine:
                         hit_prior_len=_hit_prior_len,
                         prompt_len=len(full_prompt_token_ids),
                         reason=reason,
+                        tools_canonical=_tools_canonical,
+                        prompt_fingerprint=_incoming_fp,
                     )
                 else:
                     logger.warning(
@@ -4326,6 +4964,8 @@ class MLXEngine:
                     hit_prior_len=_hit_prior_len,
                     prompt_len=len(full_prompt_token_ids),
                     reason="cancelled",
+                    tools_canonical=_tools_canonical,
+                    prompt_fingerprint=_incoming_fp,
                 )
             # Idempotence marker: the cancel terminal is consistent (commit /
             # rollback / invalidate all reconcile messages ↔ token_ids).
@@ -4369,6 +5009,8 @@ class MLXEngine:
                         hit_prior_len=_hit_prior_len,
                         prompt_len=len(full_prompt_token_ids),
                         reason="empty response",
+                        tools_canonical=_tools_canonical,
+                        prompt_fingerprint=_incoming_fp,
                     )
                 else:
                     logger.warning(
@@ -4380,7 +5022,9 @@ class MLXEngine:
                 _turn_committed = True
                 yield GenerationResult(
                     text="",
-                    finish_reason="stop",
+                    # U6: a corruption-terminated stream is an abnormal end —
+                    # surface it instead of claiming a clean stop.
+                    finish_reason="error" if _cache_corrupted else "stop",
                     prompt_tokens=total_prompt_tokens,
                     completion_tokens=gen_token_count,
                 )
@@ -4388,14 +5032,22 @@ class MLXEngine:
 
         # Parse tool_calls once — used both for session persistence and
         # for the terminal GenerationResult's finish_reason.
+        # U6/F1: NEVER on a corruption-terminated stream — the text is
+        # truncated at an arbitrary point and a partial <tool_call> block
+        # must not be surfaced (or persisted) as a real, executable call.
         parsed_tool_calls: list[dict] = []
-        if has_tools and accumulated_text:
+        if has_tools and accumulated_text and not _cache_corrupted:
             _, parsed_tool_calls = parse_tool_calls(
                 accumulated_text, model_family=self.model_family,
             )
 
         # Save session
-        if session_id:
+        # U6/F1: skip persistence entirely on a corruption-terminated stream
+        # — the truncated text must not enter session.messages (the cache is
+        # already invalidated, so the stale stored messages are harmless:
+        # the next request's HIT condition requires a live cache → honest
+        # MISS cold-fill).
+        if session_id and not _cache_corrupted:
             new_offset = self._get_cache_offset(cache_state.cache) if cache_state.cache else 0
             # Fallback: some models (GLM MoE) don't expose offset in cache objects
             if new_offset == 0 and cache_state.token_ids:
@@ -4437,6 +5089,12 @@ class MLXEngine:
                 cache_state=cache_state,
                 messages=updated_messages,
                 total_cache_tokens=new_offset,
+                # U3/U21: stamp the prompt contract the cache was built /
+                # extended under so every later HIT and rebuild path can
+                # verify + re-render it.
+                tools=_tools_canonical,
+                thinking=use_thinking,
+                prompt_fingerprint=_incoming_fp,
             )
 
             logger.debug(
@@ -4455,8 +5113,16 @@ class MLXEngine:
                 messages, prompt_token_ids, tools=tools, thinking=use_thinking,
             )
 
-        # Determine finish reason (parsed_tool_calls computed above)
-        finish_reason = "tool_calls" if parsed_tool_calls else "stop"
+        # Determine finish reason (parsed_tool_calls computed above).
+        # U6: a corruption-terminated stream (QwenMTP fail-closed / PLD
+        # rewind failure) ends with finish_reason="error" — the session
+        # cache is already invalidated, so the client's retry takes an
+        # honest MISS; a partial <tool_call> in the truncated text must not
+        # be surfaced as a real tool call either.
+        if _cache_corrupted:
+            finish_reason = "error"
+        else:
+            finish_reason = "tool_calls" if parsed_tool_calls else "stop"
 
         yield GenerationResult(
             text="",
@@ -5381,6 +6047,8 @@ class MLXEngine:
         hit_prior_len: int,
         prompt_len: int,
         reason: str,
+        tools_canonical: list | None = None,
+        prompt_fingerprint: str | None = None,
     ) -> None:
         """C1 FIX: reconcile session bookkeeping after an early-returning HIT
         turn (client cancel / empty thinking-only response).
@@ -5525,6 +6193,17 @@ class MLXEngine:
             "content": self._make_full_assistant_content(
                 accumulated_text, use_thinking,
             ),
+            # U1 marker: this turn was committed by the interrupted-turn
+            # path, so its stored content may legitimately differ from what
+            # the client received (thinking channel + wire truncation).
+            # _messages_match applies the NARROW _interrupted_resend_equiv
+            # rule to marked messages — instead of the removed
+            # last-stored-assistant wildcard. The marker round-trips disk
+            # (messages are JSON metadata) and never leaks into prompts:
+            # _format_messages copies only role/content/tool_calls/
+            # tool_call_id, and suffix builders render INCOMING client
+            # messages, never this stored dict.
+            "interrupted": True,
         }
         new_offset = (
             self._get_cache_offset(cache_state.cache) if cache_state.cache else 0
@@ -5537,6 +6216,17 @@ class MLXEngine:
             cache_state=cache_state,
             messages=list(session.messages) + list(new_messages) + [assistant_msg],
             total_cache_tokens=new_offset,
+            # F5: stamp the CURRENT request's contract (a HIT turn implies it
+            # matched the session's — the U21 gate ran before the HIT), never
+            # propagate a legacy None forward: an interrupted commit that
+            # carried fp=None would re-open the legacy leniency indefinitely.
+            tools=tools_canonical,
+            thinking=use_thinking,
+            prompt_fingerprint=(
+                prompt_fingerprint
+                if prompt_fingerprint is not None
+                else self._prompt_fingerprint(tools_canonical, use_thinking)
+            ),
         )
         logger.info(
             f"[KV Cache] session={session_id} | {reason} on HIT | committed "
@@ -5715,7 +6405,15 @@ class MLXEngine:
         thinking, content = split_thinking_and_content(full_text, model_family=self.model_family)
         result.thinking = thinking
 
-        if tools:
+        if result.finish_reason == "error":
+            # U6/F1: corruption-terminated stream — the text is truncated at
+            # an arbitrary point, so a partial <tool_call> block must never
+            # be parsed into an executable tool call, and 'error' must not
+            # be overwritten with 'tool_calls'. The API layer turns this
+            # into an error response (it is not a valid OpenAI
+            # finish_reason); content is kept for diagnostics only.
+            result.content = content
+        elif tools:
             text_part, tool_calls = parse_tool_calls(content, model_family=self.model_family)
             if tool_calls:
                 result.tool_calls = tool_calls
@@ -5750,15 +6448,32 @@ class MLXEngine:
         """Replace a session's messages and rebuild KV cache from scratch.
 
         Used when client compresses/summarizes conversation context.
+
+        U3: the rebuild tokenizes WITH the session's stored prompt contract
+        (tools + thinking) — a bare re-tokenization would silently drop the
+        tool schema from the cached prefix, so every later HIT turn would
+        answer without the tools in context.
         """
         with self._lock:
             self._touch_gpu()
             t0 = time.perf_counter()
 
-            prompt_tokens = self._tokenize_prompt(messages)
+            prev = self._sessions.get(session_id)
+            # An evicted-but-persisted session still carries its contract on
+            # disk — reload it (mirrors truncate_session) before rebuilding.
+            if prev is None and self._has_disk_cache(session_id):
+                prev = self._load_session_from_disk(session_id)
+                if prev:
+                    self._sessions[session_id] = prev
+            sess_tools = getattr(prev, "tools", None) if prev else None
+            sess_thinking = getattr(prev, "thinking", True) if prev else True
+
+            prompt_tokens = self._tokenize_prompt(
+                messages, thinking=sess_thinking, tools=sess_tools,
+            )
 
             # Try base cache first
-            base = self._find_base_cache(messages)
+            base = self._find_base_cache(messages, tools=sess_tools)
             base_tokens_used = 0
             prompt_cache = None
             if base and len(prompt_tokens) >= base.token_count:
@@ -5782,12 +6497,16 @@ class MLXEngine:
             cache_state.cache = prompt_cache
             cache_state.token_ids = prompt_tokens
 
-            prev = self._sessions.get(session_id)
             prev_tokens = prev.total_cache_tokens if prev else 0
             self._sessions[session_id] = SessionState(
                 cache_state=cache_state,
                 messages=messages,
                 total_cache_tokens=new_offset,
+                tools=sess_tools,
+                thinking=sess_thinking,
+                prompt_fingerprint=self._prompt_fingerprint(
+                    sess_tools, sess_thinking,
+                ),
             )
 
             logger.info(
@@ -5799,7 +6518,9 @@ class MLXEngine:
             )
 
             # Auto-register base cache
-            self._maybe_register_base_cache(messages, prompt_tokens)
+            self._maybe_register_base_cache(
+                messages, prompt_tokens, tools=sess_tools, thinking=sess_thinking,
+            )
 
             self._mark_dirty(session_id)
 
@@ -6137,7 +6858,14 @@ class MLXEngine:
         else:
             return {"error": "source session not found and no messages provided"}
 
-        return self._rebuild_session(new_session_id, engine_messages)
+        # U3: the branch inherits the SOURCE session's prompt contract; a
+        # message-only branch (no source) has no contract to inherit.
+        return self._rebuild_session(
+            new_session_id,
+            engine_messages,
+            tools=getattr(source, "tools", None) if source else None,
+            thinking=getattr(source, "thinking", True) if source else True,
+        )
 
     def prepare_regenerate(self, session_id: str) -> dict:
         """Remove last assistant message and restore cache."""
@@ -6175,19 +6903,38 @@ class MLXEngine:
             return {"error": "nothing to truncate"}
 
         restore_messages = session.messages[:target_msg_count]
-        return self._rebuild_session(session_id, restore_messages)
+        # U3: rebuild under the session's own prompt contract.
+        return self._rebuild_session(
+            session_id,
+            restore_messages,
+            tools=getattr(session, "tools", None),
+            thinking=getattr(session, "thinking", True),
+        )
 
-    def _rebuild_session(self, session_id: str, messages: list[dict]) -> dict:
-        """Build a fresh KV cache for the given messages."""
+    def _rebuild_session(
+        self,
+        session_id: str,
+        messages: list[dict],
+        tools: list | None = None,
+        thinking: bool = True,
+    ) -> dict:
+        """Build a fresh KV cache for the given messages.
+
+        U3: ``tools``/``thinking`` are the session's stored prompt contract
+        (callers pass the source SessionState's fields) so the rebuilt
+        prefix keeps the tool schema in context — a bare re-tokenization
+        would silently drop it for every later HIT turn."""
         with self._lock:
             self._touch_gpu()
             t0 = time.perf_counter()
 
-            prompt_tokens = self._tokenize_prompt(messages)
+            prompt_tokens = self._tokenize_prompt(
+                messages, thinking=thinking, tools=tools,
+            )
 
             # Try base cache first
             prompt_cache = None
-            base = self._find_base_cache(messages)
+            base = self._find_base_cache(messages, tools=tools)
             feed_tokens = prompt_tokens
             if base and len(prompt_tokens) >= base.token_count:
                 if prompt_tokens[:base.token_count] == base.tokens:
@@ -6211,6 +6958,9 @@ class MLXEngine:
                 messages=messages,
                 total_cache_tokens=new_offset,
                 pending_build_time=elapsed,
+                tools=tools,
+                thinking=thinking,
+                prompt_fingerprint=self._prompt_fingerprint(tools, thinking),
             )
             self._mark_dirty(session_id)
 

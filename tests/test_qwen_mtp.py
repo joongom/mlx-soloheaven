@@ -30,7 +30,25 @@ Covers:
     gen_iter.close() still runs the finalize), the reconcile must either
     trim back cleanly (verified per-layer) or INVALIDATE — a lying or
     throwing trim must never leave a partially-trimmed (desynced) cache
-    live; the MTP finalize-hidden stash is cleared with the cache.
+    live; the MTP finalize-hidden stash is cleared with the cache;
+  * HIT-session early-return commit (C1) — a cancelled or empty
+    (thinking-only) HIT turn must never leave session.messages desynced
+    from the in-place-advanced session cache: partial output is committed
+    as an assistant turn, cancel-before-any-token rolls the prefilled
+    suffix back (or invalidates when untrimmable), and the next
+    same-history request never splices user_N a second time. Amendments:
+    (A1) the turn close is TRI-STATE (TurnCloseResult) — gemma4/glm or an
+    already-terminated tail commit as-is (NOT_REQUIRED), a verified
+    <|im_end|> forward commits (CLOSED), and a required-but-unavailable
+    close (vlm path / head-bearing cache / no eot / non-callable target /
+    forward failure / offset mismatch) INVALIDATES fail-closed (FAILED)
+    instead of committing an unterminated ChatML turn; (A2) the
+    empty-response commit verifies the recorded tail IS an end-of-turn
+    token before assuming natural termination (max_tokens exhaustion must
+    close or invalidate); (A3) closing the engine generator mid-stream
+    (GeneratorExit — the client-disconnect teardown both production
+    drivers produce) runs the same reconcile+commit via a rescue
+    finalization instead of skipping the post-loop entirely.
 """
 
 from __future__ import annotations
@@ -1174,7 +1192,9 @@ def _generate_engine(cache, stored, *, mtp, suffix):
     the mlx-lm path with a PRE-SEEDED cache-hit session. The session's
     cache_state object is mutated in place by the post-loop reconcile, so a
     cancelled stream's outcome (clean trim vs invalidation) is observable
-    even though cancellation skips the session save. No real model."""
+    directly on it; since the C1 fix, cancellation additionally COMMITS the
+    session (messages + total_cache_tokens) instead of skipping the save.
+    No real model."""
     from mlx_soloheaven.engine.mlx_engine import SessionState
     from mlx_vlm.generate import PromptCacheState
 
@@ -1425,15 +1445,25 @@ def test_generate_locked_cancel_honest_trim_survives_verified(monkeypatch):
     """Positive control: with honest trimmable layers the cancel-path
     reconcile trims the cache back to EXACTLY len(token_ids) (verified
     per-layer) and the cache survives — the fail-closed guard must not
-    degrade the legitimate trim-back into a blanket cold-fill."""
+    degrade the legitimate trim-back into a blanket cold-fill. Since the
+    tri-state amendment the C1 commit additionally template-CLOSES the
+    interrupted ChatML turn (this engine is close-capable), so the eot id
+    trails the recorded history."""
     from mlx_soloheaven.engine import mlx_engine as mlx_engine_module
 
+    EOT = 77
     stored = [1, 2, 3, 4, 5]
     suffix = [40, 20, 21]
     cache = [MockKV() for _ in range(5)]
     for c in cache:
         c.offset = len(stored)
     eng, cs, messages = _generate_engine(cache, stored, mtp=False, suffix=suffix)
+    eng._language_model = _CallableTargetModel()
+    eng.tokenizer = SimpleNamespace(
+        decode=lambda ids: "x",
+        eos_token_ids=[],
+        get_vocab=lambda: {"<|im_end|>": EOT},
+    )
 
     def fake_lm_stream(model, tokenizer, prompt, **kwargs):
         prompt_cache = kwargs["prompt_cache"]
@@ -1454,9 +1484,10 @@ def test_generate_locked_cancel_honest_trim_survives_verified(monkeypatch):
 
     chunks = _drive_cancelled(eng, messages, cancel_after=2)
     assert len(chunks) == 2
-    # Cache survived, trimmed back to exactly the recorded history.
+    # Cache survived: trimmed back to exactly the recorded history, then
+    # template-closed (eot forwarded + recorded) by the C1 commit.
     assert cs.cache is cache
-    assert cs.token_ids == stored + suffix + [101, 102]
+    assert cs.token_ids == stored + suffix + [101, 102, EOT]
     for c in cache:
         assert c.offset == len(cs.token_ids)
     _assert_no_desynced_cache(cs)
@@ -1748,3 +1779,877 @@ def test_generate_locked_healthy_length_stop_exact_accounting(monkeypatch):
         cs.mtp_last_hidden,
     )
     assert ok, why
+
+
+# ---------------------------------------------------------------------------
+# C1: HIT-session early-return cache pollution — cancel / empty-response
+# turns must COMMIT (or roll back) so session.messages never desyncs from the
+# in-place-advanced session cache, and the next same-history request never
+# splices user_N a second time after a dangling partial output.
+# ---------------------------------------------------------------------------
+
+
+def _use_real_messages_match(eng):
+    """Swap the helper's always-True matcher for the REAL prefix matcher so
+    the committed interrupted turn has to survive the production leniency
+    rules (last-stored-assistant content tolerance etc.)."""
+    from mlx_soloheaven.engine.mlx_engine import MLXEngine
+
+    eng._messages_match = MLXEngine._messages_match.__get__(eng)
+
+
+def _content_token_suffix(eng):
+    """Suffix stub that encodes each non-assistant message's content ("uN")
+    as one distinctive token (50+N) plus the assistant-header token 99 — a
+    re-spliced user message is then visible as its token appearing twice in
+    the prompt handed to the runner."""
+
+    def fake_suffix(msgs, thinking=True):
+        out = []
+        for m in msgs:
+            if m.get("role") != "assistant":
+                out.append(50 + int(str(m.get("content"))[1:]))
+        out.append(99)
+        return out
+
+    eng._suffix_tokens = fake_suffix
+
+
+def _scripted_lm_stream(monkeypatch, prompts_seen, scripts, *, advance="pre"):
+    """Monkeypatch lm_stream_generate with per-call token scripts.
+
+    ``advance="pre"``: each layer's offset advances BEFORE the frame is
+    yielded (a dropped in-flight frame leaves the cache AHEAD — the shape
+    the reconcile trim-back handles). ``advance="post"``: mlx-lm lookahead
+    semantics — at yield of y_i the cache holds exactly prompt+i tokens, so
+    a cancel on the FIRST frame leaves the cache exactly at the prompt.
+    """
+    from mlx_soloheaven.engine import mlx_engine as mlx_engine_module
+
+    calls = {"n": 0}
+
+    def fake_lm_stream(model, tokenizer, prompt, **kwargs):
+        prompts_seen.append(list(prompt))
+        script = scripts[min(calls["n"], len(scripts) - 1)]
+        calls["n"] += 1
+        prompt_cache = kwargs["prompt_cache"]
+
+        def gen():
+            for c in prompt_cache:
+                if hasattr(c, "offset"):
+                    c.offset += len(prompt)
+            for tid, text in script:
+                if advance == "pre":
+                    for c in prompt_cache:
+                        if hasattr(c, "offset"):
+                            c.offset += 1
+                yield SimpleNamespace(
+                    text=text, token=tid, prompt_tps=1.0, generation_tps=1.0,
+                )
+                if advance == "post":
+                    for c in prompt_cache:
+                        if hasattr(c, "offset"):
+                            c.offset += 1
+
+        return gen()
+
+    monkeypatch.setattr(mlx_engine_module, "lm_stream_generate", fake_lm_stream)
+
+
+def _drive_full(eng, messages, *, max_tokens=8, thinking=False):
+    """Drive _generate_locked to natural completion (no cancel)."""
+    return list(
+        eng._generate_locked(
+            messages,
+            max_tokens=max_tokens,
+            temperature=0.0,
+            session_id="s",
+            tools=None,
+            cancel_event=None,
+            thinking=thinking,
+            thinking_budget=0,
+            top_p=1.0,
+            min_p=0.0,
+            top_k=0,
+            repetition_penalty=1.0,
+            response_format=None,
+        )
+    )
+
+
+def _drive_pre_cancelled(eng, messages, *, max_tokens=8):
+    """Cancel BEFORE any token is recorded: the event is set up front, so the
+    stream loop pulls exactly one frame, sees the cancel, and drops it."""
+    cancel = threading.Event()
+    cancel.set()
+    return list(
+        eng._generate_locked(
+            messages,
+            max_tokens=max_tokens,
+            temperature=0.0,
+            session_id="s",
+            tools=None,
+            cancel_event=cancel,
+            thinking=False,
+            thinking_budget=0,
+            top_p=1.0,
+            min_p=0.0,
+            top_k=0,
+            repetition_penalty=1.0,
+            response_format=None,
+        )
+    )
+
+
+def test_generate_locked_cancel_commits_turn_no_double_inject(monkeypatch):
+    """C1 (a): cancel mid-generation on a HIT session. The partial turn must
+    be COMMITTED (messages + total_cache_tokens consistent with token_ids),
+    and the NEXT same-history request must extend with user_{N+1} ONLY —
+    pre-fix, the stale session.messages matched the resent history and
+    user_N's suffix tokens were spliced a SECOND time after the dangling
+    partial output.
+
+    Tri-state amendment (A1): a ChatML commit is only allowed when the turn
+    is (or can be made) template-valid — this engine is close-CAPABLE
+    (callable target + <|im_end|> in vocab), so the close reconcile returns
+    CLOSED: the eot id lands in token_ids and the commit proceeds."""
+    EOT = 77
+    stored = [1, 2, 3, 4, 5]
+    cache = [MockKV() for _ in range(5)]
+    for c in cache:
+        c.offset = len(stored)
+    eng, cs, messages = _generate_engine(cache, stored, mtp=False, suffix=[])
+    _use_real_messages_match(eng)
+    _content_token_suffix(eng)
+    eng._language_model = _CallableTargetModel()
+    eng.tokenizer = SimpleNamespace(
+        decode=lambda ids: "x",
+        eos_token_ids=[],
+        get_vocab=lambda: {"<|im_end|>": EOT},
+    )
+
+    prompts_seen: list = []
+    _scripted_lm_stream(
+        monkeypatch, prompts_seen,
+        [
+            [(101, "x"), (102, "x"), (103, "x"), (104, "x")],
+            [(201, "y"), (202, "y")],
+        ],
+    )
+
+    orig_sess = eng._sessions["s"]
+    chunks = _drive_cancelled(eng, messages, cancel_after=2)
+    assert len(chunks) == 2
+
+    # Turn 1 prompt: stored history + suffix([u2]) = [52, 99].
+    assert prompts_seen[0] == [52, 99]
+
+    # Committed session: messages ↔ token_ids consistent, turn CLOSED (eot).
+    sess = eng._sessions["s"]
+    assert sess is not orig_sess  # committed via a fresh SessionState
+    assert sess.cache_state is cs  # alias preserved
+    assert cs.token_ids == stored + [52, 99] + [101, 102, EOT]
+    assert [m.get("role") for m in sess.messages] == [
+        "user", "assistant", "user", "assistant",
+    ]
+    assert sess.messages[-1]["content"] == "xx"  # partial output, no thinking
+    assert sess.total_cache_tokens == len(cs.token_ids)
+    for c in cache:
+        assert c.offset == len(cs.token_ids)
+    _assert_no_desynced_cache(cs)
+
+    # Turn 2: client resends its (truncated) view of the partial assistant
+    # turn + a new user message. _messages_match's last-assistant leniency
+    # accepts the content difference -> HIT -> suffix for u3 ONLY.
+    messages2 = list(messages) + [
+        {"role": "assistant", "content": "x"},
+        {"role": "user", "content": "u3"},
+    ]
+    chunks2 = _drive_full(eng, messages2, max_tokens=2)
+    assert chunks2[-1].finish_reason == "stop"
+    # THE BUG SHAPE: pre-fix this prompt was [52, 53, 99] (u2 re-spliced).
+    assert prompts_seen[1] == [53, 99]
+    assert cs.token_ids == (
+        stored + [52, 99] + [101, 102, EOT] + [53, 99] + [201, 202]
+    )
+    _assert_no_desynced_cache(cs)
+    sess2 = eng._sessions["s"]
+    assert [m.get("content") for m in sess2.messages] == [
+        "u1", "a1", "u2", "xx", "u3", "yy",
+    ]
+    assert sess2.total_cache_tokens == len(cs.token_ids)
+
+
+class _CallableTargetModel:
+    """Callable stand-in for the mlx-lm target: forwarding T tokens advances
+    every offset-bearing cache layer by T (what the C1 turn-close forward
+    relies on)."""
+
+    def __init__(self, n_layers=5):
+        self.layers = [object()] * n_layers
+
+    def __call__(self, toks, cache=None):
+        n = int(toks.shape[1])
+        for c in cache or []:
+            if hasattr(c, "offset"):
+                c.offset += n
+
+    def make_cache(self):
+        return [MockKV() for _ in range(5)]
+
+
+def test_generate_locked_cancel_commit_template_closes_chatml(monkeypatch):
+    """C1 principle 2: on the chatml/mlx-lm path with a target-only cache,
+    the cancel commit template-closes the interrupted assistant turn by
+    forwarding <|im_end|> through the target (1-token forward) — token_ids
+    gains the eot id, every layer lands on len(token_ids), and the cached
+    sequence is template-valid for the next turn."""
+    EOT = 77
+    stored = [1, 2, 3, 4, 5]
+    cache = [MockKV() for _ in range(5)]
+    for c in cache:
+        c.offset = len(stored)
+    eng, cs, messages = _generate_engine(cache, stored, mtp=False, suffix=[])
+    _use_real_messages_match(eng)
+    _content_token_suffix(eng)
+    eng._language_model = _CallableTargetModel()
+    eng.tokenizer = SimpleNamespace(
+        decode=lambda ids: "x",
+        eos_token_ids=[],
+        get_vocab=lambda: {"<|im_end|>": EOT},
+    )
+
+    prompts_seen: list = []
+    _scripted_lm_stream(
+        monkeypatch, prompts_seen,
+        [
+            [(101, "x"), (102, "x"), (103, "x"), (104, "x")],
+            [(201, "y")],
+        ],
+    )
+
+    chunks = _drive_cancelled(eng, messages, cancel_after=2)
+    assert len(chunks) == 2
+
+    # Turn closed: eot forwarded through the target and recorded.
+    assert cs.token_ids == stored + [52, 99] + [101, 102, EOT]
+    for c in cache:
+        assert c.offset == len(cs.token_ids)
+    _assert_no_desynced_cache(cs)
+    sess = eng._sessions["s"]
+    assert sess.messages[-1] == {"role": "assistant", "content": "xx"}
+    assert sess.total_cache_tokens == len(cs.token_ids)
+
+    # Next turn extends the template-valid sequence with u3's suffix only.
+    messages2 = list(messages) + [
+        {"role": "assistant", "content": "xx"},
+        {"role": "user", "content": "u3"},
+    ]
+    _drive_full(eng, messages2, max_tokens=1)
+    assert prompts_seen[1] == [53, 99]
+
+
+def test_generate_locked_empty_response_hit_commits_consistent(monkeypatch):
+    """C1 (b): a thinking-only (no content) HIT turn used to 'SKIP SAVE' —
+    but the session's live cache had already been advanced in place. The
+    guard must COMMIT the thinking-only assistant turn (same shape the
+    normal save stores: <think>\\n prefix + accumulated text) so the next
+    request extends honestly instead of double-splicing user_N.
+
+    A2 amendment: the commit no longer ASSUMES natural termination — it
+    verifies the recorded tail against the end-of-turn ids. Here the stream
+    DID end naturally (the terminal frame's token 302 is a tokenizer EOS id,
+    recorded + forwarded like mlx-lm's real terminal frame), so the close
+    reconcile returns NOT_REQUIRED and the turn commits as-is (no eot
+    injection)."""
+    stored = [1, 2, 3, 4, 5]
+    cache = [MockKV() for _ in range(5)]
+    for c in cache:
+        c.offset = len(stored)
+    eng, cs, messages = _generate_engine(cache, stored, mtp=False, suffix=[])
+    _use_real_messages_match(eng)
+    _content_token_suffix(eng)
+    # The terminal frame's token IS an end-of-turn token: natural EOS shape.
+    eng.tokenizer = SimpleNamespace(decode=lambda ids: "x", eos_token_ids=[302])
+
+    prompts_seen: list = []
+    _scripted_lm_stream(
+        monkeypatch, prompts_seen,
+        [
+            [(301, "pondering"), (302, "</think>")],
+            [(401, "z")],
+        ],
+    )
+
+    chunks = _drive_full(eng, messages, max_tokens=8, thinking=True)
+    # The guard still yields the terminal stop frame to the client.
+    assert chunks[-1].finish_reason == "stop"
+    assert chunks[-1].text == ""
+
+    sess = eng._sessions["s"]
+    assert sess.messages[-1] == {
+        "role": "assistant",
+        "content": "<think>\npondering</think>",
+    }
+    assert cs.token_ids == stored + [52, 99] + [301, 302]
+    assert sess.total_cache_tokens == len(cs.token_ids)
+    for c in cache:
+        assert c.offset == len(cs.token_ids)
+    _assert_no_desynced_cache(cs)
+
+    # Next turn: client's assistant view is empty content (it never received
+    # any) — normalization strips the stored thinking, both sides match, and
+    # only u3's suffix is spliced (pre-fix: [52, 53, 99] double-inject).
+    messages2 = list(messages) + [
+        {"role": "assistant", "content": ""},
+        {"role": "user", "content": "u3"},
+    ]
+    _drive_full(eng, messages2, max_tokens=1, thinking=True)
+    assert prompts_seen[1] == [53, 99]
+    _assert_no_desynced_cache(cs)
+
+
+def test_generate_locked_cancel_before_any_token_rolls_suffix_back(monkeypatch):
+    """C1 principle 3 (trimmable): cancel before ANY generated token was
+    recorded. Committing an empty assistant turn would be wrong — the
+    prefilled suffix is ROLLED BACK (verified per-layer) to the pre-turn
+    history, and session.messages (unchanged) exactly describes the result.
+    The next request re-splices u2 fresh, exactly once."""
+    stored = [1, 2, 3, 4, 5]
+    cache = [MockKV() for _ in range(5)]
+    for c in cache:
+        c.offset = len(stored)
+    eng, cs, messages = _generate_engine(cache, stored, mtp=False, suffix=[])
+    _use_real_messages_match(eng)
+    _content_token_suffix(eng)
+
+    prompts_seen: list = []
+    # advance="post": mlx-lm lookahead — at the first yield the cache holds
+    # exactly the prompt, so the dropped frame leaves offset == prompt_len.
+    _scripted_lm_stream(
+        monkeypatch, prompts_seen,
+        [
+            [(101, "x"), (102, "x"), (103, "x")],
+            [(201, "y")],
+        ],
+        advance="post",
+    )
+
+    orig_sess = eng._sessions["s"]
+    chunks = _drive_pre_cancelled(eng, messages)
+    assert chunks == []  # nothing reached the client
+
+    # Suffix rolled back: cache and token_ids at the pre-turn history,
+    # session object untouched (messages already accurate).
+    assert eng._sessions["s"] is orig_sess
+    assert cs.token_ids == stored
+    for c in cache:
+        assert c.offset == len(stored)
+    assert orig_sess.total_cache_tokens == len(stored)
+    assert [m.get("content") for m in orig_sess.messages] == ["u1", "a1"]
+    _assert_no_desynced_cache(cs)
+
+    # Next request (same history): HIT again, u2 spliced exactly once.
+    _drive_full(eng, messages, max_tokens=1)
+    assert prompts_seen[1] == [52, 99]
+    assert cs.token_ids == stored + [52, 99] + [201]
+    _assert_no_desynced_cache(cs)
+
+
+def test_generate_locked_cancel_before_any_token_hybrid_invalidates(monkeypatch):
+    """C1 principle 3 (untrimmable): same cancel-before-any-token shape on a
+    hybrid cache (ArraysCache recurrent layers cannot trim) — the suffix
+    cannot be rolled back, so the session cache is INVALIDATED (fail-closed;
+    stale messages are then harmless) and the next request honestly MISSes
+    into a full cold-fill instead of splicing after a dangling suffix."""
+    stored = [1, 2, 3, 4, 5]
+    cache = [MockArrays(), MockArrays(), MockKV(), MockArrays(), MockKV()]
+    for c in cache:
+        if hasattr(c, "offset"):
+            c.offset = len(stored)
+    eng, cs, messages = _generate_engine(cache, stored, mtp=False, suffix=[])
+    _use_real_messages_match(eng)
+    _content_token_suffix(eng)
+
+    prompts_seen: list = []
+    _scripted_lm_stream(
+        monkeypatch, prompts_seen,
+        [
+            [(101, "x"), (102, "x")],
+            [(201, "y")],
+        ],
+        advance="post",
+    )
+
+    orig_sess = eng._sessions["s"]
+    chunks = _drive_pre_cancelled(eng, messages)
+    assert chunks == []
+
+    # Fail-closed: cache + token_ids + stash gone, messages untouched.
+    assert cs.cache is None
+    assert cs.token_ids is None
+    _assert_no_desynced_cache(cs)
+    assert eng._sessions["s"] is orig_sess
+    assert [m.get("content") for m in orig_sess.messages] == ["u1", "a1"]
+
+    # Next request: no live cache -> MISS -> full tokenized prompt cold-fill.
+    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None: [11, 12, 13, 14]
+    _drive_full(eng, messages, max_tokens=1)
+    assert prompts_seen[1] == [11, 12, 13, 14]
+    new_cs = eng._sessions["s"].cache_state
+    assert new_cs is not cs
+    _assert_no_desynced_cache(new_cs)
+
+
+def test_generate_locked_mtp_cancel_session_consistent_next_turn(monkeypatch):
+    """C1 test 4: cancel on an MTP-finalized (target+head) HIT session. The
+    reconcile invalidates the hybrid cache (finalize ran at close, cache
+    lands AHEAD, ArraysCache cannot rewind) and the C1 commit's Path 0
+    leaves the stale messages harmless: no desynced survivor (stash/head
+    included), and the next same-history request MISSes into an honest full
+    cold-fill whose new session passes _assert_no_desynced_cache with the
+    finalized head layout."""
+    from mlx_soloheaven.engine import qwen_mtp as qwen_mtp_mod
+
+    STOP = 7
+    next_map = lambda t: (t + 1) % 50
+    stored = [1, 2, 3, 4, STOP]
+    suffix = [40, 20, 21]
+
+    cache = [
+        MockArrays(), MockArrays(), MockKV(), MockArrays(), MockKV(), MockKV(),
+    ]
+    for c in cache:
+        if hasattr(c, "offset"):
+            c.offset = len(stored)
+    cache[5].offset = len(stored) - 1
+    for i in (0, 1, 3):
+        cache[i].cache = [tuple(stored)]
+
+    eng, cs, messages = _generate_engine(cache, stored, mtp=True, suffix=suffix)
+    cs.mtp_last_hidden = mx.array([[[float(STOP)]]])
+    cs.mtp_hidden_offset = len(stored)
+
+    prompt_lens: List[int] = []
+
+    def fake_step(prompt, model, head, **kwargs):
+        prompt_lens.append(int(prompt.size))
+        return qwen_mtp_generate_step(
+            prompt, model=None, head=None,
+            ops=MockOps(next_map, next_map), **kwargs,
+        )
+
+    monkeypatch.setattr(qwen_mtp_mod, "qwen_mtp_generate_step", fake_step)
+    # Mock-vs-real artifact: the turn-2 cold-fill appends a REAL mlx-lm
+    # KVCache head after the 5 MOCK target entries, and _get_cache_offset's
+    # first pass (type name == "KVCache") would then read the HEAD's offset
+    # instead of a target's. In production every full-attention TARGET layer
+    # is a real KVCache and precedes the head, so the head is never selected
+    # — keep the mock cache homogeneous instead.
+    monkeypatch.setattr(
+        qwen_mtp_mod, "make_head_cache",
+        lambda n: [MockKV() for _ in range(max(1, n))],
+    )
+
+    orig_sess = eng._sessions["s"]
+    chunks = _drive_cancelled(eng, messages, cancel_after=2)
+    assert len(chunks) == 2
+
+    # Invalidated fail-closed; stash/head cannot survive desynced.
+    assert cs.cache is None and cs.token_ids is None
+    assert cs.mtp_last_hidden is None and cs.mtp_hidden_offset is None
+    _assert_no_desynced_cache(cs)
+    # Path 0: session untouched — stale messages are harmless w/o a cache.
+    assert eng._sessions["s"] is orig_sess
+    assert [m.get("content") for m in orig_sess.messages] == ["u1", "a1"]
+
+    # Next same-history request: HIT requires a live cache -> honest MISS ->
+    # the FULL tokenized prompt is cold-filled (no stale splice), and the
+    # new MTP session finalizes into the consistent head-trailing layout.
+    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None: [11, 12, 13, 14]
+    chunks2 = _drive_full(eng, messages, max_tokens=3)
+    assert chunks2[-1].finish_reason == "stop"
+    assert prompt_lens[-1] == 4  # full prompt, not a suffix splice
+    sess2 = eng._sessions["s"]
+    new_cs = sess2.cache_state
+    assert new_cs is not cs
+    _assert_no_desynced_cache(new_cs, mtp_head_trailing=True)
+    assert [m.get("content") for m in sess2.messages[:-1]] == ["u1", "a1", "u2"]
+    assert sess2.messages[-1]["role"] == "assistant"
+    assert sess2.total_cache_tokens == len(new_cs.token_ids)
+
+
+def test_generate_locked_normal_eos_save_regression(monkeypatch):
+    """C1 test 5 (regression): a normal, uncancelled turn with real content
+    must save the session EXACTLY as before the fix — one assistant message
+    appended, token_ids == prompt + generated, no interrupted-turn commit
+    artifacts (no eot injection, no rollback)."""
+    stored = [1, 2, 3, 4, 5]
+    cache = [MockKV() for _ in range(5)]
+    for c in cache:
+        c.offset = len(stored)
+    eng, cs, messages = _generate_engine(cache, stored, mtp=False, suffix=[])
+    _use_real_messages_match(eng)
+    _content_token_suffix(eng)
+    # A vocab-bearing tokenizer proves the eot close does NOT fire on the
+    # healthy path even when it is detectable.
+    eng._language_model = _CallableTargetModel()
+    eng.tokenizer = SimpleNamespace(
+        decode=lambda ids: "x",
+        eos_token_ids=[],
+        get_vocab=lambda: {"<|im_end|>": 77},
+    )
+
+    prompts_seen: list = []
+    _scripted_lm_stream(
+        monkeypatch, prompts_seen,
+        [[(101, "x"), (102, "x")]],
+    )
+
+    chunks = _drive_full(eng, messages, max_tokens=2)
+    assert chunks[-1].finish_reason == "stop"
+
+    sess = eng._sessions["s"]
+    assert [m.get("content") for m in sess.messages] == ["u1", "a1", "u2", "xx"]
+    assert cs.token_ids == stored + [52, 99] + [101, 102]  # no 77 injected
+    assert sess.total_cache_tokens == len(cs.token_ids)
+    for c in cache:
+        assert c.offset == len(cs.token_ids)
+    _assert_no_desynced_cache(cs)
+
+
+# ---------------------------------------------------------------------------
+# C1 amendments — A1 tri-state close, A2 empty-response tail verification,
+# A3 GeneratorExit (stream teardown) finalization.
+# ---------------------------------------------------------------------------
+
+
+def test_try_close_interrupted_turn_tri_state():
+    """A1 unit coverage: every close path maps to the right tri-state, and
+    every FAILED path invalidates fail-closed — 'close unnecessary'
+    (gemma4/glm, EOT tail) commits as-is, while 'close unavailable' must
+    NEVER leave a live cache for an unterminated ChatML commit."""
+    from mlx_soloheaven.engine.mlx_engine import TurnCloseResult
+
+    def fresh(family="chatml", *, vlm=False, model=None, tokenizer=None,
+              n_cache=5):
+        stored = [1, 2, 3, 4, 5]
+        cache = [MockKV() for _ in range(n_cache)]
+        for c in cache:
+            c.offset = len(stored)
+        eng, cs, _ = _generate_engine(cache, stored, mtp=False, suffix=[])
+        eng.model_family = family
+        eng._use_vlm = vlm
+        if model is not None:
+            eng._language_model = model
+        if tokenizer is not None:
+            eng.tokenizer = tokenizer
+        return eng, cs
+
+    vocab_tok = SimpleNamespace(
+        decode=lambda ids: "x",
+        eos_token_ids=[],
+        get_vocab=lambda: {"<|im_end|>": 77},
+    )
+
+    # gemma4 / glm: template needs no closer — NOT_REQUIRED, cache untouched.
+    for family in ("gemma4", "glm"):
+        eng, cs = fresh(family)
+        assert (
+            eng._try_close_interrupted_turn("s", cs)
+            is TurnCloseResult.NOT_REQUIRED
+        )
+        assert cs.cache is not None and cs.token_ids == [1, 2, 3, 4, 5]
+
+    # A2: recorded tail already an end-of-turn token — NOT_REQUIRED even on
+    # an otherwise close-incapable engine (natural termination verified).
+    eng, cs = fresh(
+        tokenizer=SimpleNamespace(decode=lambda ids: "x", eos_token_ids=[5]),
+    )
+    assert (
+        eng._try_close_interrupted_turn("s", cs)
+        is TurnCloseResult.NOT_REQUIRED
+    )
+    assert cs.cache is not None
+    assert cs.token_ids[-1] == 5  # nothing injected
+
+    # ChatML + mlx-vlm path: close unavailable — FAILED + invalidated.
+    eng, cs = fresh(vlm=True, tokenizer=vocab_tok, model=_CallableTargetModel())
+    assert eng._try_close_interrupted_turn("s", cs) is TurnCloseResult.FAILED
+    assert cs.cache is None and cs.token_ids is None
+
+    # ChatML + head-bearing (target+head) cache: FAILED + invalidated.
+    eng, cs = fresh(n_cache=6, tokenizer=vocab_tok, model=_CallableTargetModel())
+    assert eng._try_close_interrupted_turn("s", cs) is TurnCloseResult.FAILED
+    assert cs.cache is None and cs.token_ids is None
+
+    # ChatML + non-callable target: FAILED + invalidated.
+    eng, cs = fresh(tokenizer=vocab_tok)
+    assert eng._try_close_interrupted_turn("s", cs) is TurnCloseResult.FAILED
+    assert cs.cache is None and cs.token_ids is None
+
+    # ChatML + no detectable end-of-turn token: FAILED + invalidated.
+    eng, cs = fresh(model=_CallableTargetModel())
+    assert eng._try_close_interrupted_turn("s", cs) is TurnCloseResult.FAILED
+    assert cs.cache is None and cs.token_ids is None
+
+    # ChatML + callable target + vocab: CLOSED — eot recorded + verified.
+    eng, cs = fresh(tokenizer=vocab_tok, model=_CallableTargetModel())
+    assert eng._try_close_interrupted_turn("s", cs) is TurnCloseResult.CLOSED
+    assert cs.token_ids == [1, 2, 3, 4, 5, 77]
+    for c in cs.cache:
+        assert c.offset == len(cs.token_ids)
+
+
+def test_generate_locked_cancel_chatml_close_unavailable_invalidates(
+    monkeypatch,
+):
+    """A1 end-to-end: cancel on a ChatML HIT where the close is UNAVAILABLE
+    (no <|im_end|> in the vocab, non-callable target). Pre-amendment this
+    COMMITTED the unterminated turn — the next HIT's suffix splice
+    (_suffix_tokens_chatml) then assumed a prior <|im_end|> that was never
+    in the KV (template corruption). Now: FAILED → session cache
+    invalidated fail-closed, messages left stale-but-harmless, and the next
+    same-history request honestly MISSes into a full cold-fill."""
+    stored = [1, 2, 3, 4, 5]
+    cache = [MockKV() for _ in range(5)]
+    for c in cache:
+        c.offset = len(stored)
+    eng, cs, messages = _generate_engine(cache, stored, mtp=False, suffix=[])
+    _use_real_messages_match(eng)
+    _content_token_suffix(eng)
+    # Default _generate_engine stub: no get_vocab (eot undetectable) and a
+    # non-callable SimpleNamespace target — close-incapable by construction.
+
+    prompts_seen: list = []
+    _scripted_lm_stream(
+        monkeypatch, prompts_seen,
+        [
+            [(101, "x"), (102, "x"), (103, "x")],
+            [(201, "y")],
+        ],
+    )
+
+    orig_sess = eng._sessions["s"]
+    chunks = _drive_cancelled(eng, messages, cancel_after=2)
+    assert len(chunks) == 2
+
+    # NOT committed unterminated: invalidated fail-closed instead.
+    assert cs.cache is None
+    assert cs.token_ids is None
+    _assert_no_desynced_cache(cs)
+    assert eng._sessions["s"] is orig_sess  # no commit happened
+    assert [m.get("content") for m in orig_sess.messages] == ["u1", "a1"]
+
+    # Next same-history request: HIT requires a live cache → honest MISS →
+    # the FULL tokenized prompt cold-fills (no stale splice).
+    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None: [11, 12, 13, 14]
+    _drive_full(eng, messages, max_tokens=1)
+    assert prompts_seen[1] == [11, 12, 13, 14]
+
+
+def test_generate_locked_empty_response_exhaustion_closes_chatml(monkeypatch):
+    """A2 end-to-end: a thinking-only HIT turn whose stream ended WITHOUT an
+    end-of-turn tail — the max_tokens-exhaustion shape (token 302 decodes to
+    '</think>' but is NOT an EOS id, so the cached tail is not a turn
+    terminator). The old close_turn=False commit assumed 'ended naturally';
+    now the tail verification fails and the commit CLOSES the turn (eot
+    forwarded through the target + recorded) before committing."""
+    EOT = 77
+    stored = [1, 2, 3, 4, 5]
+    cache = [MockKV() for _ in range(5)]
+    for c in cache:
+        c.offset = len(stored)
+    eng, cs, messages = _generate_engine(cache, stored, mtp=False, suffix=[])
+    _use_real_messages_match(eng)
+    _content_token_suffix(eng)
+    eng._language_model = _CallableTargetModel()
+    eng.tokenizer = SimpleNamespace(
+        decode=lambda ids: "x",
+        eos_token_ids=[],  # 302 is NOT an EOS: exhaustion, not natural end
+        get_vocab=lambda: {"<|im_end|>": EOT},
+    )
+
+    prompts_seen: list = []
+    _scripted_lm_stream(
+        monkeypatch, prompts_seen,
+        [
+            [(301, "pondering"), (302, "</think>")],
+            [(401, "z")],
+        ],
+    )
+
+    chunks = _drive_full(eng, messages, max_tokens=8, thinking=True)
+    assert chunks[-1].finish_reason == "stop"
+
+    # Turn CLOSED then committed: eot in token_ids, every layer on target.
+    sess = eng._sessions["s"]
+    assert sess.messages[-1] == {
+        "role": "assistant",
+        "content": "<think>\npondering</think>",
+    }
+    assert cs.token_ids == stored + [52, 99] + [301, 302, EOT]
+    assert sess.total_cache_tokens == len(cs.token_ids)
+    for c in cache:
+        assert c.offset == len(cs.token_ids)
+    _assert_no_desynced_cache(cs)
+
+    # Next turn extends the now template-valid sequence with u3 only.
+    messages2 = list(messages) + [
+        {"role": "assistant", "content": ""},
+        {"role": "user", "content": "u3"},
+    ]
+    _drive_full(eng, messages2, max_tokens=1, thinking=True)
+    assert prompts_seen[1] == [53, 99]
+    _assert_no_desynced_cache(cs)
+
+
+def test_generate_locked_empty_response_exhaustion_close_unavailable_invalidates(
+    monkeypatch,
+):
+    """A2 fail-closed arm: the same thinking-only exhaustion shape (no EOS
+    tail) on a close-INCAPABLE ChatML engine — committing the unterminated
+    turn is forbidden, so the session cache invalidates; the client still
+    receives the terminal stop frame."""
+    stored = [1, 2, 3, 4, 5]
+    cache = [MockKV() for _ in range(5)]
+    for c in cache:
+        c.offset = len(stored)
+    eng, cs, messages = _generate_engine(cache, stored, mtp=False, suffix=[])
+    _use_real_messages_match(eng)
+    _content_token_suffix(eng)
+
+    prompts_seen: list = []
+    _scripted_lm_stream(
+        monkeypatch, prompts_seen,
+        [[(301, "pondering"), (302, "</think>")]],
+    )
+
+    orig_sess = eng._sessions["s"]
+    chunks = _drive_full(eng, messages, max_tokens=8, thinking=True)
+    assert chunks[-1].finish_reason == "stop"
+
+    assert cs.cache is None
+    assert cs.token_ids is None
+    _assert_no_desynced_cache(cs)
+    assert eng._sessions["s"] is orig_sess  # no commit happened
+    assert [m.get("content") for m in orig_sess.messages] == ["u1", "a1"]
+
+
+def _drive_generator_exit(eng, messages, *, frames=2, max_tokens=8):
+    """Pull ``frames`` chunks then .close() the ENGINE generator at the
+    suspended streaming yield — the client-disconnect teardown shape (A3):
+    both production drivers (generate_stream_async/_batches_async `_run`
+    threads and the process worker's _run_generate) break out of their
+    consumer loop on cancel_event and DROP the generator, which closes it
+    (GeneratorExit at the yield) BEFORE the engine loop can observe the
+    event — skipping every post-loop commit."""
+    gen = eng._generate_locked(
+        messages,
+        max_tokens=max_tokens,
+        temperature=0.0,
+        session_id="s",
+        tools=None,
+        cancel_event=None,
+        thinking=False,
+        thinking_budget=0,
+        top_p=1.0,
+        min_p=0.0,
+        top_k=0,
+        repetition_penalty=1.0,
+        response_format=None,
+    )
+    chunks = [next(gen) for _ in range(frames)]
+    gen.close()
+    return chunks
+
+
+def test_generate_locked_generator_exit_mid_stream_commits_consistent(
+    monkeypatch,
+):
+    """A3: .close() on the engine generator mid-stream on a HIT session —
+    GeneratorExit at the streaming yield skips the whole post-loop, which
+    pre-amendment resurrected the original C1 desync (stale messages +
+    advanced live cache → double-spliced user_N). The rescue finalization
+    must reconcile + commit exactly like a cancel: turn template-closed,
+    messages ↔ token_ids consistent, and the next same-history request
+    splices u3 ONLY."""
+    EOT = 77
+    stored = [1, 2, 3, 4, 5]
+    cache = [MockKV() for _ in range(5)]
+    for c in cache:
+        c.offset = len(stored)
+    eng, cs, messages = _generate_engine(cache, stored, mtp=False, suffix=[])
+    _use_real_messages_match(eng)
+    _content_token_suffix(eng)
+    eng._language_model = _CallableTargetModel()
+    eng.tokenizer = SimpleNamespace(
+        decode=lambda ids: "x",
+        eos_token_ids=[],
+        get_vocab=lambda: {"<|im_end|>": EOT},
+    )
+
+    prompts_seen: list = []
+    _scripted_lm_stream(
+        monkeypatch, prompts_seen,
+        [
+            [(101, "x"), (102, "x"), (103, "x"), (104, "x")],
+            [(201, "y")],
+        ],
+    )
+
+    orig_sess = eng._sessions["s"]
+    chunks = _drive_generator_exit(eng, messages, frames=2)
+    assert len(chunks) == 2
+
+    # Rescue committed the interrupted turn (closed + consistent).
+    sess = eng._sessions["s"]
+    assert sess is not orig_sess
+    assert sess.cache_state is cs
+    assert cs.token_ids == stored + [52, 99] + [101, 102, EOT]
+    assert sess.messages[-1] == {"role": "assistant", "content": "xx"}
+    assert sess.total_cache_tokens == len(cs.token_ids)
+    for c in cache:
+        assert c.offset == len(cs.token_ids)
+    _assert_no_desynced_cache(cs)
+
+    # Next request: HIT, u3 spliced exactly once after the closed turn.
+    messages2 = list(messages) + [
+        {"role": "assistant", "content": "xx"},
+        {"role": "user", "content": "u3"},
+    ]
+    _drive_full(eng, messages2, max_tokens=1)
+    assert prompts_seen[1] == [53, 99]
+    _assert_no_desynced_cache(cs)
+
+
+def test_generate_locked_generator_exit_close_unavailable_invalidates(
+    monkeypatch,
+):
+    """A3 fail-closed arm: GeneratorExit mid-stream on a close-INCAPABLE
+    ChatML HIT — no desync survives: the rescue's commit reaches the FAILED
+    close and invalidates the session cache (messages stale-but-harmless,
+    next request MISSes)."""
+    stored = [1, 2, 3, 4, 5]
+    cache = [MockKV() for _ in range(5)]
+    for c in cache:
+        c.offset = len(stored)
+    eng, cs, messages = _generate_engine(cache, stored, mtp=False, suffix=[])
+    _use_real_messages_match(eng)
+    _content_token_suffix(eng)
+
+    prompts_seen: list = []
+    _scripted_lm_stream(
+        monkeypatch, prompts_seen,
+        [[(101, "x"), (102, "x"), (103, "x")]],
+    )
+
+    orig_sess = eng._sessions["s"]
+    chunks = _drive_generator_exit(eng, messages, frames=2)
+    assert len(chunks) == 2
+
+    assert cs.cache is None
+    assert cs.token_ids is None
+    _assert_no_desynced_cache(cs)
+    assert eng._sessions["s"] is orig_sess
+    assert [m.get("content") for m in orig_sess.messages] == ["u1", "a1"]

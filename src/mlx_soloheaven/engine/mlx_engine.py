@@ -31,6 +31,7 @@ Cross-session sharing:
 import asyncio
 import contextlib
 import copy
+import enum
 import hashlib
 import json
 import logging
@@ -221,6 +222,33 @@ def _make_eager_sampler(
     return sampler
 
 
+def _collect_eos_ids(tokenizer) -> set[int]:
+    """Collect end-of-sequence token IDs from every surface a model exposes
+    them on: the mlx-lm wrapper's ``eos_token_ids`` list, the inner HF
+    tokenizer's ``eos_token_id`` (scalar or list), and
+    ``generation_config.eos_token_id`` (GLM-family multi-EOS). Returns an
+    empty set when nothing is exposed."""
+    eos_ids: set[int] = set()
+    if getattr(tokenizer, "eos_token_ids", None):
+        eos_ids.update(int(i) for i in tokenizer.eos_token_ids)
+    inner = getattr(tokenizer, "_tokenizer", tokenizer)
+    eid = getattr(inner, "eos_token_id", None)
+    if eid is not None:
+        if isinstance(eid, (list, tuple, set)):
+            eos_ids.update(int(i) for i in eid)
+        else:
+            eos_ids.add(int(eid))
+    gc = getattr(inner, "generation_config", None)
+    if gc is not None:
+        gc_eos = getattr(gc, "eos_token_id", None)
+        if gc_eos is not None:
+            if isinstance(gc_eos, (list, tuple, set)):
+                eos_ids.update(int(i) for i in gc_eos)
+            else:
+                eos_ids.add(int(gc_eos))
+    return eos_ids
+
+
 def _pld_response_adapter(pld_iter, tokenizer, label: str = "PLD"):
     """Adapt (token, logprobs, from_draft) tuples (pld_generate_step or
     qwen_mtp_generate_step — same contract) to mimic lm_stream_generate's
@@ -236,26 +264,9 @@ def _pld_response_adapter(pld_iter, tokenizer, label: str = "PLD"):
     import time as _time
     from types import SimpleNamespace
 
-    # Collect EOS token IDs from both mlx-lm wrapper and HF tokenizer
-    eos_ids: set[int] = set()
-    if hasattr(tokenizer, "eos_token_ids") and tokenizer.eos_token_ids:
-        eos_ids.update(tokenizer.eos_token_ids)
-    inner = getattr(tokenizer, "_tokenizer", tokenizer)
-    eid = getattr(inner, "eos_token_id", None)
-    if eid is not None:
-        if isinstance(eid, (list, tuple, set)):
-            eos_ids.update(eid)
-        else:
-            eos_ids.add(eid)
-    # GLM-family and other models expose multi-EOS via generation_config
-    gc = getattr(inner, "generation_config", None)
-    if gc is not None:
-        gc_eos = getattr(gc, "eos_token_id", None)
-        if gc_eos is not None:
-            if isinstance(gc_eos, (list, tuple, set)):
-                eos_ids.update(gc_eos)
-            else:
-                eos_ids.add(gc_eos)
+    # Collect EOS token IDs from the mlx-lm wrapper, HF tokenizer, and
+    # generation_config (GLM-family multi-EOS) — shared helper.
+    eos_ids: set[int] = _collect_eos_ids(tokenizer)
 
     # Use mlx-lm's StreamingDetokenizer to buffer partial UTF-8 bytes
     # across tokens (mirrors stream_generate's behavior).
@@ -401,6 +412,33 @@ def _detect_token_ids(tokenizer, text: str) -> list[int]:
     """
     ids = tokenizer.encode(text, add_special_tokens=False)
     return list(ids)
+
+
+class TurnCloseResult(enum.Enum):
+    """Tri-state outcome of ``MLXEngine._try_close_interrupted_turn`` (C1).
+
+    A plain bool conflated two very different "no close happened" shapes:
+    "close UNNECESSARY" (gemma4/glm — the next-turn suffix leads with the
+    closer, committing unterminated is template-valid) versus "close
+    UNAVAILABLE" (ChatML where the closer could not be forwarded/verified —
+    committing there hands the next HIT a cache whose suffix splice assumes
+    a ``<|im_end|>`` that is NOT in the KV: template corruption).
+
+    NOT_REQUIRED — the cached turn needs no template closer (gemma4/glm
+        templates delimit turns themselves, or the recorded tail already IS
+        an end-of-turn token — natural termination verified): commit as-is.
+    CLOSED — the end-of-turn token was forwarded through the target and
+        verified against every offset-bearing layer: commit.
+    FAILED — a close is REQUIRED but could not be performed or verified
+        (ChatML on the mlx-vlm path, head-bearing MTP cache, no detectable
+        end-of-turn token, non-callable target, forward failure, or a
+        post-forward offset mismatch). The session cache has been
+        INVALIDATED fail-closed: do NOT commit.
+    """
+
+    NOT_REQUIRED = "not_required"
+    CLOSED = "closed"
+    FAILED = "failed"
 
 
 def _load_generation_config_sampling(model_path: str) -> dict:
@@ -3628,6 +3666,14 @@ class MLXEngine:
         # - On cache miss: use incoming messages as-is
         prompt_messages = messages
         cache_state = PromptCacheState()
+        # C1 FIX bookkeeping: on a cache HIT, ``cache_state`` below becomes an
+        # ALIAS of session.cache_state, so generation advances the session's
+        # LIVE cache in place. These two record what the HIT turn started from
+        # so the interrupted-turn commit (client cancel / empty-response early
+        # returns) can keep session.messages ↔ cache_state.token_ids in sync,
+        # or roll the prefilled suffix back when nothing was generated.
+        new_messages: list[dict] = []
+        _hit_prior_len = 0
 
         if (
             session
@@ -3651,6 +3697,7 @@ class MLXEngine:
                 # round-trip (e.g. Gemma 4 <|channel>/<channel|>).
                 cache_mode = "hit"
                 cache_state = session.cache_state
+                _hit_prior_len = len(cache_state.token_ids or [])
                 cached_tokens = session.total_cache_tokens
                 suffix = self._suffix_tokens(new_messages, thinking=use_thinking)
                 prompt_token_ids = list(cache_state.token_ids or []) + suffix
@@ -3867,6 +3914,265 @@ class MLXEngine:
         global _MTP_LOGITS_PROCESSORS, _MTP_TOKEN_HISTORY_SEED
         global _MTP_THINK_BUDGET, _MTP_THINK_END_TOKEN, _MTP_THINK_START_TOKEN
         global _MTP_THINK_FAMILY, _MTP_THINK_BARE_OPEN_TOKENS
+        # ------------------------------------------------------------------
+        # A3 (GeneratorExit safety): the post-stream reconcile + the HIT-turn
+        # commit must NOT live only on the straight-line path after the loop.
+        # A client disconnect can close THIS generator at the streaming yield
+        # — GeneratorExit then propagates from that yield and everything
+        # after the loop is SKIPPED, resurrecting the exact C1 desync
+        # (session.messages stale while the HIT session's LIVE cache was
+        # already advanced in place). Both production drivers close the
+        # engine generator directly, racing the in-loop cancel check:
+        #   * in-process mode: generate_stream_async / _batches_async `_run`
+        #     threads break out of their for-loop on cancel_event and DROP
+        #     the generator — CPython refcounting closes it at the suspended
+        #     yield (GeneratorExit) before the engine loop ever observes the
+        #     event;
+        #   * process mode: the worker's _run_generate does the same
+        #     cancel_event break before pulling the next frame (the parent's
+        #     _drain_engine_generator name refers to draining the PROXY; the
+        #     child-side break is what closes the engine generator).
+        # The reconcile below is idempotent and yield-free so the
+        # GeneratorExit handler can drive it; the rescue commits the
+        # interrupted turn exactly like a cancel (the inner finally has
+        # already settled the backend stream) and ANY failure inside the
+        # rescue invalidates the session cache fail-closed.
+        _turn_committed = False    # a consistent terminal was reached
+        _stream_reconciled = False  # post-stream reconcile ran (idempotence)
+
+        def _reconcile_stream_end():
+            """Post-stream reconcile: join text, drafter finalize, write back
+            / trim / invalidate the cache so cache offsets == token_ids.
+            Idempotent (guarded by _stream_reconciled) and yield-free — safe
+            to run from the normal post-loop path AND from the GeneratorExit
+            rescue handler."""
+            nonlocal accumulated_text, _stream_reconciled
+            if _stream_reconciled:
+                return
+            _stream_reconciled = True
+            # PERF: single join at end of loop — replaces O(N^2) accumulation.
+            accumulated_text = "".join(text_parts)
+            # PERF: drafter-stats finalize (post-stream, exactly once). Captures
+            # all drafter.accept_lens accumulated during _mtp_rounds → log + per-
+            # session bookkeeping. Replaces the per-token generator wrapper.
+            if _drafter_finalize is not None:
+                try:
+                    _drafter_finalize()
+                except Exception:  # noqa: BLE001 — finalize must never break inference
+                    logger.exception("[Drafter] post-stream finalize failed")
+            self._touch_gpu()
+
+            # Unified post-generation cache_state update (both VLM and legacy
+            # mlx-lm paths). mlx-vlm's stream_generate mutates cache_state.cache
+            # in place but never appends generated IDs to cache_state.token_ids;
+            # the legacy branch needs an explicit write-back of `prompt_cache` too.
+            # Both paths converge on:
+            #     cache_state.cache     = <post-generation cache>
+            #     cache_state.token_ids = full_prompt_token_ids + generated_token_ids
+            # Doing this even on cancellation keeps cache_state.token_ids consistent
+            # with the in-place mutated cache_state.cache (the VLM path may have
+            # already prefilled / advanced the cache before the cancel was observed).
+            # Legacy mlx-lm path returns a local `prompt_cache` reference that
+            # must be written back; VLM path mutates cache_state.cache in place
+            # and `prompt_cache` is None — the conditional below is the single
+            # remaining `self._use_vlm` branch in this method's post-loop and
+            # is kept because the two paths legitimately diverge in WHERE the
+            # post-generation KV cache lives.
+            # FIX-2 (PLD fail-closed rewind): if pld_generate_step signalled a
+            # trim failure mid-stream, the local prompt_cache contains ghost
+            # tokens (RoPE/offset desync) — INVALIDATE the session cache instead
+            # of writing it back; the next turn cold-fills from scratch.
+            _pld_cache_invalid = bool(getattr(self, "_pld_cache_invalid", False))
+            self._pld_cache_invalid = False
+            if _pld_cache_invalid:
+                logger.error(
+                    f"[KV Cache] session={session_id} | PLD cache rewind failed "
+                    f"mid-stream — INVALIDATING session cache (next turn "
+                    f"cold-fills)"
+                )
+                cache_state.cache = None
+                cache_state.token_ids = None
+            elif prompt_cache is not None:
+                cache_state.cache = prompt_cache
+            # Reconcile token_ids to the cache's TRUE offset. Speculative paths
+            # can drift from cache.offset (PLD never forwards the final token;
+            # the gemma4 vlm MTP terminating block forwards past the recorded
+            # tail; cancellation drops in-flight tokens). The QwenMTP path now
+            # finalizes to EXACT equality — its finalize forwards the pending
+            # stop token through the target (mirroring plain mlx-lm's lookahead)
+            # and gen_iter.close() above runs that finalize deterministically —
+            # so on that path this is a no-op except after cancellation. If
+            # token_ids != cache logical length, next turn's reuse cold-fills
+            # (offset != prefix_len → full re-prefill, multi-second TTFT). Trim
+            # any un-forwarded tail so token_ids EXACTLY matches the cache
+            # content; the dropped 1–2 tokens are reprocessed as part of the
+            # next turn's suffix (cheap).
+            # (Skipped entirely when the PLD corruption signal invalidated the
+            # cache above — there is nothing consistent to reconcile against.)
+            _actual_token_ids = full_prompt_token_ids + list(generated_token_ids)
+            _cache_off = (
+                self._get_cache_offset(cache_state.cache) if cache_state.cache else None
+            )
+            if not _pld_cache_invalid:
+                cache_state.token_ids = _actual_token_ids
+            if _cache_off is not None and _cache_off > 0:
+                if _cache_off < len(_actual_token_ids):
+                    # Cache BEHIND recorded (a yielded token not yet forwarded —
+                    # bonus lag / final token). Drop the un-forwarded tail so
+                    # token_ids matches the cache content exactly.
+                    cache_state.token_ids = _actual_token_ids[:_cache_off]
+                elif _cache_off > len(_actual_token_ids) and cache_state.cache:
+                    # Cache AHEAD of recorded (speculative tail forwarded past
+                    # the last RECORDED token — e.g. the terminating block
+                    # forwards b but its only output is the stop token, which
+                    # stream_generate drops before the engine records it; or a
+                    # cancelled QwenMTP stream whose finalize forwarded tokens
+                    # the cancel-break dropped). Trim the cache back so
+                    # cache.offset == len(token_ids); the few trimmed positions
+                    # are reprocessed in next turn's suffix. Without this,
+                    # offset>prefix_len → wrapped reuse COLD-FILLs.
+                    # FAIL-CLOSED guard: trimming requires EVERY layer to be
+                    # trimmable. A hybrid cache (qwen3.5: ArraysCache recurrent
+                    # layers have no .trim) would desync — KV layers rewound,
+                    # recurrent state still containing the trimmed tokens (ghost
+                    # tokens on the next forward) — so INVALIDATE instead.
+                    _over = _cache_off - len(_actual_token_ids)
+                    if all(hasattr(_c, "trim") for _c in cache_state.cache):
+                        # FAIL-CLOSED trim-back (mirrors the 8491f1d prefix-trim
+                        # post-condition): a trim() exception OR any offset-
+                        # bearing layer NOT landing exactly on len(token_ids)
+                        # leaves a PARTIALLY-trimmed cache (some layers rewound,
+                        # others not — e.g. a wrapped RotatingKVCache whose trim
+                        # silently no-ops, or a mid-list layer that raised) while
+                        # token_ids above was already reconciled to the shorter
+                        # history. That desynced cache must never survive into
+                        # next turn's reuse — verify every layer and INVALIDATE
+                        # on any shortfall. (The qwen MTP head entry trails the
+                        # target by one BY DESIGN after finalize, so a head-
+                        # bearing cache that lands here also invalidates — the
+                        # post-trim stash offset tag is stale anyway, so MTP
+                        # resume was already off; a cold-fill is the only safe
+                        # outcome.)
+                        from mlx_soloheaven.engine.pld import _layer_offsets
+                        _trim_exc = False
+                        for _c in cache_state.cache:
+                            try:
+                                _c.trim(_over)
+                            except Exception:  # noqa: BLE001
+                                _trim_exc = True
+                                logger.exception(
+                                    "[KV Cache] offset>len cache trim failed"
+                                )
+                        _bad_layers = [
+                            (i, off)
+                            for i, off in enumerate(_layer_offsets(cache_state.cache))
+                            if off is not None and off != len(_actual_token_ids)
+                        ]
+                        if _trim_exc or _bad_layers:
+                            logger.warning(
+                                f"[KV Cache] session={session_id} | post-stream "
+                                f"trim-back to {len(_actual_token_ids)} failed "
+                                f"(exception={_trim_exc}, layers off target: "
+                                f"{_bad_layers[:8]}) — INVALIDATING session "
+                                f"cache (next turn cold-fills)"
+                            )
+                            cache_state.cache = None
+                            cache_state.token_ids = None
+                            # The MTP finalize-hidden stash is offset-tagged
+                            # against the now-discarded cache — clear it so a
+                            # later turn can never pair a stale hidden with a
+                            # rebuilt cache.
+                            cache_state.mtp_last_hidden = None
+                            cache_state.mtp_hidden_offset = None
+                    else:
+                        logger.warning(
+                            f"[KV Cache] session={session_id} | cache ahead of "
+                            f"recorded ids by {_over} but the cache has "
+                            f"untrimmable (recurrent) layers — INVALIDATING "
+                            f"session cache (next turn cold-fills)"
+                        )
+                        cache_state.cache = None
+                        cache_state.token_ids = None
+                        # Same stash hygiene as the verified-trim branch above.
+                        cache_state.mtp_last_hidden = None
+                        cache_state.mtp_hidden_offset = None
+
+            # WHY: F3 pins every mlx-vlm call to one persistent _vlm_executor
+            # worker thread (model + drafter + generation_stream all bound to
+            # that thread). Under F3 there is no cross-thread lazy-array
+            # hazard — the post-gen _eval_cache here is redundant and the
+            # forced full materialization adds measurable per-request overhead
+            # (large KV tensor sync). We now skip it on the VLM path and only
+            # keep it for the legacy mlx-lm path as a defensive no-op (mlx-lm
+            # runs on the request thread; this is a cheap final eval).
+            if (not self._use_vlm) and cache_state.cache is not None:
+                try:
+                    self._eval_cache(cache_state.cache)
+                except Exception as _eval_err:  # noqa: BLE001 — best-effort
+                    logger.warning(
+                        f"[KV Cache] session={session_id} | "
+                        f"post-gen _eval_cache failed: {_eval_err!r}"
+                    )
+
+        def _rescue_uncommitted_turn(reason: str, *, commit: bool) -> None:
+            """Finalization guard for a stream that never reached a
+            consistent terminal (GeneratorExit at the streaming yield, or an
+            exception escaping the loop). Idempotent via _turn_committed —
+            the normal path commits exactly once and sets the flag before
+            its terminal yields, so a GeneratorExit AT a terminal yield is a
+            no-op here. Only HIT turns need rescue: non-HIT modes use a
+            fresh/cloned cache_state that is simply discarded, leaving the
+            stored session untouched and self-consistent.
+
+            ``commit=True`` (GeneratorExit — a clean client disconnect, the
+            same shape as a cancel): close the backend stream (idempotent;
+            the enclosing finally re-runs it) so the QwenMTP finalize has
+            settled BEFORE offsets are read, then reconcile and commit the
+            interrupted turn via _commit_interrupted_hit_turn.
+            ``commit=False`` (arbitrary exception — generation state is
+            mid-frame and unverifiable): invalidate fail-closed instead of
+            committing. Any failure inside the rescue itself also
+            invalidates fail-closed."""
+            if _turn_committed:
+                return
+            if cache_mode != "hit" or session is None:
+                return
+            try:
+                if commit:
+                    try:
+                        _close = getattr(gen_iter, "close", None)
+                        if _close is not None:
+                            _close()
+                    except Exception:  # noqa: BLE001 — teardown must never mask the rescue
+                        logger.exception(
+                            "[Generate] rescue gen_iter.close() failed"
+                        )
+                    _reconcile_stream_end()
+                    self._commit_interrupted_hit_turn(
+                        session_id=session_id,
+                        session=session,
+                        cache_state=cache_state,
+                        new_messages=new_messages,
+                        accumulated_text=accumulated_text,
+                        use_thinking=use_thinking,
+                        hit_prior_len=_hit_prior_len,
+                        prompt_len=len(full_prompt_token_ids),
+                        reason=reason,
+                    )
+                else:
+                    logger.warning(
+                        f"[KV Cache] session={session_id} | {reason} before "
+                        f"the turn was committed — INVALIDATING session "
+                        f"cache fail-closed (next turn cold-fills)"
+                    )
+                    self._invalidate_cache_state(cache_state)
+            except BaseException:  # noqa: BLE001 — rescue must never mask the exit
+                logger.exception(
+                    f"[KV Cache] session={session_id} | stream-teardown "
+                    f"rescue failed — INVALIDATING session cache"
+                )
+                self._invalidate_cache_state(cache_state)
+
         try:
             for resp in gen_iter:
                 if cancel_event is not None and cancel_event.is_set():
@@ -3934,6 +4240,22 @@ class MLXEngine:
                     generation_tps=gen_tps,
                 )
 
+        except GeneratorExit:
+            # A3: the response generator was closed at the streaming yield
+            # (client disconnect / consumer break-and-drop — see the rescue
+            # closure's driver notes). Commit the interrupted HIT turn like
+            # a cancel, then let the exit propagate (never swallow it).
+            _rescue_uncommitted_turn(
+                "disconnected (stream torn down)", commit=True,
+            )
+            raise
+        except BaseException:
+            # Fail-closed consistency guard: an exception escaping the loop
+            # leaves the HIT session's in-place-advanced cache unreconciled
+            # and mid-frame — invalidate rather than commit unverifiable
+            # state, then re-raise.
+            _rescue_uncommitted_turn("generation failed mid-stream", commit=False)
+            raise
         finally:
             # Deterministically close the backend stream BEFORE the post-loop
             # reads cache offsets. The QwenMTP runner settles + finalizes its
@@ -3967,169 +4289,9 @@ class MLXEngine:
             _MTP_THINK_START_TOKEN = None
             _MTP_THINK_FAMILY = None
             _MTP_THINK_BARE_OPEN_TOKENS = None
-        # PERF: single join at end of loop — replaces O(N^2) accumulation.
-        accumulated_text = "".join(text_parts)
-        # PERF: drafter-stats finalize (post-stream, exactly once). Captures
-        # all drafter.accept_lens accumulated during _mtp_rounds → log + per-
-        # session bookkeeping. Replaces the per-token generator wrapper.
-        if _drafter_finalize is not None:
-            try:
-                _drafter_finalize()
-            except Exception:  # noqa: BLE001 — finalize must never break inference
-                logger.exception("[Drafter] post-stream finalize failed")
-        self._touch_gpu()
-
-        # Unified post-generation cache_state update (both VLM and legacy
-        # mlx-lm paths). mlx-vlm's stream_generate mutates cache_state.cache
-        # in place but never appends generated IDs to cache_state.token_ids;
-        # the legacy branch needs an explicit write-back of `prompt_cache` too.
-        # Both paths converge on:
-        #     cache_state.cache     = <post-generation cache>
-        #     cache_state.token_ids = full_prompt_token_ids + generated_token_ids
-        # Doing this even on cancellation keeps cache_state.token_ids consistent
-        # with the in-place mutated cache_state.cache (the VLM path may have
-        # already prefilled / advanced the cache before the cancel was observed).
-        # Legacy mlx-lm path returns a local `prompt_cache` reference that
-        # must be written back; VLM path mutates cache_state.cache in place
-        # and `prompt_cache` is None — the conditional below is the single
-        # remaining `self._use_vlm` branch in this method's post-loop and
-        # is kept because the two paths legitimately diverge in WHERE the
-        # post-generation KV cache lives.
-        # FIX-2 (PLD fail-closed rewind): if pld_generate_step signalled a
-        # trim failure mid-stream, the local prompt_cache contains ghost
-        # tokens (RoPE/offset desync) — INVALIDATE the session cache instead
-        # of writing it back; the next turn cold-fills from scratch.
-        _pld_cache_invalid = bool(getattr(self, "_pld_cache_invalid", False))
-        self._pld_cache_invalid = False
-        if _pld_cache_invalid:
-            logger.error(
-                f"[KV Cache] session={session_id} | PLD cache rewind failed "
-                f"mid-stream — INVALIDATING session cache (next turn "
-                f"cold-fills)"
-            )
-            cache_state.cache = None
-            cache_state.token_ids = None
-        elif prompt_cache is not None:
-            cache_state.cache = prompt_cache
-        # Reconcile token_ids to the cache's TRUE offset. Speculative paths
-        # can drift from cache.offset (PLD never forwards the final token;
-        # the gemma4 vlm MTP terminating block forwards past the recorded
-        # tail; cancellation drops in-flight tokens). The QwenMTP path now
-        # finalizes to EXACT equality — its finalize forwards the pending
-        # stop token through the target (mirroring plain mlx-lm's lookahead)
-        # and gen_iter.close() above runs that finalize deterministically —
-        # so on that path this is a no-op except after cancellation. If
-        # token_ids != cache logical length, next turn's reuse cold-fills
-        # (offset != prefix_len → full re-prefill, multi-second TTFT). Trim
-        # any un-forwarded tail so token_ids EXACTLY matches the cache
-        # content; the dropped 1–2 tokens are reprocessed as part of the
-        # next turn's suffix (cheap).
-        # (Skipped entirely when the PLD corruption signal invalidated the
-        # cache above — there is nothing consistent to reconcile against.)
-        _actual_token_ids = full_prompt_token_ids + list(generated_token_ids)
-        _cache_off = (
-            self._get_cache_offset(cache_state.cache) if cache_state.cache else None
-        )
-        if not _pld_cache_invalid:
-            cache_state.token_ids = _actual_token_ids
-        if _cache_off is not None and _cache_off > 0:
-            if _cache_off < len(_actual_token_ids):
-                # Cache BEHIND recorded (a yielded token not yet forwarded —
-                # bonus lag / final token). Drop the un-forwarded tail so
-                # token_ids matches the cache content exactly.
-                cache_state.token_ids = _actual_token_ids[:_cache_off]
-            elif _cache_off > len(_actual_token_ids) and cache_state.cache:
-                # Cache AHEAD of recorded (speculative tail forwarded past
-                # the last RECORDED token — e.g. the terminating block
-                # forwards b but its only output is the stop token, which
-                # stream_generate drops before the engine records it; or a
-                # cancelled QwenMTP stream whose finalize forwarded tokens
-                # the cancel-break dropped). Trim the cache back so
-                # cache.offset == len(token_ids); the few trimmed positions
-                # are reprocessed in next turn's suffix. Without this,
-                # offset>prefix_len → wrapped reuse COLD-FILLs.
-                # FAIL-CLOSED guard: trimming requires EVERY layer to be
-                # trimmable. A hybrid cache (qwen3.5: ArraysCache recurrent
-                # layers have no .trim) would desync — KV layers rewound,
-                # recurrent state still containing the trimmed tokens (ghost
-                # tokens on the next forward) — so INVALIDATE instead.
-                _over = _cache_off - len(_actual_token_ids)
-                if all(hasattr(_c, "trim") for _c in cache_state.cache):
-                    # FAIL-CLOSED trim-back (mirrors the 8491f1d prefix-trim
-                    # post-condition): a trim() exception OR any offset-
-                    # bearing layer NOT landing exactly on len(token_ids)
-                    # leaves a PARTIALLY-trimmed cache (some layers rewound,
-                    # others not — e.g. a wrapped RotatingKVCache whose trim
-                    # silently no-ops, or a mid-list layer that raised) while
-                    # token_ids above was already reconciled to the shorter
-                    # history. That desynced cache must never survive into
-                    # next turn's reuse — verify every layer and INVALIDATE
-                    # on any shortfall. (The qwen MTP head entry trails the
-                    # target by one BY DESIGN after finalize, so a head-
-                    # bearing cache that lands here also invalidates — the
-                    # post-trim stash offset tag is stale anyway, so MTP
-                    # resume was already off; a cold-fill is the only safe
-                    # outcome.)
-                    from mlx_soloheaven.engine.pld import _layer_offsets
-                    _trim_exc = False
-                    for _c in cache_state.cache:
-                        try:
-                            _c.trim(_over)
-                        except Exception:  # noqa: BLE001
-                            _trim_exc = True
-                            logger.exception(
-                                "[KV Cache] offset>len cache trim failed"
-                            )
-                    _bad_layers = [
-                        (i, off)
-                        for i, off in enumerate(_layer_offsets(cache_state.cache))
-                        if off is not None and off != len(_actual_token_ids)
-                    ]
-                    if _trim_exc or _bad_layers:
-                        logger.warning(
-                            f"[KV Cache] session={session_id} | post-stream "
-                            f"trim-back to {len(_actual_token_ids)} failed "
-                            f"(exception={_trim_exc}, layers off target: "
-                            f"{_bad_layers[:8]}) — INVALIDATING session "
-                            f"cache (next turn cold-fills)"
-                        )
-                        cache_state.cache = None
-                        cache_state.token_ids = None
-                        # The MTP finalize-hidden stash is offset-tagged
-                        # against the now-discarded cache — clear it so a
-                        # later turn can never pair a stale hidden with a
-                        # rebuilt cache.
-                        cache_state.mtp_last_hidden = None
-                        cache_state.mtp_hidden_offset = None
-                else:
-                    logger.warning(
-                        f"[KV Cache] session={session_id} | cache ahead of "
-                        f"recorded ids by {_over} but the cache has "
-                        f"untrimmable (recurrent) layers — INVALIDATING "
-                        f"session cache (next turn cold-fills)"
-                    )
-                    cache_state.cache = None
-                    cache_state.token_ids = None
-                    # Same stash hygiene as the verified-trim branch above.
-                    cache_state.mtp_last_hidden = None
-                    cache_state.mtp_hidden_offset = None
-
-        # WHY: F3 pins every mlx-vlm call to one persistent _vlm_executor
-        # worker thread (model + drafter + generation_stream all bound to
-        # that thread). Under F3 there is no cross-thread lazy-array
-        # hazard — the post-gen _eval_cache here is redundant and the
-        # forced full materialization adds measurable per-request overhead
-        # (large KV tensor sync). We now skip it on the VLM path and only
-        # keep it for the legacy mlx-lm path as a defensive no-op (mlx-lm
-        # runs on the request thread; this is a cheap final eval).
-        if (not self._use_vlm) and cache_state.cache is not None:
-            try:
-                self._eval_cache(cache_state.cache)
-            except Exception as _eval_err:  # noqa: BLE001 — best-effort
-                logger.warning(
-                    f"[KV Cache] session={session_id} | "
-                    f"post-gen _eval_cache failed: {_eval_err!r}"
-                )
+        # Post-stream reconcile (idempotent, yield-free — shared with the
+        # GeneratorExit rescue defined above the loop).
+        _reconcile_stream_end()
 
         # Log generated text for debugging
         if accumulated_text:
@@ -4141,6 +4303,33 @@ class MLXEngine:
             )
 
         if cancelled:
+            # C1 FIX (a): on a cache HIT, ``cache_state`` ALIASES the
+            # session's live cache_state and the reconcile above has already
+            # advanced its token_ids to prompt+generated — returning without
+            # touching session.messages would desync them: the next
+            # same-history request would match the STALE messages, take HIT,
+            # and splice user_N a SECOND time after the dangling partial
+            # output (silently corrupted model input, persistent in the
+            # session KV). Commit or roll back so messages ↔ token_ids/KV
+            # stay consistent. Non-HIT modes keep the old skip: their
+            # cache_state is a fresh/cloned object that is simply discarded
+            # and the session (if any) is untouched and still
+            # self-consistent.
+            if cache_mode == "hit" and session is not None:
+                self._commit_interrupted_hit_turn(
+                    session_id=session_id,
+                    session=session,
+                    cache_state=cache_state,
+                    new_messages=new_messages,
+                    accumulated_text=accumulated_text,
+                    use_thinking=use_thinking,
+                    hit_prior_len=_hit_prior_len,
+                    prompt_len=len(full_prompt_token_ids),
+                    reason="cancelled",
+                )
+            # Idempotence marker: the cancel terminal is consistent (commit /
+            # rollback / invalidate all reconcile messages ↔ token_ids).
+            _turn_committed = True
             return
 
         # Guard: detect empty response (no content after thinking)
@@ -4149,10 +4338,46 @@ class MLXEngine:
                 accumulated_text, model_family=self.model_family,
             )
             if not content or not content.strip():
-                logger.warning(
-                    f"[KV Cache] session={session_id} | SKIP SAVE | "
-                    f"empty response ({gen_token_count} tokens, no content)"
-                )
+                if cache_mode == "hit" and session is not None:
+                    # C1 FIX (b): the session's live cache already contains
+                    # suffix(user_N) + the thinking-only output (in-place
+                    # alias advance) — "SKIP SAVE" would leave
+                    # session.messages claiming the turn never happened and
+                    # the next request would splice user_N twice. Commit the
+                    # turn instead. A2: do NOT assume the stream ended
+                    # naturally — a thinking-only exhaustion at max_tokens
+                    # has no stop token in the KV. The commit's close
+                    # reconcile verifies the recorded tail against the
+                    # end-of-turn ids: verified → commit as-is; otherwise it
+                    # closes the turn (or invalidates fail-closed). The
+                    # guard's original no-junk-persistence intent is
+                    # preserved for non-HIT modes below, where the fresh
+                    # cache_state is discarded and nothing desyncs.
+                    logger.warning(
+                        f"[KV Cache] session={session_id} | EMPTY RESPONSE "
+                        f"on HIT ({gen_token_count} tokens, no content) — "
+                        f"committing thinking-only turn for messages ↔ "
+                        f"token_ids consistency"
+                    )
+                    self._commit_interrupted_hit_turn(
+                        session_id=session_id,
+                        session=session,
+                        cache_state=cache_state,
+                        new_messages=new_messages,
+                        accumulated_text=accumulated_text,
+                        use_thinking=use_thinking,
+                        hit_prior_len=_hit_prior_len,
+                        prompt_len=len(full_prompt_token_ids),
+                        reason="empty response",
+                    )
+                else:
+                    logger.warning(
+                        f"[KV Cache] session={session_id} | SKIP SAVE | "
+                        f"empty response ({gen_token_count} tokens, no content)"
+                    )
+                # Idempotence marker BEFORE the terminal yield: a
+                # GeneratorExit delivered at that yield must not re-commit.
+                _turn_committed = True
                 yield GenerationResult(
                     text="",
                     finish_reason="stop",
@@ -4219,6 +4444,10 @@ class MLXEngine:
                 f"offset: {prev_offset} -> {new_offset} tokens "
                 f"(+{new_offset - prev_offset})"
             )
+
+        # Idempotence marker: the normal save is done — a GeneratorExit at
+        # the final yield below finds a consistent session.
+        _turn_committed = True
 
         # Auto-register base cache on miss
         if cache_mode in ("miss", "retry") and messages:
@@ -4984,6 +5213,336 @@ class MLXEngine:
             prefix = "<think>" if self.model_family == "glm" else "<think>\n"
             return prefix + accumulated_text
         return accumulated_text
+
+    @staticmethod
+    def _invalidate_cache_state(cache_state) -> None:
+        """Fail-closed session-cache invalidation: the next turn's HIT
+        condition requires a live cache, so it takes the honest MISS /
+        cold-fill path. The MTP finalize-hidden stash is cleared with the
+        cache — a stale hidden must never pair with a rebuilt cache."""
+        cache_state.cache = None
+        cache_state.token_ids = None
+        cache_state.mtp_last_hidden = None
+        cache_state.mtp_hidden_offset = None
+
+    # End-of-turn text used to template-close a client-cancelled assistant
+    # turn on the ChatML family (Qwen etc.). gemma4/glm need no close: the
+    # gemma4 next-turn suffix LEADS with the ``<turn|>`` closer (see
+    # _suffix_tokens_gemma4) and GLM turns are delimited by the role markers
+    # (<|user|>/<|assistant|>) themselves — neither template records a
+    # per-turn terminator that the interrupted turn would be missing.
+    _CHATML_TURN_END = "<|im_end|>"
+
+    def _try_close_interrupted_turn(
+        self, session_id: str, cache_state,
+    ) -> TurnCloseResult:
+        """Template-close reconcile for an interrupted assistant turn (C1).
+
+        Forwards the end-of-turn token through the TARGET model (1-token
+        forward — cheap) and appends it to token_ids, so the cached sequence
+        is template-valid for the next turn — mirroring the natural-EOS path,
+        where the stop token is recorded into token_ids and forwarded through
+        the cache (mlx-lm lookahead / QwenMTP finalize).
+
+        Tri-state per-path policy (see TurnCloseResult):
+        - gemma4 / glm: NOT_REQUIRED — see _CHATML_TURN_END comment; the
+          commit proceeds without a close and stays template-valid.
+        - recorded tail already IS an end-of-turn token (tokenizer EOS ids /
+          <|im_end|>): NOT_REQUIRED — the turn terminated naturally and the
+          stop token is in the KV (recorded + forwarded by the runner). This
+          is the A2 verification: an "empty response" (thinking-only) turn
+          may equally be a max_tokens exhaustion, which does NOT end with a
+          stop token and must be closed like a cancel.
+        - chatml + mlx-lm + target-only cache: CLOSED (forward, then verify
+          every offset-bearing layer landed on len(token_ids)).
+        - mlx-vlm path: FAILED — F3 pins every mlx-vlm model call to the
+          persistent _vlm_executor worker thread; a raw forward from this
+          (request) thread would break that pinning, and committing the
+          unterminated ChatML turn instead would hand the next HIT a cache
+          whose suffix splice (_suffix_tokens_chatml) assumes a prior
+          <|im_end|> that is NOT in the KV — template corruption.
+        - MTP head-bearing (target+head) cache: FAILED — the head/lazy-slot
+          bookkeeping is owned by the runner finalize, which
+          gen_iter.close() already ran (never double-commit); a target-only
+          forward here would desync head offset == target - 1. (Nearly
+          unreachable: the cancel reconcile invalidates head-bearing caches
+          whose target offsets cannot equal len(token_ids); a finalized
+          natural end passes the tail check above instead.)
+        - Detection failures (eot not in vocab, non-callable model): FAILED.
+        - Failure DURING the forward, or a post-forward offset mismatch:
+          FAILED (layers may be half-advanced).
+
+        EVERY FAILED path invalidates the session cache before returning
+        (fail-closed): a close was needed but cannot be performed/verified,
+        so the only safe outcome is an honest MISS → cold-fill next turn.
+        """
+        if self.model_family in ("gemma4", "glm"):
+            return TurnCloseResult.NOT_REQUIRED
+        cache = cache_state.cache
+        if cache is None or not cache_state.token_ids:
+            # Defensive: callers gate on a live cache; anything else has
+            # nothing verifiable to close — fail closed (invalidation of an
+            # already-dead state is a no-op).
+            self._invalidate_cache_state(cache_state)
+            return TurnCloseResult.FAILED
+
+        # A2 verification: natural termination leaves the stop token as the
+        # recorded tail (the terminal frame carries token=eos and the runner
+        # forwarded it — mlx-lm lookahead / QwenMTP finalize). If the tail
+        # already IS an end-of-turn token, the cached sequence is
+        # template-terminated: no close needed.
+        eot_ids: set[int] = set()
+        try:
+            eot_ids |= _collect_eos_ids(self.tokenizer)
+        except Exception:  # noqa: BLE001 — vocab probing must never raise
+            pass
+        try:
+            eot = _detect_token_id(self.tokenizer, self._CHATML_TURN_END)
+        except Exception:  # noqa: BLE001 — vocab probing must never raise
+            eot = -1
+        if eot >= 0:
+            eot_ids.add(eot)
+        if eot_ids and int(cache_state.token_ids[-1]) in eot_ids:
+            return TurnCloseResult.NOT_REQUIRED
+
+        # From here a close IS required — any unavailability is FAILED
+        # (fail-closed invalidate), never an unterminated ChatML commit.
+        def _close_unavailable(why: str) -> TurnCloseResult:
+            logger.warning(
+                f"[KV Cache] session={session_id} | interrupted turn needs "
+                f"an end-of-turn close but {why} — INVALIDATING session "
+                f"cache (fail-closed; an unterminated ChatML commit would "
+                f"corrupt the next HIT's suffix splice)"
+            )
+            self._invalidate_cache_state(cache_state)
+            return TurnCloseResult.FAILED
+
+        if self._use_vlm:
+            return _close_unavailable(
+                "the mlx-vlm path cannot forward from this thread (F3 "
+                "worker-thread pinning)"
+            )
+        model = self._language_model
+        n_target = len(getattr(model, "layers", None) or [])
+        if n_target and len(cache) > n_target:
+            return _close_unavailable(
+                "the cache carries trailing MTP head entries (a target-only "
+                "forward would desync the head offset)"
+            )
+        if not callable(model):
+            return _close_unavailable("the target model is not callable")
+        if eot < 0:
+            return _close_unavailable(
+                f"no {self._CHATML_TURN_END!r} token in the vocab"
+            )
+        try:
+            model(mx.array([[eot]]), cache=cache)
+            self._eval_cache(cache)
+        except Exception:  # noqa: BLE001 — fail closed: layers may be half-advanced
+            logger.exception(
+                f"[KV Cache] session={session_id} | end-of-turn close "
+                f"forward failed — INVALIDATING session cache (next turn "
+                f"cold-fills)"
+            )
+            self._invalidate_cache_state(cache_state)
+            return TurnCloseResult.FAILED
+        cache_state.token_ids = list(cache_state.token_ids) + [eot]
+        from mlx_soloheaven.engine.pld import _layer_offsets
+        expected = len(cache_state.token_ids)
+        _bad_layers = [
+            (i, off)
+            for i, off in enumerate(_layer_offsets(cache))
+            if off is not None and off != expected
+        ]
+        if _bad_layers:
+            logger.warning(
+                f"[KV Cache] session={session_id} | end-of-turn close left "
+                f"layers off target (expected {expected}, layers: "
+                f"{_bad_layers[:8]}) — INVALIDATING session cache"
+            )
+            self._invalidate_cache_state(cache_state)
+            return TurnCloseResult.FAILED
+        # The interrupted turn is closed; any finalize-hidden stash from it
+        # is offset-stale now — clear rather than let the next-turn gate
+        # discover it (single-use hygiene, same as the plain-dispatch strip).
+        cache_state.mtp_last_hidden = None
+        cache_state.mtp_hidden_offset = None
+        return TurnCloseResult.CLOSED
+
+    def _commit_interrupted_hit_turn(
+        self,
+        *,
+        session_id: str,
+        session: SessionState,
+        cache_state,
+        new_messages: list[dict],
+        accumulated_text: str,
+        use_thinking: bool,
+        hit_prior_len: int,
+        prompt_len: int,
+        reason: str,
+    ) -> None:
+        """C1 FIX: reconcile session bookkeeping after an early-returning HIT
+        turn (client cancel / empty thinking-only response).
+
+        On a cache HIT ``cache_state`` IS ``session.cache_state`` (alias) and
+        generation advanced the session's live KV + token_ids IN PLACE; only
+        the normal save at the end of _generate_locked keeps
+        session.messages / total_cache_tokens in step. When an early return
+        skips that save, session.messages claims the turn never happened
+        while token_ids already contain suffix(user_N) + partial output — the
+        next same-history request then matches the STALE messages, takes HIT,
+        and splices user_N a SECOND time after the dangling partial output.
+        This helper restores messages ↔ token_ids on every early-return
+        shape:
+
+        - cache already invalidated (AHEAD-reconcile on an untrimmable /
+          hybrid cache, PLD/MTP corruption callback): nothing to commit —
+          the stale messages are harmless because the next request's HIT
+          condition requires a live cache (honest MISS → cold-fill).
+        - no generated token recorded in the cache (cancel before any
+          token): committing an (empty) assistant turn would be semantically
+          wrong for the client's next request shape — ROLL BACK the
+          prefilled suffix instead (verified per-layer trim back to the
+          pre-turn history), or INVALIDATE if any layer cannot trim
+          (fail-closed). session.messages, unchanged, describes exactly the
+          rolled-back state.
+        - partial (cancel / stream teardown) or thinking-only (empty
+          response) output in the cache: reconcile the turn's template close
+          FIRST (_try_close_interrupted_turn's tri-state — NOT_REQUIRED and
+          CLOSED commit; FAILED already invalidated fail-closed, so nothing
+          is committed), then COMMIT the assistant message the same way the
+          normal save path does (full content incl. thinking via
+          _make_full_assistant_content, session.messages + new_messages +
+          assistant, total_cache_tokens from the cache offset) so the next
+          request's existing _messages_match machinery decides reuse
+          honestly — its last-assistant leniency accepts client-side
+          truncation of the partial output; real divergence takes the
+          existing cold-fill path. The close reconcile runs for EVERY
+          committed shape, including the "empty response" one: a
+          thinking-only stream may have ended at max_tokens exhaustion
+          rather than EOS, and only the recorded-tail verification inside
+          _try_close_interrupted_turn can tell them apart (A2).
+
+        Tool-call XML in a cancelled partial output is stored RAW (no
+        parsing / content stripping, unlike the normal save): the stored
+        assistant content is engine-internal and only consulted by
+        _messages_match — whose assistant leniency covers the difference —
+        and a partial <tool_call> block must never be surfaced as a real
+        tool call.
+        """
+        # Path 0 — already invalidated upstream: token_ids is gone too, so
+        # there is nothing to keep consistent (fail-closed already happened).
+        if cache_state.cache is None or not cache_state.token_ids:
+            logger.info(
+                f"[KV Cache] session={session_id} | {reason} on HIT | cache "
+                f"already invalidated — messages left as-is (next turn "
+                f"MISSes and cold-fills)"
+            )
+            return
+
+        token_ids = list(cache_state.token_ids)
+
+        # Path C — interrupted before ANY generated token was recorded: the
+        # KV holds at most the prefilled suffix (the reconcile already
+        # trimmed any un-recorded speculative tail back to the prompt).
+        if len(token_ids) <= prompt_len:
+            over = len(token_ids) - hit_prior_len
+            if over <= 0:
+                logger.info(
+                    f"[KV Cache] session={session_id} | {reason} on HIT | "
+                    f"cache still at pre-turn history ({len(token_ids)} "
+                    f"tokens) — nothing to roll back"
+                )
+                return
+            if all(hasattr(_c, "trim") for _c in cache_state.cache):
+                from mlx_soloheaven.engine.pld import _layer_offsets
+                _trim_exc = False
+                for _c in cache_state.cache:
+                    try:
+                        _c.trim(over)
+                    except Exception:  # noqa: BLE001
+                        _trim_exc = True
+                        logger.exception(
+                            f"[KV Cache] session={session_id} | suffix "
+                            f"rollback trim failed"
+                        )
+                _bad_layers = [
+                    (i, off)
+                    for i, off in enumerate(_layer_offsets(cache_state.cache))
+                    if off is not None and off != hit_prior_len
+                ]
+                if _trim_exc or _bad_layers:
+                    logger.warning(
+                        f"[KV Cache] session={session_id} | {reason} before "
+                        f"any generated token — suffix rollback to "
+                        f"{hit_prior_len} failed (exception={_trim_exc}, "
+                        f"layers off target: {_bad_layers[:8]}) — "
+                        f"INVALIDATING session cache (next turn cold-fills)"
+                    )
+                    self._invalidate_cache_state(cache_state)
+                    return
+                cache_state.token_ids = token_ids[:hit_prior_len]
+                # The whole turn was rolled back — any finalize stash from
+                # it is bogus (a pre-turn stash cannot exist here: the MTP
+                # gate consumes it and the plain-dispatch strip clears it).
+                cache_state.mtp_last_hidden = None
+                cache_state.mtp_hidden_offset = None
+                session.total_cache_tokens = hit_prior_len
+                session.touch()
+                logger.info(
+                    f"[KV Cache] session={session_id} | {reason} before any "
+                    f"generated token — rolled the {over}-token suffix back "
+                    f"(cache at {hit_prior_len} tokens, messages unchanged)"
+                )
+            else:
+                logger.warning(
+                    f"[KV Cache] session={session_id} | {reason} before any "
+                    f"generated token but the cache has untrimmable "
+                    f"(recurrent) layers — INVALIDATING session cache (next "
+                    f"turn cold-fills)"
+                )
+                self._invalidate_cache_state(cache_state)
+            return
+
+        # Path A/B — partial (cancel / stream teardown) or thinking-only
+        # (empty response) output is in the KV: reconcile the template close
+        # (tri-state), then commit. FAILED means a close was REQUIRED but
+        # unavailable/unverifiable — _try_close_interrupted_turn already
+        # invalidated the cache fail-closed; the stale messages are harmless
+        # without a live cache (the next request's HIT condition requires
+        # one → honest MISS → cold-fill), exactly like Path 0.
+        close = self._try_close_interrupted_turn(session_id, cache_state)
+        if close is TurnCloseResult.FAILED or cache_state.cache is None:
+            logger.info(
+                f"[KV Cache] session={session_id} | {reason} on HIT | "
+                f"turn close unavailable — session cache invalidated "
+                f"fail-closed, messages left as-is (next turn cold-fills)"
+            )
+            return
+        assistant_msg = {
+            "role": "assistant",
+            "content": self._make_full_assistant_content(
+                accumulated_text, use_thinking,
+            ),
+        }
+        new_offset = (
+            self._get_cache_offset(cache_state.cache) if cache_state.cache else 0
+        )
+        # Fallback mirrors the normal save: some models (GLM MoE) don't
+        # expose offset in cache objects.
+        if new_offset == 0 and cache_state.token_ids:
+            new_offset = len(cache_state.token_ids)
+        self._sessions[session_id] = SessionState(
+            cache_state=cache_state,
+            messages=list(session.messages) + list(new_messages) + [assistant_msg],
+            total_cache_tokens=new_offset,
+        )
+        logger.info(
+            f"[KV Cache] session={session_id} | {reason} on HIT | committed "
+            f"interrupted turn ({len(new_messages)} new + 1 assistant msg, "
+            f"offset {hit_prior_len} -> {new_offset})"
+        )
 
     def _strip_mtp_head_for_plain_dispatch(self, cache_state, prompt_cache):
         """Hygiene invariant for every plain (non-MTP) dispatch route.

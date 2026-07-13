@@ -32,6 +32,15 @@ logger = logging.getLogger(__name__)
 IDLE_FLUSH_POLL_S = 5.0
 IDLE_FLUSH_AFTER_S = 60.0
 
+# GPU keepalive fallback interval (seconds). The authoritative value is
+# MLXEngine.GPU_KEEPALIVE_INTERVAL (thread mode's constant) read off the
+# engine at loop start; this fallback only covers engine stand-ins in tests.
+GPU_KEEPALIVE_INTERVAL_FALLBACK_S = 1.0
+
+# Log the first keepalive-touch failure with a traceback, then go quiet:
+# a persistently failing ping would otherwise spam the log every interval.
+_keepalive_error_logged = False
+
 
 class _GracefulShutdown(BaseException):
     """Sentinel raised by the worker's SIGTERM/SIGINT handler to unwind the
@@ -93,6 +102,46 @@ def _idle_flush(engine):
             engine._lock.release()
     except Exception:  # noqa: BLE001
         logger.exception("[child] idle flush failed (ignored)")
+
+
+def _gpu_keepalive_touch(engine, shutdown_flag=None):
+    """GPU keepalive touch on the child MAIN thread (process-mode analog of
+    thread mode's keepalive thread, which load_model never starts in
+    main_thread mode — see MLXEngine._start_gpu_keepalive).
+
+    Runs only from the main loop's poll-timeout branch, so it can never be
+    concurrent with a generation (the loop drives every generation inline to
+    completion before the next poll). The NON-BLOCKING lock acquire is
+    defense in depth: if the lock is somehow held, skip — NEVER wait behind
+    a generation. Skipped outright while shutdown is unwinding
+    (``shutdown_flag`` set by the SIGTERM sentinel / final flush).
+
+    Fail-closed: the first ping failure is logged with a traceback, later
+    ones are suppressed, and the loop never dies.
+
+    Returns True if the touch was ATTEMPTED (success or logged failure —
+    the caller resets its interval timer either way, so a broken ping is
+    retried at the normal cadence, not in a tight loop) and False if it was
+    SKIPPED (shutdown unwinding / lock held).
+    """
+    global _keepalive_error_logged
+    if shutdown_flag is not None and shutdown_flag.is_set():
+        return False
+    if not engine._lock.acquire(blocking=False):
+        return False
+    try:
+        try:
+            engine._gpu_keepalive_ping()
+        except Exception:  # noqa: BLE001
+            if not _keepalive_error_logged:
+                _keepalive_error_logged = True
+                logger.exception(
+                    "[child] GPU keepalive touch failed "
+                    "(logged once; further failures suppressed)"
+                )
+        return True
+    finally:
+        engine._lock.release()
 
 
 def worker_main(cfg_dict, cmd_conn, resp_conn, ctrl_conn):
@@ -196,6 +245,25 @@ def worker_main(cfg_dict, cmd_conn, resp_conn, ctrl_conn):
     coalesce_ms = getattr(cfg, "stream_coalesce_ms", 30)
     coalescing = coalesce_n > 1
 
+    # GPU keepalive (process mode): the engine skips its keepalive THREAD in
+    # main_thread mode (no background MLX access), but between requests this
+    # main loop idles in poll() — and this IS the child's main thread, so
+    # the poll-timeout branch below may touch MLX safely. When enabled, the
+    # poll granularity shrinks to the thread-mode keepalive interval so the
+    # touch cadence matches thread mode; the idle flush and shutdown paths
+    # are unaffected (the flush trigger is wall-clock based on
+    # ``last_activity``, and a shorter poll only makes the loop MORE
+    # responsive to 'shutdown' ops / signals).
+    keepalive_enabled = bool(getattr(engine.cfg, "gpu_keepalive", False))
+    keepalive_interval = float(getattr(
+        engine, "GPU_KEEPALIVE_INTERVAL", GPU_KEEPALIVE_INTERVAL_FALLBACK_S
+    ))
+    poll_s = (
+        min(IDLE_FLUSH_POLL_S, keepalive_interval)
+        if keepalive_enabled else IDLE_FLUSH_POLL_S
+    )
+    last_keepalive = time.monotonic()
+
     # MAIN LOOP. Ops are strictly SERIAL: each generation runs to completion
     # inline before the next recv(), so a 'shutdown' op (or the sentinel /
     # pipe EOF) is never processed concurrently with an active generation —
@@ -207,11 +275,21 @@ def worker_main(cfg_dict, cmd_conn, resp_conn, ctrl_conn):
         while not shutdown_requested.is_set():
             try:
                 # Bounded wait instead of a blocking recv so the loop can run
-                # the periodic idle flush while the server sits quiet.
-                if not cmd_conn.poll(IDLE_FLUSH_POLL_S):
-                    if time.monotonic() - last_activity >= IDLE_FLUSH_AFTER_S:
+                # the periodic idle flush (and GPU keepalive) while the
+                # server sits quiet.
+                if not cmd_conn.poll(poll_s):
+                    now = time.monotonic()
+                    # Idle flush FIRST — the keepalive touch must never
+                    # starve or delay it.
+                    if now - last_activity >= IDLE_FLUSH_AFTER_S:
                         _idle_flush(engine)
                         last_activity = time.monotonic()
+                    if (
+                        keepalive_enabled
+                        and now - last_keepalive >= keepalive_interval
+                        and _gpu_keepalive_touch(engine, shutdown_requested)
+                    ):
+                        last_keepalive = time.monotonic()
                     continue
                 cmd = cmd_conn.recv()
             except (EOFError, OSError):

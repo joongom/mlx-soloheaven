@@ -1801,10 +1801,18 @@ class MLXEngine:
             logger.info(f"[{self.model_id}] GPU keepalive enabled (interval={self.GPU_KEEPALIVE_INTERVAL}s)")
         elif self.cfg.gpu_keepalive and self.execution_mode == "main_thread":
             # No background thread may touch MLX cache tensors in main-thread
-            # mode (codex constraint). The keepalive flush is skipped entirely.
+            # mode (codex constraint), so the keepalive THREAD is never
+            # started here. In PROCESS mode this engine lives inside the
+            # child whose main loop (process_worker.worker_main) runs the
+            # same GPU touch (_gpu_keepalive_ping) from its poll-timeout
+            # branch — that loop IS the child's main thread, so it may touch
+            # MLX safely. For a bare in-process main_thread engine (no
+            # worker loop) keepalive stays off entirely: there is no safe
+            # idle hook on the main thread to piggyback the touch on.
             logger.info(
-                f"[{self.model_id}] GPU keepalive DISABLED (main_thread mode — "
-                f"no background MLX access permitted)"
+                f"[{self.model_id}] GPU keepalive: no background thread in "
+                f"main_thread mode — the process-mode worker loop provides "
+                f"the periodic GPU touch (see process_worker)"
             )
 
     def _apply_generation_config_sampling(self) -> dict:
@@ -2006,9 +2014,7 @@ class MLXEngine:
                     if self._lock.acquire(blocking=False):
                         try:
                             t0 = time.perf_counter()
-                            a = mx.random.normal((32, 32))
-                            b = a @ a
-                            mx.eval(b)
+                            self._gpu_keepalive_ping()
                             elapsed = (time.perf_counter() - t0) * 1000
                             self._keepalive_ping_count += 1
                             if self._keepalive_ping_count % 100 == 1 or elapsed > 100:
@@ -2142,6 +2148,23 @@ class MLXEngine:
     def _touch_gpu(self):
         """Mark GPU as recently active (resets keepalive timer)."""
         MLXEngine._global_last_gpu_activity = time.time()
+
+    def _gpu_keepalive_ping(self):
+        """Tiny GPU op that keeps Metal clocked up (avoids the idle
+        downclock that roughly doubles the next request's TTFT).
+
+        This is the CORE OP of the thread-mode keepalive loop
+        (_start_gpu_keepalive), factored out so the PROCESS-mode child's
+        main loop (process_worker._gpu_keepalive_touch) can run the
+        identical touch from its poll-timeout branch — that loop IS the
+        child's main thread, so the main-thread-only MLX contract holds.
+
+        CALLER MUST HOLD self._lock (non-blocking acquire recommended) so
+        the ping can never overlap a generation.
+        """
+        a = mx.random.normal((32, 32))
+        b = a @ a
+        mx.eval(b)
 
     # --- Disk cache persistence ---
 

@@ -74,11 +74,13 @@ export SOLOHEAVEN_MODELS=""
 # ---------------------------------------------------------------------------
 DRAFT_ARGS=(--draft-model "$DRAFT_PATH" --draft-block-size 1)
 # --thinking-budget/--repetition-penalty: anti-loop safety net (overridable via "$@")
+# --gpu-keepalive intentionally NOT set here (user choice). NOTE: a '#' inside a
+# backslash-continued argument list BREAKS the command — keep disabled flags in
+# comments ABOVE the command, never inline.
 mlx-soloheaven \
   --model "$MODEL_PATH" \
   --memory-budget-gb 20 \
   "${DRAFT_ARGS[@]}" \
-  --gpu-keepalive \
   --prefill-step-size 2048 \
   --temperature 0.6 \
   --top-k 20 \

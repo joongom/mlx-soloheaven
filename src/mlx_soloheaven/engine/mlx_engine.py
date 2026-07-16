@@ -4965,7 +4965,26 @@ class MLXEngine:
     def _suffix_tokens_gemma4(
         self, new_messages: list[dict], thinking: bool,
     ) -> list[int]:
-        """Gemma 4 suffix: <turn|>\\n<|turn>user\\n{content}<turn|>\\n<|turn>model\\n"""
+        """Gemma 4 suffix: <turn|>\\n<|turn>user\\n{content}<turn|>\\n<|turn>model\\n
+
+        U18 — the leading ``<turn|>`` closer is for the INTERRUPTED-turn
+        contract (C1: gemma4 turns are committed unterminated on cancel /
+        empty response, _try_close_interrupted_turn returns NOT_REQUIRED
+        because this suffix supplies the closer). A NATURAL mlx-lm EOS,
+        however, RECORDS ``<turn|>`` as the stored tail (stream_generate's
+        terminal frame carries token=eos — gemma4 generation_config
+        eos_token_id includes ``<turn|>``=106 — and generate_step's
+        lookahead already forwarded it through the KV), so splicing this
+        suffix verbatim would DOUBLE the closer:
+            stored [..., '4', '.', 106] + suffix [106, 107('\\n'), ...]
+        while apply_chat_template over the full conversation renders a
+        single ``<turn|>``. The HIT path therefore runs the result through
+        _dedupe_gemma4_turn_closer, which drops the duplicate leading
+        closer when the stored tail already IS ``<turn|>`` (token-exact:
+        verified against the real gemma-4-31B tokenizer in
+        tests/test_gemma4_hit_suffix_eot.py — ``<turn|>`` is a special
+        token, so dropping suffix[0] equals encoding without the closer).
+        """
         parts = ["<turn|>"]
         for msg in new_messages:
             role = msg.get("role", "user")
@@ -4992,6 +5011,40 @@ class MLXEngine:
                 parts.append(f"\n<|turn>user\n{content}<turn|>")
         parts.append("\n<|turn>model\n")
         return self.tokenizer.encode("".join(parts), add_special_tokens=False)
+
+    def _gemma4_turn_end_id(self) -> int:
+        """Lazily detected id of ``<turn|>`` (gemma4 end-of-turn; also the
+        chat EOS the mlx-lm terminal frame records at a natural stop).
+        Memoized — _detect_token_id builds the full vocab dict, too costly
+        for the per-HIT dedupe check. Returns -1 when not in the vocab."""
+        cached = getattr(self, "_gemma4_eot_id_cache", None)
+        if cached is None:
+            try:
+                cached = _detect_token_id(self.tokenizer, self._GEMMA4_TURN_END)
+            except Exception:  # noqa: BLE001 — vocab probing must never break a HIT
+                cached = -1
+            self._gemma4_eot_id_cache = cached
+        return cached
+
+    def _dedupe_gemma4_turn_closer(
+        self, suffix: list[int], stored_ids: list[int] | None,
+    ) -> list[int]:
+        """U18: drop the suffix's duplicate leading ``<turn|>`` closer when
+        the stored ids already end with one (natural mlx-lm EOS — the
+        terminal frame records the eos token and the lookahead forwarded it
+        through the KV). Without this, every cache-HIT turn after a natural
+        stop splices a SECOND ``<turn|>`` back-to-back into the model
+        context (token-exact divergence from apply_chat_template; see
+        _suffix_tokens_gemma4's docstring for the recorded evidence).
+        An interrupted turn (no closer recorded — C1 NOT_REQUIRED) keeps
+        the leading closer: that is what makes the unterminated commit
+        template-valid. Non-gemma4 families pass through untouched."""
+        if self.model_family != "gemma4" or not suffix or not stored_ids:
+            return suffix
+        eot = self._gemma4_turn_end_id()
+        if eot >= 0 and suffix[0] == eot and int(stored_ids[-1]) == eot:
+            return suffix[1:]
+        return suffix
 
     def _suffix_tokens_chatml(
         self, new_messages: list[dict], thinking: bool,
@@ -5593,6 +5646,16 @@ class MLXEngine:
                 _hit_prior_len = len(cache_state.token_ids or [])
                 cached_tokens = session.total_cache_tokens
                 suffix = self._suffix_tokens(new_messages, thinking=use_thinking)
+                # U18: gemma4's suffix leads with the <turn|> closer for the
+                # C1 interrupted-turn contract, but a natural mlx-lm EOS
+                # already recorded <turn|> as the stored tail — splicing the
+                # closer again would double it back-to-back in the model
+                # context. Drop the duplicate (token-exact vs
+                # apply_chat_template; no-op for other families and for
+                # interrupted turns whose tail is not the closer).
+                suffix = self._dedupe_gemma4_turn_closer(
+                    suffix, cache_state.token_ids,
+                )
                 prompt_token_ids = list(cache_state.token_ids or []) + suffix
                 logger.info(
                     f"[KV Cache] session={session_id} | HIT | "
@@ -7780,7 +7843,13 @@ class MLXEngine:
     # _suffix_tokens_gemma4) and GLM turns are delimited by the role markers
     # (<|user|>/<|assistant|>) themselves — neither template records a
     # per-turn terminator that the interrupted turn would be missing.
+    # (U18: on a NATURAL gemma4 EOS the closer IS recorded as the stored
+    # tail, so the HIT path dedupes the suffix's leading closer — see
+    # _dedupe_gemma4_turn_closer.)
     _CHATML_TURN_END = "<|im_end|>"
+    # gemma4 end-of-turn token — the template's per-turn closer AND the chat
+    # EOS recorded by the mlx-lm terminal frame at a natural stop (U18).
+    _GEMMA4_TURN_END = "<turn|>"
 
     def _try_close_interrupted_turn(
         self, session_id: str, cache_state,

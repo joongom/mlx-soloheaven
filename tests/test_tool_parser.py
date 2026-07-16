@@ -311,22 +311,30 @@ def test_g4_split_multiple_channel_spans():
 
 
 def test_g4_split_orphan_close_marker():
-    """FIX 3: orphan <channel|> (reasoning that never opened a channel) splits
-    at the boundary — content is everything after the LAST close."""
+    """Round 6 (codex round 5, finding 3) — POLICY CHANGE from FIX 3: an
+    orphan <channel|> with NO open thought span is CONTENT under the
+    positional-router semantics. The streaming router (content mode, scans
+    only for thought OPENERS) had already emitted everything — marker
+    included — as content; the split now agrees byte-for-byte (the old
+    extraction discarded everything before the last orphan close as
+    'reasoning', so store != wire)."""
     t, c = split_thinking_and_content(
         "leftover reasoning<channel|>real content", "gemma4"
     )
-    assert c == "real content"
-    assert "<channel|>" not in c
+    assert t is None
+    assert c == "leftover reasoning<channel|>real content"
 
 
-def test_g4_split_orphan_open_marker_dropped():
-    """FIX 3: orphan <|channel> with no close is degenerate — the bare marker
-    must be dropped from content (not replayed)."""
+def test_g4_split_orphan_open_marker_kept_as_content():
+    """Round 6 (codex round 5, finding 3) — POLICY CHANGE from FIX 3: an
+    orphan <|channel> that never forms a thought opener is plain content
+    under the router (store == wire); the old extraction scrubbed the
+    marker, making the stored turn diverge from what streamed."""
     t, c = split_thinking_and_content(
         "answer text <|channel> dangling open", "gemma4"
     )
-    assert "<|channel>" not in c
+    assert t is None
+    assert c == "answer text <|channel> dangling open"
 
 
 def test_g4_split_sliding_window_variant():

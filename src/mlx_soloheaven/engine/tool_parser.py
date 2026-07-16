@@ -14,9 +14,10 @@ def generate_call_id() -> str:
 
 
 # Per-family tool_call block markers. The streaming emitter uses these to
-# detect block boundaries and extract the function name as soon as it's
-# determinable, so the first OpenAI-format chunk can be emitted early
-# instead of waiting for the whole block to close.
+# detect block boundaries; tool-call deltas (id/name, then arguments) are
+# deliberately deferred until the closed block parses successfully, so a
+# malformed block can fall back to raw-content passthrough without ever
+# having emitted a phantom tool_calls delta.
 _TOOL_MARKERS = {
     "chatml": ("<tool_call>", "</tool_call>"),
     "qwen":   ("<tool_call>", "</tool_call>"),
@@ -29,13 +30,22 @@ def get_tool_markers(model_family: str) -> tuple[str, str]:
     return _TOOL_MARKERS.get(model_family, _TOOL_MARKERS["chatml"])
 
 
+# U11: legal tool/function/parameter name charset. OpenAI function names
+# allow [A-Za-z0-9_.-] (MCP-style clients routinely register dotted/dashed
+# names like "server.tool-name"); the old ``\w+`` patterns failed to match
+# them and the whole block was silently deleted from the output. ``\w``
+# is kept (superset of A-Za-z0-9_) and dot/dash added; the XML formats
+# delimit names with ``>`` / ``{`` so the widened class stays unambiguous.
+_NAME = r"[\w.\-]+"
+
+
 def try_extract_tool_name(buf_after_start: str, model_family: str) -> Optional[str]:
     """Extract function name from text buffered *after* the start marker.
 
     Returns the name if determinable, else None (need more text).
     """
     if model_family == "gemma4":
-        m = re.match(r"\s*call:(\w+)\s*\{", buf_after_start)
+        m = re.match(r"\s*call:(" + _NAME + r")\s*\{", buf_after_start)
         return m.group(1) if m else None
     if model_family == "glm":
         # GLM: name is bare text between <tool_call> and first <arg_key>
@@ -44,7 +54,7 @@ def try_extract_tool_name(buf_after_start: str, model_family: str) -> Optional[s
         first_fn = buf_after_start.find("<function=")
         first_end = buf_after_start.find("</tool_call>")
         if first_fn >= 0 and (first_ak < 0 or first_fn < first_ak):
-            m = re.match(r"\s*<function=(\w+)>", buf_after_start)
+            m = re.match(r"\s*<function=(" + _NAME + r")>", buf_after_start)
             return m.group(1) if m else None
         cutoffs = [p for p in (first_ak, first_end) if p >= 0]
         if not cutoffs:
@@ -52,11 +62,16 @@ def try_extract_tool_name(buf_after_start: str, model_family: str) -> Optional[s
         name = buf_after_start[:min(cutoffs)].strip().lstrip("\n").strip()
         return name or None
     # Qwen / chatml default
-    m = re.match(r"\s*<function=(\w+)>", buf_after_start)
+    m = re.match(r"\s*<function=(" + _NAME + r")>", buf_after_start)
     return m.group(1) if m else None
 
 
-def parse_tool_calls(text: str, model_family: str = "chatml") -> tuple[str, list[dict]]:
+def parse_tool_calls(
+    text: str,
+    model_family: str = "chatml",
+    *,
+    rstrip_content: bool = True,
+) -> tuple[str, list[dict]]:
     """
     Parse tool_call blocks from model output.
 
@@ -67,42 +82,82 @@ def parse_tool_calls(text: str, model_family: str = "chatml") -> tuple[str, list
 
     Returns:
         (content_text, tool_calls)
-        - content_text: text before any tool_call block
+        - content_text: the input text with successfully parsed tool_call
+          blocks REMOVED. U11 round 2 (per-block fail-closed preservation):
+          the text is walked block by block — an unparseable block, an
+          unclosed trailing block, and ALL surrounding ordinary text are
+          RETAINED in the content in their original order (matching what the
+          streaming FSM emits, which handles blocks independently and passes
+          garbage through), never silently deleted. When at least one call
+          parsed the content is right-stripped (historical batch behavior);
+          when nothing parses the raw text is returned byte-identical.
         - tool_calls: list of OpenAI-format tool call dicts
+
+    ``rstrip_content=False`` (codex round 3, finding 3 — SEGMENT MODE):
+    callers that parse one CONTENT SEGMENT of a larger text (the stored-
+    content tool-XML strip walks segments and reassembles them) must keep
+    the segment's trailing whitespace — it is INTERNAL whitespace of the
+    reassembled string, and the historical per-call right-strip silently
+    glued the segment to the following thinking marker. The top-level
+    caller applies ONE right-strip to the final reconstructed string; the
+    default True preserves the historical whole-output batch behavior.
     """
     if model_family == "gemma4":
-        return _parse_gemma4_tool_calls(text)
+        return _parse_gemma4_tool_calls(text, rstrip_content=rstrip_content)
     if model_family == "glm":
         # GLM format has <arg_key>/<arg_value> pairs; if not found, fall through
         # to Qwen-style parsing (some GLM variants follow Qwen format).
         if "<arg_key>" in text or "<arg_value>" in text:
-            return _parse_glm_tool_calls(text)
-    return _parse_chatml_tool_calls(text)
+            return _parse_glm_tool_calls(text, rstrip_content=rstrip_content)
+    return _parse_chatml_tool_calls(text, rstrip_content=rstrip_content)
 
 
-def _parse_chatml_tool_calls(text: str) -> tuple[str, list[dict]]:
-    """Parse Qwen/ChatML XML tool call format."""
-    tool_call_pattern = re.compile(
-        r"<tool_call>\s*<function=(\w+)>(.*?)</function>\s*</tool_call>",
-        re.DOTALL,
-    )
+# ChatML/Qwen block span (the FSM's block boundary: start marker to the
+# FIRST end marker) and the strict call shape a span must fully match to
+# count as a real call.
+_CHATML_BLOCK_RE = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
+_CHATML_CALL_RE = re.compile(
+    r"<tool_call>\s*<function=(" + _NAME + r")>(.*?)</function>\s*</tool_call>",
+    re.DOTALL,
+)
+_CHATML_PARAM_RE = re.compile(
+    r"<parameter=(" + _NAME + r")>(.*?)</parameter>", re.DOTALL
+)
 
-    first_tc = text.find("<tool_call>")
-    if first_tc == -1:
+
+def _parse_chatml_tool_calls(
+    text: str, *, rstrip_content: bool = True,
+) -> tuple[str, list[dict]]:
+    """Parse Qwen/ChatML XML tool call format.
+
+    U11 round 2 (per-block preservation): walk closed
+    ``<tool_call>...</tool_call>`` spans left to right; a span that fully
+    matches the call shape is consumed into ``tool_calls`` and removed from
+    the content; every other span (garbage body, unclosed trailing block)
+    and all surrounding ordinary text stay in the content in original order
+    — converging with the streaming FSM, which passes unparseable closed
+    blocks through as raw content. Pre-fix, a single parseable block caused
+    the content to be cut at the FIRST start marker, silently deleting any
+    malformed sibling block plus the ordinary text around it.
+    """
+    if "<tool_call>" not in text:
         return text, []
 
-    content_text = text[:first_tc].rstrip()
-    tool_calls = []
+    tool_calls: list[dict] = []
+    content_parts: list[str] = []
+    pos = 0
+    for block in _CHATML_BLOCK_RE.finditer(text):
+        call = _CHATML_CALL_RE.fullmatch(block.group(0))
+        if call is None:
+            # Unparseable block: NOT consumed — it is retained in content
+            # via the text[pos:...] span of the next consumed block (or the
+            # final tail append below).
+            continue
+        func_name = call.group(1)
+        params_block = call.group(2)
 
-    for match in tool_call_pattern.finditer(text):
-        func_name = match.group(1)
-        params_block = match.group(2)
-
-        param_pattern = re.compile(
-            r"<parameter=(\w+)>(.*?)</parameter>", re.DOTALL
-        )
         arguments = {}
-        for pm in param_pattern.finditer(params_block):
+        for pm in _CHATML_PARAM_RE.finditer(params_block):
             key = pm.group(1)
             value = pm.group(2).strip()
             try:
@@ -118,11 +173,21 @@ def _parse_chatml_tool_calls(text: str) -> tuple[str, list[dict]]:
                 "arguments": json.dumps(arguments, ensure_ascii=False),
             },
         })
+        content_parts.append(text[pos:block.start()])
+        pos = block.end()
+    content_parts.append(text[pos:])
 
-    return content_text, tool_calls
+    # U11 fail-closed: a start marker was present but NOTHING parsed —
+    # pass the raw text through byte-identical (no vanished block).
+    if not tool_calls:
+        return text, []
+    content = "".join(content_parts)
+    return (content.rstrip() if rstrip_content else content), tool_calls
 
 
-def _parse_glm_tool_calls(text: str) -> tuple[str, list[dict]]:
+def _parse_glm_tool_calls(
+    text: str, *, rstrip_content: bool = True,
+) -> tuple[str, list[dict]]:
     """Parse GLM-family tool call format.
 
     Format (from GLM chat_template.jinja):
@@ -136,13 +201,22 @@ def _parse_glm_tool_calls(text: str) -> tuple[str, list[dict]]:
     and preceding the first <arg_key>. Key/value pairs alternate.
     Values may be JSON strings, numbers, booleans, or nested JSON; we
     attempt json.loads per value and fall back to raw string.
+
+    U11 round 2 (per-block preservation): blocks are walked left to right;
+    a block that yields a function name is consumed and removed from the
+    content, an unparseable block (empty name) and all surrounding ordinary
+    text are retained in content in original order (see
+    _parse_chatml_tool_calls). The deliberate leniency for a MISSING
+    trailing ``</tool_call>`` (generation cut mid-stream, the ``\\Z``
+    alternate) is unchanged — match-time consumers discount it separately
+    (see MLXEngine._content_xml_calls_for_match, round 5).
     """
-    first_tc = text.find("<tool_call>")
-    if first_tc == -1:
+    if "<tool_call>" not in text:
         return text, []
 
-    content_text = text[:first_tc].rstrip()
-    tool_calls = []
+    tool_calls: list[dict] = []
+    content_parts: list[str] = []
+    pos = 0
 
     # Full tool_call block pattern (non-greedy, tolerate missing </tool_call>)
     tc_pattern = re.compile(
@@ -168,6 +242,7 @@ def _parse_glm_tool_calls(text: str) -> tuple[str, list[dict]]:
         # Some models prepend a newline or whitespace inside <tool_call>
         func_name = func_name.strip().lstrip("\n").strip()
         if not func_name:
+            # Unparseable block: retained in content (not consumed).
             continue
 
         arguments = {}
@@ -188,8 +263,16 @@ def _parse_glm_tool_calls(text: str) -> tuple[str, list[dict]]:
                 "arguments": json.dumps(arguments, ensure_ascii=False),
             },
         })
+        content_parts.append(text[pos:tc_match.start()])
+        pos = tc_match.end()
+    content_parts.append(text[pos:])
 
-    return content_text, tool_calls
+    # U11 fail-closed: never silently delete an unparseable block (see
+    # _parse_chatml_tool_calls).
+    if not tool_calls:
+        return text, []
+    content = "".join(content_parts)
+    return (content.rstrip() if rstrip_content else content), tool_calls
 
 
 def _parse_gemma4_value(raw: str):
@@ -371,23 +454,38 @@ def _parse_gemma4_args(args_str: str) -> dict:
     return result
 
 
-def _parse_gemma4_tool_calls(text: str) -> tuple[str, list[dict]]:
-    """Parse Gemma 4 tool call format: <|tool_call>call:name{args}<tool_call|>"""
-    pattern = re.compile(
-        r"<\|tool_call>call:(\w+)(\{.*?\})<tool_call\|>",
-        re.DOTALL,
-    )
+# Gemma 4 block span (start marker to the FIRST end marker) and the strict
+# call shape a span must fully match to count as a real call.
+_GEMMA4_BLOCK_RE = re.compile(r"<\|tool_call>.*?<tool_call\|>", re.DOTALL)
+_GEMMA4_CALL_RE = re.compile(
+    r"<\|tool_call>call:(" + _NAME + r")(\{.*?\})<tool_call\|>",
+    re.DOTALL,
+)
 
-    first_tc = text.find("<|tool_call>")
-    if first_tc == -1:
+
+def _parse_gemma4_tool_calls(
+    text: str, *, rstrip_content: bool = True,
+) -> tuple[str, list[dict]]:
+    """Parse Gemma 4 tool call format: <|tool_call>call:name{args}<tool_call|>
+
+    U11 round 2 (per-block preservation): parsed blocks are consumed and
+    removed from the content; unparseable/unclosed blocks and all
+    surrounding ordinary text are retained in original order (see
+    _parse_chatml_tool_calls).
+    """
+    if "<|tool_call>" not in text:
         return text, []
 
-    content_text = text[:first_tc].rstrip()
-    tool_calls = []
-
-    for match in pattern.finditer(text):
-        func_name = match.group(1)
-        args_str = match.group(2)
+    tool_calls: list[dict] = []
+    content_parts: list[str] = []
+    pos = 0
+    for block in _GEMMA4_BLOCK_RE.finditer(text):
+        call = _GEMMA4_CALL_RE.fullmatch(block.group(0))
+        if call is None:
+            # Unparseable block: retained in content (not consumed).
+            continue
+        func_name = call.group(1)
+        args_str = call.group(2)
         arguments = _parse_gemma4_args(args_str)
 
         tool_calls.append({
@@ -398,8 +496,16 @@ def _parse_gemma4_tool_calls(text: str) -> tuple[str, list[dict]]:
                 "arguments": json.dumps(arguments, ensure_ascii=False),
             },
         })
+        content_parts.append(text[pos:block.start()])
+        pos = block.end()
+    content_parts.append(text[pos:])
 
-    return content_text, tool_calls
+    # U11 fail-closed: never silently delete an unparseable block (see
+    # _parse_chatml_tool_calls).
+    if not tool_calls:
+        return text, []
+    content = "".join(content_parts)
+    return (content.rstrip() if rstrip_content else content), tool_calls
 
 
 # Gemma 4 thinking-channel markers. The well-formed shape is
@@ -422,6 +528,13 @@ _CHATML_THINK_CLOSE = "</think>"
 # (the sliding-window variant drops it and starts straight at ``thought\n``).
 _GEMMA4_THOUGHT_SPAN_RE = re.compile(
     r"(?:<\|channel>)?thought\n.*?<channel\|>\s*", re.DOTALL
+)
+# Codex round 7, finding 3: FULL-marker-only variant — used when the thinking
+# contract is INACTIVE, where the bare ``thought\n`` opener is ambiguous
+# (legitimate content may start with those words) and must not be treated as
+# a thought span; the model-emitted ``<|channel>`` open stays authoritative.
+_GEMMA4_THOUGHT_SPAN_FULL_RE = re.compile(
+    r"<\|channel>thought\n.*?<channel\|>\s*", re.DOTALL
 )
 
 
@@ -452,6 +565,26 @@ def _partial_marker_tail(buf: str, markers: tuple[str, ...]) -> int:
 # Channel labels emitted by ``ThinkingRouter``.
 CHANNEL_REASONING = "reasoning"
 CHANNEL_CONTENT = "content"
+
+
+def thinking_router_active(model_family: str, enable_thinking: bool) -> bool:
+    """Codex round 5, finding 3 — the SINGLE routing-activation policy for
+    both streaming APIs (OpenAI-compat and the web chat SSE path).
+
+    gemma4 markers are ALWAYS authoritative: the model emits its own
+    ``<|channel>thought`` / ``<channel|>`` channel markers regardless of the
+    prompt-side thinking contract, so the router stays MARKER-ACTIVE even
+    with ``enable_thinking=False``. Pre-fix, a thinking=False request made
+    the router a pure passthrough — a tool call the model REHEARSED inside a
+    thought span reached the streaming tool FSM and was emitted as a REAL
+    call (finish_reason=tool_calls), while the batch parse and the session
+    store (content_segments, which already ignores the flag for gemma4 —
+    round 4 / U12) excluded it as a rehearsal. chatml/glm keep flag-driven
+    activation: their thought block exists only when the prompt suffix opens
+    it, so an inactive router is correct there (a literal ``</think>`` in
+    non-thinking output is a quote).
+    """
+    return bool(enable_thinking) or model_family == "gemma4"
 
 
 class ThinkingRouter:
@@ -486,9 +619,23 @@ class ThinkingRouter:
     ``flush()`` -> list[(channel, text)] remainder safely emittable at stream
     end. For non-thinking / non-routed callers construct with ``active=False``
     and ``feed`` is a pass-through that yields ``(CHANNEL_CONTENT, text)``.
+
+    ``enable_thinking`` (codex round 7, finding 3 — gemma4 only): the
+    EFFECTIVE thinking contract of the request. The gemma4 router stays
+    marker-ACTIVE regardless of the flag (round 6 / U12: FULL
+    ``<|channel>thought`` markers are model-emitted and unambiguous), but the
+    AMBIGUOUS BARE ``thought\n`` opener heuristic is only trusted when the
+    thinking contract is active — under ``enable_thinking=False`` legitimate
+    content that genuinely starts with the words ``thought\n...`` must stay
+    content. ``None`` (legacy callers) falls back to ``active``.
     """
 
-    def __init__(self, active: bool, model_family: str = "chatml"):
+    def __init__(
+        self,
+        active: bool,
+        model_family: str = "chatml",
+        enable_thinking: Optional[bool] = None,
+    ):
         self.active = active
         self.model_family = model_family
         self._is_gemma4 = model_family == "gemma4"
@@ -506,6 +653,12 @@ class ThinkingRouter:
         # ``<|channel>thought\n`` opener may re-open mid-content (real
         # multi-cycle). Tracks whether the router has emitted any content yet.
         self._content_seen = False
+        # Codex round 7, finding 3: bare-opener recognition additionally
+        # requires the thinking contract to be active (full markers stay
+        # authoritative regardless — the router itself stays active).
+        self._bare_opener_active = active and (
+            enable_thinking if enable_thinking is not None else active
+        )
 
     def feed(self, text: str) -> list[tuple[str, str]]:
         if not self.active:
@@ -550,8 +703,11 @@ class ThinkingRouter:
             # no content preceding it in this buffer). So a literal ``thought\n``
             # line inside content / tool args is NOT mis-routed to reasoning,
             # whether it appears after earlier content or after content in the
-            # same buffer.
-            at_gen_start = not self._content_seen
+            # same buffer. Codex round 7, finding 3: it is additionally gated
+            # on the thinking contract being active — with thinking disabled a
+            # position-zero ``thought\n`` is legitimate content, not the
+            # sliding-window degenerate opener.
+            at_gen_start = self._bare_opener_active and not self._content_seen
             full = buf.find(_GEMMA4_THOUGHT_OPEN_FULL)
             bare = buf.find(_GEMMA4_THOUGHT_OPEN_BARE)
             # The bare opener only counts at absolute generation start (position
@@ -664,7 +820,9 @@ class ThinkingRouter:
         return out
 
 
-def _gemma4_extract_content(text: str) -> tuple[Optional[str], str]:
+def _gemma4_extract_content(
+    text: str, *, bare_opener_active: bool = True,
+) -> tuple[Optional[str], str]:
     """Strip ALL Gemma 4 thought channels and return ``(thinking, content)``.
 
     Robust to degenerate multi-cycle output: removes every
@@ -673,7 +831,22 @@ def _gemma4_extract_content(text: str) -> tuple[Optional[str], str]:
     (content is everything after the LAST orphan close), and finally drops
     leftover orphan ``<|channel>`` / ``<channel|>`` markers. ``thinking`` is the
     concatenation of the removed reasoning (best-effort, for inspection).
+
+    ``bare_opener_active=False`` (codex round 7, finding 3 — thinking
+    contract inactive): only FULL ``<|channel>thought\\n`` spans are treated
+    as thought spans; a BARE ``thought\\n`` opener is ambiguous under an
+    inactive contract (legitimate content may start with those words) and is
+    left in the content. The orphan-``<channel|>`` boundary reduction (step
+    2) is skipped too — with no thinking contract, a close that never had an
+    open span is model noise inside CONTENT the client already received (the
+    router passes it through), so hiding everything before it would lose
+    real content. Stray orphan markers themselves are still dropped from the
+    replayed prompt (step 3), and FULL spans strip regardless (U12).
     """
+    span_re = (
+        _GEMMA4_THOUGHT_SPAN_RE if bare_opener_active
+        else _GEMMA4_THOUGHT_SPAN_FULL_RE
+    )
     # 1. Capture + remove all well-formed thought spans.
     thoughts: list[str] = []
 
@@ -694,12 +867,16 @@ def _gemma4_extract_content(text: str) -> tuple[Optional[str], str]:
             thoughts.append(t)
         return ""
 
-    cleaned = _GEMMA4_THOUGHT_SPAN_RE.sub(_grab, text)
+    cleaned = span_re.sub(_grab, text)
 
     # 2. Any orphan ``<channel|>`` left (reasoning that never opened a proper
     #    channel, or a final degenerate cycle) — split at the LAST one; the tail
-    #    is the real answer, the head is leftover reasoning.
-    last_close = cleaned.rfind(_GEMMA4_CHANNEL_CLOSE)
+    #    is the real answer, the head is leftover reasoning. Skipped when the
+    #    thinking contract is inactive (codex round 7, finding 3): without a
+    #    contract the head is content, not leftover reasoning.
+    last_close = (
+        cleaned.rfind(_GEMMA4_CHANNEL_CLOSE) if bare_opener_active else -1
+    )
     if last_close != -1:
         head = cleaned[:last_close]
         head_t = head.replace(_GEMMA4_CHANNEL_OPEN, "").replace(
@@ -718,10 +895,164 @@ def _gemma4_extract_content(text: str) -> tuple[Optional[str], str]:
     return thinking, cleaned.strip()
 
 
+def _gemma4_router_split(
+    text: str, thinking_active: bool = True,
+) -> tuple[Optional[str], str]:
+    """Codex round 5, finding 3: the gemma4 thinking/content split with
+    POSITIONAL-ROUTER semantics — the streaming ``ThinkingRouter`` is the
+    authority on what reached each channel, and this is its whole-text twin
+    (the same state machine ``content_segments`` simulates, additionally
+    collecting the reasoning spans):
+
+    * content  = the byte-exact concatenation of the router's
+      content-channel output (== the ``content_segments`` union);
+    * thinking = the concatenation of the reasoning-channel output
+      (stripped for storage; ``None`` when empty).
+
+    Divergences from the legacy ``_gemma4_extract_content`` regex
+    extraction this replaces for the split/persistence path:
+    - a BARE ``thought\\n`` opener AFTER content is CONTENT (FIX 4: bare
+      openers only count at absolute generation start — the extraction
+      matched them anywhere and hid streamed content as 'thinking');
+    - an orphan ``<channel|>`` with no open thought span is CONTENT, never
+      a reasoning/answer boundary (the extraction discarded everything
+      before the LAST orphan close — text the router had already streamed
+      to the client as content);
+    - orphan ``<|channel>`` markers in content are preserved byte-for-byte
+      (the router passes them through; store == wire).
+
+    ``thinking_active`` (codex round 7, finding 3): the effective thinking
+    contract the text streamed under. FULL markers stay authoritative
+    regardless; the AMBIGUOUS BARE ``thought\\n`` opener is only recognized
+    when the contract is active (the router's ``enable_thinking`` gate).
+    """
+    reasoning_parts: list[str] = []
+    content_parts: list[str] = []
+    pos = 0
+    in_reasoning = False
+    n = len(text)
+    # The BARE opener is only recognized at the absolute start of generation
+    # (FIX 4 — before any content has been emitted) AND under an active
+    # thinking contract (codex round 7, finding 3).
+    if thinking_active and text.startswith(_GEMMA4_THOUGHT_OPEN_BARE):
+        in_reasoning = True
+        pos = len(_GEMMA4_THOUGHT_OPEN_BARE)
+    while pos < n:
+        if in_reasoning:
+            close = text.find(_GEMMA4_CHANNEL_CLOSE, pos)
+            if close == -1:
+                # Unclosed reasoning runs to the end (router: reasoning).
+                reasoning_parts.append(text[pos:])
+                break
+            reasoning_parts.append(text[pos:close])
+            pos = close + len(_GEMMA4_CHANNEL_CLOSE)
+            in_reasoning = False
+        else:
+            opener = text.find(_GEMMA4_THOUGHT_OPEN_FULL, pos)
+            if opener == -1:
+                content_parts.append(text[pos:])
+                break
+            if opener > pos:
+                content_parts.append(text[pos:opener])
+            pos = opener + len(_GEMMA4_THOUGHT_OPEN_FULL)
+            in_reasoning = True
+    thinking = "".join(reasoning_parts).strip() or None
+    return thinking, "".join(content_parts)
+
+
+def content_segments(
+    text: str, model_family: str = "chatml", thinking_active: bool = True,
+) -> list[tuple[int, int]]:
+    """U12 round 2 / codex round 3, finding 4: ``(start, end)`` spans of the
+    CONTENT channel in raw assistant text, in order.
+
+    This is the POSITIONAL twin of the streaming ``ThinkingRouter`` — the
+    router is the AUTHORITY on what reached the client's content channel —
+    for callers that must keep or strip RAW text per channel (the engine's
+    stored-content tool-XML stripping and the cache-match helpers). gemma4
+    explicitly supports MULTIPLE reasoning/content cycles (thought → content
+    → thought → content), so reducing content to the suffix after the LAST
+    close marker drops legitimate earlier content segments; this returns
+    every one.
+
+    ``thinking_active`` is the router-active state the text streamed under:
+
+    - chatml/glm, ``thinking_active=False``: the inactive router is a pure
+      pass-through — the WHOLE text is one content span, and a literal
+      ``</think>`` in it (a quote) is content, never a boundary (round 3,
+      finding 4 repro b).
+    - chatml/glm, ``thinking_active=True``: generation starts inside the
+      thought block (the opener lives in the prompt suffix); the FIRST
+      ``</think>`` ends reasoning and the router never re-enters it —
+      everything after is one content span. No close marker → the whole
+      text is content (KEPT legacy divergence: the router routes the
+      degenerate unclosed stream entirely to reasoning; callers that need
+      that exact shape use ``split_thinking_and_content`` with
+      ``started_in_thinking=True``, as the engine's batch parse does — the
+      shapes that reach THIS helper always carry the close).
+    - gemma4: the router's exact policy, simulated positionally — start in
+      CONTENT mode scanning for THOUGHT OPENERS ONLY (full
+      ``<|channel>thought\\n`` anywhere; the BARE ``thought\\n`` opener only
+      at the very start of generation, FIX 4); a ``<channel|>`` close only
+      ends an OPEN thought span. An orphan close with no prior thought-open
+      is therefore CONTENT (round 3, finding 4 repro a — the old
+      _gemma4_extract_content-style orphan-close reduction discarded
+      everything before it, text the router had already emitted as
+      content). FULL markers deliberately IGNORE the flag: the model emits
+      its own channel markers regardless of the prompt-side thinking
+      contract, and the U12 rehearsal protection (tool XML inside a thought
+      span is never a call) must hold for stored turns of either contract.
+      Codex round 7, finding 3: the AMBIGUOUS BARE opener is the exception —
+      it is only recognized when ``thinking_active`` is True (with thinking
+      disabled, content genuinely starting with the words ``thought\\n``
+      stays content, matching the router's ``enable_thinking`` gate).
+    """
+    if not text:
+        return []
+    if model_family != "gemma4":
+        if not thinking_active:
+            return [(0, len(text))]
+        idx = text.find(_CHATML_THINK_CLOSE)
+        start = idx + len(_CHATML_THINK_CLOSE) if idx != -1 else 0
+        return [(start, len(text))] if start < len(text) else []
+    # gemma4: positional simulation of the (active) router.
+    segments: list[tuple[int, int]] = []
+    pos = 0
+    in_reasoning = False
+    n = len(text)
+    # The BARE opener is only recognized at the absolute start of generation
+    # (FIX 4 — before any content has been emitted) AND under an active
+    # thinking contract (codex round 7, finding 3).
+    if thinking_active and text.startswith(_GEMMA4_THOUGHT_OPEN_BARE):
+        in_reasoning = True
+        pos = len(_GEMMA4_THOUGHT_OPEN_BARE)
+    while pos < n:
+        if in_reasoning:
+            close = text.find(_GEMMA4_CHANNEL_CLOSE, pos)
+            if close == -1:
+                # Unclosed reasoning runs to the end (router: reasoning).
+                pos = n
+                break
+            pos = close + len(_GEMMA4_CHANNEL_CLOSE)
+            in_reasoning = False
+        else:
+            opener = text.find(_GEMMA4_THOUGHT_OPEN_FULL, pos)
+            if opener == -1:
+                segments.append((pos, n))
+                pos = n
+                break
+            if opener > pos:
+                segments.append((pos, opener))
+            pos = opener + len(_GEMMA4_THOUGHT_OPEN_FULL)
+            in_reasoning = True
+    return [(s, e) for s, e in segments if s < e]
+
+
 def split_thinking_and_content(
     text: str,
     model_family: str = "chatml",
     started_in_thinking: bool = False,
+    thinking_active: bool = True,
 ) -> tuple[Optional[str], str]:
     """
     Split thinking from content in model output.
@@ -734,13 +1065,25 @@ def split_thinking_and_content(
     case, routing the whole output to reasoning (content="") so the non-streaming
     split matches the streaming ``ThinkingRouter``. Default False preserves the
     legacy "no markers -> content" behavior for non-thinking output.
+
+    ``thinking_active`` (gemma4 only — codex round 7, finding 3): the
+    effective thinking contract the text was generated under. FULL channel
+    markers stay authoritative regardless; only the AMBIGUOUS BARE
+    ``thought\\n`` opener recognition is gated on it (see
+    ``_gemma4_router_split``). Default True preserves the round-6 behavior
+    for callers without a contract in scope.
     """
     if model_family == "gemma4":
-        # Strengthened (FIX 3): handle ALL thought spans + orphan markers +
-        # degenerate multi-cycle/trailing reasoning, not just the first block.
-        if _GEMMA4_CHANNEL_OPEN in text or _GEMMA4_CHANNEL_CLOSE in text or text.startswith("thought\n"):
-            return _gemma4_extract_content(text)
-        return None, text
+        # Codex round 5, finding 3: POSITIONAL-ROUTER semantics — this split
+        # feeds persistence (web chat / OpenAI-compat session stores) and the
+        # engine batch parse, all of which must agree byte-for-byte with what
+        # the streaming ThinkingRouter emitted on the wire. The old regex
+        # extraction (_gemma4_extract_content, still used for INPUT-history
+        # stripping in strip_thinking_tags) disagreed on degenerate shapes:
+        # a bare ``thought\n`` opener after content and an orphan
+        # ``<channel|>`` are CONTENT under the router. Marker-free text is
+        # (None, text) either way.
+        return _gemma4_router_split(text, thinking_active=thinking_active)
 
     # ChatML: <think>...</think>
     # Case 1: Has <think>...</think> wrapper (full tags in output)
@@ -797,10 +1140,22 @@ def normalize_content(content) -> str:
     return str(content) if content else ""
 
 
-def strip_thinking_tags(messages: list[dict], model_family: str = "chatml") -> list[dict]:
+def strip_thinking_tags(
+    messages: list[dict],
+    model_family: str = "chatml",
+    thinking_active: bool = True,
+) -> list[dict]:
     """Strip thinking tags from assistant messages and normalize content.
 
     Supports ChatML (<think>...</think>) and Gemma 4 (<|channel>thought...<channel|>).
+
+    ``thinking_active`` (codex round 7, finding 3): the session/request
+    thinking contract of the prompt-side caller. FULL gemma4 channel markers
+    are always stripped (model-emitted, unambiguous); the AMBIGUOUS BARE
+    ``thought\\n`` opener is only treated as a thinking span when the
+    contract is active — with thinking disabled an assistant turn genuinely
+    starting with the words ``thought\\n...`` is content and must replay
+    into the prompt untouched. Default True preserves round-6 behavior.
     """
     result = []
     for msg in messages:
@@ -814,8 +1169,17 @@ def strip_thinking_tags(messages: list[dict], model_family: str = "chatml") -> l
             # ALL <|channel>thought...<channel|> spans + orphan markers +
             # degenerate trailing reasoning (the old single-span re.sub +
             # first-<channel|> split left repeated cycles to replay raw).
-            if _GEMMA4_CHANNEL_OPEN in content or _GEMMA4_CHANNEL_CLOSE in content or content.startswith("thought\n"):
-                _, cleaned = _gemma4_extract_content(content)
+            # Codex round 7, finding 3: the bare-opener TRIGGER (and the
+            # extraction's bare-span matching) is gated on the thinking
+            # contract; full markers keep triggering regardless.
+            if (
+                _GEMMA4_CHANNEL_OPEN in content
+                or _GEMMA4_CHANNEL_CLOSE in content
+                or (thinking_active and content.startswith("thought\n"))
+            ):
+                _, cleaned = _gemma4_extract_content(
+                    content, bare_opener_active=thinking_active,
+                )
             else:
                 cleaned = content
             # Strip ChatML thinking tags

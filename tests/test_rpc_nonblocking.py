@@ -217,7 +217,7 @@ def test_openai_sync_completion_nonblocking_event_loop(monkeypatch):
         request = SimpleNamespace(
             model="m", stream=False, user=None, thinking=None,
             max_tokens=8, max_completion_tokens=None,
-            response_format=None,
+            response_format=None, stop=None,
             messages=[SimpleNamespace(role="user", content="hi")],
         )
         out, ticks = asyncio.run(

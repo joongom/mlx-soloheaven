@@ -1312,7 +1312,7 @@ def _generate_engine(cache, stored, *, mtp, suffix):
     # decode must be non-empty so the response adapter emits one frame per
     # token (empty text would be buffered as a partial-UTF8 segment).
     eng.tokenizer = SimpleNamespace(decode=lambda ids: "x", eos_token_ids=[])
-    eng._messages_match = lambda stored_msgs, incoming: True
+    eng._messages_match = lambda stored_msgs, incoming, **kw: True
     eng._suffix_tokens = lambda msgs, thinking=True: list(suffix)
 
     cs = PromptCacheState()
@@ -2080,7 +2080,9 @@ def test_generate_locked_cancel_commits_turn_no_double_inject(monkeypatch):
         {"role": "user", "content": "u3"},
     ]
     chunks2 = _drive_full(eng, messages2, max_tokens=2)
-    assert chunks2[-1].finish_reason == "stop"
+    # U7: the scripted turn exhausts max_tokens without an EOS — a normal
+    # (non-error) terminal that now correctly reports "length".
+    assert chunks2[-1].finish_reason == "length"
     # THE BUG SHAPE: pre-fix this prompt was [52, 53, 99] (u2 re-spliced).
     assert prompts_seen[1] == [53, 99]
     assert cs.token_ids == (
@@ -2423,7 +2425,9 @@ def test_generate_locked_mtp_cancel_session_consistent_next_turn(monkeypatch):
     # new MTP session finalizes into the consistent head-trailing layout.
     eng._tokenize_prompt = lambda msgs, thinking=True, tools=None: [11, 12, 13, 14]
     chunks2 = _drive_full(eng, messages, max_tokens=3)
-    assert chunks2[-1].finish_reason == "stop"
+    # U7: the scripted cold-fill exhausts max_tokens without an EOS — a
+    # normal (non-error) terminal that now correctly reports "length".
+    assert chunks2[-1].finish_reason == "length"
     assert prompt_lens[-1] == 4  # full prompt, not a suffix splice
     sess2 = eng._sessions["s"]
     new_cs = sess2.cache_state
@@ -2462,7 +2466,9 @@ def test_generate_locked_normal_eos_save_regression(monkeypatch):
     )
 
     chunks = _drive_full(eng, messages, max_tokens=2)
-    assert chunks[-1].finish_reason == "stop"
+    # U7: the scripted turn exhausts max_tokens without an EOS — a normal
+    # (non-error) terminal that now correctly reports "length".
+    assert chunks[-1].finish_reason == "length"
 
     sess = eng._sessions["s"]
     assert [m.get("content") for m in sess.messages] == ["u1", "a1", "u2", "xx"]

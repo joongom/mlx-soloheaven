@@ -1045,9 +1045,15 @@ def test_tools_change_on_hit_forces_honest_miss(monkeypatch):
 
 
 def test_thinking_flip_on_hit_forces_honest_miss(monkeypatch):
-    """The fingerprint also covers the thinking flag."""
+    """The fingerprint also covers the thinking flag.
+
+    Round 4 (batch 4, finding 4): the script now CLOSES the thought block —
+    with the router-authoritative channel policy, a thinking=True stream
+    that never emits </think> is a thinking-only (empty content) turn and
+    takes the empty-response SKIP path, which carries no cache_info. The
+    contract-flip behavior under test is unchanged."""
     eng, cs, messages, prompts_seen, tokenized = _contract_engine(
-        monkeypatch, [[(101, "x"), (102, "x")]],
+        monkeypatch, [[(101, "x"), (102, "</think>ok")]],
     )
     _stamp_contract(eng, None, False)
     chunks = _drive(eng, messages, thinking=True)
@@ -1401,7 +1407,9 @@ def test_generate_locked_mtp_corruption_terminates_with_error(monkeypatch):
     monkeypatch.setattr(qwen_mtp_mod, "qwen_mtp_generate_step", fake_step2)
     eng._tokenize_prompt = lambda msgs, thinking=True, tools=None: [11, 12, 13, 14]
     chunks2 = _drive(eng, messages, max_tokens=3)
-    assert chunks2[-1].finish_reason == "stop"
+    # U7: the scripted retry exhausts max_tokens without an EOS — a normal
+    # (non-error) terminal that now correctly reports "length".
+    assert chunks2[-1].finish_reason == "length"
     assert prompt_lens[-1] == 4  # full prompt, not a stale suffix splice
 
 

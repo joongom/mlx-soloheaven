@@ -26,6 +26,7 @@ from mlx_soloheaven.engine.tool_parser import (
     CHANNEL_REASONING,
     ThinkingRouter,
     split_thinking_and_content,
+    thinking_router_active,
 )
 from mlx_soloheaven.storage import database as db
 from mlx_soloheaven.api.compaction import build_post_compaction_messages
@@ -218,8 +219,13 @@ async def _chat_after_admission(
     (non-streaming) admission reservation — split out so the reservation's
     try/finally in ``chat`` covers every DB mutation below (codex round 11,
     finding 1)."""
-    # Add user message
-    await db.add_message(session_id, "user", content=req.content)
+    # Add user message. Its row id is threaded through the request (codex
+    # round 3, finding 2): the assistant row is persisted only AFTER
+    # generation, so a delete-last landing in between removes this row —
+    # the assistant insert is made CONDITIONAL on it still existing, or an
+    # orphan assistant row (a turn with no originating user message) lands.
+    user_row = await db.add_message(session_id, "user", content=req.content)
+    user_message_id = user_row["id"]
 
     # Build messages from last compaction point (or all if no compaction)
     system_prompt = session.get("system_prompt", "")
@@ -295,6 +301,7 @@ async def _chat_after_admission(
                 repetition_penalty=repetition_penalty,
                 thinking_budget=thinking_budget,
                 max_tokens=max_tokens,
+                user_message_id=user_message_id,
             ),
             media_type="text/event-stream",
             headers={
@@ -304,7 +311,73 @@ async def _chat_after_admission(
             },
         )
     else:
-        return await _sync_chat(session_id, messages, use_engine, reservation=slot)
+        return await _sync_chat(
+            session_id, messages, use_engine, reservation=slot,
+            user_message_id=user_message_id,
+        )
+
+
+async def _persist_assistant_turn(
+    session_id: str,
+    eng: "MLXEngine",
+    *,
+    user_message_id: str | None,
+    content: str | None,
+    thinking: str | None,
+    token_count: int,
+    stats: dict | None = None,
+) -> bool:
+    """Persist this turn's assistant row, conditional on its originating
+    user row (codex round 3, finding 2).
+
+    /chat inserts the user row BEFORE generation and the assistant row only
+    AFTER, so a delete-last landing in between removes the user row; an
+    unconditional insert then created an ORPHAN assistant row and the
+    completing generation's engine-session install held a turn the DB no
+    longer has (the U4/U25 class of DB↔engine divergence).
+
+    Returns True when the row was inserted (normal completion — the caller
+    proceeds with the engine commit and token bookkeeping). Returns False
+    when the parent row is gone: the DB insert is skipped (WARNING only —
+    the stream already delivered the content, so this is not a client
+    error) and the ENGINE session is deleted so the next request rebuilds
+    honestly from the DB instead of extending a state whose turn no longer
+    exists. A failed engine delete is log-only: the stale engine messages
+    can no longer prefix-match the shortened DB view, so the next request
+    degrades to an honest MISS anyway.
+
+    ``user_message_id=None`` (legacy/direct callers) keeps the historical
+    unconditional insert."""
+    if user_message_id is None:
+        await db.add_message(
+            session_id, "assistant",
+            content=content, thinking=thinking,
+            token_count=token_count, stats=stats,
+        )
+        return True
+    inserted = await db.add_message_if_parent_exists(
+        session_id, "assistant",
+        parent_id=user_message_id,
+        content=content, thinking=thinking,
+        token_count=token_count, stats=stats,
+    )
+    if inserted is not None:
+        return True
+    logger.warning(
+        f"[Chat] session={session_id} | turn deleted mid-generation "
+        f"(user row {user_message_id} gone) — assistant row skipped; "
+        f"invalidating the engine session so the next request rebuilds "
+        f"from the DB"
+    )
+    try:
+        await run_critical(eng.delete_session, session_id)
+    except Exception:  # noqa: BLE001 — the terminal event must still go out
+        logger.exception(
+            f"[Chat] session={session_id} | engine session invalidation "
+            f"after mid-generation delete failed (next request degrades to "
+            f"an honest MISS via the message-prefix mismatch)"
+        )
+    return False
 
 
 async def _stream_chat(
@@ -318,6 +391,7 @@ async def _stream_chat(
     repetition_penalty: float = 1.0,
     thinking_budget: int = 8192,
     max_tokens: int = 32768,
+    user_message_id: str | None = None,
 ) -> AsyncGenerator[str, None]:
     """Stream chat response with real-time stats.
 
@@ -335,6 +409,7 @@ async def _stream_chat(
             repetition_penalty=repetition_penalty,
             thinking_budget=thinking_budget,
             max_tokens=max_tokens,
+            user_message_id=user_message_id,
         ):
             yield chunk
     except EngineRestartingError as exc:
@@ -363,8 +438,14 @@ async def _stream_chat_body(
     repetition_penalty: float = 1.0,
     thinking_budget: int = 8192,
     max_tokens: int = 32768,
+    user_message_id: str | None = None,
 ) -> AsyncGenerator[str, None]:
-    """Stream chat response with real-time stats."""
+    """Stream chat response with real-time stats.
+
+    ``user_message_id`` is the row id of the user message this turn
+    originates from (codex round 3, finding 2): the assistant persist below
+    is conditional on that row still existing, so a delete-last that removed
+    the turn mid-generation never gains an orphan assistant row."""
     eng = eng or engine
 
     t_start = time.perf_counter()
@@ -459,9 +540,22 @@ async def _stream_chat_body(
     # U6/F1: engine terminal reason; "error" diverts to an error frame and
     # suppresses DB/session persistence of the truncated text.
     final_finish_reason = None
-    # Router active when thinking is enabled for this model. Pass-through
-    # (all content) otherwise, so the non-thinking path is unchanged.
-    router = ThinkingRouter(active=enable_thinking, model_family=model_family)
+    # Router activation (shared policy with the OpenAI-compat path,
+    # thinking_router_active): chatml/glm activate on the thinking flag
+    # (pass-through otherwise, so non-thinking output is unchanged); codex
+    # round 5, finding 3 — gemma4 is MARKER-ACTIVE regardless of the flag
+    # (the model emits its own channel markers; a passthrough streamed
+    # thought-span text as content, disagreeing with the batch parse and
+    # the session store).
+    # Codex round 7, finding 3: enable_thinking threads the effective
+    # contract — the gemma4 router stays marker-active (full markers
+    # authoritative), while the ambiguous bare ``thought\n`` opener heuristic
+    # only fires when thinking is active.
+    router = ThinkingRouter(
+        active=thinking_router_active(model_family, enable_thinking),
+        model_family=model_family,
+        enable_thinking=enable_thinking,
+    )
     reasoning_seen = False
     thinking_done_signaled = False
 
@@ -634,9 +728,27 @@ async def _stream_chat_body(
 
     # PERF: single join at end of loop — replaces O(N^2) accumulation.
     accumulated_text = "".join(acc_parts)
-    thinking, content = split_thinking_and_content(
-        accumulated_text, model_family=eng.model_family
-    )
+    # Codex round 3, finding 4: the persisted thinking/content split must
+    # match what the router above actually emitted on the wire. Thinking
+    # DISABLED (chatml/glm) → the router was a pass-through, so the whole
+    # text is content and a literal </think> in it is a quote, never a
+    # boundary. Thinking ENABLED → the stream began inside the thought block
+    # (started_in_thinking mirrors the active router, including the
+    # degenerate no-</think> turn routing entirely to reasoning). gemma4
+    # keeps its marker-driven split (the model emits its own channels).
+    if model_family != "gemma4" and not enable_thinking:
+        thinking, content = None, accumulated_text
+    else:
+        # Codex round 7, finding 3: thinking_active threads the contract into
+        # the gemma4 split so its bare-opener recognition matches the router
+        # that streamed the text.
+        thinking, content = split_thinking_and_content(
+            accumulated_text, model_family=eng.model_family,
+            started_in_thinking=(
+                enable_thinking and model_family != "gemma4"
+            ),
+            thinking_active=enable_thinking,
+        )
 
     # Include build_time from branch/regenerate BUILD if available
     build_time = 0.0
@@ -672,42 +784,49 @@ async def _stream_chat_body(
     }
 
     if accumulated_text:
-        await db.add_message(
-            session_id,
-            "assistant",
+        # Codex round 3, finding 2: conditional persist — the insert commits
+        # only if the originating user row still exists (one transaction).
+        # A delete-last that removed the turn mid-generation gets NO orphan
+        # assistant row, and the engine session (installed by the completing
+        # generation with the deleted turn inside) is invalidated so the
+        # next request rebuilds honestly from the DB.
+        persisted = await _persist_assistant_turn(
+            session_id, eng,
+            user_message_id=user_message_id,
             content=content,
             thinking=thinking,
             token_count=completion_tokens,
             stats=stats,
         )
 
-        updated_messages = messages + [{"role": "assistant", "content": content}]
-        # U14: synchronous engine RPC — keep it off the event loop.
-        # Codex round 5, finding 1: this commit runs BETWEEN the last
-        # streamed token and the terminal "done" event — a saturated long
-        # pool used to reject it (EngineBusyError escaped mid-stream, no
-        # done event, and pre-1a no dirty-mark for the fresh cache). It now
-        # rides the guaranteed critical lane, and ANY failure is log-only:
-        # the engine already marked the session dirty at install (finding
-        # 1a), so the terminal event below must be unconditional.
-        try:
-            await run_critical(
-                eng.update_session_messages, session_id, updated_messages
-            )
-        except Exception:  # noqa: BLE001 — terminal event must still go out
-            logger.exception(
-                f"[Stream] session={session_id} | post-stream session commit "
-                f"failed (persistence already guaranteed engine-side)"
-            )
+        if persisted:
+            updated_messages = messages + [{"role": "assistant", "content": content}]
+            # U14: synchronous engine RPC — keep it off the event loop.
+            # Codex round 5, finding 1: this commit runs BETWEEN the last
+            # streamed token and the terminal "done" event — a saturated long
+            # pool used to reject it (EngineBusyError escaped mid-stream, no
+            # done event, and pre-1a no dirty-mark for the fresh cache). It now
+            # rides the guaranteed critical lane, and ANY failure is log-only:
+            # the engine already marked the session dirty at install (finding
+            # 1a), so the terminal event below must be unconditional.
+            try:
+                await run_critical(
+                    eng.update_session_messages, session_id, updated_messages
+                )
+            except Exception:  # noqa: BLE001 — terminal event must still go out
+                logger.exception(
+                    f"[Stream] session={session_id} | post-stream session commit "
+                    f"failed (persistence already guaranteed engine-side)"
+                )
 
-        # Update session total tokens
-        new_total = await db.get_session_total_tokens(session_id)
-        await db.update_session_tokens(session_id, new_total)
+            # Update session total tokens
+            new_total = await db.get_session_total_tokens(session_id)
+            await db.update_session_tokens(session_id, new_total)
 
-        if len(messages) <= 2:
-            title = messages[-1].get("content", "")[:50]
-            if title:
-                await db.update_session(session_id, title=title)
+            if len(messages) <= 2:
+                title = messages[-1].get("content", "")[:50]
+                if title:
+                    await db.update_session(session_id, title=title)
 
     if client_disconnected:
         return
@@ -728,6 +847,10 @@ async def _stream_chat_body(
             "thinking": thinking,
             "content": content,
             "stats": stats,
+            # U7: surface the engine's terminal reason ("length" when
+            # max_tokens truncated the answer) instead of implying a clean
+            # stop.
+            "finish_reason": final_finish_reason or "stop",
             "needs_compaction": needs_compaction,
         },
         ensure_ascii=False,
@@ -740,10 +863,13 @@ async def _sync_chat(
     messages: list[dict],
     eng: "MLXEngine | None" = None,
     reservation: "LongReservation | None" = None,
+    user_message_id: str | None = None,
 ) -> dict:
     """Non-streaming chat response. ``reservation`` is the admission slot
     the chat endpoint acquired BEFORE persisting the user message (codex
-    round 11, finding 1) — consumed by the run_long below."""
+    round 11, finding 1) — consumed by the run_long below.
+    ``user_message_id`` gates the assistant persist on the originating user
+    row (codex round 3, finding 2 — see ``_persist_assistant_turn``)."""
     eng = eng or engine
     # U14: complete() blocks for the WHOLE generation — off the event loop.
     # F2: non-streaming generation -> bounded long-ops executor.
@@ -758,38 +884,44 @@ async def _sync_chat(
             "partial output was not saved — please retry"
         )}
 
-    await db.add_message(
-        session_id,
-        "assistant",
+    # Codex round 3, finding 2: conditional persist (see the streaming path
+    # — same contract). Parent gone → no orphan row, engine session
+    # invalidated; the completed response still goes out to the client.
+    persisted = await _persist_assistant_turn(
+        session_id, eng,
+        user_message_id=user_message_id,
         content=result.content,
         thinking=result.thinking,
         token_count=result.completion_tokens,
     )
 
-    updated_messages = messages + [{"role": "assistant", "content": result.content}]
-    # U14: synchronous engine RPC — keep it off the event loop.
-    # Codex round 5, finding 1 (same shape as the streaming path): the
-    # generation COMPLETED — failing the whole response over this
-    # bookkeeping call would drop finished work, and the engine-side
-    # dirty-mark (finding 1a) already guarantees persistence. Critical
-    # lane + log-only failure.
-    try:
-        await run_critical(
-            eng.update_session_messages, session_id, updated_messages
-        )
-    except Exception:  # noqa: BLE001 — the completed response must go out
-        logger.exception(
-            f"[Chat] session={session_id} | post-completion session commit "
-            f"failed (persistence already guaranteed engine-side)"
-        )
+    if persisted:
+        updated_messages = messages + [{"role": "assistant", "content": result.content}]
+        # U14: synchronous engine RPC — keep it off the event loop.
+        # Codex round 5, finding 1 (same shape as the streaming path): the
+        # generation COMPLETED — failing the whole response over this
+        # bookkeeping call would drop finished work, and the engine-side
+        # dirty-mark (finding 1a) already guarantees persistence. Critical
+        # lane + log-only failure.
+        try:
+            await run_critical(
+                eng.update_session_messages, session_id, updated_messages
+            )
+        except Exception:  # noqa: BLE001 — the completed response must go out
+            logger.exception(
+                f"[Chat] session={session_id} | post-completion session commit "
+                f"failed (persistence already guaranteed engine-side)"
+            )
 
-    # Update session total tokens
-    new_total = await db.get_session_total_tokens(session_id)
-    await db.update_session_tokens(session_id, new_total)
+        # Update session total tokens
+        new_total = await db.get_session_total_tokens(session_id)
+        await db.update_session_tokens(session_id, new_total)
 
     return {
         "content": result.content,
         "thinking": result.thinking,
+        # U7: surface the engine's terminal reason (e.g. "length").
+        "finish_reason": result.finish_reason,
         "usage": {
             "prompt_tokens": result.prompt_tokens,
             "completion_tokens": result.completion_tokens,
@@ -836,8 +968,13 @@ async def branch_session(session_id: str, req: BranchRequest):
         )
         new_id = new_session["id"]
 
+        # Codex round 7, finding 1: remap the persisted turn-ownership links
+        # onto the copied rows' NEW ids (a verbatim parent_id would dangle
+        # into the source session; an unmapped parent degrades to NULL —
+        # the walker's legacy positional behavior).
+        branch_id_map: dict = {}
         for msg in branch_messages:
-            await db.add_message(
+            new_row = await db.add_message(
                 new_id, msg["role"],
                 content=msg.get("content"),
                 tool_calls=msg.get("tool_calls"),
@@ -845,7 +982,9 @@ async def branch_session(session_id: str, req: BranchRequest):
                 thinking=msg.get("thinking"),
                 token_count=msg.get("token_count", 0),
                 stats=msg.get("stats"),
+                parent_id=branch_id_map.get(msg.get("parent_id")),
             )
+            branch_id_map[msg["id"]] = new_row["id"]
 
         # Build engine messages (with system prompt, same format as chat endpoint)
         engine_msgs = []
@@ -883,9 +1022,153 @@ async def branch_session(session_id: str, req: BranchRequest):
     }
 
 
+_COMPACTION_PREFIX = "The conversation history before this point was compacted"
+
+
+def _is_compaction_message(msg: dict) -> bool:
+    return ((msg.get("content") or "")).startswith(_COMPACTION_PREFIX)
+
+
+def _delete_last_turn_count(messages: list[dict]) -> int:
+    """U25: number of trailing DB messages that make up the last turn.
+
+    Contract: the DB drives — the handler deletes exactly this suffix and
+    the engine follows the resulting message list. Cases:
+    - last message is a compaction summary → delete just it (1);
+    - otherwise the turn spans from the LAST user message to the end
+      (user+assistant pair = 2; tool chains like user / assistant(tool_calls)
+      / tool / assistant delete as one unit), never crossing a compaction
+      summary (it is not part of any turn);
+    - no user message in the trailing region → 0 (caller answers 400).
+    """
+    if _is_compaction_message(messages[-1]):
+        return 1
+    for i in range(len(messages) - 1, -1, -1):
+        if _is_compaction_message(messages[i]):
+            return 0
+        if messages[i].get("role") == "user":
+            return len(messages) - i
+    return 0
+
+
+def _turn_delete_ids_from_anchor(
+    messages: list[dict], anchor_id: str, *, compaction: bool,
+) -> list[str]:
+    """Codex round 5, finding 1 — pure rows→ids walker for the
+    transactional delete-last (the turn-walk logic of
+    ``_delete_last_turn_count``, re-run against the delete transaction's
+    OWN row snapshot). ``anchor_id`` is the first row of the turn the
+    handler identified on its pre-snapshot: the turn's user row, or the
+    compaction summary row (``compaction=True``).
+
+    - anchor gone (a concurrent delete already removed the turn) → ``[]``:
+      nothing is deleted, mirroring the conditional insert's WHERE EXISTS;
+    - ``compaction`` → exactly the anchor row (a compaction summary is not
+      part of any turn — rows after it are other turns' territory);
+    - otherwise the turn is the UNION of:
+      (a) OWNERSHIP (codex round 7, finding 1): every row whose persisted
+          ``parent_id`` equals the anchor, REGARDLESS of position. The
+          positional walk alone cannot survive an INTERVENING user row —
+          pre-snapshot [..., uA], a concurrent request appends uB, then
+          the completing generation's conditional insert lands aA (uA
+          still exists): the walk from uA stopped at the uB boundary,
+          deleted ONLY uA, and aA survived as an orphan;
+      (b) the POSITIONAL walk (covers legacy rows with NULL parent_id):
+          from the anchor THROUGH every following non-user row up to the
+          next user message / compaction summary — an assistant row a
+          completing generation appended AFTER the handler's pre-snapshot
+          belongs to THIS turn and is deleted with it (the round-4 shape
+          deleted only the pre-snapshotted ids, leaving that row as an
+          orphan); old sessions keep the round-6 delete behavior.
+          Codex round 9, finding 1: the walk only CLAIMS rows with no
+          persisted owner (parent_id IS NULL). A row carrying a DIFFERENT
+          explicit owner belongs to its parent's turn and is skipped —
+          after concurrency settles as [uA, uB, aA(parent=uA)], deleting
+          the last turn (anchored on uB) must not take A's answer with it
+          and leave uA incomplete. Rows owned by THIS anchor are covered
+          by the ownership half regardless of position.
+      A concurrently appended NEW user turn survives untouched in both
+      (the U25 round-2 append-survival contract): it is never anchored
+      here and its rows never carry the anchor's parent_id.
+    """
+    idx = next(
+        (i for i, m in enumerate(messages) if m.get("id") == anchor_id),
+        None,
+    )
+    if idx is None:
+        return []
+    if compaction:
+        return [messages[idx]["id"]]
+    end = idx + 1
+    while end < len(messages):
+        row = messages[end]
+        if row.get("role") == "user" or _is_compaction_message(row):
+            break
+        end += 1
+    # Positional fallback: the anchor itself plus trailing LEGACY rows only
+    # (parent_id IS NULL). Explicitly-owned rows are the ownership union's
+    # territory — a different owner means a different turn (round 9, f1).
+    out = [messages[idx]["id"]]
+    out.extend(
+        m["id"] for m in messages[idx + 1 : end]
+        if m.get("parent_id") is None
+    )
+    positional = set(out)
+    # Ownership union: rows persisted for THIS turn that landed beyond the
+    # positional boundary (snapshot order kept for determinism).
+    out.extend(
+        m["id"] for m in messages
+        if m.get("parent_id") == anchor_id and m["id"] not in positional
+    )
+    return out
+
+
 @router.post("/sessions/{session_id}/delete-last")
 async def delete_last_turn(session_id: str):
-    """Delete the last turn. Removes user+assistant pair, or single compaction message."""
+    """Delete the last turn. Removes the whole trailing turn (user message
+    through any assistant/tool messages), or a single compaction message.
+
+    U25 contract: the DB drives and the engine follows. The handler deletes
+    exactly the last-turn suffix and derives the engine's message view from
+    the ACTUAL remaining rows; a compaction delete rebuilds via
+    compact_session (the engine session holds the compacted view, which a
+    count-slice cannot express).
+
+    U25 round 2 (codex finding 5) — concurrency safety. The round-1 shape
+    snapshotted messages once, then deleted 'whichever row is currently
+    last' N times (N separate transactions) and derived the remaining view
+    from the STALE snapshot: a chat append landing after the snapshot got
+    DELETED while part of the old turn survived, and the engine was rebuilt
+    from rows that no longer matched the DB.
+
+    Codex round 5, finding 1 — the round-4 id-targeted delete was still a
+    SEPARATE transaction from the snapshot, so the /chat conditional
+    assistant insert could commit in between: its WHERE EXISTS saw the user
+    row still present (insert lands), the delete then removed ONLY the
+    snapshotted user row, and the assistant row survived as an ORPHAN the
+    drift rebuild fed to the engine. Now snapshot + turn-walk + delete run
+    as ONE write transaction (db.delete_last_turn_tx, BEGIN IMMEDIATE):
+    - the write lock is held from the start, so the conditional insert
+      lands entirely BEFORE the transaction (its row is in the tx snapshot
+      and the anchored walk deletes the WHOLE turn including it) or
+      entirely AFTER (WHERE EXISTS sees the user row gone → insert
+      skipped) — no orphan in either ordering;
+    - the walk is re-run INSIDE the transaction, anchored on the turn's
+      first row from the handler's pre-snapshot: rows a concurrent writer
+      appended to THIS turn are deleted with it, while a concurrently
+      appended NEW user turn survives (U25 round-2 contract) and a turn a
+      concurrent delete already removed walks to zero ids (no delete);
+    - the engine view is built from the transaction's own remaining rows
+      (exact under the held lock — no separate re-read can drift);
+    - the truncate_session(count) fast path is used ONLY when the tx
+      snapshot equals the handler's pre-snapshot (no concurrent write
+      happened); any drift falls back to a full compact_session rebuild.
+    There is no per-session asyncio lock in this API layer to serialize
+    against a concurrent /chat append, and adding one cannot cover external
+    writers anyway. The residual race (a write landing AFTER the delete
+    transaction) is the pre-existing benign one — the writer's own request
+    path hands the engine the full up-to-date view on its next generate
+    call, and the conditional insert skips by construction."""
     messages = await db.get_messages(session_id)
     if not messages:
         raise HTTPException(400, "No messages to delete")
@@ -899,8 +1182,25 @@ async def delete_last_turn(session_id: str):
     if ensure_available is not None:
         ensure_available()
 
-    last_content = messages[-1].get("content", "") or ""
-    is_compaction = last_content.startswith("The conversation history before this point was compacted")
+    is_compaction = _is_compaction_message(messages[-1])
+    n_delete = _delete_last_turn_count(messages)
+    if n_delete <= 0:
+        raise HTTPException(400, "Not enough messages to delete")
+    # The turn's ANCHOR row (its user message, or the compaction summary):
+    # the transactional walk below re-identifies the turn from this row
+    # against the transaction's own snapshot.
+    anchor_id = messages[-n_delete]["id"]
+    pre_snapshot_ids = [m["id"] for m in messages]
+
+    tx_snapshot_ids: list[str] = []
+
+    def _compute_delete_ids(rows: list[dict]) -> list[str]:
+        """Pure walker handed to the delete transaction (runs under the
+        write lock, against the tx's own row snapshot)."""
+        tx_snapshot_ids[:] = [m["id"] for m in rows]
+        return _turn_delete_ids_from_anchor(
+            rows, anchor_id, compaction=is_compaction,
+        )
 
     # Codex round 11, finding 1: reserve the long-pool admission slot BEFORE
     # deleting DB messages — a saturated pool used to reject run_long only
@@ -908,40 +1208,47 @@ async def delete_last_turn(session_id: str):
     # retry deletes a SECOND turn). Busy now answers 503 with the DB
     # untouched.
     with reserve_long_slot() as slot:
-        if is_compaction:
-            # Compaction message: delete just this one
-            await db.delete_last_message(session_id)
-        else:
-            # Normal turn: delete assistant + user pair
-            if len(messages) < 2:
-                raise HTTPException(400, "Not enough messages to delete")
-            await db.delete_last_message(session_id)
-            await db.delete_last_message(session_id)
+        # ONE write transaction: snapshot + anchored turn-walk + delete
+        # (codex round 5, finding 1 — see the docstring).
+        deleted_ids, remaining_db = await db.delete_last_turn_tx(
+            session_id, _compute_delete_ids,
+        )
+        if not deleted_ids:
+            # The anchored turn vanished between the pre-check and the
+            # transaction (a concurrent delete) — nothing was removed and
+            # the DB is untouched.
+            raise HTTPException(400, "Not enough messages to delete")
 
-        # Build engine messages for remaining
+        # DB is the source of truth: the engine's message view is built from
+        # the transaction's own remaining rows, through the same
+        # compaction-aware assembly the chat endpoint uses.
         source = await db.get_session(session_id)
-        remaining_db = messages[:-2]
-        engine_msgs = []
         system_prompt = source.get("system_prompt", "") if source else ""
-        if system_prompt:
-            engine_msgs.append({"role": "system", "content": system_prompt})
-        for msg in remaining_db:
-            m = {"role": msg["role"]}
-            if msg.get("content"):
-                m["content"] = msg["content"]
-            if msg.get("tool_calls"):
-                m["tool_calls"] = msg["tool_calls"]
-            if msg.get("tool_call_id"):
-                m["tool_call_id"] = msg["tool_call_id"]
-            engine_msgs.append(m)
+        engine_msgs = build_post_compaction_messages(system_prompt, remaining_db)
 
-        # Truncate engine session (engine resolved + preflighted at the top)
+        # The count-slice fast path is only valid when nothing else wrote
+        # between the handler's pre-snapshot and the delete transaction
+        # (the tx saw exactly the rows the handler saw). Any drift —
+        # concurrent append, concurrent delete, a mid-generation assistant
+        # row folded into the deleted turn — rebuilds from the tx view.
+        concurrent_drift = tx_snapshot_ids != pre_snapshot_ids
+
+        # Engine follows (engine resolved + preflighted at the top).
         # U14: heavy synchronous engine call — keep it off the event loop.
         # F2: mutating RPC -> long-ops executor (consumes the reservation).
-        result = await run_long(
-            eng.truncate_session, session_id, len(engine_msgs),
-            reservation=slot,
-        )
+        if is_compaction or concurrent_drift:
+            # Compaction boundary changed, or the DB moved under us: the
+            # engine session's view cannot be expressed as a count-slice —
+            # rebuild from the fresh post-delete rows instead.
+            result = await run_long(
+                eng.compact_session, session_id, engine_msgs,
+                reservation=slot,
+            )
+        else:
+            result = await run_long(
+                eng.truncate_session, session_id, len(engine_msgs),
+                reservation=slot,
+            )
 
     return {
         "status": "ok",

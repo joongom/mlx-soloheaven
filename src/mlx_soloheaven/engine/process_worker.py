@@ -751,6 +751,7 @@ def _run_generate(engine, rid, messages, params, cancel_event, resp_conn,
         thinking=params.get("thinking"),
         thinking_budget=params.get("thinking_budget"),
         response_format=response_format,
+        stop=params.get("stop"),
     )
 
     batch: list[dict] = []

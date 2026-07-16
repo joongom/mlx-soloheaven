@@ -54,6 +54,7 @@ async def init_db():
                 thinking TEXT,
                 token_count INTEGER DEFAULT 0,
                 stats TEXT,
+                parent_id TEXT,
                 created_at REAL,
                 FOREIGN KEY (session_id) REFERENCES sessions(id)
             );
@@ -151,6 +152,18 @@ async def init_db():
 
         try:
             await db.execute("ALTER TABLE sessions ADD COLUMN branch_turn INTEGER")
+            await db.commit()
+        except Exception:
+            pass
+
+        # Codex round 7, finding 1: persisted turn ownership. Assistant rows
+        # record the id of the user row that originated their turn, so the
+        # delete-last walker can find a turn's rows by OWNERSHIP instead of
+        # adjacency (an intervening concurrent user row no longer strands a
+        # late-landing assistant row as an orphan). Nullable: legacy rows
+        # stay NULL and keep the positional-walk behavior.
+        try:
+            await db.execute("ALTER TABLE messages ADD COLUMN parent_id TEXT")
             await db.commit()
         except Exception:
             pass
@@ -288,7 +301,11 @@ async def add_message(
     thinking: str | None = None,
     token_count: int = 0,
     stats: dict | None = None,
+    parent_id: str | None = None,
 ) -> dict:
+    """``parent_id`` (codex round 7, finding 1): id of the user row that
+    originated this row's turn — set on assistant rows where the API layer
+    knows it; user rows keep NULL."""
     now = time.time()
     mid = uuid.uuid4().hex[:16]
     tc_json = json.dumps(tool_calls, ensure_ascii=False) if tool_calls else None
@@ -297,10 +314,10 @@ async def add_message(
         await db.execute(
             """INSERT INTO messages
                (id, session_id, role, content, tool_calls, tool_call_id,
-                thinking, token_count, stats, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                thinking, token_count, stats, parent_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (mid, session_id, role, content, tc_json, tool_call_id,
-             thinking, token_count, stats_json, now),
+             thinking, token_count, stats_json, parent_id, now),
         )
         await db.execute(
             "UPDATE sessions SET updated_at = ? WHERE id = ?", (now, session_id)
@@ -309,8 +326,86 @@ async def add_message(
     return {
         "id": mid, "session_id": session_id, "role": role, "content": content,
         "tool_calls": tool_calls, "thinking": thinking, "stats": stats,
-        "created_at": now,
+        "parent_id": parent_id, "created_at": now,
     }
+
+
+async def add_message_if_parent_exists(
+    session_id: str,
+    role: str,
+    *,
+    parent_id: str,
+    content: str | None = None,
+    tool_calls: list | None = None,
+    tool_call_id: str | None = None,
+    thinking: str | None = None,
+    token_count: int = 0,
+    stats: dict | None = None,
+) -> dict | None:
+    """Insert a message ONLY IF its originating (parent) row still exists.
+
+    Codex round 3, finding 2: /chat persists the user row BEFORE generation
+    and the assistant row only AFTER — a delete-last landing in between
+    removes the user row, and an unconditional assistant insert then creates
+    an ORPHAN assistant row for a turn that no longer exists. The existence
+    check and the insert are ONE atomic statement (INSERT ... SELECT ...
+    WHERE EXISTS), so a delete committing between a separate SELECT and
+    INSERT can never slip through.
+
+    Returns the inserted row dict, or ``None`` when the parent row is gone
+    (the caller skips persistence — the turn was deleted mid-generation).
+
+    Codex round 7, finding 1: the inserted row PERSISTS ``parent_id`` — the
+    conditional insert alone cannot prevent the orphan when a concurrent
+    request appends a NEW user row between the delete handler's pre-snapshot
+    and this insert (the parent still exists, so the insert lands, but the
+    delete transaction's positional walk stops at the intervening user-row
+    boundary and never reaches this row). The delete walker now also deletes
+    every row whose ``parent_id`` equals the turn's anchor, regardless of
+    position (ownership, not adjacency).
+    """
+    now = time.time()
+    mid = uuid.uuid4().hex[:16]
+    tc_json = json.dumps(tool_calls, ensure_ascii=False) if tool_calls else None
+    stats_json = json.dumps(stats, ensure_ascii=False) if stats else None
+    async with get_db() as db:
+        cur = await db.execute(
+            """INSERT INTO messages
+               (id, session_id, role, content, tool_calls, tool_call_id,
+                thinking, token_count, stats, parent_id, created_at)
+               SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+               WHERE EXISTS (
+                   SELECT 1 FROM messages WHERE id = ? AND session_id = ?
+               )""",
+            (mid, session_id, role, content, tc_json, tool_call_id,
+             thinking, token_count, stats_json, parent_id, now,
+             parent_id, session_id),
+        )
+        inserted = cur.rowcount > 0
+        if inserted:
+            await db.execute(
+                "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                (now, session_id),
+            )
+        await db.commit()
+    if not inserted:
+        return None
+    return {
+        "id": mid, "session_id": session_id, "role": role, "content": content,
+        "tool_calls": tool_calls, "thinking": thinking, "stats": stats,
+        "parent_id": parent_id, "created_at": now,
+    }
+
+
+def _decode_message_row(row) -> dict:
+    """Decode one messages row into the dict shape get_messages returns
+    (tool_calls / stats JSON columns parsed)."""
+    d = dict(row)
+    if d.get("tool_calls"):
+        d["tool_calls"] = json.loads(d["tool_calls"])
+    if d.get("stats"):
+        d["stats"] = json.loads(d["stats"])
+    return d
 
 
 async def get_messages(session_id: str, limit: int | None = None) -> list[dict]:
@@ -328,15 +423,7 @@ async def get_messages(session_id: str, limit: int | None = None) -> list[dict]:
                 "SELECT * FROM messages WHERE session_id = ? ORDER BY created_at",
                 (session_id,),
             )
-        result = []
-        for r in rows:
-            d = dict(r)
-            if d.get("tool_calls"):
-                d["tool_calls"] = json.loads(d["tool_calls"])
-            if d.get("stats"):
-                d["stats"] = json.loads(d["stats"])
-            result.append(d)
-        return result
+        return [_decode_message_row(r) for r in rows]
 
 
 async def count_messages_after_last_compaction(session_id: str) -> int:
@@ -484,6 +571,99 @@ async def delete_last_message(session_id: str):
             ")", (session_id,)
         )
         await db.commit()
+
+
+async def delete_messages_by_ids(session_id: str, ids: list[str]) -> int:
+    """Delete exactly the given message rows, atomically (ONE transaction).
+
+    U25 round 2 (concurrency): delete-last used to call delete_last_message
+    N times — N separate committed transactions each targeting whichever row
+    was CURRENTLY newest. A chat append committed between the handler's
+    snapshot and those deletes made the loop delete the NEW user row and
+    leave part of the old turn behind. Deleting by the snapshot's identified
+    row ids is safe against concurrent appends by construction: rows created
+    after the snapshot can never match, and an id another writer already
+    removed simply doesn't match either (no error, no positional drift).
+    Returns the number of rows actually deleted.
+    """
+    if not ids:
+        return 0
+    # NIT (codex round 3): chunk the IN clause — SQLite builds compiled with
+    # a low SQLITE_MAX_VARIABLE_NUMBER (999 historically) reject a single
+    # statement with thousands of placeholders. All chunks execute inside
+    # ONE transaction (a single commit below), so atomicity is preserved.
+    _CHUNK = 500
+    deleted = 0
+    async with get_db() as db:
+        for i in range(0, len(ids), _CHUNK):
+            chunk = ids[i:i + _CHUNK]
+            placeholders = ",".join("?" for _ in chunk)
+            cur = await db.execute(
+                f"DELETE FROM messages WHERE session_id = ? "
+                f"AND id IN ({placeholders})",
+                (session_id, *chunk),
+            )
+            deleted += cur.rowcount
+        await db.commit()
+        return deleted
+
+
+async def delete_last_turn_tx(
+    session_id: str,
+    compute_delete_ids,
+) -> tuple[list[str], list[dict]]:
+    """Snapshot + turn-walk + delete as ONE write transaction.
+
+    Codex round 5, finding 1: the round-4 delete-last shape snapshotted the
+    rows in a SEPARATE read, so the /chat conditional assistant insert
+    (add_message_if_parent_exists) could commit BETWEEN that snapshot and
+    the id-targeted delete — the insert's WHERE EXISTS saw the user row
+    still present, the already-computed delete then removed ONLY the user
+    row, and the assistant row survived as an ORPHAN the drift rebuild fed
+    to the engine.
+
+    BEGIN IMMEDIATE takes the write lock UP FRONT, so any concurrent write
+    transaction serializes entirely BEFORE this one (the snapshot below
+    then includes its rows and the walker can extend the turn over them)
+    or entirely AFTER (the conditional insert's WHERE EXISTS sees the user
+    row already gone and skips). There is no in-between.
+
+    ``compute_delete_ids(rows) -> list[str]`` is a PURE callback: it
+    receives the transaction's own row snapshot (get_messages dict shape,
+    ordered by created_at) and returns the ids to delete (empty → nothing
+    is deleted). Returns ``(deleted_ids, remaining_rows)`` where
+    ``remaining_rows`` is snapshot-minus-deleted — exact under the held
+    write lock, no separate re-read can drift from it.
+    """
+    _CHUNK = 500
+    async with get_db() as db:
+        # Explicit write transaction: sqlite3's autocommit handling only
+        # auto-BEGINs (deferred) before DML; an explicit BEGIN IMMEDIATE
+        # acquires the RESERVED lock now, before the snapshot read.
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            rows = await db.execute_fetchall(
+                "SELECT * FROM messages WHERE session_id = ? "
+                "ORDER BY created_at",
+                (session_id,),
+            )
+            snapshot = [_decode_message_row(r) for r in rows]
+            delete_ids = list(compute_delete_ids(snapshot) or [])
+            for i in range(0, len(delete_ids), _CHUNK):
+                chunk = delete_ids[i:i + _CHUNK]
+                placeholders = ",".join("?" for _ in chunk)
+                await db.execute(
+                    f"DELETE FROM messages WHERE session_id = ? "
+                    f"AND id IN ({placeholders})",
+                    (session_id, *chunk),
+                )
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+    deleted_set = set(delete_ids)
+    remaining = [m for m in snapshot if m["id"] not in deleted_set]
+    return delete_ids, remaining
 
 
 # --- Memories (long-term) ---

@@ -29,6 +29,7 @@ Cross-session sharing:
 """
 
 import asyncio
+import bisect
 import contextlib
 import copy
 import enum
@@ -71,6 +72,8 @@ from mlx_soloheaven.engine.thinking import (
 )
 from mlx_soloheaven.engine.tool_parser import (
     _parse_glm_tool_calls,
+    _partial_marker_tail,
+    content_segments,
     get_tool_markers,
     parse_tool_calls,
     split_thinking_and_content,
@@ -347,6 +350,9 @@ def _pld_response_adapter(pld_iter, tokenizer, label: str = "PLD",
                     text=remaining, token=token,
                     prompt_tps=0.0, generation_tps=tps,
                     from_draft=from_draft,
+                    # U7: mirror mlx-lm's stream_generate terminal frame —
+                    # a natural EOS reports finish_reason="stop".
+                    finish_reason="stop",
                 )
                 break
 
@@ -382,6 +388,38 @@ def _pld_response_adapter(pld_iter, tokenizer, label: str = "PLD",
                 prompt_tps=0.0, generation_tps=tps,
                 from_draft=from_draft,
             )
+        else:
+            # U8/U7: the inner runner EXHAUSTED without EOS — max_tokens.
+            # The runner already ran its own finalize (natural return), but
+            # the DETOKENIZER still buffers tail text (partial UTF-8 bytes /
+            # BPE-held whitespace) that mlx-lm's stream_generate would flush
+            # via detokenizer.finalize(). Flush it here as a TEXT-ONLY frame
+            # (token=None — every generated token id was already yielded on
+            # its own frame and recorded by the engine's post-loop, so the
+            # cache/token-id accounting contract is untouched), tagged
+            # finish_reason="length" (U7). No frame when nothing is buffered
+            # — the engine's max_tokens heuristic labels the bare-exhaustion
+            # case, and an early corruption/cancel termination must not be
+            # mislabeled here.
+            remaining = ""
+            if detok is not None:
+                try:
+                    detok.finalize()
+                    remaining = detok.last_segment or ""
+                except Exception:
+                    remaining = ""
+            if remaining:
+                yield SimpleNamespace(
+                    text=remaining, token=None,
+                    prompt_tps=0.0,
+                    generation_tps=(
+                        count / (_time.perf_counter() - t_first)
+                        if t_first and _time.perf_counter() > t_first
+                        else 0.0
+                    ),
+                    from_draft=False,
+                    finish_reason="length",
+                )
     finally:
         # Codex round 7, finding 1: signal the close reason, then close the
         # INNER runner explicitly. Runs on EVERY teardown — the natural
@@ -1434,14 +1472,84 @@ _NORMALIZE_RE_TODAYS_DATE = re.compile(
 _NORMALIZE_RE_SYSTEM_REMINDER = re.compile(
     r"\n?<system-reminder>.*?</system-reminder>", re.DOTALL
 )
-_NORMALIZE_RE_THINK_PREFIX = re.compile(r"^<think>\n?")
-_NORMALIZE_RE_CHANNEL_THOUGHT_PREFIX = re.compile(r"^<\|channel>thought\n?")
-_NORMALIZE_RE_THOUGHT_PREFIX = re.compile(r"^thought\n")
+# (round 9, finding 2: the gemma4 prefix regexes that lived here were
+# replaced by the router-authoritative _content_channel_union reduction in
+# _normalize_for_match. Codex round 13, finding 1: the bare ``<think>``
+# opener-strip regex is retired too — an unclosed raw is kept RAW.)
+# Codex round 13, finding 2 (companion): the gemma4 channel markers are
+# EXACTLY "<|tool_call>" / "<tool_call|>" (tool_parser._TOOL_MARKERS). The
+# old optional-pipe pattern (<\|?tool_call>…<\|?tool_call\|?>) also matched
+# a bare chatml "<tool_call>" opener as BOTH start and end, so on a turn
+# with two chatml call blocks it consumed "block1 … <tool_call>" — from the
+# first opener through the SECOND — and left the second block's body behind
+# as phantom content. The removed prefix shortcut had masked this (it
+# continued before normalization ran); with the real content comparison in
+# effect the pattern must match only the genuine gemma4 markers.
 _NORMALIZE_RE_TOOL_CALL_CHANNEL = re.compile(
-    r"<\|?tool_call>.*?<\|?tool_call\|?>", re.DOTALL
+    r"<\|tool_call>.*?<tool_call\|>", re.DOTALL
 )
 _NORMALIZE_RE_TOOL_CALL_XML = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
-_NORMALIZE_RE_TOOL_CALL_SPLIT = re.compile(r"\n*<tool_call>")
+# (codex round 13, finding 2: the first-<tool_call> prefix-split regex is
+# retired with the _messages_match shortcut it served.)
+
+
+def _content_channel_union(
+    text: str, model_family: str, thinking_active: bool = True,
+) -> str:
+    """U12 round 2: the CONTENT channel of raw assistant text, as the
+    concatenation of ALL content segments (``content_segments`` — the
+    positional twin of the streaming router, which is the authority).
+
+    Tool-call XML inside a thinking segment is the model REHEARSING a call,
+    not making one — the match helpers and the stored-content stripping
+    below must never see it. The round-1 reduction (suffix after the LAST
+    close marker) broke gemma4 multi-cycle output (thought → content →
+    thought → content): a legitimate call in an EARLIER content cycle was
+    treated as thinking territory, so the session stored BOTH the raw XML
+    and the structured tool_calls, the match helpers ignored the call, and
+    a rebuild could double-render it.
+
+    Codex round 3, finding 4: ``thinking_active`` is the router-active
+    state the text streamed/was stored under — with thinking DISABLED the
+    router passes EVERYTHING through as content, so a literal ``</think>``
+    in the text is a quote, never a channel boundary (gemma4 segmentation
+    stays marker-driven regardless; see content_segments)."""
+    return "".join(
+        text[s:e]
+        for s, e in content_segments(text, model_family, thinking_active)
+    )
+
+
+def _strip_content_channel_tool_xml(
+    text: str, model_family: str, thinking_active: bool = True,
+) -> str:
+    """U12 round 2: remove PARSEABLE tool-call XML from every CONTENT
+    segment of raw assistant text, preserving thinking segments byte-for-
+    byte (rehearsals stay intact) and — per the U11 per-block contract —
+    retaining unparseable blocks and all ordinary content text in their
+    original order. Used by the session save so the stored content never
+    duplicates the structured ``tool_calls`` entry (template double-render),
+    across ALL content cycles, not just the one after the last close
+    marker. The result is right-stripped (historical save behavior).
+
+    Codex round 3, finding 3: the per-segment parse runs in SEGMENT MODE
+    (``rstrip_content=False``) — a segment's trailing whitespace is INTERNAL
+    whitespace of the reassembled string (it sits before the next thinking
+    marker), and the historical per-call right-strip silently deleted it.
+    Only the final reconstructed string gets the one historical right-strip.
+    Finding 4: ``thinking_active`` threads the router-active state into the
+    channel segmentation (see _content_channel_union)."""
+    out: list[str] = []
+    pos = 0
+    for s, e in content_segments(text, model_family, thinking_active):
+        out.append(text[pos:s])
+        seg_content, _ = parse_tool_calls(
+            text[s:e], model_family=model_family, rstrip_content=False,
+        )
+        out.append(seg_content)
+        pos = e
+    out.append(text[pos:])
+    return "".join(out).rstrip()
 
 
 class MLXEngine:
@@ -3284,18 +3392,69 @@ class MLXEngine:
             )
 
     @staticmethod
+    def _flatten_cache_layers(cache) -> list:
+        """Flatten CacheList-like containers into their leaf cache objects.
+
+        Codex round 3, finding 1: GLM-5.1 / DeepSeek-V3.2 (MLA + DSA
+        indexer) wrap TWO KVCaches per layer in a top-level ``CacheList``
+        that exposes NO ``offset`` of its own — offset discovery that only
+        inspects top-level attributes reads 0 for the whole cache. Containers
+        expose their children via ``.caches`` (the established mlx-lm idiom —
+        the same attribute cache/manager.py's size estimator recurses
+        through); anything without it is a leaf and is returned as-is."""
+        flat: list = []
+        for c in cache or []:
+            sub = getattr(c, "caches", None)
+            if sub is not None:
+                flat.extend(MLXEngine._flatten_cache_layers(sub))
+            else:
+                flat.append(c)
+        return flat
+
+    @staticmethod
+    def _leaf_trimmable(c) -> bool:
+        """Codex round 5, finding 2: POSITIVE trimmability for one flattened
+        cache leaf. Method presence alone is insufficient — RotatingKVCache
+        exposes ``trim()`` while ``is_trimmable()`` is False once the ring
+        has wrapped (a trim decrements offsets so the post-trim per-layer
+        verification passes, but the evicted window entries cannot be
+        restored — the rewound cache is semantically corrupt). Honor the
+        semantic gate when the leaf provides one; a probe failure is
+        unverifiable → not trimmable (fail-closed).
+
+        NOTE: this gates the POST-STREAM reconcile trim-back only. The
+        mlx-vlm speculative ROLLBACK path (rejected draft tokens trimmed in
+        the same step they were appended) deliberately keeps upstream's
+        unconditional trim — see the B3/RCA-2 note in the MTP patch module.
+        """
+        if not hasattr(c, "trim"):
+            return False
+        probe = getattr(c, "is_trimmable", None)
+        if callable(probe):
+            try:
+                return bool(probe())
+            except Exception:  # noqa: BLE001 — unverifiable → fail-closed
+                return False
+        return True
+
+    @staticmethod
     def _get_cache_offset(cache: list) -> int:
         """Get the total number of tokens processed by this cache.
 
         Prefers KVCache (full attention, accurate cumulative offset) over
         RotatingKVCache (offset is cumulative but size() caps at max_size).
+
+        Codex round 3, finding 1a: discovery recurses through CacheList-like
+        containers (GLM MoE/DSA layouts) — the leaf KVCaches carry the real
+        offsets even when the top-level entries expose none.
         """
+        layers = MLXEngine._flatten_cache_layers(cache)
         # First pass: look for unbounded KVCache (full attention layers)
-        for c in cache:
+        for c in layers:
             if type(c).__name__ == "KVCache" and hasattr(c, "offset"):
                 return c.offset
         # Fallback: any cache with offset (RotatingKVCache, ArraysCache, etc.)
-        for c in cache:
+        for c in layers:
             if hasattr(c, "offset"):
                 return c.offset
         return 0
@@ -3385,8 +3544,43 @@ class MLXEngine:
         return "\n".join(parts)
 
     @staticmethod
-    def _normalize_for_match(content, role: str) -> str:
-        """Normalize message content for comparison."""
+    def _normalize_for_match(
+        content, role: str, model_family: str = "chatml",
+        thinking_active: bool = True,
+    ) -> str:
+        """Normalize message content for comparison.
+
+        Codex round 9, finding 2: the assistant thinking-channel reduction
+        follows the authoritative router machinery under the message's
+        ``thinking_active`` contract (threaded from _messages_match — the
+        round-3/8 threading covered the tool-call helpers but left this one
+        flag-blind and suffix-only):
+
+        - gemma4: the content channel is the MULTI-CYCLE union of all
+          content segments (_content_channel_union). The old
+          last-``<channel|>`` slice matched suffix-only (multi-cycle stored
+          'thought → important → thought → done' wrong-HIT against a bare
+          incoming 'done'), and the unconditional bare ``thought\\n`` strip
+          let a thinking-DISABLED stored turn genuinely starting with those
+          words ('thought\\nSECRET<channel|>answer' — all content under the
+          router's enable_thinking gate) wrong-HIT against 'answer'.
+        - chatml/glm, thinking active: FIRST-close reduction under the
+          router contract (codex round 11, finding 1 — the router never
+          re-enters thinking, tool_parser.content_segments). A raw side
+          (leading ``<think>`` — the engine always stores the opener, see
+          _make_full_assistant_content) reduces to the text after the
+          FIRST ``</think>``; any later ``</think>`` is a literal quote
+          INSIDE the content channel. An already-split side (no leading
+          opener) is kept WHOLE — the old LAST-close (rindex) reduction
+          collapsed distinct content channels onto their final suffix, so
+          a forged plain resend of that suffix wrong-HIT even on the
+          strict anon path. The degenerate UNCLOSED shape (leading opener,
+          no close) is kept RAW — codex round 13, finding 1; see the
+          inline comment.
+        - chatml/glm, thinking DISABLED: pure pass-through — a literal
+          ``</think>`` in content is a quote, never a boundary (round 3,
+          finding 4 semantics, previously missing here).
+        """
         content = MLXEngine._flatten_multipart(content)
         if role == "system":
             # Normalize dynamic date (e.g. "Today's date: Tue Mar 10 2026" → placeholder)
@@ -3402,15 +3596,57 @@ class MLXEngine:
         # Strip thinking and tool calls from assistant messages for comparison.
         # Only the actual text content matters for cache matching.
         if role == "assistant":
-            # Strip thinking blocks
-            if "<channel|>" in content:
-                content = content[content.rindex("<channel|>") + len("<channel|>"):]
-            elif "</think>" in content:
-                content = content[content.rindex("</think>") + len("</think>"):]
-            else:
-                content = _NORMALIZE_RE_THINK_PREFIX.sub("", content)
-                content = _NORMALIZE_RE_CHANNEL_THOUGHT_PREFIX.sub("", content)
-                content = _NORMALIZE_RE_THOUGHT_PREFIX.sub("", content)
+            # Strip thinking blocks (channel reduction per family/contract —
+            # see the docstring).
+            if model_family == "gemma4":
+                content = _content_channel_union(
+                    content, model_family, thinking_active,
+                )
+            elif thinking_active:
+                # Codex round 11, finding 1: FIRST-close channel reduction.
+                # The router contract (content_segments /
+                # split_thinking_and_content) makes the FIRST ``</think>``
+                # authoritative — chatml/glm never re-enter thinking, so any
+                # later ``</think>`` is a literal quote INSIDE the content
+                # channel (both families share the <think> markers). Shape
+                # alignment:
+                # - leading ``<think>``: raw wire text (the engine always
+                #   stores the opener — _make_full_assistant_content);
+                #   content is everything after the FIRST close, quotes
+                #   included. No close at all → kept RAW (codex round 13,
+                #   finding 1; see below).
+                # - no leading opener: the text IS a content channel — a
+                #   literal ``</think>`` in it is a quote, never a boundary.
+                #   Kept WHOLE: shapes that cannot be aligned one-to-one
+                #   against a stored raw (e.g. a bare leading ``</think>``
+                #   with no open) must never normalize onto a plain resend
+                #   — an honest MISS, not a forgeable suffix HIT (the old
+                #   rindex reduction collapsed distinct content channels
+                #   onto their final suffix).
+                body = content.lstrip()
+                if body.startswith("<think>"):
+                    close = body.find("</think>", len("<think>"))
+                    if close == -1:
+                        # Codex round 13, finding 1: an UNCLOSED raw (leading
+                        # opener, no close) is kept RAW — returned verbatim
+                        # (outer whitespace trim only), skipping every
+                        # reduction including the tool-call strips below.
+                        # Under an active chatml/glm contract the router
+                        # routes an unclosed stream ENTIRELY to reasoning
+                        # with EMPTY content, so the legacy bare-opener strip
+                        # normalized stored '<think>SECRET' equal to a plain
+                        # incoming 'SECRET' — a forgeable suffix even on the
+                        # strict/anon path. Normalizing to '' (the router-
+                        # faithful content channel) would instead collide
+                        # with genuinely-empty assistant content — another
+                        # many-to-one. The legitimate interrupted-resend
+                        # equivalence is handled by _interrupted_resend_equiv
+                        # (which splits the channel itself under exact
+                        # rules), never by plain equality: an unclosed-
+                        # thinking turn must normalize equal to nothing but
+                        # its byte-identical self.
+                        return content.strip()
+                    content = body[close + len("</think>"):]
             # Strip tool call blocks (both ChatML and Gemma 4 formats)
             content = _NORMALIZE_RE_TOOL_CALL_CHANNEL.sub("", content)
             content = _NORMALIZE_RE_TOOL_CALL_XML.sub("", content)
@@ -3442,7 +3678,7 @@ class MLXEngine:
 
     @staticmethod
     def _content_xml_calls_for_match(
-        raw_content: str, model_family: str,
+        raw_content: str, model_family: str, thinking_active: bool = True,
     ) -> list:
         """Canonical calls parsed from tool-call XML embedded in RAW content
         (legacy engine-stored turns kept the template XML in content) —
@@ -3476,7 +3712,24 @@ class MLXEngine:
         ``<tool_call>...</tool_call>`` spans exist the trailing call is
         dropped. The dropped call then surfaces through the existing checks
         (one-sided / residual marker / self-conflict). A spurious drop can
-        only reject (honest MISS), never produce a wrong HIT."""
+        only reject (honest MISS), never produce a wrong HIT.
+
+        U12: only the CONTENT channel is scanned — tool-call XML inside a
+        thinking segment is a rehearsal the engine no longer records, so at
+        match time it must not count as an extractable call (or a residual
+        marker) either; otherwise every turn after a rehearsal would FAIL
+        the one-sided check against the client's clean resend. Round 2: the
+        channel reduction is the UNION of all content segments
+        (_content_channel_union) — gemma4 multi-cycle output keeps a
+        legitimate call in an EARLIER content cycle visible here, while
+        thinking segments stay excluded. Round 3 (finding 4):
+        ``thinking_active`` is the router-active state the message's turn
+        ran under (the session's stored thinking flag) — with thinking
+        disabled a literal ``</think>`` in content is a quote, not a
+        boundary, so a call BEFORE it stays extractable."""
+        raw_content = _content_channel_union(
+            raw_content or "", model_family, thinking_active,
+        )
         start_tag, end_tag = get_tool_markers(model_family)
         if not raw_content or start_tag not in raw_content:
             return []
@@ -3503,6 +3756,7 @@ class MLXEngine:
     @staticmethod
     def _tool_calls_for_match(
         msg: dict, raw_content: str, model_family: str,
+        thinking_active: bool = True,
     ) -> list | None:
         """F3: canonical, comparable form of an assistant message's tool
         calls — ``[(name, canonical-args-json), ...]`` or ``None`` when no
@@ -3524,13 +3778,16 @@ class MLXEngine:
             return out
         # Fall back to tool-call XML in the raw content (legacy stored shape).
         return (
-            MLXEngine._content_xml_calls_for_match(raw_content, model_family)
+            MLXEngine._content_xml_calls_for_match(
+                raw_content, model_family, thinking_active,
+            )
             or None
         )
 
     @staticmethod
     def _structured_content_call_conflict(
         msg: dict, raw_content: str, model_family: str,
+        thinking_active: bool = True,
     ) -> bool:
         """Round 4: True when a message carries BOTH tool-call
         representations — a structured ``tool_calls`` field AND tool-call
@@ -3558,16 +3815,30 @@ class MLXEngine:
         structured = MLXEngine._canonicalize_calls(msg.get("tool_calls") or [])
         if not structured:
             return False
+        # U12: a marker inside a thinking segment is a rehearsal, not a
+        # conflicting representation — only content-channel XML must agree
+        # with the structured list. Round 2: the channel is the UNION of all
+        # content segments (multi-cycle aware); the RAW content is handed to
+        # _content_xml_calls_for_match, which applies the same reduction
+        # itself (the reduction is not idempotent for chatml text quoting a
+        # literal ``</think>`` in its content, so it must run exactly once).
+        content_union = _content_channel_union(
+            raw_content or "", model_family, thinking_active,
+        )
         start_tag, _ = get_tool_markers(model_family)
-        if not raw_content or start_tag not in raw_content:
+        if not content_union or start_tag not in content_union:
             return False
         return (
-            MLXEngine._content_xml_calls_for_match(raw_content, model_family)
+            MLXEngine._content_xml_calls_for_match(
+                raw_content or "", model_family, thinking_active,
+            )
             != structured
         )
 
     @staticmethod
-    def _has_residual_tool_markers(raw_content: str, model_family: str) -> bool:
+    def _has_residual_tool_markers(
+        raw_content: str, model_family: str, thinking_active: bool = True,
+    ) -> bool:
         """Round 3 (N3): True when ``raw_content`` holds tool-call START
         markers the family parse chain does NOT consume into canonical calls
         (a partial/garbled block trailing — or preceding — valid blocks).
@@ -3589,15 +3860,28 @@ class MLXEngine:
         positive (e.g. a parameter VALUE containing the literal marker)
         degrades to an honest MISS, never a wrong HIT — and only when the two
         sides' raw contents already differ (byte-identical sides skip this
-        check entirely)."""
+        check entirely).
+
+        U12: markers inside thinking segments are rehearsals, not
+        residuals — only the content channel is counted. Round 2: the
+        channel is the UNION of all content segments (mirrors the reduction
+        in _content_xml_calls_for_match, so parsed-call and marker counts
+        stay aligned; the RAW content is handed down so the reduction runs
+        exactly once)."""
+        content_union = _content_channel_union(
+            raw_content or "", model_family, thinking_active,
+        )
         start_tag, _ = get_tool_markers(model_family)
-        if not raw_content or start_tag not in raw_content:
+        if not content_union or start_tag not in content_union:
             return False
-        calls = MLXEngine._content_xml_calls_for_match(raw_content, model_family)
-        return len(calls) < raw_content.count(start_tag)
+        calls = MLXEngine._content_xml_calls_for_match(
+            raw_content or "", model_family, thinking_active,
+        )
+        return len(calls) < content_union.count(start_tag)
 
     def _interrupted_resend_equiv(
         self, s_content: str, i_norm: str, *, exact: bool = False,
+        thinking_active: bool = True,
     ) -> bool:
         """U1 narrow equivalence for a C1-committed INTERRUPTED assistant turn.
 
@@ -3626,15 +3910,40 @@ class MLXEngine:
         Arbitrary divergence — anything that is not (a prefix of, or under
         ``exact`` equal to) what was actually streamed — does NOT match
         (honest MISS / new anon session), unlike the old
-        last-stored-assistant wildcard this replaces."""
+        last-stored-assistant wildcard this replaces.
+
+        ``thinking_active`` (codex round 9, finding 2): the stored turn's
+        thinking contract, threaded into the split AND the normalization —
+        the default-active split treated a thinking-DISABLED gemma4 turn's
+        bare ``thought\\n`` content as a reasoning span, so its content
+        channel shrank to the post-``<channel|>`` suffix and a forged bare
+        resend passed even the EXACT (anon/strict) rule."""
         s_content = s_content or ""
+        family = getattr(self, "model_family", "chatml")
         started = s_content.lstrip().startswith("<think>")
-        thinking, content = split_thinking_and_content(
-            s_content,
-            model_family=getattr(self, "model_family", "chatml"),
-            started_in_thinking=started,
+        if family == "gemma4" or (thinking_active and started):
+            # gemma4 keeps its positional-router split; a chatml/glm stored
+            # raw always carries the leading opener
+            # (_make_full_assistant_content), and the split's Case 1 is
+            # already FIRST-close (non-greedy) — any later ``</think>`` in
+            # the resulting content is a literal quote it preserves.
+            thinking, content = split_thinking_and_content(
+                s_content,
+                model_family=family,
+                started_in_thinking=started,
+                thinking_active=thinking_active,
+            )
+        else:
+            # Codex round 11, finding 1: no leading opener (or thinking
+            # disabled) — the stored text IS the content channel and a
+            # literal ``</think>`` in it is a quote, never a boundary. The
+            # old unconditional split reduced it at the close, so a forged
+            # resend of the post-quote suffix passed even the EXACT
+            # (anon/strict) rule. Kept whole → honest MISS instead.
+            thinking, content = None, s_content
+        c_norm = self._normalize_for_match(
+            content or "", "assistant", family, thinking_active,
         )
-        c_norm = self._normalize_for_match(content or "", "assistant")
         if exact:
             return c_norm == i_norm
         if c_norm.startswith(i_norm):
@@ -3652,6 +3961,7 @@ class MLXEngine:
         incoming: list[dict],
         *,
         last_assistant_wildcard: bool = True,
+        thinking_active: bool = True,
     ) -> bool:
         """Check if incoming messages start with the stored conversation.
 
@@ -3697,7 +4007,16 @@ class MLXEngine:
         structured ``tool_calls`` AND tool-call XML in content — must agree
         with itself; a conflicting side (the structured comparison prefers
         the field, so content XML for a DIFFERENT call was invisible) FAILS
-        on both paths (see _structured_content_call_conflict)."""
+        on both paths (see _structured_content_call_conflict).
+
+        Codex round 3, finding 4: ``thinking_active`` is the session's
+        stored thinking contract — threaded into the content-channel
+        reduction of every helper below so a literal ``</think>`` in a
+        NON-thinking turn's content is a quote, never a channel boundary
+        that hides tool-call XML from matching. Callers pass the STORED
+        session's flag (the HIT gate only reaches here after the
+        fingerprint check, so it equals the request's flag there; the anon
+        resolver passes each candidate's own flag)."""
         if len(incoming) < len(stored):
             logger.debug(
                 f"[Match] FAIL: incoming({len(incoming)}) < stored({len(stored)})"
@@ -3726,8 +4045,12 @@ class MLXEngine:
             # stubs without the helper bound still work.
             family = getattr(self, "model_family", "chatml")
             if role == "assistant":
-                s_calls = MLXEngine._tool_calls_for_match(s_msg, s_content, family)
-                i_calls = MLXEngine._tool_calls_for_match(i_msg, i_content, family)
+                s_calls = MLXEngine._tool_calls_for_match(
+                    s_msg, s_content, family, thinking_active,
+                )
+                i_calls = MLXEngine._tool_calls_for_match(
+                    i_msg, i_content, family, thinking_active,
+                )
                 if s_calls is not None and i_calls is not None:
                     if s_calls != i_calls:
                         logger.debug(
@@ -3773,8 +4096,12 @@ class MLXEngine:
                 # Byte-identical contents carry no divergence to hide, so
                 # verbatim replays of a degenerate turn still match.
                 if s_content != i_content and (
-                    MLXEngine._has_residual_tool_markers(s_content, family)
-                    or MLXEngine._has_residual_tool_markers(i_content, family)
+                    MLXEngine._has_residual_tool_markers(
+                        s_content, family, thinking_active,
+                    )
+                    or MLXEngine._has_residual_tool_markers(
+                        i_content, family, thinking_active,
+                    )
                 ):
                     logger.debug(
                         f"[Match] FAIL at msg[{i}]: residual unparsed "
@@ -3796,10 +4123,10 @@ class MLXEngine:
                 # list (the same call rendered both ways) never trips this.
                 if (
                     MLXEngine._structured_content_call_conflict(
-                        s_msg, s_content, family,
+                        s_msg, s_content, family, thinking_active,
                     )
                     or MLXEngine._structured_content_call_conflict(
-                        i_msg, i_content, family,
+                        i_msg, i_content, family, thinking_active,
                     )
                 ):
                     logger.debug(
@@ -3819,23 +4146,39 @@ class MLXEngine:
                     )
                     return False
 
-            # Assistant tool_call messages: OpenCode strips <tool_call> from content
-            # and moves it to tool_calls field. Handle all cases:
-            # 1. stored="<tool_call>..." vs incoming="" (pure tool call)
-            # 2. stored="text\n\n<tool_call>..." vs incoming="text" (text + tool call)
-            if role == "assistant" and s_content != i_content:
-                s_stripped = _NORMALIZE_RE_TOOL_CALL_SPLIT.split(s_content, maxsplit=1)[0].rstrip()
-                i_stripped = _NORMALIZE_RE_TOOL_CALL_SPLIT.split(i_content, maxsplit=1)[0].rstrip()
-                if s_stripped == i_stripped:
-                    logger.debug(
-                        f"[Match] msg[{i}] assistant tool_call content mismatch ignored "
-                        f"(stored_len={len(s_content)}, incoming_len={len(i_content)})"
-                    )
-                    continue
+            # Codex round 13, finding 2: the historical first-<tool_call>
+            # PREFIX SHORTCUT that lived here (initial commit — OpenCode
+            # strips tool-call XML from content and moves it to the
+            # structured tool_calls field, so stored
+            # "text\n\n<tool_call>..." had to match incoming "text")
+            # compared ONLY the text before the FIRST start marker and then
+            # accepted the whole message on BOTH paths. Everything after
+            # that marker was invisible: divergent content AFTER the call
+            # blocks ("...ALPHA" vs "...BETA"), and — because a rehearsal
+            # call inside a thinking segment also carries the marker (U12:
+            # not extractable, so the structural comparison above sees
+            # None on both sides) — the entire post-thinking content
+            # channel, a wrong-HIT vector even in strict/anon mode. It is
+            # REMOVED: its two legitimate shapes are covered end-to-end by
+            # the modern machinery — (a) call lists compare STRUCTURALLY
+            # above (F3/N2, with N3/round-4 rejecting any unvalidated
+            # marker on a differing side), and (b) _normalize_for_match
+            # strips the validated closed blocks, so the SURROUNDING
+            # content channel is byte-compared below; both must agree. The
+            # streaming-truncated mid-call stored turn is not a lost
+            # leniency either: the N3 residual check above already
+            # rejected that shape before the shortcut could run (honest
+            # MISS), on the strict and the lenient path alike.
 
-            # Normalize and compare
-            s_norm = self._normalize_for_match(s_content, role)
-            i_norm = self._normalize_for_match(i_content, role)
+            # Normalize and compare (round 9, finding 2: the channel
+            # reduction inside runs under the same family/contract as the
+            # tool-call helpers above).
+            s_norm = self._normalize_for_match(
+                s_content, role, family, thinking_active,
+            )
+            i_norm = self._normalize_for_match(
+                i_content, role, family, thinking_active,
+            )
             if s_norm != i_norm:
                 # Tool content compacted/cleared by client (either direction)
                 # KV cache still valid — the tokens were already processed.
@@ -3874,6 +4217,7 @@ class MLXEngine:
                         if self._interrupted_resend_equiv(
                             s_content, i_norm,
                             exact=not last_assistant_wildcard,
+                            thinking_active=thinking_active,
                         ):
                             logger.debug(
                                 f"[Match] msg[{i}] interrupted-turn "
@@ -4052,6 +4396,9 @@ class MLXEngine:
                 continue
             if not self._messages_match(
                 stored, messages, last_assistant_wildcard=False,
+                # Round 3, finding 4: the candidate's own stored thinking
+                # contract drives its content-channel reduction.
+                thinking_active=getattr(session, "thinking", True),
             ):
                 continue
             n = len(stored)
@@ -4309,8 +4656,14 @@ class MLXEngine:
         thinking: bool | None = None,
         thinking_budget: int | None = None,
         response_format=None,
+        stop: str | list[str] | None = None,
     ) -> Generator[GenerationResult, None, None]:
         """Generate with session-based KV cache reuse (holds lock)."""
+        # U24: normalize OpenAI's ``stop`` (string or array) to a list of
+        # non-empty sequences once, up front (empty -> None: no scanning).
+        if isinstance(stop, str):
+            stop = [stop]
+        stop_sequences = [s for s in (stop or []) if s] or None
         t_wait = time.perf_counter()
         logger.debug(
             f"[Queue] session={session_id or 'anon?'} | waiting for lock | "
@@ -4338,11 +4691,22 @@ class MLXEngine:
             # request's prompt-contract fingerprint (U21) so two anon
             # conversations with identical message prefixes but different
             # tool schemas never share a slot.
+            # U9: mirror _generate_locked's structured-output thinking
+            # suppression so the anon resolver fingerprints the CONTRACT the
+            # generation will actually stamp (thinking=False for
+            # json_schema/json_object requests).
+            _fp_thinking = (
+                thinking if thinking is not None else self.cfg.enable_thinking
+            )
+            if _fp_thinking and getattr(response_format, "type", None) in (
+                "json_schema", "json_object",
+            ):
+                _fp_thinking = False
             sid = session_id or self._resolve_anon_session_id_locked(
                 messages,
                 prompt_fingerprint=self._prompt_fingerprint(
                     self._canonical_tools(tools),
-                    thinking if thinking is not None else self.cfg.enable_thinking,
+                    _fp_thinking,
                 ),
             )
             logger.debug(f"[Queue] session={sid} | lock acquired | waited={wait_ms:.0f}ms")
@@ -4367,6 +4731,7 @@ class MLXEngine:
                     thinking=thinking,
                     thinking_budget=thinking_budget,
                     response_format=response_format,
+                    stop_sequences=stop_sequences,
                 )
             finally:
                 # Clear busy BEFORE eviction so this session is a normal LRU
@@ -4668,6 +5033,7 @@ class MLXEngine:
         top_k: int = 0,
         repetition_penalty: float = 1.0,
         response_format=None,
+        stop_sequences: list[str] | None = None,
     ) -> Generator[GenerationResult, None, None]:
         """Core generation logic using mlx-vlm (must hold lock).
 
@@ -4679,6 +5045,24 @@ class MLXEngine:
 
         has_tools = bool(tools)
         use_thinking = thinking if thinking is not None else self.cfg.enable_thinking
+        # U9: structured output (json_schema/json_object) suppresses thinking
+        # for THIS request. The FSM processor masks logits to the JSON grammar
+        # from the first generated token, so pairing it with the chatml/glm
+        # <think> prompt opener produced an unclosed thought block whose
+        # "reasoning" was the entire JSON answer (content empty; a thinking-
+        # budget-forced </think> would corrupt the constrained JSON). With
+        # thinking off, prompt/template/FSM/router all agree: the output IS
+        # the content. Applied before the prompt-contract fingerprint below,
+        # so the session is stamped with the contract actually rendered.
+        if use_thinking and getattr(response_format, "type", None) in (
+            "json_schema", "json_object",
+        ):
+            logger.info(
+                f"[Structured] thinking suppressed for this request: "
+                f"response_format={getattr(response_format, 'type', None)!r} "
+                f"constrains output to JSON from the first token"
+            )
+            use_thinking = False
 
         # Defensive fallback only: generate_stream always passes a resolved id
         # (explicit session_id, or an anon-* id from
@@ -4757,7 +5141,12 @@ class MLXEngine:
                 )
                 _reusable = False
         if _reusable:
-            _reusable = self._messages_match(session.messages, messages)
+            # Round 3, finding 4: the fingerprint gate above already
+            # verified stored thinking == request thinking; use_thinking is
+            # therefore the contract BOTH sides' turns ran under.
+            _reusable = self._messages_match(
+                session.messages, messages, thinking_active=use_thinking,
+            )
         if _reusable:
             new_messages = messages[len(session.messages):]
             _blocked_asst = self._suffix_blocking_assistants(new_messages)
@@ -5038,6 +5427,122 @@ class MLXEngine:
         # and the next turn takes an honest MISS (the corruption callback
         # already invalidated the session cache).
         _cache_corrupted = False
+        # U7: terminal-reason bookkeeping. ``_runner_finish`` captures the
+        # backend runner's own terminal signal when it provides one (mlx-lm's
+        # stream_generate and the PLD/MTP response adapter tag their final
+        # frame "stop"/"length"). The mlx-vlm path yields no finish_reason —
+        # the post-loop falls back to a max_tokens/EOS heuristic using
+        # ``_eos_ids``.
+        _runner_finish: Optional[str] = None
+        _eos_ids: set[int] = set()
+        try:
+            _eos_ids = _collect_eos_ids(self.tokenizer)
+        except Exception:  # noqa: BLE001 — vocab probing must never break generation
+            pass
+        # U24: stop-sequence scan state. ``_stop_pending`` holds back the
+        # longest suffix of emitted-so-far text that could still begin a stop
+        # sequence (a stop can split across token boundaries); text is only
+        # released downstream once it provably cannot be part of a match.
+        # Scanning happens on the RAW generated text (thinking included) —
+        # matching vLLM/LM-Studio semantics for stop strings on reasoning
+        # models.
+        #
+        # U24 round 2 (codex finding 1) — commit-or-invalidate on a stop hit,
+        # mirroring the C1 design. The round-1 behavior recorded the withheld
+        # stop tokens in generated_token_ids/the KV while session.messages
+        # stored the TRUNCATED text: the next HIT spliced its suffix onto the
+        # untruncated ids, so the model context silently kept the stop text
+        # the client never saw (contract violation — stored messages must
+        # describe the cached ids). Now, on a stop hit:
+        #   (a) the visible text ends EXACTLY on a token boundary (the match
+        #       starts at the first character of a token's decoded segment):
+        #       generated_token_ids is trimmed back to that boundary and the
+        #       post-stream reconcile trims the cache the same way (its
+        #       existing all-layers-trimmable check + per-layer verification
+        #       — the C1 machinery). messages ↔ ids ↔ cache all agree.
+        #   (b) the match starts mid-token (the stop shares a token with
+        #       visible text) OR any cache layer is untrimmable (the
+        #       production Qwen hybrid's ArraysCache layers, MTP head-bearing
+        #       layouts): the truncated text is still committed to
+        #       session.messages but the session cache is INVALIDATED
+        #       fail-closed — the next turn takes an honest MISS/cold-fill.
+        # TRADEOFF (documented on the invalidation site below): on the hybrid
+        # production model a stop hit costs the session cache. ``stop`` is
+        # off by default and rare; correctness wins over the lost reuse.
+        #
+        # ``_stop_tok_bounds[i]`` = cumulative scanned-text length after the
+        # frame that recorded generated_token_ids[i] (text-only frames extend
+        # the LAST entry — their bytes belong to already-recorded tokens, so
+        # a match inside them can never be boundary-aligned). ``_stop_match_abs``
+        # is the absolute scanned-text position where the accepted stop match
+        # starts; ``_stop_keep_tokens`` is the boundary-aligned kept-token
+        # count (None = case (b): not aligned).
+        _stop_hit = False
+        _stop_pending = ""
+        _stop_flush_text = ""
+        _stop_total_len = 0
+        _stop_tok_bounds: list[int] = []
+        # NIT (codex round 3): ``_stop_tok_bounds`` used to grow one int per
+        # generated token for the whole stream (~1.2MB at 32k tokens) while
+        # boundary resolution only ever needs the RECENT window a future
+        # match could still start in: a match starts at or after the pending
+        # buffer's absolute start (``_stop_total_len - len(_stop_pending)``,
+        # monotonically non-decreasing), padded by the longest stop for
+        # slack. Old entries are pruned in batches; ``_stop_bounds_dropped``
+        # counts the dropped leading entries so resolved indices stay
+        # ABSOLUTE token counts.
+        _stop_bounds_dropped = 0
+        _stop_max_len = max((len(s) for s in stop_sequences or ()), default=0)
+        _STOP_BOUNDS_PRUNE_AT = 4096
+        _stop_match_abs = -1
+        _stop_keep_tokens: Optional[int] = None
+        # Codex round 7, finding 2 (U24 cancellation): set when a
+        # cancellation/teardown reconciled a NON-EMPTY _stop_pending buffer —
+        # bytes withheld from the wire whose token ids were already recorded
+        # (and forwarded through the KV). The reconcile epilogue then applies
+        # the same commit-or-invalidate contract as a stop hit: survive only
+        # on a positively verified boundary trim, else invalidate.
+        _cancel_pending_hidden = False
+
+        def _resolve_stop_boundary():
+            """Finding 1, case (a): map the accepted stop-match start onto a
+            generated-token boundary and trim generated_token_ids to it.
+
+            The visible text is boundary-aligned iff SOME kept-token count n
+            has cumulative decoded length exactly _stop_match_abs; pick the
+            SMALLEST such n (a trailing token whose decoded segment is empty
+            holds bytes of the stop text — trim it too, fail-closed).
+            Trimming the recorded ids HERE — at the hit site, before any
+            reconcile (normal post-loop OR the GeneratorExit rescue) — makes
+            the reconcile see the cache AHEAD of the recorded ids and run its
+            existing C1 trim-back: all-layers-trimmable check, per-layer
+            offset verification, and fail-closed invalidation on any hybrid /
+            MTP-head-bearing / partially-trimmed cache. ``None`` (not
+            boundary-aligned) is case (b): the reconcile invalidates instead.
+            """
+            nonlocal _stop_keep_tokens
+            keep: Optional[int] = None
+            if _stop_match_abs == 0:
+                keep = 0
+            else:
+                # NIT (round 3): the bounds list is pruned from the front;
+                # _stop_bounds_dropped restores the ABSOLUTE token index. A
+                # match can never start inside the pruned region (entries are
+                # only dropped once they fall behind the pending buffer's
+                # start minus the longest-stop slack).
+                _i = bisect.bisect_left(_stop_tok_bounds, _stop_match_abs)
+                if (
+                    _i < len(_stop_tok_bounds)
+                    and _stop_tok_bounds[_i] == _stop_match_abs
+                ):
+                    keep = _stop_bounds_dropped + _i + 1
+            if keep is not None and keep > len(generated_token_ids):
+                # Defensive: a boundary beyond the recorded ids cannot be
+                # trimmed to — treat as unaligned (case b, invalidation).
+                keep = None
+            _stop_keep_tokens = keep
+            if keep is not None:
+                del generated_token_ids[keep:]
 
         def _reconcile_stream_end():
             """Post-stream reconcile: join text, drafter finalize, write back
@@ -5046,11 +5551,35 @@ class MLXEngine:
             to run from the normal post-loop path AND from the GeneratorExit
             rescue handler."""
             nonlocal accumulated_text, _stream_reconciled, _cache_corrupted
+            nonlocal _stop_pending, _stop_match_abs, _cancel_pending_hidden
             if _stream_reconciled:
                 return
             _stream_reconciled = True
             # PERF: single join at end of loop — replaces O(N^2) accumulation.
             accumulated_text = "".join(text_parts)
+            # Codex round 7, finding 2 (U24 cancellation): a cancellation or
+            # stream teardown can reach this reconcile with _stop_pending
+            # still NON-EMPTY (the normal post-loop flush is guarded by
+            # ``not cancelled``, and the GeneratorExit rescue never runs it).
+            # Those bytes were withheld from the wire, but their token ids
+            # are ALREADY in generated_token_ids and forwarded through the
+            # KV — committing accumulated_text without them would leave a
+            # live cache holding hidden context ('answer ST' in the KV vs
+            # 'answer ' in messages) that the next HIT silently resumes
+            # from. Fail-closed, mirroring the stop-hit-site trim: when the
+            # pending text starts EXACTLY at a generated-token boundary,
+            # trim the recorded ids back to that boundary HERE — the
+            # cache-ahead trim-back below then rewinds the cache and
+            # verifies every flattened leaf (the C1 machinery); a mid-token
+            # pending start (or any trim/verify shortfall) is caught by the
+            # epilogue at the end of this reconcile, which INVALIDATES the
+            # session cache. The committed message stays byte-what-the-
+            # client-received either way (pending text is never appended).
+            if _stop_pending:
+                _cancel_pending_hidden = True
+                _stop_match_abs = _stop_total_len - len(_stop_pending)
+                _resolve_stop_boundary()
+                _stop_pending = ""
             # PERF: drafter-stats finalize (post-stream, exactly once). Captures
             # all drafter.accept_lens accumulated during _mtp_rounds → log + per-
             # session bookkeeping. Replaces the per-token generator wrapper.
@@ -5137,7 +5666,20 @@ class MLXEngine:
                     # recurrent state still containing the trimmed tokens (ghost
                     # tokens on the next forward) — so INVALIDATE instead.
                     _over = _cache_off - len(_actual_token_ids)
-                    if all(hasattr(_c, "trim") for _c in cache_state.cache):
+                    # Codex round 3, finding 1: trimmability + per-layer
+                    # verification run on the FLATTENED layers so a
+                    # CacheList container (GLM MoE/DSA) is judged by its
+                    # leaf KVCaches, not by the offset-less wrapper. The
+                    # trim() calls themselves stay on the top-level entries
+                    # (CacheList.trim delegates to every child).
+                    # Codex round 5, finding 2: trimmability is the SEMANTIC
+                    # gate (_leaf_trimmable), not mere trim()-presence — a
+                    # wrapped RotatingKVCache decrements offsets on trim (so
+                    # the post-trim verification below would pass) while the
+                    # evicted ring entries are unrecoverable; it must take
+                    # the invalidate path instead.
+                    _flat_layers = self._flatten_cache_layers(cache_state.cache)
+                    if all(self._leaf_trimmable(_c) for _c in _flat_layers):
                         # FAIL-CLOSED trim-back (mirrors the 8491f1d prefix-trim
                         # post-condition): a trim() exception OR any offset-
                         # bearing layer NOT landing exactly on len(token_ids)
@@ -5165,7 +5707,7 @@ class MLXEngine:
                                 )
                         _bad_layers = [
                             (i, off)
-                            for i, off in enumerate(_layer_offsets(cache_state.cache))
+                            for i, off in enumerate(_layer_offsets(_flat_layers))
                             if off is not None and off != len(_actual_token_ids)
                         ]
                         if _trim_exc or _bad_layers:
@@ -5188,8 +5730,10 @@ class MLXEngine:
                         logger.warning(
                             f"[KV Cache] session={session_id} | cache ahead of "
                             f"recorded ids by {_over} but the cache has "
-                            f"untrimmable (recurrent) layers — INVALIDATING "
-                            f"session cache (next turn cold-fills)"
+                            f"untrimmable layers (recurrent state, or a "
+                            f"wrapped RotatingKVCache whose is_trimmable() "
+                            f"is False) — INVALIDATING session cache (next "
+                            f"turn cold-fills)"
                         )
                         cache_state.cache = None
                         cache_state.token_ids = None
@@ -5213,6 +5757,83 @@ class MLXEngine:
                         f"[KV Cache] session={session_id} | "
                         f"post-gen _eval_cache failed: {_eval_err!r}"
                     )
+
+            # U24 round 2 (finding 1, case b): the stop match starts
+            # MID-TOKEN — no token-boundary trim can remove the stop text
+            # from the KV, so the advanced cache must not stay alive:
+            # session.messages commits the truncated text (normal save /
+            # interrupted-turn Path 0) while the cache is invalidated
+            # fail-closed → the next turn takes an honest MISS/cold-fill.
+            # This sits at the END of the reconcile so it runs AFTER the
+            # runner close has settled (MTP finalize done — the settle
+            # contract) on BOTH drivers (normal post-loop and the
+            # GeneratorExit rescue), and _invalidate_cache_state clears the
+            # MTP finalize-hidden stash so no on_finalize resume state
+            # survives for the invalidated session.
+            # TRADEOFF: on the production Qwen hybrid (30 untrimmable
+            # ArraysCache layers) even a boundary-aligned stop hit already
+            # invalidates via the trim-back's trimmability check above — a
+            # stop hit costs the session cache there. ``stop`` is off by
+            # default and rare; a silent " STOP" resurrected into the next
+            # HIT's model context is worse than one cold-fill.
+            # Codex round 3, finding 1b — FAIL-CLOSED backstop: a stop hit
+            # must never leave an UNVERIFIABLE cache alive. The mid-token
+            # case (_stop_keep_tokens is None) always invalidates as before;
+            # additionally, a boundary-aligned hit only keeps the cache when
+            # its alignment is POSITIVELY established.
+            # Codex round 5, finding 2: alignment is verified PER FLATTENED
+            # LEAF, not on the first readable offset — with leaves
+            # [N, N+1] and N == len(trimmed ids), the scalar read reported
+            # N (ahead/trim branch skipped, backstop accepted) while the
+            # second leaf stayed AHEAD with the withheld stop tokens
+            # inside a 'reusable' cache; the same hole covered an
+            # offset-opaque leaf sitting next to one aligned visible leaf.
+            # Survival now requires EVERY leaf's offset to be readable AND
+            # to land exactly on the trimmed recorded ids; ANY opaque or
+            # divergent leaf invalidates.
+            # Codex round 7, finding 2: the SAME backstop covers a
+            # cancellation/teardown that reconciled a withheld _stop_pending
+            # buffer (see the pending resolution at the top of this
+            # reconcile) — the hidden bytes' ids must be verifiably trimmed
+            # out of the cache, or the cache must not survive.
+            if _stop_hit or _cancel_pending_hidden:
+                from mlx_soloheaven.engine.pld import _layer_offsets
+                _stop_leaf_offs = (
+                    _layer_offsets(
+                        self._flatten_cache_layers(cache_state.cache)
+                    )
+                    if cache_state.cache is not None else []
+                )
+                _recorded_len = len(cache_state.token_ids or [])
+                _stop_cache_verified = (
+                    _stop_keep_tokens is not None
+                    and cache_state.cache is not None
+                    and cache_state.token_ids is not None
+                    and _recorded_len > 0
+                    and bool(_stop_leaf_offs)
+                    and all(
+                        off is not None and off == _recorded_len
+                        for off in _stop_leaf_offs
+                    )
+                )
+                if not _stop_cache_verified and cache_state.cache is not None:
+                    _stop_why = (
+                        "stop sequence hit"
+                        if _stop_hit
+                        else "cancellation with withheld stop-scan text"
+                    )
+                    logger.warning(
+                        f"[KV Cache] session={session_id} | {_stop_why} "
+                        f"but cache alignment could not be positively "
+                        f"verified on every leaf "
+                        f"(keep_tokens={_stop_keep_tokens}, "
+                        f"match at scan pos {_stop_match_abs}, "
+                        f"leaf offsets={_stop_leaf_offs[:8]}, recorded="
+                        f"{_recorded_len}) — INVALIDATING "
+                        f"session cache (messages keep the truncated text; "
+                        f"next turn cold-fills)"
+                    )
+                    self._invalidate_cache_state(cache_state)
 
         def _rescue_uncommitted_turn(reason: str, *, commit: bool) -> None:
             """Finalization guard for a stream that never reached a
@@ -5288,23 +5909,109 @@ class MLXEngine:
                     cancelled = True
                     break
 
-                gen_token_count += 1
                 text = resp.text if hasattr(resp, "text") else ""
                 tok_attr = getattr(resp, "token", None)
                 token = tok_attr if tok_attr is not None else 0
                 prompt_tps = getattr(resp, "prompt_tps", 0.0) or 0.0
                 gen_tps = getattr(resp, "generation_tps", 0.0) or 0.0
+                # U7: capture the runner's terminal signal (mlx-lm final
+                # frame / adapter EOS + exhaustion frames). Never forwarded
+                # on the per-token GenerationResults below — only the
+                # engine's own terminal frame carries a finish_reason.
+                _fr = getattr(resp, "finish_reason", None)
+                if _fr in ("stop", "length"):
+                    _runner_finish = _fr
+
+                # U8: count/record GENERATED TOKENS only. A text-only frame
+                # (token=None — the adapter's detokenizer tail flush, or a
+                # synthetic terminal) carries text whose token ids were
+                # already recorded on their own frames.
+                if tok_attr is not None:
+                    gen_token_count += 1
+                    generated_token_ids.append(int(tok_attr))
+                elif not text:
+                    # Signal-only frame (e.g. the adapter's exhaustion frame
+                    # with no buffered tail): the finish signal was captured
+                    # above; nothing to convey outward.
+                    continue
+
+                # U24: stop-sequence scan with holdback. The pending buffer
+                # is bounded by max(len(stop)) once released text is emitted;
+                # on a match the emitted text ends BEFORE the stop sequence
+                # and the loop terminates after this frame.
+                if stop_sequences:
+                    _stop_total_len += len(text)
+                    if tok_attr is not None:
+                        _stop_tok_bounds.append(_stop_total_len)
+                    elif _stop_tok_bounds:
+                        # Text-only frame (detokenizer tail flush): its bytes
+                        # come from already-recorded tokens — extend the last
+                        # token's segment so a match inside it can never be
+                        # mistaken for boundary-aligned (fail-closed).
+                        _stop_tok_bounds[-1] = _stop_total_len
+                    # NIT (round 3): batched front-prune of bounds that no
+                    # future match can land on. Threshold = start of the
+                    # pending buffer minus the longest-stop slack (matches
+                    # start at/after the pending start; the slack is pure
+                    # belt-and-braces). The NEWEST entry always survives so
+                    # a text-only frame keeps extending the last segment.
+                    if len(_stop_tok_bounds) >= _STOP_BOUNDS_PRUNE_AT:
+                        _thresh = (
+                            _stop_total_len - len(_stop_pending)
+                            - len(text) - _stop_max_len
+                        )
+                        _cut = bisect.bisect_left(_stop_tok_bounds, _thresh)
+                        _cut = min(_cut, len(_stop_tok_bounds) - 1)
+                        if _cut > 0:
+                            del _stop_tok_bounds[:_cut]
+                            _stop_bounds_dropped += _cut
+                if stop_sequences and text:
+                    _stop_pending += text
+                    _hit_idx = None
+                    for _s in stop_sequences:
+                        _j = _stop_pending.find(_s)
+                        if _j != -1 and (_hit_idx is None or _j < _hit_idx):
+                            _hit_idx = _j
+                    # U24 round 2 (codex finding 2): deterministic
+                    # earliest-START semantics independent of chunking. A
+                    # completed match at position P is only accepted when NO
+                    # other stop has a viable partial match starting BEFORE P
+                    # that extends to the end of the buffer (repro: stops
+                    # ["b","aba"] — frame ["aba"] vs frames ["ab","a"] must
+                    # both yield ""). While such a partial is alive, HOLD:
+                    # it either completes (its earlier start wins on a later
+                    # rescan of the same buffer) or dies (the rescan then
+                    # accepts the held completed match at P). At stream end
+                    # the post-loop flush resolves a still-held buffer the
+                    # same way (partials can never complete there).
+                    # _partial_marker_tail returns the LONGEST buffer suffix
+                    # that is a proper prefix of any stop == the EARLIEST
+                    # viable partial start.
+                    _keep = _partial_marker_tail(
+                        _stop_pending, tuple(stop_sequences)
+                    )
+                    if _hit_idx is not None and (
+                        len(_stop_pending) - _keep >= _hit_idx
+                    ):
+                        text = _stop_pending[:_hit_idx]
+                        _stop_match_abs = (
+                            _stop_total_len - len(_stop_pending) + _hit_idx
+                        )
+                        _stop_pending = ""
+                        _stop_hit = True
+                        # Finding 1: resolve the token boundary + trim the
+                        # recorded ids AT THE HIT SITE, so even a client
+                        # disconnect at this frame's yield (GeneratorExit
+                        # rescue) reconciles against the truncated ids.
+                        _resolve_stop_boundary()
+                    else:
+                        text = _stop_pending[: len(_stop_pending) - _keep]
+                        _stop_pending = _stop_pending[len(_stop_pending) - _keep:]
 
                 # PERF: append-to-list + post-loop join avoids the O(N^2)
                 # cost of repeated ``str += text`` (each += allocates a new
                 # string and copies the entire accumulated buffer).
                 text_parts.append(text)
-                # Track yielded token IDs so the post-loop update keeps
-                # cache_state.token_ids == full_prompt_token_ids + generated_token_ids
-                # on both paths. resp.token may be None on the synthetic terminal
-                # frame; in that case the token has already been counted earlier.
-                if tok_attr is not None:
-                    generated_token_ids.append(int(tok_attr))
 
                 if t_first_token is None:
                     t_first_token = time.perf_counter()
@@ -5341,6 +6048,23 @@ class MLXEngine:
                     prompt_tps=prompt_tps,
                     generation_tps=gen_tps,
                 )
+
+                if _stop_hit:
+                    # U24: a stop sequence completed in this frame's text.
+                    # Break out — the finally below closes gen_iter (the GPU
+                    # actually stops) and the post-loop reconcile applies the
+                    # commit-or-invalidate contract: generated_token_ids was
+                    # already trimmed to the visible-text token boundary at
+                    # the hit site (case a — the reconcile trims the cache to
+                    # match, all-layers-trimmable + verified), or the match
+                    # is mid-token/untrimmable (case b — the reconcile
+                    # invalidates the session cache fail-closed). Either way
+                    # the stored messages never claim less than the KV holds.
+                    _logger.info(
+                        f"[Generate] session={session_id} | STOP sequence hit "
+                        f"at token {gen_token_count} — terminating generation"
+                    )
+                    break
 
         except GeneratorExit:
             # A3: the response generator was closed at the streaming yield
@@ -5408,9 +6132,56 @@ class MLXEngine:
             _MTP_THINK_START_TOKEN = None
             _MTP_THINK_FAMILY = None
             _MTP_THINK_BARE_OPEN_TOKENS = None
+        # U24: resolve the held-back scan buffer at stream end (exhaustion /
+        # EOS reached with text still held). Finding 2: a COMPLETED match may
+        # be sitting in the buffer, held only because an earlier viable
+        # partial could still have won — at stream end partials can never
+        # complete, so accept the EARLIEST completed match (identical output
+        # for every chunk segmentation of the same text). Otherwise the held
+        # tail is real output — fold it into the accumulated text BEFORE the
+        # reconcile (session persistence) and remember it for a text-only
+        # flush frame after the save (its token ids are already recorded).
+        if _stop_pending and not cancelled and not _stop_hit:
+            _hit_idx = None
+            for _s in stop_sequences or ():
+                _j = _stop_pending.find(_s)
+                if _j != -1 and (_hit_idx is None or _j < _hit_idx):
+                    _hit_idx = _j
+            if _hit_idx is not None:
+                _stop_hit = True
+                _stop_match_abs = (
+                    _stop_total_len - len(_stop_pending) + _hit_idx
+                )
+                _resolve_stop_boundary()
+                _vis = _stop_pending[:_hit_idx]
+                if _vis:
+                    text_parts.append(_vis)
+                    _stop_flush_text = _vis
+            else:
+                text_parts.append(_stop_pending)
+                _stop_flush_text = _stop_pending
+            _stop_pending = ""
+
         # Post-stream reconcile (idempotent, yield-free — shared with the
-        # GeneratorExit rescue defined above the loop).
+        # GeneratorExit rescue defined above the loop). Includes the stop-hit
+        # commit-or-invalidate epilogue (finding 1).
         _reconcile_stream_end()
+
+        # U7: max_tokens exhaustion detection. Prefer the runner's explicit
+        # terminal signal; the mlx-vlm path reports none, so fall back to a
+        # heuristic: the loop consumed max_tokens frames and the last
+        # generated token is not an EOS (an EOS landing exactly on the limit
+        # is still a natural stop).
+        _length_hit = not cancelled and not _stop_hit and (
+            _runner_finish == "length"
+            or (
+                _runner_finish is None
+                and max_tokens > 0
+                and gen_token_count >= max_tokens
+                and bool(generated_token_ids)
+                and int(generated_token_ids[-1]) not in _eos_ids
+            )
+        )
 
         # Log generated text for debugging
         if accumulated_text:
@@ -5455,9 +6226,22 @@ class MLXEngine:
 
         # Guard: detect empty response (no content after thinking)
         if accumulated_text and session_id:
+            # Round 3, finding 4: judge emptiness on the router-authoritative
+            # content channel — with thinking DISABLED the whole text is
+            # content (a literal </think> quote no longer empties it); with
+            # thinking active the stream began inside the thought block.
+            # Codex round 7, finding 3: thinking_active gates the gemma4
+            # bare-opener recognition (a thinking=False turn genuinely
+            # starting with 'thought\n' is content, not empty).
             _, content = split_thinking_and_content(
                 accumulated_text, model_family=self.model_family,
+                started_in_thinking=(
+                    use_thinking and self.model_family != "gemma4"
+                ),
+                thinking_active=use_thinking,
             )
+            if not use_thinking and self.model_family != "gemma4":
+                content = accumulated_text
             if not content or not content.strip():
                 if cache_mode == "hit" and session is not None:
                     # C1 FIX (b): the session's live cache already contains
@@ -5501,11 +6285,23 @@ class MLXEngine:
                 # Idempotence marker BEFORE the terminal yield: a
                 # GeneratorExit delivered at that yield must not re-commit.
                 _turn_committed = True
+                # U24: the held partial-match tail was already folded into
+                # the persisted text — deliver it on the wire too.
+                if _stop_flush_text:
+                    yield GenerationResult(
+                        text=_stop_flush_text,
+                        prompt_tokens=total_prompt_tokens,
+                        completion_tokens=gen_token_count,
+                    )
                 yield GenerationResult(
                     text="",
                     # U6: a corruption-terminated stream is an abnormal end —
-                    # surface it instead of claiming a clean stop.
-                    finish_reason="error" if _cache_corrupted else "stop",
+                    # surface it instead of claiming a clean stop. U7: a
+                    # thinking-only max_tokens exhaustion is "length".
+                    finish_reason=(
+                        "error" if _cache_corrupted
+                        else ("length" if _length_hit else "stop")
+                    ),
                     prompt_tokens=total_prompt_tokens,
                     completion_tokens=gen_token_count,
                 )
@@ -5516,10 +6312,45 @@ class MLXEngine:
         # U6/F1: NEVER on a corruption-terminated stream — the text is
         # truncated at an arbitrary point and a partial <tool_call> block
         # must not be surfaced (or persisted) as a real, executable call.
+        # U12: parse the CONTENT CHANNEL only. A model "rehearsing" a tool
+        # call inside its thinking region must not have the rehearsal
+        # recorded/emitted as a real tool_calls entry — only text outside
+        # the thinking region is tool-call territory (the streaming path
+        # already enforces this via the ThinkingRouter, whose tool FSM only
+        # consumes content segments).
         parsed_tool_calls: list[dict] = []
         if has_tools and accumulated_text and not _cache_corrupted:
+            # Codex round 3, finding 4 — the content channel here must be
+            # what the STREAMING router would have emitted (the authority):
+            # - gemma4: the router-policy union of all content segments
+            #   (orphan-close with no prior thought-open is CONTENT — the
+            #   old extract-based split discarded everything before it,
+            #   hiding a call the streaming FSM had already parsed);
+            # - chatml/glm, thinking ACTIVE: the stream began inside the
+            #   thought block — split with started_in_thinking=True (the
+            #   degenerate no-</think> turn is ALL reasoning, rehearsals
+            #   never parsed; unchanged from U12/FIX 1);
+            # - chatml/glm, thinking DISABLED: the inactive router passes
+            #   EVERYTHING through — the whole text is the content channel
+            #   and a literal </think> in it is a quote, never a boundary
+            #   that hides a call before it.
+            if self.model_family == "gemma4":
+                # Codex round 7, finding 3: thread the turn's thinking
+                # contract — bare-opener recognition inside the segmentation
+                # follows the router (full markers stay authoritative).
+                _content_channel = _content_channel_union(
+                    accumulated_text, "gemma4", use_thinking,
+                )
+            elif use_thinking:
+                _, _content_channel = split_thinking_and_content(
+                    accumulated_text,
+                    model_family=self.model_family,
+                    started_in_thinking=True,
+                )
+            else:
+                _content_channel = accumulated_text
             _, parsed_tool_calls = parse_tool_calls(
-                accumulated_text, model_family=self.model_family,
+                _content_channel, model_family=self.model_family,
             )
 
         # Save session
@@ -5544,10 +6375,23 @@ class MLXEngine:
             if parsed_tool_calls:
                 # Strip the tool_call XML from stored content so the template
                 # doesn't double-render (content + tool_calls both emit XML).
-                start_tag, _ = get_tool_markers(self.model_family)
-                tc_idx = full_assistant_content.find(start_tag)
-                if tc_idx >= 0:
-                    full_assistant_content = full_assistant_content[:tc_idx].rstrip()
+                # U12: strip from CONTENT segments only — a rehearsed marker
+                # inside the (kept) thinking segments must never truncate the
+                # stored thinking. Round 2: channel-aware across ALL content
+                # segments — gemma4 multi-cycle output (thought → content
+                # with a call → thought → content) keeps the earlier cycle's
+                # call strippable (the round-1 last-close-marker reduction
+                # missed it, storing BOTH the raw XML and the structured
+                # tool_calls); parse-based per-block removal also stops
+                # truncating unrelated post-call text.
+                # Round 3, finding 4: thread the turn's thinking contract so
+                # the strip's channel segmentation matches the batch parse
+                # above (thinking disabled → the whole text is content and a
+                # literal </think> never hides a strippable block).
+                full_assistant_content = _strip_content_channel_tool_xml(
+                    full_assistant_content, self.model_family,
+                    thinking_active=use_thinking,
+                )
 
             # On HIT: extend session.messages with new incoming + assistant
             # On MISS: use incoming messages + assistant
@@ -5605,16 +6449,35 @@ class MLXEngine:
                 cancel_event=cancel_event,
             )
 
+        # U24: deliver the held partial-match tail on the wire (it was
+        # already folded into the persisted text before the reconcile). The
+        # turn is committed, so a GeneratorExit at this yield is safe.
+        if _stop_flush_text:
+            yield GenerationResult(
+                text=_stop_flush_text,
+                prompt_tokens=total_prompt_tokens,
+                completion_tokens=gen_token_count,
+            )
+
         # Determine finish reason (parsed_tool_calls computed above).
         # U6: a corruption-terminated stream (QwenMTP fail-closed / PLD
         # rewind failure) ends with finish_reason="error" — the session
         # cache is already invalidated, so the client's retry takes an
         # honest MISS; a partial <tool_call> in the truncated text must not
         # be surfaced as a real tool call either.
+        # U7/U24 precedence: error > tool_calls > stop-sequence stop >
+        # length > natural stop. A stop-sequence termination reports the
+        # OpenAI "stop" reason; max_tokens exhaustion reports "length".
         if _cache_corrupted:
             finish_reason = "error"
+        elif parsed_tool_calls:
+            finish_reason = "tool_calls"
+        elif _stop_hit:
+            finish_reason = "stop"
+        elif _length_hit:
+            finish_reason = "length"
         else:
-            finish_reason = "tool_calls" if parsed_tool_calls else "stop"
+            finish_reason = "stop"
 
         yield GenerationResult(
             text="",
@@ -6918,6 +7781,7 @@ class MLXEngine:
         thinking: bool | None = None,
         thinking_budget: int | None = None,
         response_format=None,
+        stop: str | list[str] | None = None,
     ) -> CompletionResult:
         """Non-streaming completion.
 
@@ -6952,6 +7816,7 @@ class MLXEngine:
                 thinking=thinking,
                 thinking_budget=thinking_budget,
                 response_format=response_format,
+                stop=stop,
             ):
                 if chunk.text:
                     chunks.append(chunk.text)
@@ -6971,8 +7836,35 @@ class MLXEngine:
             all_text = _drive()
 
         full_text = "".join(all_text)
-        thinking, content = split_thinking_and_content(full_text, model_family=self.model_family)
+        # U12/FIX 1 alignment: when thinking is active the chatml/glm stream
+        # begins INSIDE the thought block (opener in the prompt suffix) — a
+        # degenerate no-</think> output is ALL reasoning, and any tool-call
+        # XML in it is a rehearsal that must not be parsed below. Mirrors
+        # the streaming router and _generate_locked's parse. Structured
+        # requests suppress thinking engine-side (U9), matching this flag.
+        _use_thinking = thinking if thinking is not None else self.cfg.enable_thinking
+        if _use_thinking and getattr(response_format, "type", None) in (
+            "json_schema", "json_object",
+        ):
+            _use_thinking = False
+        # Codex round 7, finding 3: thinking_active gates the gemma4
+        # bare-opener recognition to the request's effective contract.
+        thinking, content = split_thinking_and_content(
+            full_text,
+            model_family=self.model_family,
+            started_in_thinking=_use_thinking and self.model_family != "gemma4",
+            thinking_active=_use_thinking,
+        )
         result.thinking = thinking
+        # Codex round 3, finding 4: the channel handed to the tool parse (and
+        # returned as content) follows the streaming router — with thinking
+        # DISABLED on chatml/glm the whole output is content (a literal
+        # </think> quote is not a boundary hiding a call before it). gemma4
+        # keeps the split (its extract also feeds result.thinking); the
+        # session-persistence parse above already converged its tool
+        # extraction on the router-policy union.
+        if not _use_thinking and self.model_family != "gemma4":
+            content = full_text
 
         if result.finish_reason == "error":
             # U6/F1: corruption-terminated stream — the text is truncated at
@@ -6983,7 +7875,19 @@ class MLXEngine:
             # finish_reason); content is kept for diagnostics only.
             result.content = content
         elif tools:
-            text_part, tool_calls = parse_tool_calls(content, model_family=self.model_family)
+            # Round 3, finding 4 (gemma4): parse calls from the router-policy
+            # content union — an orphan <channel|> with no prior thought-open
+            # is content, so a call BEFORE it (which the streaming FSM
+            # parsed) is not hidden by the extract-based split above.
+            # Codex round 7, finding 3: the union threads the thinking
+            # contract (bare-opener gate) like the split above.
+            _parse_channel = (
+                _content_channel_union(full_text, "gemma4", _use_thinking)
+                if self.model_family == "gemma4" else content
+            )
+            text_part, tool_calls = parse_tool_calls(
+                _parse_channel, model_family=self.model_family,
+            )
             if tool_calls:
                 result.tool_calls = tool_calls
                 result.content = text_part if text_part else None
@@ -7186,6 +8090,7 @@ class MLXEngine:
         stored_messages: list | None = None
         cached_tokens = 0
         cache_live = False
+        stored_thinking = True
         with self._read_locked("cache preflight"):
             session_state = self._sessions.get(session_id)
             if session_state is not None:
@@ -7195,6 +8100,7 @@ class MLXEngine:
                     session_state.cache_state is not None
                     and session_state.cache_state.cache is not None
                 )
+                stored_thinking = bool(getattr(session_state, "thinking", True))
             check_disk = session_state is None and self._has_disk_cache(session_id)
 
         if session_state is not None:
@@ -7234,8 +8140,13 @@ class MLXEngine:
             }
 
         # Phase 3 — pure-Python match on the snapshots (no lock, no MLX).
+        # Round 3, finding 4: advisory match runs under the stored session's
+        # thinking contract (disk fallback keeps the default — informational
+        # only; the generation re-resolves authoritatively).
         cache_hit = False
-        if self._messages_match(stored_messages, messages):
+        if self._messages_match(
+            stored_messages, messages, thinking_active=stored_thinking,
+        ):
             cache_hit = cache_live
             new_msgs = messages[len(stored_messages):]
             suffix_desc = (
@@ -7341,6 +8252,7 @@ class MLXEngine:
         thinking: bool | None = None,
         thinking_budget: int | None = None,
         response_format=None,
+        stop: str | list[str] | None = None,
     ) -> AsyncGenerator[GenerationResult, None]:
         """Async wrapper for generate_stream. Supports client disconnect cancellation."""
         loop = asyncio.get_event_loop()
@@ -7363,6 +8275,7 @@ class MLXEngine:
                     thinking=thinking,
                     thinking_budget=thinking_budget,
                     response_format=response_format,
+                    stop=stop,
                 ):
                     if cancel_event.is_set():
                         break
@@ -7421,6 +8334,7 @@ class MLXEngine:
         thinking: bool | None = None,
         thinking_budget: int | None = None,
         response_format=None,
+        stop: str | list[str] | None = None,
     ) -> AsyncGenerator[list[GenerationResult], None]:
         """Batched async wrapper for generate_stream.
 
@@ -7477,6 +8391,7 @@ class MLXEngine:
                     thinking=thinking,
                     thinking_budget=thinking_budget,
                     response_format=response_format,
+                    stop=stop,
                 ):
                     if cancel_event.is_set():
                         # Flush whatever's batched, then stop.

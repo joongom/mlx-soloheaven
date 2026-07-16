@@ -948,6 +948,8 @@ class EngineProcessProxy:
             "thinking": params.get("thinking"),
             "thinking_budget": params.get("thinking_budget"),
             "response_format": proto.serialize_response_format(rf),
+            # U24: OpenAI stop sequences (plain str/list — wire-safe as-is).
+            "stop": params.get("stop"),
         }
 
         make_cmd = proto.make_generate_scalar if scalar else proto.make_generate

@@ -932,6 +932,11 @@ class _EndpointStubDB:
             {"role": "user", "content": "q", "token_count": 1},
             {"role": "assistant", "content": "a", "token_count": 1},
         ]
+        # U25 round 2: rows carry ids (delete-last deletes by id).
+        self._messages = [
+            {**m, "id": m.get("id", f"m{i}")}
+            for i, m in enumerate(self._messages)
+        ]
         self._raise_on_delete = raise_on_delete
 
     # reads
@@ -952,6 +957,16 @@ class _EndpointStubDB:
     # writes (must NOT happen when admission is saturated)
     async def add_message(self, *a, **k):
         self.writes.append(("add_message", a))
+        # Round 4 (batch 4, finding 2): the chat endpoint threads the user
+        # row's id through the request — return the real function's row
+        # shape.
+        return {"id": f"w{len(self.writes)}", "role": a[1] if len(a) > 1 else None}
+
+    async def add_message_if_parent_exists(self, *a, **k):
+        # Round 4 (finding 2): conditional assistant insert. This stub does
+        # not delete the parent mid-flow, so it always reports inserted.
+        self.writes.append(("add_message_if_parent_exists", a))
+        return {"id": f"w{len(self.writes)}", "parent_id": k.get("parent_id")}
 
     async def create_session(self, *a, **k):
         self.writes.append(("create_session", a))
@@ -961,6 +976,31 @@ class _EndpointStubDB:
         if self._raise_on_delete:
             raise RuntimeError("db exploded")
         self.writes.append(("delete_last_message", a))
+
+    async def delete_messages_by_ids(self, session_id, ids):
+        # U25 round 2: id-based atomic turn delete. Must NOT run while the
+        # pool is saturated (writes recorded like every other mutation);
+        # actually removes the rows so the handler's fresh re-read sees the
+        # post-delete state (no-drift fast path).
+        if self._raise_on_delete:
+            raise RuntimeError("db exploded")
+        self.writes.append(("delete_messages_by_ids", (session_id, list(ids))))
+        id_set = set(ids)
+        self._messages = [m for m in self._messages if m["id"] not in id_set]
+        return len(id_set)
+
+    async def delete_last_turn_tx(self, session_id, compute_delete_ids):
+        # Round 6 (codex round 5, finding 1): delete-last is now the
+        # one-transaction snapshot + walk + delete. Must NOT run while the
+        # pool is saturated (recorded like every other mutation).
+        if self._raise_on_delete:
+            raise RuntimeError("db exploded")
+        snapshot = [dict(m) for m in self._messages]
+        ids = list(compute_delete_ids(snapshot) or [])
+        self.writes.append(("delete_last_turn_tx", (session_id, ids)))
+        id_set = set(ids)
+        self._messages = [m for m in self._messages if m["id"] not in id_set]
+        return ids, [m for m in snapshot if m["id"] not in id_set]
 
     async def update_session_tokens(self, *a, **k):
         self.writes.append(("update_session_tokens", a))

@@ -43,7 +43,7 @@ from mlx_soloheaven.engine.tool_parser import (
     parse_tool_calls,
     split_thinking_and_content,
     strip_thinking_tags,
-    try_extract_tool_name,
+    thinking_router_active,
 )
 
 if TYPE_CHECKING:
@@ -120,6 +120,28 @@ async def chat_completions(request: ChatCompletionRequest):
     if ensure_available is not None:
         ensure_available()
 
+    # U24: validate the ``stop`` parameter early (OpenAI: a string or an
+    # array of up to 4 non-empty strings). Anything else is a 400, matching
+    # OpenAI's invalid_request_error behavior.
+    if request.stop is not None:
+        stops = [request.stop] if isinstance(request.stop, str) else list(request.stop)
+        if len(stops) > 4:
+            return JSONResponse(
+                status_code=400,
+                content={"error": {
+                    "message": "'stop': maximum of 4 stop sequences allowed",
+                    "type": "invalid_request_error",
+                }},
+            )
+        if any(not isinstance(s, str) or not s for s in stops):
+            return JSONResponse(
+                status_code=400,
+                content={"error": {
+                    "message": "'stop': stop sequences must be non-empty strings",
+                    "type": "invalid_request_error",
+                }},
+            )
+
     # Validate response_format.json_schema early — return 400 on malformed
     # schemas (matches OpenAI's behavior; avoids silent fallback to
     # unconstrained generation).
@@ -193,23 +215,8 @@ def _sync_completion(request: ChatCompletionRequest, engine: "MLXEngine"):
     Returns a ChatCompletionResponse, or a 500 JSONResponse error object
     when the engine terminated the stream fail-closed (U6/F1: 'error' is an
     engine-internal reason, never a valid OpenAI finish_reason)."""
-    # FIX 3: pass model_family so Gemma 4 <|channel>thought...<channel|> spans
-    # in the INPUT history are actually stripped (the default "chatml" left
-    # them — and degenerate trailing reasoning — to replay raw into the prompt).
-    messages = strip_thinking_tags(
-        [m.model_dump(exclude_none=True) for m in request.messages],
-        model_family=engine.model_family,
-    )
-    tools = [t.model_dump() for t in request.tools] if request.tools else None
-
     enable_thinking = request.thinking if request.thinking is not None else engine.cfg.enable_thinking
-    # Map OpenAI frequency/presence_penalty to repetition_penalty if not explicitly set
-    rep_penalty = request.repetition_penalty
-    if rep_penalty is None and (request.frequency_penalty or request.presence_penalty):
-        # Approximate: OpenAI penalties are additive [-2,2], repetition_penalty is multiplicative [0.1, 2.0]
-        fp = request.frequency_penalty or 0.0
-        pp = request.presence_penalty or 0.0
-        rep_penalty = 1.0 + (fp + pp) * 0.25  # rough mapping
+    tools = [t.model_dump() for t in request.tools] if request.tools else None
 
     response_format = request.response_format
     if response_format and tools:
@@ -218,6 +225,42 @@ def _sync_completion(request: ChatCompletionRequest, engine: "MLXEngine"):
             f"tools are present (OpenAI behavior)."
         )
         response_format = None
+
+    # U9: structured output suppresses thinking for the request. The FSM
+    # only permits JSON-grammar tokens, so a thinking prompt opener would
+    # pair an unclosed <think> with a pure-JSON stream — the whole answer
+    # would be routed to reasoning_content and content would stay empty.
+    # The engine applies the same suppression (prompt rendered without the
+    # thinking opener); this keeps the API-side split consistent with it.
+    # Codex round 9, finding 3: resolved BEFORE the input-history strip —
+    # enable_thinking below is the EFFECTIVE contract the whole request
+    # (prompt render, router, history preprocessing) runs under.
+    if response_format and response_format.type in ("json_schema", "json_object"):
+        enable_thinking = False
+
+    # FIX 3: pass model_family so Gemma 4 <|channel>thought...<channel|> spans
+    # in the INPUT history are actually stripped (the default "chatml" left
+    # them — and degenerate trailing reasoning — to replay raw into the prompt).
+    # Codex round 7, finding 3: thread the request's thinking contract so the
+    # AMBIGUOUS gemma4 bare ``thought\n`` opener is only stripped when
+    # thinking is active (full markers strip regardless). Codex round 9,
+    # finding 3: the contract is the EFFECTIVE one (structured suppression
+    # applied above) — pre-fix the strip ran under the request flag while the
+    # engine rendered under thinking=False, mutilating gemma4 bare-opener
+    # history the thinking=False contract preserves.
+    messages = strip_thinking_tags(
+        [m.model_dump(exclude_none=True) for m in request.messages],
+        model_family=engine.model_family,
+        thinking_active=enable_thinking,
+    )
+
+    # Map OpenAI frequency/presence_penalty to repetition_penalty if not explicitly set
+    rep_penalty = request.repetition_penalty
+    if rep_penalty is None and (request.frequency_penalty or request.presence_penalty):
+        # Approximate: OpenAI penalties are additive [-2,2], repetition_penalty is multiplicative [0.1, 2.0]
+        fp = request.frequency_penalty or 0.0
+        pp = request.presence_penalty or 0.0
+        rep_penalty = 1.0 + (fp + pp) * 0.25  # rough mapping
 
     result = engine.complete(
         messages,
@@ -232,6 +275,7 @@ def _sync_completion(request: ChatCompletionRequest, engine: "MLXEngine"):
         thinking=enable_thinking,
         thinking_budget=request.thinking_budget,
         response_format=response_format,
+        stop=request.stop,
     )
 
     # U6/F1: corruption-terminated generation — return an error response,
@@ -335,15 +379,59 @@ async def _stream_completion_body(
     engine: "MLXEngine",
 ) -> AsyncGenerator[str, None]:
     """Streaming SSE completion with tool call detection."""
+    # Determine thinking mode (moved above the input-history strip — codex
+    # round 7, finding 3: the strip needs the request's thinking contract).
+    enable_thinking = request.thinking if request.thinking is not None else engine.cfg.enable_thinking
+    thinking_budget = request.thinking_budget
+
+    tools = [t.model_dump() for t in request.tools] if request.tools else None
+    has_tools = bool(tools)
+
+    # Structured output (response_format): build constraint but skip if
+    # tools are present (tools take priority per OpenAI semantics).
+    # Resolved BEFORE the ThinkingRouter below — U9 needs the surviving
+    # response_format to decide the router's active flag.
+    response_format = request.response_format
+    if response_format and has_tools:
+        logger.warning(
+            f"[Structured] response_format={response_format.type} ignored: "
+            f"tools are present (OpenAI behavior)."
+        )
+        response_format = None
+
+    # U9: structured output suppresses thinking for the request. The FSM
+    # masks logits to the JSON grammar from the first token, so with the
+    # chatml/glm <think> prompt opener the ENTIRE JSON answer streamed as
+    # reasoning_content and content stayed empty (no </think> ever comes; a
+    # budget-forced one would corrupt the JSON). The engine suppresses the
+    # prompt-side opener the same way, so the router must start in content
+    # mode to match the actual stream.
+    # Codex round 9, finding 3: resolved BEFORE the input-history strip —
+    # enable_thinking below is the EFFECTIVE contract the whole request
+    # (prompt render, router, history preprocessing) runs under.
+    if response_format and response_format.type in ("json_schema", "json_object"):
+        if enable_thinking:
+            logger.info(
+                f"[Structured] thinking suppressed: response_format="
+                f"{response_format.type} constrains output to JSON"
+            )
+        enable_thinking = False
+
     # FIX 3: pass model_family so Gemma 4 thinking channels (incl. degenerate
     # multi-cycle / trailing reasoning) are stripped from the INPUT history
     # rather than replayed raw into the prompt.
+    # Codex round 7, finding 3: thread the thinking contract — the AMBIGUOUS
+    # gemma4 bare ``thought\n`` opener is only stripped when thinking is
+    # active (full markers strip regardless). Codex round 9, finding 3: the
+    # contract is the EFFECTIVE one (structured suppression applied above) —
+    # pre-fix the strip ran under the request flag while the engine rendered
+    # under thinking=False, mutilating gemma4 bare-opener history the
+    # thinking=False contract preserves.
     messages = strip_thinking_tags(
         [m.model_dump(exclude_none=True) for m in request.messages],
         model_family=engine.model_family,
+        thinking_active=enable_thinking,
     )
-    tools = [t.model_dump() for t in request.tools] if request.tools else None
-    has_tools = bool(tools)
 
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
@@ -358,10 +446,6 @@ async def _stream_completion_body(
     )
     yield f"data: {first_chunk.model_dump_json(exclude_none=True)}\n\n"
 
-    # Determine thinking mode
-    enable_thinking = request.thinking if request.thinking is not None else engine.cfg.enable_thinking
-    thinking_budget = request.thinking_budget
-
     # Map OpenAI frequency/presence_penalty to repetition_penalty if not explicitly set
     rep_penalty = request.repetition_penalty
     if rep_penalty is None and (request.frequency_penalty or request.presence_penalty):
@@ -374,12 +458,22 @@ async def _stream_completion_body(
     # Reasoning-channel router (shared with the web chat path). Instead of
     # dropping the thought channel, route it: thinking-phase text becomes
     # ``delta.reasoning_content`` (LM-Studio shape), the post-thinking answer
-    # becomes ``delta.content``. Active when thinking is enabled (gemma4 detects
-    # <|channel>thought...<channel|>; chatml/glm stream begins inside <think>
-    # and routes up to </think>). A pass-through when thinking is disabled, so
-    # non-thinking output stays byte-identical.
+    # becomes ``delta.content``. chatml/glm activate on the thinking flag
+    # (their stream begins inside <think>, routed up to </think>; a
+    # pass-through when thinking is disabled, so non-thinking output stays
+    # byte-identical). Codex round 5, finding 3: gemma4 is MARKER-ACTIVE
+    # regardless of the flag (thinking_router_active) — the model emits its
+    # own channel markers, and an inactive passthrough let a thought-span
+    # tool-call REHEARSAL reach the tool FSM as a real call while the batch
+    # parse and the session store excluded it.
+    # Codex round 7, finding 3: the effective thinking contract is threaded
+    # in — the gemma4 router stays marker-active regardless (full markers
+    # authoritative), but the AMBIGUOUS bare ``thought\n`` opener heuristic
+    # inside it only fires when thinking is active.
     thinking_router = ThinkingRouter(
-        active=enable_thinking, model_family=model_family
+        active=thinking_router_active(model_family, enable_thinking),
+        model_family=model_family,
+        enable_thinking=enable_thinking,
     )
     # NOTE: we no longer inject an opening "<think>\n" content chunk for
     # non-gemma4 — reasoning is now routed to reasoning_content instead of being
@@ -397,26 +491,27 @@ async def _stream_completion_body(
     holdback = ""
 
     # === Incremental tool_call emission state ===
-    # When a <tool_call> block starts, we buffer per-block text (tc_block) and
-    # try to emit the OpenAI first chunk (id + name) as soon as the function
-    # name is determinable. The args chunk is emitted when the block closes.
-    # Parallel calls are tracked by monotonically increasing tc_index.
+    # When a <tool_call> block starts, we buffer the per-block text
+    # (tc_block). Codex round 3, finding 5: NOTHING is emitted for the block
+    # until it is STRUCTURALLY VALIDATED — the old shape emitted the id+name
+    # delta as soon as try_extract_tool_name succeeded, so a block whose
+    # body later failed to parse produced a PHANTOM tool_calls delta
+    # followed by the raw block as content (the client saw a call that
+    # never materialized, then finish_reason "stop"). The block closes →
+    # parse → on success emit id+name, then arguments (order preserved); on
+    # failure the raw block passes through as content ONLY. Tool blocks are
+    # small, so full-block buffering costs nothing perceptible, and the
+    # round-1 'dangling name chunk' edge (stream ends mid-block after the
+    # name was emitted) is gone by construction — no name delta exists
+    # before validation. Codex round 11, finding 2: the streamed tool_calls
+    # index is assigned POST-validation (len(parsed_tool_calls) at emission
+    # time) — the old per-start-marker counter also charged malformed blocks
+    # that were passed through as content, leaving HOLES in the emitted
+    # index sequence (clients reconstructing calls by index drop/reject).
     tc_active = False           # inside a tool_call block
     tc_block = ""               # buffered text after TOOL_START (excl. start tag itself)
-    tc_name_sent = False        # whether first chunk (name) was emitted
     tc_id: Optional[str] = None
-    tc_index = -1
     parsed_tool_calls: list[dict] = []   # completed calls (for session persistence)
-
-    # Structured output (response_format): build constraint but skip if
-    # tools are present (tools take priority per OpenAI semantics).
-    response_format = request.response_format
-    if response_format and has_tools:
-        logger.warning(
-            f"[Structured] response_format={response_format.type} ignored: "
-            f"tools are present (OpenAI behavior)."
-        )
-        response_format = None
 
     # COALESCING: consume batches of GenerationResult.
     #  - has_tools False: concatenate the batch's content and emit ONE content
@@ -446,6 +541,7 @@ async def _stream_completion_body(
             thinking=enable_thinking,
             thinking_budget=thinking_budget,
             response_format=response_format,
+            stop=request.stop,
         ):
             # Concatenate the batch's content text; capture finish separately.
             chunk_text_parts: list[str] = []
@@ -516,45 +612,47 @@ async def _stream_completion_body(
                         tc_block += chunk
                         chunk = ""
 
-                        # Emit first chunk (id + name) as soon as name is known.
-                        if not tc_name_sent:
-                            name = try_extract_tool_name(tc_block, model_family)
-                            if name:
+                        # Check for block close. Codex round 3, finding 5:
+                        # the id/name delta is DEFERRED to this point — it is
+                        # only emitted once the closed block actually parses,
+                        # so a malformed block never produces a phantom
+                        # tool_calls delta before its raw passthrough.
+                        if TOOL_END in tc_block:
+                            end_idx = tc_block.index(TOOL_END)
+                            block_text = TOOL_START + tc_block[:end_idx] + TOOL_END
+                            _, calls = parse_tool_calls(block_text, model_family=model_family)
+                            if not calls:
+                                # U11 fail-closed: the closed block did not
+                                # parse (e.g. a malformed body) — pass the
+                                # RAW block through as content instead of
+                                # silently deleting it. No tool_calls delta
+                                # was emitted for it (finding 5).
+                                content_chunk = _make_content_chunk(
+                                    chunk_id, created, model, block_text
+                                )
+                                yield f"data: {content_chunk}\n\n"
+                            if calls:
+                                tc = calls[0]
+                                # Structurally validated: emit id+name first,
+                                # then arguments (same chunk order clients
+                                # always saw). Finding 2: the index is the
+                                # count of calls parsed SO FAR — contiguous
+                                # from 0 regardless of malformed passthrough
+                                # blocks in between.
+                                tc_index = len(parsed_tool_calls)
                                 first = ChatCompletionChunk(
                                     id=chunk_id, created=created, model=model,
                                     choices=[ChunkChoice(delta=DeltaMessage(tool_calls=[{
                                         "index": tc_index,
                                         "id": tc_id,
                                         "type": "function",
-                                        "function": {"name": name, "arguments": ""},
+                                        "function": {
+                                            "name": tc["function"]["name"],
+                                            "arguments": "",
+                                        },
                                     }]))],
                                 )
                                 yield f"data: {first.model_dump_json(exclude_none=True)}\n\n"
-                                tc_name_sent = True
-
-                        # Check for block close.
-                        if TOOL_END in tc_block:
-                            end_idx = tc_block.index(TOOL_END)
-                            block_text = TOOL_START + tc_block[:end_idx] + TOOL_END
-                            _, calls = parse_tool_calls(block_text, model_family=model_family)
-                            if calls:
-                                tc = calls[0]
-                                # If name chunk wasn't emitted yet (whole block
-                                # arrived at once), emit it now.
-                                if not tc_name_sent:
-                                    first = ChatCompletionChunk(
-                                        id=chunk_id, created=created, model=model,
-                                        choices=[ChunkChoice(delta=DeltaMessage(tool_calls=[{
-                                            "index": tc_index,
-                                            "id": tc_id,
-                                            "type": "function",
-                                            "function": {
-                                                "name": tc["function"]["name"],
-                                                "arguments": "",
-                                            },
-                                        }]))],
-                                    )
-                                    yield f"data: {first.model_dump_json(exclude_none=True)}\n\n"
                                 args_chunk = ChatCompletionChunk(
                                     id=chunk_id, created=created, model=model,
                                     choices=[ChunkChoice(delta=DeltaMessage(tool_calls=[{
@@ -573,7 +671,6 @@ async def _stream_completion_body(
                             trailing = tc_block[end_idx + len(TOOL_END):]
                             tc_active = False
                             tc_block = ""
-                            tc_name_sent = False
                             tc_id = None
                             if trailing:
                                 chunk = trailing
@@ -592,9 +689,7 @@ async def _stream_completion_body(
                             )
                             yield f"data: {content_chunk}\n\n"
                         tc_active = True
-                        tc_index += 1
                         tc_id = generate_call_id()
-                        tc_name_sent = False
                         # Re-feed everything after TOOL_START into the active-block
                         # branch on the next loop turn (handles full block in chunk).
                         chunk = holdback[idx + len(TOOL_START):]
@@ -682,26 +777,46 @@ async def _stream_completion_body(
         yield f"data: {chunk}\n\n"
 
     # If generation ended mid-block (no TOOL_END seen), try best-effort parse
-    # so we don't silently drop a tool_call the model truncated.
-    if tc_active and tc_block:
+    # so we don't silently drop a tool_call the model truncated. Round-1
+    # behavior kept (codex round 3, finding 5): an unparseable truncated
+    # block is a raw content passthrough — and since the name delta is now
+    # deferred to validation, no dangling name chunk can precede it.
+    # Codex round 5, finding 4: the branch runs whenever tc_active — a
+    # stream ending EXACTLY at the start marker leaves tc_block EMPTY
+    # (tc_active was set, the marker itself already consumed), and the old
+    # ``tc_active and tc_block`` guard silently dropped the bare marker
+    # while the batch parser preserves it byte-for-byte. An empty body
+    # never parses, so it flows through the raw-content passthrough below,
+    # emitting the bare marker as content (all families share this FSM —
+    # TOOL_START is the family's own marker).
+    if tc_active:
         block_text = TOOL_START + tc_block
         _, calls = parse_tool_calls(block_text, model_family=model_family)
+        if not calls:
+            # U11 fail-closed: the truncated block did not parse — flush the
+            # raw text as content rather than silently dropping it.
+            content_chunk = _make_content_chunk(
+                chunk_id, created, model, block_text
+            )
+            yield f"data: {content_chunk}\n\n"
         if calls:
             tc = calls[0]
-            if not tc_name_sent:
-                first = ChatCompletionChunk(
-                    id=chunk_id, created=created, model=model,
-                    choices=[ChunkChoice(delta=DeltaMessage(tool_calls=[{
-                        "index": tc_index,
-                        "id": tc_id,
-                        "type": "function",
-                        "function": {
-                            "name": tc["function"]["name"],
-                            "arguments": "",
-                        },
-                    }]))],
-                )
-                yield f"data: {first.model_dump_json(exclude_none=True)}\n\n"
+            # Finding 2: post-validation index here too — the end-of-stream
+            # flush must stay contiguous with the mid-stream emissions.
+            tc_index = len(parsed_tool_calls)
+            first = ChatCompletionChunk(
+                id=chunk_id, created=created, model=model,
+                choices=[ChunkChoice(delta=DeltaMessage(tool_calls=[{
+                    "index": tc_index,
+                    "id": tc_id,
+                    "type": "function",
+                    "function": {
+                        "name": tc["function"]["name"],
+                        "arguments": "",
+                    },
+                }]))],
+            )
+            yield f"data: {first.model_dump_json(exclude_none=True)}\n\n"
             args_chunk = ChatCompletionChunk(
                 id=chunk_id, created=created, model=model,
                 choices=[ChunkChoice(delta=DeltaMessage(tool_calls=[{
@@ -713,7 +828,17 @@ async def _stream_completion_body(
             tc["id"] = tc_id
             parsed_tool_calls.append(tc)
 
-    finish_reason = "tool_calls" if parsed_tool_calls else "stop"
+    # U7: honor the engine's terminal reason. max_tokens exhaustion must
+    # surface as OpenAI finish_reason="length" — the old unconditional
+    # "stop" overwrote it. Tool-call turns keep reporting "tool_calls";
+    # "error" was already diverted to the error envelope above; anything
+    # unexpected falls back to "stop".
+    if parsed_tool_calls:
+        finish_reason = "tool_calls"
+    elif final_finish_reason == "length":
+        finish_reason = "length"
+    else:
+        finish_reason = "stop"
 
     # Update session — persist tool_calls in assistant message so next turn's
     # chat template can render {% if m.tool_calls %} block (required for
@@ -723,11 +848,21 @@ async def _stream_completion_body(
         # enabled (opener lives in the prompt suffix). Pass that so a degenerate
         # no-</think> turn is persisted as reasoning (content="") — matching what
         # the streaming router already emitted on the wire.
-        thinking, content = split_thinking_and_content(
-            "".join(acc_parts),
-            model_family=model_family,
-            started_in_thinking=enable_thinking and model_family != "gemma4",
-        )
+        # Codex round 3, finding 4: with thinking DISABLED the router was a
+        # pass-through — the whole text is content and a literal </think> in
+        # it is a quote, never a boundary (mirrors the engine's batch parse).
+        if model_family != "gemma4" and not enable_thinking:
+            thinking, content = None, "".join(acc_parts)
+        else:
+            # Codex round 7, finding 3: thinking_active threads the contract
+            # into the gemma4 split so its bare-opener recognition matches
+            # the router that streamed the text.
+            thinking, content = split_thinking_and_content(
+                "".join(acc_parts),
+                model_family=model_family,
+                started_in_thinking=enable_thinking and model_family != "gemma4",
+                thinking_active=enable_thinking,
+            )
         assistant_msg: dict = {"role": "assistant", "content": content or ""}
         if parsed_tool_calls:
             assistant_msg["tool_calls"] = [

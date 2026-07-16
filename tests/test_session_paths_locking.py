@@ -223,7 +223,7 @@ def _preflight_engine(tmp_path, *, match=True, with_cache=True):
     eng = _shell_engine(tmp_path)
     eng._has_disk_cache = lambda sid: False
     eng._load_session_from_disk = lambda sid: None
-    eng._messages_match = lambda stored, incoming: match
+    eng._messages_match = lambda stored, incoming, **kw: match
     if with_cache:
         eng._sessions["s1"].cache_state = SimpleNamespace(
             cache=object(), token_ids=[1, 2, 3],

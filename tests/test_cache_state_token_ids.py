@@ -76,7 +76,9 @@ def _make_stub_engine(generated_ids: list[int], use_vlm: bool):
     eng._has_disk_cache = lambda sid: False
     eng._find_base_cache = lambda messages, tools=None: None
     eng._maybe_register_base_cache = (
-        lambda messages, prompt_tokens, tools=None, thinking=True: None
+        # F4: the engine now threads cancel_event through — accept it.
+        lambda messages, prompt_tokens, tools=None, thinking=True,
+        cancel_event=None: None
     )
     eng._mark_dirty = lambda sid: None
     # _get_cache_offset is a staticmethod — keep it on the class.
@@ -202,3 +204,49 @@ def test_mlx_lm_path_token_ids_extended_with_generated(monkeypatch):
         f"mlx-lm path: expected trailing {generated}, got {token_ids[-n:]}"
     )
     assert token_ids[: len(expected_prompt_ids)] == expected_prompt_ids
+
+
+def test_generation_install_marks_session_dirty_engine_side(monkeypatch):
+    """Codex round 5, finding 1a: the generation itself must mark the
+    session dirty ATOMICALLY where it installs the new SessionState (under
+    the engine lock it already holds). Persistence used to depend entirely
+    on the API layer's post-stream update_session_messages call — dropped
+    by a saturated long pool or a disconnect-torn SSE generator, the fresh
+    cache was never marked and could never be flushed."""
+    import threading
+
+    generated = [101, 102, 103]
+    eng = _make_stub_engine(generated, use_vlm=True)
+    # Use the REAL _mark_dirty (the shared stub no-ops it): drop the
+    # instance override and give the shell the lock it needs.
+    del eng._mark_dirty
+    eng._dirty_lock = threading.Lock()
+
+    eng._tokenize_prompt = lambda messages, thinking=True, tools=None: [1, 2, 3]
+    monkeypatch.setattr(
+        mlx_engine_module,
+        "vlm_stream_generate",
+        _fake_stream_factory(generated),
+    )
+
+    drained = list(
+        eng._generate_locked(
+            [{"role": "user", "content": "hi"}],
+            max_tokens=16,
+            temperature=0.0,
+            session_id="s-dirty",
+            tools=None,
+            cancel_event=None,
+            thinking=False,
+            thinking_budget=0,
+            top_p=1.0,
+            min_p=0.0,
+            top_k=0,
+            repetition_penalty=1.0,
+            response_format=None,
+        )
+    )
+    assert drained
+    assert "s-dirty" in eng._sessions
+    # The install marked it dirty — WITHOUT any update_session_messages.
+    assert "s-dirty" in eng._dirty_sessions

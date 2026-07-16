@@ -24,6 +24,7 @@ conventions as tests/test_qwen_mtp.py):
 
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 from typing import List
 
@@ -389,6 +390,9 @@ def _e2e_engine(base_entry, full_prompt):
     )
     eng.tokenizer = SimpleNamespace(decode=lambda ids: "x", eos_token_ids=[])
     eng._sessions = {}
+    # Codex round 5, finding 1a: generation installs mark dirty engine-side.
+    eng._dirty_sessions = set()
+    eng._dirty_lock = threading.Lock()
     eng._touch_gpu = lambda: None
     eng._has_disk_cache = lambda sid: False
     eng._has_rotating_cache = False

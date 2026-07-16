@@ -20,6 +20,7 @@ import signal
 import threading
 import time
 import traceback
+from collections import OrderedDict
 
 from mlx_soloheaven.engine import process_protocol as proto
 
@@ -41,6 +42,79 @@ GPU_KEEPALIVE_INTERVAL_FALLBACK_S = 1.0
 # a persistently failing ping would otherwise spam the log every interval.
 _keepalive_error_logged = False
 
+# U13: bound on remembered PRE-ACTIVATION cancels (cancel ops that arrive
+# before their request activates — e.g. the client disconnected while its
+# generate command was still queued behind a long generation). Insertion-
+# ordered; the oldest entry is dropped past the cap. 256 is far beyond any
+# realistic queue depth on a single-worker engine.
+PENDING_CANCEL_MAX = 256
+
+# F3: bound on remembered RPC tombstones (rpc_cancel ops for parent-side
+# timed-out RPCs whose commands are still queued behind a generation).
+# Mirrors the U13 pending-cancel pattern: insertion-ordered, oldest dropped
+# past the cap; rids are uuid4-unique, so a stale tombstone can never match
+# a future request. F5 residual (codex round 3, finding 3): every tombstone
+# is PENDING-ACK — "cancelled" is only sent when the MAIN loop actually
+# consumes the tombstone and skips dispatch; an eviction sends "unknown"
+# for the evicted rid (the bound just revoked the skip promise, and the
+# parent must never believe "cancelled" for an RPC that may still execute).
+CANCELLED_RPC_MAX = 256
+
+# F5 (batch-3 round 2): bound on remembered COMPLETED rpc rids — consulted
+# by the ctrl loop so an rpc_cancel that crossed the RPC's reply on the wire
+# acks "unknown" (it RAN) instead of "cancelled" (it did not). Same bounded
+# insertion-ordered pattern as the two sets above.
+COMPLETED_RPC_MAX = 256
+
+# U17: ONLY these ops reset the idle-flush timer (``last_activity``).
+# Read-only RPCs (stats / health / list / overview — anything an admin UI or
+# monitor polls periodically) must NOT starve the 60s idle flush: a dashboard
+# polling every 30s would otherwise keep dirty sessions unflushed forever.
+# Future ops default to NON-resetting unless added here (generation-shaped =
+# it generates tokens or mutates session/cache state that the flush cadence
+# should trail).
+GENERATION_OPS = frozenset({"generate", "generate_scalar"})
+# F5 (batch-3 round 2): mutating-RPC IDEMPOTENCY — consulted when a
+# parent-side timeout leaves an operation OUTCOME-UNKNOWN (see the
+# rpc_cancel ack contract in process_protocol / the ctrl loop below).
+# "Idempotent" = safe for the caller to blindly retry after an unknown
+# outcome (re-running with the same args converges to the same state):
+#
+#   complete                — NOT idempotent (generates tokens; a retry
+#                             re-generates and advances session state again)
+#   compact_session         — idempotent (rebuilds to the given messages)
+#   truncate_session        — idempotent (same target count -> same state)
+#   prepare_regenerate      — NOT idempotent (each call strips another
+#                             assistant turn via truncate_session)
+#   branch_from_turn        — idempotent (same args overwrite the same branch)
+#   update_session_messages — idempotent (touch + mark-dirty only)
+#   delete_session          — idempotent (delete-after-delete is a no-op)
+#   clear_caches / reset    — idempotent (converge to the empty state)
+ACTIVITY_RPC_METHODS = frozenset({
+    "complete",
+    "compact_session",
+    "truncate_session",
+    "prepare_regenerate",
+    "branch_from_turn",
+    "update_session_messages",
+    "delete_session",
+    "clear_caches",
+    "reset",
+})
+
+
+def _resets_activity(cmd) -> bool:
+    """U17: True iff this command is generation-shaped and should reset the
+    idle-flush timer. Read-only RPCs and unknown ops do not."""
+    if not isinstance(cmd, dict):
+        return False
+    op = cmd.get("op")
+    if op in GENERATION_OPS:
+        return True
+    if op == "rpc":
+        return cmd.get("method") in ACTIVITY_RPC_METHODS
+    return False
+
 
 class _GracefulShutdown(BaseException):
     """Sentinel raised by the worker's SIGTERM/SIGINT handler to unwind the
@@ -48,6 +122,24 @@ class _GracefulShutdown(BaseException):
     ``except Exception`` blocks in the loop can never swallow it — it always
     reaches the loop's own handler, whose ``finally`` runs the shutdown
     flush."""
+
+
+class _SendLockedConn:
+    """resp-pipe wrapper serializing ``send()`` across threads.
+
+    F5 (batch-3 round 2): the ctrl thread now sends ``rpc_cancel_ack``
+    frames on the resp pipe while the MAIN loop may be sending
+    batch/final/rpc_result frames — ``multiprocessing.Connection.send`` is
+    not documented thread-safe, so both writers go through one lock. Only
+    ``send`` is exposed: the worker never recv()s on the resp pipe."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self._lock = threading.Lock()
+
+    def send(self, obj):
+        with self._lock:
+            self._conn.send(obj)
 
 
 def _flush_engine_for_shutdown(engine, shutdown_flag=None):
@@ -169,6 +261,10 @@ def worker_main(cfg_dict, cmd_conn, resp_conn, ctrl_conn):
 
     cfg = _dict_to_config(cfg_dict)
 
+    # F5 (round 2): the ctrl thread sends cancel-ack frames on the resp
+    # pipe concurrently with the main loop — serialize every send.
+    resp_conn = _SendLockedConn(resp_conn)
+
     # Build + load the engine on THIS (main) thread.
     engine = MLXEngine(cfg, execution_mode="main_thread")
     engine.load_model()
@@ -177,10 +273,34 @@ def worker_main(cfg_dict, cmd_conn, resp_conn, ctrl_conn):
     # Mutated by the main loop (add/remove) and read by the ctrl thread.
     active: dict[str, threading.Event] = {}
     active_lock = threading.Lock()
+    # U13: cancels that arrived BEFORE their request activated (queued
+    # request, client already gone). Consulted (and consumed) at request
+    # activation so the child never runs a full generation for a
+    # disconnected client. Bounded + insertion-ordered; entries are dropped
+    # when consumed, when their request completes, or when the cap evicts
+    # the oldest. Guarded by active_lock (same registry).
+    pending_cancels: "OrderedDict[str, None]" = OrderedDict()
+    # F3: tombstones for parent-side TIMED-OUT RPCs still queued on the cmd
+    # pipe. Consulted (and consumed) right before an rpc op would execute —
+    # the parent's reply slot is gone and late replies are dropped at its
+    # reader, so executing the stale request would only delay the next
+    # generation / idle flush / GPU keepalive. Guarded by active_lock.
+    cancelled_rpcs: "OrderedDict[str, None]" = OrderedDict()
+    # F5 (round 2): rids of RPCs the main loop has STARTED executing —
+    # added in the SAME critical section that consumes the tombstone,
+    # removed on completion. Lets the ctrl loop ack an rpc_cancel with the
+    # truthful outcome ("already_started") instead of silently tombstoning
+    # work already in flight. Guarded by active_lock.
+    started_rpcs: set = set()
+    # F5 (round 2): recently COMPLETED rpc rids (bounded, insertion-ordered)
+    # so a cancel that crossed the RPC's reply on the wire acks "unknown"
+    # (it ran) rather than "cancelled" (it did not). Guarded by active_lock.
+    completed_rpcs: "OrderedDict[str, None]" = OrderedDict()
 
     def _ctrl_loop():
         # Daemon thread: block on cancel frames, set the matching event.
-        # Never touches MLX — only flips a Python threading.Event.
+        # Never touches MLX — only flips a Python threading.Event / records
+        # a tombstone id.
         while True:
             try:
                 frame = ctrl_conn.recv()
@@ -188,12 +308,72 @@ def worker_main(cfg_dict, cmd_conn, resp_conn, ctrl_conn):
                 break
             if not isinstance(frame, dict):
                 continue
-            if frame.get("op") == "cancel":
+            op = frame.get("op")
+            if op == "cancel":
                 rid = frame.get("id")
                 with active_lock:
                     ev = active.get(rid)
+                    if ev is None and isinstance(rid, str):
+                        # U13: request not active yet — remember the cancel
+                        # so activation consumes it instead of generating.
+                        pending_cancels[rid] = None
+                        pending_cancels.move_to_end(rid)
+                        while len(pending_cancels) > PENDING_CANCEL_MAX:
+                            pending_cancels.popitem(last=False)
                 if ev is not None:
                     ev.set()
+            elif op == "rpc_cancel":
+                # F3: parent-side bounded RPC wait expired — tombstone the
+                # rid so the queued command is skipped, never executed.
+                # F5 (round 2): a cancel CANNOT stop an RPC that already
+                # started (or finished) — ack the DEFINITIVE outcome so the
+                # parent never believes such an operation didn't run:
+                #   started        -> "already_started" (runs to completion)
+                #   completed      -> "unknown" (it ran; reply crossed the
+                #                     cancel on the wire)
+                #   still queued / -> PENDING-ACK tombstone, NO ack yet
+                #   never seen        (codex round 3, finding 3): "cancelled"
+                #                     is a promise the bounded tombstone set
+                #                     cannot keep on its own — an evicted
+                #                     tombstone's RPC EXECUTES. The ack is
+                #                     therefore emitted by whoever settles
+                #                     the tombstone's fate: the MAIN loop
+                #                     sends "cancelled" when it consumes the
+                #                     tombstone and skips dispatch; the
+                #                     eviction below sends "unknown" for the
+                #                     evicted rid (we no longer know).
+                rid = frame.get("id")
+                if isinstance(rid, str):
+                    outcome = None
+                    evicted: list = []
+                    with active_lock:
+                        if rid in started_rpcs:
+                            outcome = "already_started"
+                        elif rid in completed_rpcs:
+                            outcome = "unknown"
+                        else:
+                            cancelled_rpcs[rid] = None
+                            cancelled_rpcs.move_to_end(rid)
+                            while len(cancelled_rpcs) > CANCELLED_RPC_MAX:
+                                ev_rid, _ = cancelled_rpcs.popitem(last=False)
+                                evicted.append(ev_rid)
+                    # Sends happen OUTSIDE active_lock: pipe backpressure
+                    # must never couple into the registry lock the main
+                    # loop's dispatch path takes.
+                    for ev_rid in evicted:
+                        try:
+                            resp_conn.send(
+                                proto.make_rpc_cancel_ack(ev_rid, "unknown")
+                            )
+                        except Exception:  # noqa: BLE001 — best-effort ack
+                            pass
+                    if outcome is not None:
+                        try:
+                            resp_conn.send(
+                                proto.make_rpc_cancel_ack(rid, outcome)
+                            )
+                        except Exception:  # noqa: BLE001 — best-effort ack
+                            pass
 
     threading.Thread(target=_ctrl_loop, daemon=True, name="proc-ctrl").start()
 
@@ -271,6 +451,32 @@ def worker_main(cfg_dict, cmd_conn, resp_conn, ctrl_conn):
     # work. The only other threads are proc-ctrl (no MLX) and the engine's
     # disk-index helpers (none in main_thread mode).
     last_activity = time.monotonic()
+
+    def _flush_if_idle_due():
+        """Evaluate the U17 idle-flush deadline and flush when it elapsed.
+
+        Codex round 11, finding 3: this used to run ONLY in the
+        poll-timeout branch below. Reads correctly do NOT reset
+        ``last_activity``, but sustained read-only RPC traffic arriving
+        more often than the 5s poll timeout meant poll() always returned
+        data and the deadline was never even CHECKED — dirty sessions aged
+        unbounded under a busy dashboard. The command path now calls this
+        after handling each NON-activity command (never after
+        generation-shaped work, which just reset the timer).
+
+        GPU keepalive deliberately stays OUT of this helper (poll-timeout
+        branch only): the keepalive is a latency nicety — it keeps Metal
+        warm across true idle gaps so the next generation starts fast —
+        not a durability invariant like the flush. Under sustained read
+        traffic a missed touch risks only a slightly slower first token
+        later, while running MLX work inline here would add tail latency
+        to every read reply it piggybacked on.
+        """
+        nonlocal last_activity
+        if time.monotonic() - last_activity >= IDLE_FLUSH_AFTER_S:
+            _idle_flush(engine)
+            last_activity = time.monotonic()
+
     try:
         while not shutdown_requested.is_set():
             try:
@@ -281,9 +487,7 @@ def worker_main(cfg_dict, cmd_conn, resp_conn, ctrl_conn):
                     now = time.monotonic()
                     # Idle flush FIRST — the keepalive touch must never
                     # starve or delay it.
-                    if now - last_activity >= IDLE_FLUSH_AFTER_S:
-                        _idle_flush(engine)
-                        last_activity = time.monotonic()
+                    _flush_if_idle_due()
                     if (
                         keepalive_enabled
                         and now - last_keepalive >= keepalive_interval
@@ -294,10 +498,20 @@ def worker_main(cfg_dict, cmd_conn, resp_conn, ctrl_conn):
                 cmd = cmd_conn.recv()
             except (EOFError, OSError):
                 break
-            last_activity = time.monotonic()
+            # U17: only GENERATION-SHAPED ops reset the idle-flush timer —
+            # periodic read-only admin/health RPC traffic must not starve
+            # the 60s flush window (an explicit allowlist; see
+            # GENERATION_OPS / ACTIVITY_RPC_METHODS). Codex round 11,
+            # finding 3: non-activity commands instead CHECK the deadline
+            # after they are handled (each `_flush_if_idle_due()` call at
+            # the non-activity continue sites below).
+            cmd_resets_activity = _resets_activity(cmd)
+            if cmd_resets_activity:
+                last_activity = time.monotonic()
             if cmd is None:
                 break
             if not isinstance(cmd, dict):
+                _flush_if_idle_due()  # junk frame: still non-activity traffic
                 continue
             op = cmd.get("op")
             if op == "shutdown":
@@ -309,6 +523,40 @@ def worker_main(cfg_dict, cmd_conn, resp_conn, ctrl_conn):
             # --- generic synchronous RPC (Stage 2) ---
             if op == "rpc":
                 rid = cmd.get("id", "")
+                # F3: consume a tombstone for a parent-side TIMED-OUT RPC —
+                # its reply slot is gone (a late reply would drop at the
+                # reader), so executing it would only delay the next
+                # generation / idle flush / keepalive. Skip entirely.
+                # F5 (round 2): mark STARTED in the SAME critical section
+                # that consumed the tombstone — from this point on an
+                # rpc_cancel acks "already_started" instead of tombstoning
+                # an execution it can no longer stop.
+                with active_lock:
+                    rpc_stale = cancelled_rpcs.pop(rid, "__miss__") is None
+                    if not rpc_stale and isinstance(rid, str):
+                        started_rpcs.add(rid)
+                if rpc_stale:
+                    logger.info(
+                        f"[child] rpc id={rid} cancelled (parent-side timeout)"
+                        f" — skipping execution"
+                    )
+                    # F5 residual (codex round 3, finding 3): the tombstone
+                    # was CONSUMED and dispatch skipped — only now is the
+                    # "cancelled" promise true by construction, so only now
+                    # is the ack sent (the ctrl thread registered the
+                    # tombstone pending-ack, without acking).
+                    try:
+                        resp_conn.send(
+                            proto.make_rpc_cancel_ack(rid, "cancelled")
+                        )
+                    except Exception:  # noqa: BLE001 — best-effort ack
+                        pass
+                    # Round 11, finding 3: a skipped (tombstoned) RPC is
+                    # still inbound traffic — evaluate the flush deadline
+                    # unless the method was activity-shaped.
+                    if not cmd_resets_activity:
+                        _flush_if_idle_due()
+                    continue
                 method = cmd.get("method", "")
                 args = cmd.get("args", []) or []
                 kwargs = cmd.get("kwargs", {}) or {}
@@ -316,6 +564,41 @@ def worker_main(cfg_dict, cmd_conn, resp_conn, ctrl_conn):
                     _run_rpc(engine, rid, method, args, kwargs, resp_conn)
                 except Exception as e:  # noqa: BLE001
                     resp_conn.send(proto.make_error(rid, str(e), traceback.format_exc()))
+                finally:
+                    # F5: retire the started mark and remember the
+                    # COMPLETION (bounded) so a late rpc_cancel acks
+                    # "unknown", never "cancelled". A tombstone here should
+                    # be impossible (the ctrl thread sees the rid in
+                    # started_rpcs for the whole execution and acks
+                    # "already_started" instead of tombstoning), but a
+                    # pending-ack tombstone must never vanish silently
+                    # (finding 3) — if one is somehow found, the RPC RAN, so
+                    # the definitive ack is "unknown".
+                    with active_lock:
+                        tomb_raced = (
+                            cancelled_rpcs.pop(rid, "__miss__") is None
+                        )
+                        started_rpcs.discard(rid)
+                        if isinstance(rid, str):
+                            completed_rpcs[rid] = None
+                            completed_rpcs.move_to_end(rid)
+                            while len(completed_rpcs) > COMPLETED_RPC_MAX:
+                                completed_rpcs.popitem(last=False)
+                    if tomb_raced:
+                        try:
+                            resp_conn.send(
+                                proto.make_rpc_cancel_ack(rid, "unknown")
+                            )
+                        except Exception:  # noqa: BLE001 — best-effort ack
+                            pass
+                # Round 11, finding 3: evaluate the flush deadline AFTER
+                # handling a read/metadata RPC (never after activity-shaped
+                # methods — they just reset the timer and their flush
+                # cadence should trail them by the full quiet window). The
+                # check runs after the reply went out, so it never delays
+                # the response it rode in on.
+                if not cmd_resets_activity:
+                    _flush_if_idle_due()
                 continue
 
             if op not in ("generate", "generate_scalar"):
@@ -323,6 +606,9 @@ def worker_main(cfg_dict, cmd_conn, resp_conn, ctrl_conn):
                 resp_conn.send(proto.make_error(
                     cmd.get("id", ""), f"unknown op {op!r}", ""
                 ))
+                # Round 11, finding 3: unknown ops never reset the timer —
+                # they are non-activity traffic like reads.
+                _flush_if_idle_due()
                 continue
 
             rid = cmd["id"]
@@ -333,7 +619,22 @@ def worker_main(cfg_dict, cmd_conn, resp_conn, ctrl_conn):
 
             cancel_event = threading.Event()
             with active_lock:
-                active[rid] = cancel_event
+                # U13: consume a PRE-ACTIVATION cancel — the client
+                # disconnected while this request was still queued. Skip the
+                # generation entirely (the parent already tore its stream
+                # routing down, so these terminal frames are dropped as late
+                # frames — sent anyway to keep the frame contract uniform).
+                pre_cancelled = pending_cancels.pop(rid, "__miss__") is None
+                if not pre_cancelled:
+                    active[rid] = cancel_event
+            if pre_cancelled:
+                logger.info(
+                    f"[child] rid={rid} cancelled before activation — "
+                    f"skipping generation"
+                )
+                resp_conn.send(proto.make_final(rid, None))
+                resp_conn.send(proto.make_done(rid))
+                continue
 
             try:
                 _run_generate(
@@ -345,6 +646,10 @@ def worker_main(cfg_dict, cmd_conn, resp_conn, ctrl_conn):
             finally:
                 with active_lock:
                     active.pop(rid, None)
+                    # A cancel that raced this request's completion (arrived
+                    # after the active entry was consulted but before this
+                    # cleanup) must not linger as a pending entry.
+                    pending_cancels.pop(rid, None)
     except _GracefulShutdown:
         logger.info("[child] SIGTERM/SIGINT received — graceful shutdown")
     finally:

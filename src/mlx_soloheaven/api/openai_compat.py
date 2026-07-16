@@ -32,6 +32,8 @@ from mlx_soloheaven.api.schemas import (
     UsageInfo,
 )
 from mlx_soloheaven.engine.process_client import EngineRestartingError
+from mlx_soloheaven.engine.types import EngineBusyError
+from mlx_soloheaven.executors import run_critical, run_long, run_read
 from mlx_soloheaven.engine.tool_parser import (
     CHANNEL_REASONING,
     ThinkingRouter,
@@ -174,11 +176,19 @@ async def chat_completions(request: ChatCompletionRequest):
             },
         )
     else:
-        return _sync_completion(request, engine)
+        # U14: _sync_completion blocks on the engine for the WHOLE
+        # generation (in-process: inline; process mode: a synchronous RPC
+        # the child serves only between generations). Run it off the event
+        # loop so concurrent SSE streams / other endpoints stay live.
+        # F2: on the bounded LONG-ops executor (not to_thread's shared
+        # default pool) so a burst of these can never exhaust the workers
+        # bounded reads (/health, admin) need to even start.
+        return await run_long(_sync_completion, request, engine)
 
 
 def _sync_completion(request: ChatCompletionRequest, engine: "MLXEngine"):
-    """Non-streaming completion.
+    """Non-streaming completion. BLOCKING — callers on the event loop must
+    run it off-loop via ``executors.run_long`` (U14/F2).
 
     Returns a ChatCompletionResponse, or a 500 JSONResponse error object
     when the engine terminated the stream fail-closed (U6/F1: 'error' is an
@@ -728,7 +738,23 @@ async def _stream_completion_body(
                 }
                 for tc in parsed_tool_calls
             ]
-        engine.update_session_messages(request.user, messages + [assistant_msg])
+        # U14: synchronous engine RPC — keep it off the event loop.
+        # Codex round 5, finding 1: this commit runs BETWEEN the streamed
+        # tokens and the final chunk/[DONE] below — a saturated long pool
+        # used to reject it (EngineBusyError escaped mid-stream, [DONE]
+        # never emitted). Guaranteed critical lane + log-only failure: the
+        # engine already marked the session dirty at install (finding 1a),
+        # so the terminal chunks below must be unconditional.
+        try:
+            await run_critical(
+                engine.update_session_messages, request.user,
+                messages + [assistant_msg],
+            )
+        except Exception:  # noqa: BLE001 — [DONE] must still go out
+            logger.exception(
+                f"[OpenAI Stream] user={request.user} | post-stream session "
+                f"commit failed (persistence already guaranteed engine-side)"
+            )
 
     # Final chunk
     final_chunk = ChatCompletionChunk(
@@ -793,29 +819,49 @@ class CompactRequest(BaseModel):
 async def compact_session(session_id: str, request: CompactRequest):
     """Rebuild KV cache for a session with new (compressed) messages."""
     messages = [m.model_dump(exclude_none=True) for m in request.messages]
-    result = _default_engine.compact_session(session_id, messages)
+    # U14: heavy synchronous engine call — keep it off the event loop.
+    # F2: mutating RPC -> long-ops executor.
+    result = await run_long(
+        _default_engine.compact_session, session_id, messages
+    )
     return result
 
 
 @router.get("/v1/sessions")
 async def list_sessions():
-    """List all active sessions with cache stats."""
-    return {
-        "sessions": {
-            model_id: engine.list_sessions()
-            for model_id, engine in _engines.items()
-        },
-        "base_caches": {
-            model_id: engine.base_cache_stats()
-            for model_id, engine in _engines.items()
-        },
-    }
+    """List all active sessions with cache stats.
+
+    U14: engine reads run off the event loop with a bounded wait; a busy
+    engine (generation in flight) degrades to a ``{"busy": true}`` marker
+    per model instead of hanging the endpoint. F2: on the reserved reads
+    executor so the bounded wait actually starts even under long-op load."""
+    result: dict = {"sessions": {}, "base_caches": {}}
+    for model_id, engine in _engines.items():
+        try:
+            result["sessions"][model_id] = await run_read(
+                engine.list_sessions
+            )
+            result["base_caches"][model_id] = await run_read(
+                engine.base_cache_stats
+            )
+        except EngineBusyError:
+            result["sessions"][model_id] = {"busy": True}
+            result["base_caches"][model_id] = {"busy": True}
+    return result
 
 
 @router.get("/v1/sessions/{session_id}")
 async def get_session(session_id: str):
     """Get session details."""
-    info = _default_engine.get_session(session_id)
+    try:
+        # F2: bounded read -> reserved reads executor.
+        info = await run_read(_default_engine.get_session, session_id)
+    except EngineBusyError:
+        # U14: generation in flight — honest 503 instead of a long hang.
+        return JSONResponse(
+            status_code=503,
+            content={"error": "engine busy (generation in progress), retry shortly"},
+        )
     if not info:
         return JSONResponse(status_code=404, content={"error": "session not found"})
     return info
@@ -824,5 +870,8 @@ async def get_session(session_id: str):
 @router.delete("/v1/sessions/{session_id}")
 async def delete_session(session_id: str):
     """Delete a session and its cache."""
-    _default_engine.delete_session(session_id)
+    # U14: mutating op — waits for the engine (full RPC timeout) but off the
+    # event loop, so other requests keep flowing while it queues.
+    # F2: mutating RPC -> long-ops executor.
+    await run_long(_default_engine.delete_session, session_id)
     return {"status": "ok", "session_id": session_id}

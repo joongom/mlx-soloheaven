@@ -11,6 +11,34 @@ from dataclasses import dataclass, asdict
 from typing import Optional
 
 
+class EngineBusyError(RuntimeError):
+    """A READ-ONLY engine query could not be served within its bounded wait
+    because a generation currently owns the engine (in-process mode: the
+    global engine lock; process mode: the child worker services RPCs only
+    BETWEEN generations).
+
+    Raised instead of hanging for the full generation so API callers can
+    DEGRADE (admin/stats endpoints answer with a "busy" placeholder, session
+    reads answer 503 "retry shortly") — U14/U15. Lives here (no mlx imports)
+    so the parent-process proxy, the in-process engine, and the API layer all
+    share one exception type."""
+
+
+class GenerationCancelled(Exception):
+    """Raised INSIDE chunked prefill (between chunks — engine
+    ``_prefill_cache``, mlx-lm's ``prompt_progress_callback`` hook, the
+    ``qwen_mtp`` prefill loops, PLD ``_prefill``) when the request's
+    ``cancel_event`` is set (U13).
+
+    The engine's stream loop converts it into the NORMAL cancel path, whose
+    reconcile applies the C1 fail-closed rules: a HIT session's partially
+    prefilled suffix is rolled back (verified per-layer trim) or the session
+    cache is invalidated; a MISS's partially-filled fresh cache is simply
+    discarded (never persisted). Deliberately an ``Exception`` (not
+    BaseException): it must be catchable by the engine loop and must never
+    masquerade as a shutdown sentinel."""
+
+
 @dataclass
 class GenerationResult:
     """A single token/chunk from generation."""

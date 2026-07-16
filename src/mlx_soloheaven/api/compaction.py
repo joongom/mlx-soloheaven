@@ -19,6 +19,8 @@ from pydantic import BaseModel
 from mlx_soloheaven.storage import database as db
 from mlx_soloheaven.engine.compaction import CompactionEngine, COMPACTION_SUMMARY_PREFIX, SUMMARIZATION_PROMPT
 from mlx_soloheaven.engine.process_client import EngineRestartingError
+from mlx_soloheaven.engine.types import EngineBusyError
+from mlx_soloheaven.executors import reserve_long_slot, run_long
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
@@ -149,13 +151,46 @@ async def _stream_compact_body(
     # persists (the compacted history is already the DB truth and the next
     # chat turn rebuilds the KV cache from it lazily); the wrapper above
     # turns the failed RPC into an in-band error frame.
-    wrapped_summary = CompactionEngine.wrap_summary(summary, keep_recent=keep_recent)
-    await db.add_message(session_id, "user", content=wrapped_summary, token_count=0)
+    #
+    # Codex round 11, finding 1 (audit): admission saturation, unlike an
+    # engine death, is detected BEFORE the durable insert — reserve the
+    # long-pool slot first and degrade to an in-band error frame with the
+    # DB untouched (pre-fix the EngineBusyError from run_long escaped the
+    # generator mid-stream, after the summary was already persisted). The
+    # streamed summary is discarded on a retry; acceptable — saturation is
+    # exceptional and "retry shortly" is the uniform busy contract.
+    try:
+        slot = reserve_long_slot()
+    except EngineBusyError as exc:
+        logger.warning(
+            f"[Compaction] session={session_id} | long pool saturated — "
+            f"compaction not applied: {exc}"
+        )
+        event = json.dumps(
+            {
+                "type": "error",
+                "error": "engine busy — compaction not applied, retry shortly",
+                "detail": str(exc),
+            },
+            ensure_ascii=False,
+        )
+        yield f"data: {event}\n\n"
+        return
 
-    post_compact_msgs = build_post_compaction_messages(
-        system_prompt, await db.get_messages(session_id)
-    )
-    rebuild_result = engine.compact_session(session_id, post_compact_msgs)
+    with slot:
+        wrapped_summary = CompactionEngine.wrap_summary(summary, keep_recent=keep_recent)
+        await db.add_message(session_id, "user", content=wrapped_summary, token_count=0)
+
+        post_compact_msgs = build_post_compaction_messages(
+            system_prompt, await db.get_messages(session_id)
+        )
+        # U14: the rebuild re-prefills the compacted prompt (seconds-scale) —
+        # keep it off the event loop so other SSE streams stay live.
+        # F2: mutating RPC -> long-ops executor (consumes the reservation).
+        rebuild_result = await run_long(
+            engine.compact_session, session_id, post_compact_msgs,
+            reservation=slot,
+        )
 
     old_tokens = session.get("total_prompt_tokens", 0)
     new_tokens = rebuild_result.get("cached_tokens", 0)

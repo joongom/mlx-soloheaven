@@ -28,12 +28,23 @@ rpc (cmd):  generic synchronous engine method call (Stage 2)
      "kwargs":{...}}  -- args/kwargs MUST be pickle/JSON-serializable.
 cancel (ctrl):
     {"op":"cancel", "id":<str>}
+rpc_cancel (ctrl):
+    {"op":"rpc_cancel", "id":<str>} — the parent's bounded RPC wait expired;
+    the worker must SKIP executing the still-queued command with this id
+    (its parent reply slot is gone and a late reply would be dropped anyway).
 
 ready (resp):
     {"type":"ready", "model_id", "model_family", "enable_thinking",
      "think_end_token", "cfg":<dict>}
 rpc_result (resp):
     {"id":<str>, "type":"rpc_result", "result":<json/picklable>}
+rpc_cancel_ack (resp):
+    {"id":<str>, "type":"rpc_cancel_ack",
+     "outcome":"cancelled"|"already_started"|"unknown"} — the worker's
+    best-effort reply to an ``rpc_cancel``, stating the DEFINITIVE fate of
+    the targeted RPC (see make_rpc_cancel_ack). "cancelled" is emitted only
+    when the worker MAIN loop actually consumed the tombstone and skipped
+    dispatch; a tombstone evicted by the bounded set acks "unknown".
 batch (resp):
     {"id":<str>, "type":"batch", "items":[GenerationResultDict, ...]}
 final (resp):
@@ -126,6 +137,12 @@ def make_cancel(request_id: str) -> dict:
     return {"op": "cancel", "id": request_id}
 
 
+def make_rpc_cancel(request_id: str) -> dict:
+    """F3: tombstone for a parent-side timed-out RPC — tells the worker to
+    SKIP the queued command instead of executing it after the generation."""
+    return {"op": "rpc_cancel", "id": request_id}
+
+
 # --- response frames (CHILD -> PARENT) -----------------------------------
 
 def make_ready(
@@ -143,6 +160,28 @@ def make_ready(
 
 def make_rpc_result(request_id: str, result) -> dict:
     return {"id": request_id, "type": "rpc_result", "result": result}
+
+
+def make_rpc_cancel_ack(request_id: str, outcome: str) -> dict:
+    """F5 (batch-3 rounds 2+3): the worker's reply to an ``rpc_cancel`` —
+    the definitive fate of the targeted RPC, so the parent logs the truth
+    instead of implying "cancelled" for work that actually ran:
+
+      "cancelled"       — the worker MAIN loop CONSUMED the tombstone and
+                          SKIPPED dispatch. Emitted only at that moment
+                          (codex round 3, finding 3): the ctrl thread's
+                          tombstone registration is PENDING-ACK, because the
+                          tombstone set is bounded and an evicted tombstone
+                          cannot keep the skip promise.
+      "already_started" — the RPC was already executing when the cancel
+                          arrived; it runs to completion (the parent must
+                          treat the operation as having happened).
+      "unknown"         — no skip guarantee exists: the rid already
+                          completed (its reply crossed the cancel on the
+                          wire), or its pending-ack tombstone was EVICTED by
+                          the bound before the main loop consumed it (the
+                          RPC may still execute)."""
+    return {"id": request_id, "type": "rpc_cancel_ack", "outcome": outcome}
 
 
 def make_batch(request_id: str, items: list[dict]) -> dict:

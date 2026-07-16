@@ -1167,7 +1167,9 @@ def _rebuild_engine():
     eng._lock = threading.Lock()
     eng._mark_dirty = lambda sid: None
     eng._evict_active_sessions_if_needed = lambda protect_session_id=None: None
-    eng._prefill_cache = lambda cache, tokens: None
+    # Round 5, finding 3a: rebuild/compact prefills now thread the shutdown
+    # cancel event — accept it (same shape as the F4 stub convention).
+    eng._prefill_cache = lambda cache, tokens, cancel_event=None: None
     eng._eval_cache = lambda cache: None
 
     seen: dict = {"tok": [], "base": [], "reg": []}
@@ -1180,7 +1182,7 @@ def _rebuild_engine():
         seen["base"].append(tools)
         return None
 
-    def _reg(msgs, toks, tools=None, thinking=True):
+    def _reg(msgs, toks, tools=None, thinking=True, cancel_event=None):
         seen["reg"].append((tools, thinking))
 
     eng._tokenize_prompt = _tok

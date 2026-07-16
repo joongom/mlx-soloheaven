@@ -32,6 +32,8 @@ import mlx.nn as nn
 from mlx_lm.generate import generation_stream, maybe_quantize_kv_cache
 from mlx_lm.models import cache as cache_mod
 
+from mlx_soloheaven.engine.types import GenerationCancelled
+
 logger = logging.getLogger(__name__)
 
 
@@ -179,6 +181,7 @@ def pld_generate_step(
     quantized_kv_start: int = 0,
     ngram_k: int = 3,
     on_cache_corruption: Optional[Callable[[], None]] = None,
+    cancel_event: Optional[Any] = None,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """PLD variant of ``speculative_generate_step``.
 
@@ -248,11 +251,30 @@ def pld_generate_step(
 
     def _prefill(cache_, y_):
         while y_.size > prefill_step_size:
+            if cancel_event is not None and cancel_event.is_set():
+                # U13: disconnect during a long prefill — abort between
+                # chunks. The engine's stream loop converts this into the
+                # normal cancel reconcile (trim-back or invalidate).
+                raise GenerationCancelled(
+                    f"pld prefill cancelled with {int(y_.size)} prompt "
+                    f"tokens remaining"
+                )
             model(y_[:prefill_step_size][None], cache=cache_)
             quantize_cache_fn(cache_)
             mx.eval([c.state for c in cache_])
             y_ = y_[prefill_step_size:]
             mx.clear_cache()
+        if cancel_event is not None and cancel_event.is_set():
+            # F4 (codex round 3): a disconnect DURING the final chunk
+            # passes every between-chunk check above — abort here, BEFORE
+            # the remaining/bootstrap forward in the main loop runs more
+            # model work for a dead request (consistent with the engine's
+            # _prefill_cache post-loop check).
+            raise GenerationCancelled(
+                f"pld prefill cancelled during final chunk "
+                f"({int(y_.size)} prompt tokens left for the bootstrap "
+                f"forward)"
+            )
         return y_
 
     speculative = False  # decided after prefill (see FIX-1 note above)

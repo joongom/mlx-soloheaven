@@ -42,7 +42,7 @@ from dataclasses import asdict
 from types import SimpleNamespace
 
 from mlx_soloheaven.engine import process_protocol as proto
-from mlx_soloheaven.engine.types import GenerationResult
+from mlx_soloheaven.engine.types import EngineBusyError, GenerationResult
 
 logger = logging.getLogger(__name__)
 
@@ -338,6 +338,25 @@ class EngineProcessProxy:
 
             rid = frame.get("id")
             if rid is None:
+                continue
+
+            if ftype == "rpc_cancel_ack":
+                # F5 (round 2): the worker's definitive fate for a timed-out
+                # RPC this parent already gave up on (its slot is gone).
+                # Log the truth — "already_started"/"unknown" mean the
+                # operation ran (or is running) despite the timeout report.
+                outcome = frame.get("outcome", "unknown")
+                if outcome == "cancelled":
+                    logger.info(
+                        f"[ProcessProxy] rpc_cancel ack rid={rid}: "
+                        f"outcome='cancelled' — the child skipped it"
+                    )
+                else:
+                    logger.warning(
+                        f"[ProcessProxy] rpc_cancel ack rid={rid}: "
+                        f"outcome={outcome!r} — the timed-out RPC executed "
+                        f"(or was already executing) child-side"
+                    )
                 continue
 
             # RPC result / error for a pending synchronous call.
@@ -759,11 +778,35 @@ class EngineProcessProxy:
 
     # --- generic synchronous RPC -----------------------------------------
 
-    def _rpc(self, method: str, *args, timeout: float = 600.0, **kwargs):
+    # U14: bounded wait for READ-ONLY RPCs. The child services RPCs only
+    # BETWEEN generations, so a stats/list call issued mid-generation would
+    # otherwise block for the generation's full duration. On expiry the read
+    # raises EngineBusyError and the caller degrades (busy placeholder /
+    # 503) — mirrors the in-process engine's _read_locked bound.
+    RPC_READ_TIMEOUT_S = 10.0
+
+    def _rpc_read(self, method: str, *args, **kwargs):
+        """Read-only RPC: bounded wait + EngineBusyError on expiry."""
+        return self._rpc(
+            method, *args,
+            timeout=self.RPC_READ_TIMEOUT_S, busy_on_timeout=True, **kwargs,
+        )
+
+    def _rpc(self, method: str, *args, timeout: float = 600.0,
+             busy_on_timeout: bool = False, **kwargs):
         """Forward a synchronous engine-method call to the child and block on
         the result. Returns the deserialized result; raises _RpcError on a
-        child-side exception, EngineRestartingError when the child is dead /
-        respawning (fail fast — API maps it to 503)."""
+        child-side exception (EngineBusyError instead when
+        ``busy_on_timeout`` and the wait expired — the child is busy
+        generating, not broken), EngineRestartingError when the child is
+        dead / respawning (fail fast — API maps it to 503).
+
+        BLOCKING: this wait blocks its calling THREAD. Async endpoints must
+        never call it on the event loop thread — the API layer wraps every
+        proxy RPC call site in the dedicated ``executors`` pools
+        (``run_long``/``run_read``/``run_critical``, U14) so one admin/
+        metadata RPC during a long generation cannot freeze every in-flight
+        SSE stream."""
         self.ensure_available()
         rid = uuid.uuid4().hex
         ev = threading.Event()
@@ -785,16 +828,59 @@ class EngineProcessProxy:
             # frame, but a death landing in the narrow window BEFORE this slot
             # registered would leave us blind — the dead-flag check each slice
             # is the backstop (1s worst-case instead of the full timeout).
+            # Slices shrink near the deadline so sub-second timeouts expire
+            # on time.
             deadline = time.monotonic() + timeout
-            while not ev.wait(timeout=1.0):
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    # F3: the command may still sit QUEUED child-side (the
+                    # child serves RPCs only between generations). Removing
+                    # only the parent slot would leave the child to execute
+                    # every stale request after the generation ends —
+                    # delaying the next generation / idle flush / GPU
+                    # keepalive (its late reply is dropped at the reader
+                    # regardless). Send a tombstone on the ctrl pipe so the
+                    # worker SKIPS execution. Best-effort: a dead pipe just
+                    # means the child is gone anyway.
+                    try:
+                        with self._ctrl_send_lock:
+                            self._ctrl_parent.send(proto.make_rpc_cancel(rid))
+                    except Exception:  # noqa: BLE001
+                        pass
+                    if busy_on_timeout:
+                        # Read-only RPC: a busy child is the diagnosis; the
+                        # tombstone guarantees the stale read never runs.
+                        raise EngineBusyError(
+                            f"engine busy (generation in flight) — RPC "
+                            f"{method!r} not served within {timeout}s, "
+                            f"retry shortly"
+                        )
+                    # F5 (round 2): a MUTATING RPC that timed out is
+                    # OUTCOME-UNKNOWN — the tombstone only stops a
+                    # still-QUEUED command; the child may be executing (or
+                    # have executed) this one. Never imply it didn't run;
+                    # the worker's best-effort cancel-ack (logged by the
+                    # reader) records the definitive outcome when it
+                    # arrives. See the idempotency table next to
+                    # ACTIVITY_RPC_METHODS in process_worker for which
+                    # methods are safe to blindly retry.
+                    logger.warning(
+                        f"[ProcessProxy] RPC {method!r} timed out after "
+                        f"{timeout}s — OUTCOME UNKNOWN: the operation may "
+                        f"still have executed child-side (rpc_cancel sent; "
+                        f"awaiting best-effort ack)"
+                    )
+                    raise _RpcError(
+                        f"process-mode RPC {method!r} timed out after "
+                        f"{timeout}s — outcome unknown (may have executed)"
+                    )
+                if ev.wait(timeout=min(1.0, remaining)):
+                    break
                 if self._dead or self._permanently_dead or self._closed:
                     raise EngineRestartingError(
                         f"engine child worker died during RPC {method!r} "
                         f"({self._dead_reason or 'closed'})"
-                    )
-                if time.monotonic() >= deadline:
-                    raise _RpcError(
-                        f"process-mode RPC {method!r} timed out after {timeout}s"
                     )
             with self._rpc_lock:
                 slot = self._rpc_results.get(rid)
@@ -985,24 +1071,29 @@ class EngineProcessProxy:
         )
 
     def get_session(self, session_id):
-        return self._rpc("get_session", session_id)
+        # Read-only: bounded wait, EngineBusyError while generating (U14).
+        return self._rpc_read("get_session", session_id)
 
     def delete_session(self, session_id):
         return self._rpc("delete_session", session_id)
 
     def list_sessions(self):
-        return self._rpc("list_sessions")
+        # Read-only: bounded wait, EngineBusyError while generating (U14).
+        return self._rpc_read("list_sessions")
 
     def session_stats(self):
-        return self._rpc("session_stats")
+        # Read-only: bounded wait, EngineBusyError while generating (U14).
+        return self._rpc_read("session_stats")
 
     def base_cache_stats(self):
-        return self._rpc("base_cache_stats")
+        # Read-only: bounded wait, EngineBusyError while generating (U14).
+        return self._rpc_read("base_cache_stats")
 
     # --- admin cache overview / reset (synchronous RPCs) -----------------
 
     def cache_overview(self):
-        return self._rpc("cache_overview")
+        # Read-only: bounded wait, EngineBusyError while generating (U14).
+        return self._rpc_read("cache_overview")
 
     def clear_caches(self):
         return self._rpc("clear_caches")

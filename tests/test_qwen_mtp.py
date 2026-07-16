@@ -1298,6 +1298,10 @@ def _generate_engine(cache, stored, *, mtp, suffix):
     eng.cfg.pld_enabled = False
     eng.cfg.kv_bits = 0
     eng._sessions = {}
+    # Codex round 5, finding 1a: the generation install now marks the
+    # session dirty engine-side.
+    eng._dirty_sessions = set()
+    eng._dirty_lock = threading.Lock()
     eng._touch_gpu = lambda: None
     eng._has_disk_cache = lambda sid: False
     eng._find_base_cache = lambda messages, tools=None: None
@@ -2161,6 +2165,41 @@ def test_generate_locked_cancel_commit_template_closes_chatml(monkeypatch):
     ]
     _drive_full(eng, messages2, max_tokens=1)
     assert prompts_seen[1] == [53, 99]
+
+
+def test_generate_locked_interrupted_commit_marks_session_dirty(monkeypatch):
+    """Codex round 5, finding 1a (interrupted arm): a cancel-committed turn
+    is EXACTLY the case where the API layer never reaches its post-stream
+    update_session_messages (the client is gone) — the engine-side commit
+    must mark the session dirty itself or the committed turn is
+    unflushable."""
+    EOT = 77
+    stored = [1, 2, 3, 4, 5]
+    cache = [MockKV() for _ in range(5)]
+    for c in cache:
+        c.offset = len(stored)
+    eng, cs, messages = _generate_engine(cache, stored, mtp=False, suffix=[])
+    _use_real_messages_match(eng)
+    _content_token_suffix(eng)
+    eng._language_model = _CallableTargetModel()
+    eng.tokenizer = SimpleNamespace(
+        decode=lambda ids: "x",
+        eos_token_ids=[],
+        get_vocab=lambda: {"<|im_end|>": EOT},
+    )
+    _scripted_lm_stream(
+        monkeypatch, [],
+        [[(101, "x"), (102, "x"), (103, "x"), (104, "x")]],
+    )
+
+    assert "s" not in eng._dirty_sessions
+    chunks = _drive_cancelled(eng, messages, cancel_after=2)
+    assert len(chunks) == 2
+
+    # The interrupted commit installed the turn AND marked it dirty —
+    # without any update_session_messages call.
+    assert eng._sessions["s"].messages[-1].get("interrupted") is True
+    assert "s" in eng._dirty_sessions
 
 
 def test_generate_locked_empty_response_hit_commits_consistent(monkeypatch):

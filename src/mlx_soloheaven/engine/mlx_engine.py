@@ -250,10 +250,31 @@ def _collect_eos_ids(tokenizer) -> set[int]:
     return eos_ids
 
 
-def _pld_response_adapter(pld_iter, tokenizer, label: str = "PLD"):
+def _pld_response_adapter(pld_iter, tokenizer, label: str = "PLD",
+                          close_reason=None):
     """Adapt (token, logprobs, from_draft) tuples (pld_generate_step or
     qwen_mtp_generate_step — same contract) to mimic lm_stream_generate's
     GenerationResponse objects. ``label`` tags the acceptance log line.
+
+    CLOSE-REASON CONTRACT (codex round 7, finding 1): this adapter owns the
+    EOS knowledge, so IT decides whether closing the inner runner tears
+    down a COMPLETE turn or cancels a live one. Once the EOS frame has been
+    yielded — whether the teardown is the natural break-on-resumption after
+    that yield OR a GeneratorExit received while suspended AT the EOS yield
+    (engine observed the EOS downstream, client disconnected, engine closed
+    us) — the close is NATURAL: the shared ``close_reason`` cell (see
+    ``qwen_mtp.GeneratorCloseReason``) is marked before the inner runner is
+    closed, so its finalize forwards run regardless of a late-set
+    cancel_event. Pre-fix the inner runner was only closed by GC after this
+    frame died and inferred "cancel" from the live event: finalization was
+    skipped, the cache landed one token short of the recorded ids, and the
+    persisted complete message silently corrupted the next HIT's suffix. A
+    close BEFORE the EOS frame leaves the cell unmarked (mid-stream
+    disconnect keeps the runner's cancel inference + skip semantics). The
+    inner runner is also closed EXPLICITLY in the finally — deterministic
+    finalize ordering instead of GC timing (works for close_reason=None
+    callers like the PLD path too; PLD's finally-rewind is close-reason
+    independent, so it needs no cell).
 
     - Uses mlx-lm's StreamingDetokenizer (buffers partial UTF-8 byte
       sequences so multi-byte characters like CJK aren't emitted as
@@ -286,71 +307,105 @@ def _pld_response_adapter(pld_iter, tokenizer, label: str = "PLD"):
     count = 0
     from_draft_count = 0
     last_segment = ""
-    for token, _logprobs, from_draft in pld_iter:
-        count += 1
-        if from_draft:
-            from_draft_count += 1
-        if t_first is None:
-            t_first = _time.perf_counter()
-        now = _time.perf_counter()
-        tps = count / (now - t_first) if t_first and now > t_first else 0.0
+    # Codex round 7, finding 1: True once the terminal EOS frame is about to
+    # be yielded. Set BEFORE that yield so a GeneratorExit received while
+    # suspended AT the EOS yield already counts — the turn's EOS was
+    # produced, so any close from that point on is teardown of a COMPLETE
+    # turn (see the finally below).
+    eos_yielded = False
+    try:
+        for token, _logprobs, from_draft in pld_iter:
+            count += 1
+            if from_draft:
+                from_draft_count += 1
+            if t_first is None:
+                t_first = _time.perf_counter()
+            now = _time.perf_counter()
+            tps = count / (now - t_first) if t_first and now > t_first else 0.0
 
-        # Stop on EOS BEFORE emitting the EOS token's (often empty) text
-        if token in eos_ids:
-            # Flush any remaining buffered segment, then ALWAYS emit a
-            # terminal frame carrying the EOS token id — mirroring mlx-lm's
-            # stream_generate, whose final GenerationResponse carries
-            # token=eos. The engine's post-loop records that id into
-            # cache_state.token_ids; the QwenMTP finalize forwards the stop
-            # token through the target, so stored ids MUST include it for
-            # offset == len(token_ids) to hold (multi-turn cache reuse).
-            # Paths whose cache does NOT contain the stop (e.g. PLD) are
-            # reconciled by the post-loop offset truncation as before.
-            remaining = ""
+            # Stop on EOS BEFORE emitting the EOS token's (often empty) text
+            if token in eos_ids:
+                # Flush any remaining buffered segment, then ALWAYS emit a
+                # terminal frame carrying the EOS token id — mirroring
+                # mlx-lm's stream_generate, whose final GenerationResponse
+                # carries token=eos. The engine's post-loop records that id
+                # into cache_state.token_ids; the QwenMTP finalize forwards
+                # the stop token through the target, so stored ids MUST
+                # include it for offset == len(token_ids) to hold
+                # (multi-turn cache reuse). Paths whose cache does NOT
+                # contain the stop (e.g. PLD) are reconciled by the
+                # post-loop offset truncation as before.
+                remaining = ""
+                if detok is not None:
+                    try:
+                        detok.finalize()
+                        remaining = detok.last_segment or ""
+                    except Exception:
+                        remaining = ""
+                eos_yielded = True
+                yield SimpleNamespace(
+                    text=remaining, token=token,
+                    prompt_tps=0.0, generation_tps=tps,
+                    from_draft=from_draft,
+                )
+                break
+
             if detok is not None:
                 try:
-                    detok.finalize()
-                    remaining = detok.last_segment or ""
+                    detok.add_token(token)
+                    text = detok.last_segment
                 except Exception:
-                    remaining = ""
+                    # Fallback: decode single token (may yield replacement
+                    # chars)
+                    text = tokenizer.decode([token])
+            else:
+                text = tokenizer.decode([token])
+
+            # ACCOUNTING CONTRACT: yield a frame for EVERY token pulled from
+            # the runner — INCLUDING tokens whose detok segment is empty
+            # (partial UTF-8 bytes, or a BPE space held back until the next
+            # token) — exactly mirroring mlx-lm's stream_generate, which
+            # yields a GenerationResponse per token regardless of segment
+            # emptiness. The engine's post-loop records resp.token of every
+            # frame into cache_state.token_ids, and the QwenMTP runner
+            # commits every DELIVERED token into the target cache (finalize
+            # forwards the pending one), so dropping a frame here leaks a
+            # committed-but-unrecorded token: at reconcile the cache lands
+            # AHEAD of len(token_ids) and the hybrid (untrimmable
+            # ArraysCache) branch can only INVALIDATE — every server turn
+            # cold-fills. (Production signature: "cache ahead of recorded
+            # ids by N"; the leaked ids decoded to BPE-held ' ' tokens
+            # inside markdown thinking lists.) The buffered text is not
+            # lost — the detokenizer attaches it to a later frame's segment.
             yield SimpleNamespace(
-                text=remaining, token=token,
+                text=text, token=token,
                 prompt_tps=0.0, generation_tps=tps,
                 from_draft=from_draft,
             )
-            break
-
-        if detok is not None:
+    finally:
+        # Codex round 7, finding 1: signal the close reason, then close the
+        # INNER runner explicitly. Runs on EVERY teardown — the natural
+        # break-on-resumption after the EOS yield, a GeneratorExit thrown
+        # while suspended at any yield (including AT the EOS yield), and
+        # inner-runner exhaustion/exceptions (close is then a no-op). If
+        # the EOS frame was already yielded the turn is COMPLETE: mark the
+        # cell NATURAL so the runner's finalize runs regardless of a
+        # late-set cancel_event; otherwise leave the cell unmarked so a
+        # mid-stream close keeps the runner's cancel inference (event set
+        # -> skip finalize) intact. Explicit close replaces the old
+        # GC-at-frame-death close: finalize now runs deterministically
+        # BEFORE the engine's post-loop reconcile reads cache offsets.
+        if eos_yielded and close_reason is not None:
             try:
-                detok.add_token(token)
-                text = detok.last_segment
-            except Exception:
-                # Fallback: decode single token (may yield replacement chars)
-                text = tokenizer.decode([token])
-        else:
-            text = tokenizer.decode([token])
-
-        # ACCOUNTING CONTRACT: yield a frame for EVERY token pulled from the
-        # runner — INCLUDING tokens whose detok segment is empty (partial
-        # UTF-8 bytes, or a BPE space held back until the next token) —
-        # exactly mirroring mlx-lm's stream_generate, which yields a
-        # GenerationResponse per token regardless of segment emptiness. The
-        # engine's post-loop records resp.token of every frame into
-        # cache_state.token_ids, and the QwenMTP runner commits every
-        # DELIVERED token into the target cache (finalize forwards the
-        # pending one), so dropping a frame here leaks a committed-but-
-        # unrecorded token: at reconcile the cache lands AHEAD of
-        # len(token_ids) and the hybrid (untrimmable ArraysCache) branch can
-        # only INVALIDATE — every server turn cold-fills. (Production
-        # signature: "cache ahead of recorded ids by N"; the leaked ids
-        # decoded to BPE-held ' ' tokens inside markdown thinking lists.)
-        # The buffered text is not lost — the detokenizer attaches it to a
-        # later frame's segment.
-        yield SimpleNamespace(
-            text=text, token=token,
-            prompt_tps=0.0, generation_tps=tps,
-            from_draft=from_draft,
-        )
+                close_reason.mark_natural()
+            except Exception:  # noqa: BLE001 — teardown must never mask the exit
+                logger.exception(f"[{label}] close_reason.mark_natural failed")
+        _inner_close = getattr(pld_iter, "close", None)
+        if _inner_close is not None:
+            try:
+                _inner_close()
+            except Exception:  # noqa: BLE001 — teardown must never mask the exit
+                logger.exception(f"[{label}] inner runner close() failed")
 
     if count > 0:
         logger.info(
@@ -362,7 +417,12 @@ def _pld_response_adapter(pld_iter, tokenizer, label: str = "PLD"):
 # GenerationResult / CompletionResult moved to engine/types.py (no-mlx module
 # so they can be imported in the process-mode parent + child). Re-exported
 # here so existing `from .mlx_engine import GenerationResult` imports work.
-from mlx_soloheaven.engine.types import GenerationResult, CompletionResult
+from mlx_soloheaven.engine.types import (
+    CompletionResult,
+    EngineBusyError,
+    GenerationCancelled,
+    GenerationResult,
+)
 
 
 @dataclass
@@ -1417,6 +1477,27 @@ class MLXEngine:
         self._processor = None
         self.tokenizer = None
         self._lock = MLXEngine._global_gpu_lock  # shared lock
+        # Engine-side shutdown gate (codex batch-3 round 3, finding 2): set
+        # by begin_shutdown() right before the server-shutdown flush. Checked
+        # IMMEDIATELY AFTER acquiring the engine lock on every mutating path
+        # (_mutate_locked chokepoint + _acquire_lock_cancellable), so a
+        # straggler that outlived the executors' bounded quiesce wait while
+        # BLOCKED on the engine lock becomes a mutation-free no-op instead of
+        # dirtying state after the flush. Plain bool (GIL-atomic).
+        self._shutting_down = False
+        # Codex round 5, finding 3a: mutations that ENTERED their critical
+        # section before the gate closed (a minutes-long compaction prefill)
+        # outlive the executors' bounded quiesce AND the flush's bounded lock
+        # acquire, then publish + mark dirty AFTER the final flush.
+        # ``_mutations_in_flight`` counts ops currently inside
+        # ``_mutate_locked`` (incremented/decremented under the engine lock;
+        # read lock-free — plain int, GIL-atomic) so the server shutdown can
+        # bounded-wait for them, and ``_shutdown_cancel_event`` is set by
+        # ``begin_shutdown`` as a cooperative cancellation source for the
+        # compaction/rebuild prefills (aborting a compaction at shutdown is
+        # safe — it reruns after restart).
+        self._mutations_in_flight = 0
+        self._shutdown_cancel_event = threading.Event()
         self.cache_manager = CacheManager(
             memory_budget_gb=cfg.memory_budget_gb,
             disk_budget_gb=cfg.disk_budget_gb,
@@ -2580,74 +2661,147 @@ class MLXEngine:
             self._dirty_sessions.add(session_id)
 
     def _flush_dirty_sessions(self):
-        """Flush all dirty sessions to disk. Caller MUST hold _lock."""
-        with self._dirty_lock:
-            to_save = self._dirty_sessions.copy()
-            self._dirty_sessions.clear()
+        """Flush all dirty sessions to disk. Caller MUST hold _lock.
 
-        if not to_save:
-            return
+        U16 — POP-ONE-SAVE-ONE (chosen over drain-then-iterate): the process
+        worker's SIGTERM handler raises a ``BaseException`` sentinel
+        (``_GracefulShutdown``) that can land while this runs from the idle
+        flush. The old shape drained the WHOLE dirty set up front and only
+        ``except Exception`` re-marked — a BaseException unwinding mid-loop
+        lost every drained-but-unsaved id, so the shutdown flush saw an empty
+        set and the sessions were silently dropped. Now each id is popped
+        individually right before its save, and a BaseException re-marks the
+        single in-flight id before re-raising — an interrupt therefore loses
+        NOTHING (already-saved ids need no retry; unprocessed ids were never
+        popped; the in-flight one is re-marked and the shutdown flush's own
+        pass saves it).
 
+        ``processed`` guards against re-popping an id this call already
+        handled: a failing save re-marks its id for the NEXT flush cycle,
+        which must not turn into an infinite retry loop here.
+
+        F1 (codex batch-3 review, round 2): the ENTIRE pop→save→handle-error
+        body sits inside ONE ``try``/``finally``. ``settled`` flips to True
+        only once the in-flight id needs NO restore (saved, permanently
+        unsaveable, evicted, or the ordinary-failure handler already made
+        its own re-mark decision); the ``finally`` re-marks otherwise. The
+        earlier shape used a sibling ``except BaseException`` re-mark — but
+        a BaseException (SIGTERM sentinel) raised INSIDE the
+        exception-handling path itself (during logging / just before the
+        re-mark) escapes sibling excepts, so the popped id was lost. The
+        ``finally`` re-mark covers every unwind path, and it is a bare
+        ``set.add`` — cheap, idempotent, exception-safe. sid selection stays
+        OUTSIDE the guard: an interrupt there finds the id still un-popped
+        (nothing to restore). BaseException still propagates to abort the
+        loop (never swallow the sentinel).
+        """
+        processed: set[str] = set()
+        attempted = 0
         saved = 0
-        for sid in to_save:
-            session = self._sessions.get(sid)
-            if session is None:
-                continue
+        while True:
+            with self._dirty_lock:
+                remaining = self._dirty_sessions - processed
+                if not remaining:
+                    break
+                sid = next(iter(remaining))
+            # True once this id needs NO finally re-mark (see F1 above).
+            settled = False
             try:
+                with self._dirty_lock:
+                    self._dirty_sessions.discard(sid)
+                processed.add(sid)
+                session = self._sessions.get(sid)
+                if session is None:
+                    # Evicted since it was marked: drop, never re-mark.
+                    settled = True
+                    continue
+                attempted += 1
                 success = self._save_session_to_disk(sid, session)
                 if success:
                     saved += 1
-                # If success=False (permanent failure like empty arrays), don't retry
+                # If success=False (permanent failure like empty arrays),
+                # don't retry — either way the id is settled.
+                settled = True
             except Exception as e:
                 logger.error(f"[KV Cache] session={sid} | FLUSH SAVE FAILED | {e}")
+                # Terminate this call's retry loop even if the failure landed
+                # before processed.add ran (idempotent when it already did).
+                processed.add(sid)
                 with self._dirty_lock:
                     if sid in self._sessions:
                         self._dirty_sessions.add(sid)
+                settled = True
+            finally:
+                # U16/F1: anything still un-settled here is a BaseException
+                # unwind (shutdown sentinel / KeyboardInterrupt) — from the
+                # pop→save gap, the save itself, or the except-block above.
+                # Re-mark the in-flight id so the shutdown flush retries it;
+                # the unwind then proceeds untouched. Re-adding an id the
+                # interrupt caught BEFORE the pop is a harmless no-op.
+                if not settled:
+                    with self._dirty_lock:
+                        self._dirty_sessions.add(sid)
 
         if saved:
-            logger.info(f"[Idle Flush] saved {saved}/{len(to_save)} dirty sessions")
+            logger.info(f"[Idle Flush] saved {saved}/{attempted} dirty sessions")
 
     @classmethod
     def _flush_all_on_shutdown(cls, lock_timeout: float = 10.0):
         """Save all dirty sessions across all engines on shutdown.
 
-        IDEMPOTENT: each engine's dirty set is drained up front, so a second
-        call (worker-loop flush followed by the atexit backstop, or atexit
-        after a signal handler) is a cheap no-op.
+        IDEMPOTENT: an engine whose dirty set is empty is skipped with a
+        cheap PEEK (no lock acquire), so a second call (worker-loop flush
+        followed by the atexit backstop, or atexit after a signal handler)
+        is a cheap no-op.
 
-        FAIL-CLOSED: the engine lock is acquired with a BOUNDED wait. In
-        main_thread mode a signal handler runs on the same thread as an
-        in-flight generation that holds the non-reentrant lock — a blocking
-        acquire there would self-deadlock shutdown forever. On timeout the
-        ids are re-marked dirty (so a later flush attempt can retry) and the
-        engine is skipped with a warning. Per-session and per-engine save
-        failures are logged and never propagate.
+        LOCK-FIRST ORDER (codex round 7, finding 2b): the engine lock is
+        acquired BEFORE anything is drained from the dirty set. The old
+        shape drained a snapshot first and RE-MARKED it when the bounded
+        lock acquire timed out — that re-mark could land AFTER a concurrent
+        straggler's self-flush (which holds the engine lock) had already
+        drained the set, so the re-marked ids were stranded dirty forever
+        (the self-flush was the last flush that could ever run). With the
+        lock acquired first, a timeout drained NOTHING: the ids simply stay
+        marked, and the lock-holding straggler's self-flush (which rescans
+        — finding 2c) saves them before releasing the lock.
+
+        FAIL-CLOSED: the lock acquire stays BOUNDED. In main_thread mode a
+        signal handler runs on the same thread as an in-flight generation
+        that holds the non-reentrant lock — a blocking acquire there would
+        self-deadlock shutdown forever. On timeout the engine is skipped
+        with a warning (nothing drained, nothing lost). Per-session and
+        per-engine save failures are logged and never propagate.
+
+        Draining goes through ``_flush_dirty_sessions``, which keeps the
+        U16/R2-F1 pop-one-save-one + settled-flag semantics intact: each id
+        is popped individually right before its save, a BaseException
+        unwind re-marks exactly the in-flight id via the ``finally``
+        re-mark, and the loop keeps draining ids marked while it runs
+        (bounded by ``processed`` — each id at most once per call).
         """
         for engine in cls._all_engines:
             try:
+                # Cheap idempotency peek — never touches the engine lock.
                 with engine._dirty_lock:
-                    to_save = engine._dirty_sessions.copy()
-                    engine._dirty_sessions.clear()
-                if not to_save:
+                    n_dirty = len(engine._dirty_sessions)
+                if not n_dirty:
                     continue
-                logger.info(f"[Shutdown] Flushing {len(to_save)} dirty sessions for {engine.model_id}")
+                logger.info(
+                    f"[Shutdown] Flushing {n_dirty} dirty sessions for "
+                    f"{engine.model_id}"
+                )
+                # Finding 2b: LOCK FIRST — only a holder of the engine lock
+                # may drain the dirty set during shutdown.
                 if not engine._lock.acquire(timeout=lock_timeout):
-                    with engine._dirty_lock:
-                        engine._dirty_sessions |= to_save
                     logger.warning(
                         f"[Shutdown] engine lock not acquired within "
                         f"{lock_timeout}s (in-flight generation?) — skipping "
-                        f"flush for {engine.model_id}"
+                        f"flush for {engine.model_id} (nothing drained; the "
+                        f"ids stay marked for the lock holder's self-flush)"
                     )
                     continue
                 try:
-                    for sid in to_save:
-                        session = engine._sessions.get(sid)
-                        if session:
-                            try:
-                                engine._save_session_to_disk(sid, session)
-                            except Exception as e:
-                                logger.error(f"[Shutdown] Failed to save session {sid}: {e}")
+                    engine._flush_dirty_sessions()
                 finally:
                     engine._lock.release()
             except Exception as e:  # noqa: BLE001 — never block shutdown
@@ -2981,17 +3135,22 @@ class MLXEngine:
         return cloned
 
     def base_cache_stats(self) -> list[dict]:
-        """Return stats for all base caches."""
-        return [
-            {
-                "system_hash": e.system_hash,
-                "token_count": e.token_count,
-                "hit_count": e.hit_count,
-                "created": e.created,
-                "mtp": e.mtp_layout,
-            }
-            for e in self._base_caches.values()
-        ]
+        """Return stats for all base caches.
+
+        U15: reads ``_base_caches`` under the engine lock (bounded — raises
+        EngineBusyError while a generation holds it) so a concurrent
+        registration/clear never surfaces a half-built entry."""
+        with self._read_locked("base cache stats"):
+            return [
+                {
+                    "system_hash": e.system_hash,
+                    "token_count": e.token_count,
+                    "hit_count": e.hit_count,
+                    "created": e.created,
+                    "mtp": e.mtp_layout,
+                }
+                for e in self._base_caches.values()
+            ]
 
     def _will_wrap_during_generate(self, prompt_token_ids, cache_state) -> bool:
         """True iff serving this request would cross the RotatingKVCache
@@ -3160,12 +3319,30 @@ class MLXEngine:
 
     _PREFILL_STEP = 512
 
-    def _prefill_cache(self, cache: list, tokens: list[int]):
-        """Process tokens through the language model to populate a KV cache."""
+    def _prefill_cache(self, cache: list, tokens: list[int], cancel_event=None):
+        """Process tokens through the language model to populate a KV cache.
+
+        U13: ``cancel_event`` is checked BETWEEN chunks — a client disconnect
+        during a long prefill aborts within one chunk instead of burning
+        minutes of GPU. Raises ``GenerationCancelled``; the caller owns the
+        partially-filled cache's fate (a fresh cache is simply discarded).
+
+        F4 (codex batch-3 review, round 2): checked once more AFTER the
+        final chunk — the between-chunk checks alone let a disconnect
+        DURING the last chunk slip through to the caller's follow-up work
+        (cache eval here, base-cache registration upstream)."""
         arr = mx.array(tokens)
         for i in range(0, len(tokens), self._PREFILL_STEP):
+            if cancel_event is not None and cancel_event.is_set():
+                raise GenerationCancelled(
+                    f"prefill cancelled at {i}/{len(tokens)} tokens"
+                )
             chunk = arr[i : i + self._PREFILL_STEP]
             self._language_model(chunk[None], cache=cache)
+        if cancel_event is not None and cancel_event.is_set():
+            raise GenerationCancelled(
+                f"prefill cancelled after final chunk ({len(tokens)} tokens)"
+            )
         self._eval_cache(cache)
 
     @staticmethod
@@ -4139,7 +4316,17 @@ class MLXEngine:
             f"[Queue] session={session_id or 'anon?'} | waiting for lock | "
             f"messages={len(messages)}"
         )
-        with self._lock:
+        # U13: the lock wait is CANCEL-AWARE — a client that disconnects
+        # while queued behind another generation must not start its own.
+        # threading.Lock has no wait-with-predicate, so poll with a bounded
+        # acquire and check the event between attempts.
+        if not self._acquire_lock_cancellable(cancel_event):
+            logger.info(
+                f"[Queue] session={session_id or 'anon?'} | cancelled while "
+                f"waiting for engine lock — request dropped (no generation)"
+            )
+            return
+        try:
             wait_ms = (time.perf_counter() - t_wait) * 1000
             # Resolve session-less requests to a concrete anon-* session id
             # ONCE, inside the lock and BEFORE busy-marking. The resolved id is
@@ -4189,6 +4376,282 @@ class MLXEngine:
                     self._evict_active_sessions_if_needed(protect_session_id=sid)
                 except Exception as e:  # noqa: BLE001 — never break generation
                     logger.error(f"[Active LRU] post-generation eviction failed: {e}")
+        finally:
+            self._lock.release()
+
+    # U13: bounded-acquire poll interval while waiting for the engine lock
+    # with a live cancel_event (worst-case cancel latency in the queue).
+    _LOCK_CANCEL_POLL_S = 0.1
+
+    def _acquire_lock_cancellable(self, cancel_event) -> bool:
+        """Acquire the (non-reentrant, global) engine lock; with a
+        ``cancel_event``, poll bounded acquires and give up as soon as the
+        event is set. Returns True when the lock is HELD by the caller,
+        False when the wait was cancelled (lock NOT held).
+
+        Shutdown gate (codex round 3, finding 2): the gate is checked
+        IMMEDIATELY AFTER a successful acquire — a generation that was
+        queued behind the engine lock when the server began shutting down
+        must not start (it would advance session state + mark it dirty
+        AFTER the shutdown flush). Generations that already HOLD the lock
+        are untouched: the gate only stops NEW acquisitions."""
+        if cancel_event is None:
+            self._lock.acquire()
+        else:
+            while True:
+                if cancel_event.is_set():
+                    return False
+                if self._lock.acquire(timeout=self._LOCK_CANCEL_POLL_S):
+                    break
+        try:
+            self._check_shutdown_gate("generation")
+        except BaseException:
+            self._lock.release()
+            raise
+        return True
+
+    # U15/U14: bounded lock wait for READ-ONLY session/cache queries
+    # (list/stats/overview). A generation can hold the engine lock for
+    # minutes — admin/health reads must not hang that long, but they must
+    # not read _sessions mid-mutation either. On timeout they raise
+    # EngineBusyError and the API layer degrades (busy placeholder / 503).
+    _READ_LOCK_TIMEOUT_S = 10.0
+
+    @contextlib.contextmanager
+    def _read_locked(self, what: str):
+        """Bounded-acquire context manager for read-only query paths.
+
+        Raises ``EngineBusyError`` when the engine lock cannot be acquired
+        within ``_READ_LOCK_TIMEOUT_S`` (generation in flight). MUTATING
+        admin paths (delete/clear) take the lock UNBOUNDED instead —
+        correctness over latency, and U14's ``asyncio.to_thread`` wrappers
+        keep the event loop responsive while they wait.
+
+        Deliberately NOT shutdown-gated (finding 2): reads mutate nothing,
+        so a post-flush read is harmless — and /health should stay live
+        through a graceful shutdown."""
+        if not self._lock.acquire(timeout=self._READ_LOCK_TIMEOUT_S):
+            raise EngineBusyError(
+                f"engine busy (generation in flight) — {what} not served "
+                f"within {self._READ_LOCK_TIMEOUT_S:.0f}s, retry shortly"
+            )
+        try:
+            yield
+        finally:
+            self._lock.release()
+
+    # --- engine-side shutdown gate (codex batch-3 round 3, finding 2) -----
+    #
+    # Future.cancel() cannot stop an executor worker that has STARTED but is
+    # BLOCKED on the engine lock behind a generation. The executors module's
+    # quiesce() therefore returns after its bounded wait with such work
+    # still "running"; the server then flushes; and a queued mutation
+    # (compact/truncate/branch/delete/clear/generation) could acquire the
+    # engine lock AFTER the flush, mutate state, mark it dirty — and nothing
+    # would ever flush again. The gate closes that: begin_shutdown() is
+    # called by the server shutdown hook BEFORE the flush, and every
+    # mutating lock acquisition checks it IMMEDIATELY AFTER acquiring —
+    # aborting with EngineBusyError WITHOUT mutating. Chokepoints, not
+    # per-method sprinkles:
+    #   * _mutate_locked      — the lock-taking mutating session/cache ops
+    #                           (compact_session, delete_session,
+    #                           clear_caches/reset — and, codex round 5
+    #                           finding 3b, the WHOLE truncate/branch/
+    #                           regenerate wrappers: their prelude disk
+    #                           reload + _sessions publication is inside
+    #                           the gate, not only the inner rebuild);
+    #   * _acquire_lock_cancellable — generation's lock acquire (a queued
+    #                           generation must not START post-flush; ones
+    #                           already holding the lock are untouched —
+    #                           Uvicorn's graceful shutdown owns live
+    #                           connections).
+    # Already-ENTERED mutations (codex round 5, finding 3a) are handled by
+    # _mutate_locked's in-flight counter + self-flush-on-exit, and the
+    # begin_shutdown cancel event aborts compaction/rebuild prefills
+    # cooperatively — see _mutate_locked / _self_flush_on_shutdown_exit.
+    # EXEMPT by design: the shutdown flush itself (_flush_all_on_shutdown /
+    # _flush_dirty_sessions acquire the lock directly — the flush MUST run),
+    # and _read_locked (reads mutate nothing; /health stays live).
+    # update_session_messages (lock-free touch+mark-dirty) needs no gate:
+    # it never blocks on the engine lock, and since round 5 finding 1a the
+    # generation marks its session dirty engine-side at install — a
+    # post-flush touch adds no un-flushed state beyond LRU recency.
+
+    def begin_shutdown(self):
+        """Flip the engine into shutdown mode BEFORE the shutdown flush:
+        every subsequent mutating engine-lock acquisition aborts with
+        ``EngineBusyError`` without mutating (see the block comment above).
+        Codex round 5, finding 3a: also sets ``_shutdown_cancel_event`` so
+        an ALREADY-ENTERED compaction/rebuild aborts its prefill between
+        chunks (cooperative cancel) instead of delaying shutdown by
+        minutes. Idempotent; never blocks. (getattr: shell engines built
+        via ``__new__`` in tests may not have run ``__init__``.)"""
+        if not getattr(self, "_shutting_down", False):
+            logger.info(
+                f"[Shutdown] engine {getattr(self, 'model_id', '') or '?'} — "
+                f"mutation gate closed (stragglers become no-ops)"
+            )
+        self._shutting_down = True
+        cancel_ev = getattr(self, "_shutdown_cancel_event", None)
+        if cancel_ev is not None:
+            cancel_ev.set()
+
+    def _check_shutdown_gate(self, what: str):
+        """Raise ``EngineBusyError`` (503-mappable, like every busy path)
+        once ``begin_shutdown()`` ran. Callers MUST invoke this immediately
+        after acquiring the engine lock and before any mutation."""
+        if getattr(self, "_shutting_down", False):
+            raise EngineBusyError(
+                f"engine shutting down — {what} rejected (state already "
+                f"flushed; no further mutations accepted)"
+            )
+
+    @contextlib.contextmanager
+    def _mutate_locked(self, what: str):
+        """UNBOUNDED engine-lock acquire for the mutating session/cache ops
+        (correctness over latency — same policy as before), with the
+        shutdown gate checked IMMEDIATELY AFTER the acquire: a straggler
+        that wins the lock after the shutdown flush aborts here with
+        ``EngineBusyError`` before touching any state.
+
+        Codex round 5, finding 3a — already-ENTERED mutations: an op that
+        passed the gate before shutdown began can outlive the executors'
+        bounded quiesce (minutes-long compaction prefill), make the final
+        flush's bounded lock acquire time out, and publish + mark dirty
+        AFTER that flush. Two additions close the persistence hole:
+
+        * every entered op is counted in ``_mutations_in_flight``
+          (incremented under the engine lock, after the gate check) so the
+          server shutdown can bounded-wait for in-flight mutations to
+          drain before flushing;
+        * SELF-FLUSH-ON-EXIT: if the gate closed while this op was inside
+          its critical section, the exit path — still holding the engine
+          lock — synchronously flushes THIS engine's dirty sessions before
+          releasing. "Publish after the final flush" thereby becomes
+          "publish, then immediately flush yourself": nothing dirty
+          survives un-persisted, without unbounded server-side waits. Runs
+          on EVERY unwind (success, exception, cooperative prefill
+          cancel); gate-REJECTED ops never enter, never self-flush."""
+        self._lock.acquire()
+        entered = False
+        try:
+            self._check_shutdown_gate(what)
+            # getattr: shell engines built via __new__ in tests.
+            self._mutations_in_flight = (
+                getattr(self, "_mutations_in_flight", 0) + 1
+            )
+            entered = True
+            yield
+        finally:
+            if entered:
+                try:
+                    if getattr(self, "_shutting_down", False):
+                        self._self_flush_on_shutdown_exit(what)
+                finally:
+                    # Codex round 7, finding 2a: decrement AFTER the
+                    # self-flush fully completes. The old order decremented
+                    # first, so wait_mutations_settled() could report zero
+                    # while this mutation still held the engine lock doing
+                    # the self-flush's disk IO (a VLM save can block for up
+                    # to a minute) — the server-side "mutations settled"
+                    # signal then let the final flush race a mid-save
+                    # straggler. The inner finally keeps the counter exact
+                    # even if the self-flush itself raises (it never
+                    # should — it swallows internally).
+                    self._mutations_in_flight -= 1
+            self._lock.release()
+
+    # Codex round 7, finding 2c: upper bound on self-flush rescan passes.
+    # Concurrent re-marks during shutdown are FINITE — the gate rejects new
+    # mutations, the final flush no longer re-marks (finding 2b: it drains
+    # only under the engine lock, which WE hold here), and only lock-free
+    # markers (update_session_messages' touch) can still add ids — so a
+    # handful of passes reaches an observed-empty scan (best-effort: a
+    # touch landing after the last scan stays unseen — acknowledged-benign,
+    # see _self_flush_on_shutdown_exit). The bound exists purely to
+    # guarantee termination against a misbehaving marker; failed saves are
+    # excluded from later passes (re-marked once, never retried here), so a
+    # permanent save failure cannot livelock the exit path either.
+    _SELF_FLUSH_MAX_PASSES = 8
+
+    def _self_flush_on_shutdown_exit(self, what: str):
+        """Finding 3a straggler backstop (caller HOLDS the engine lock):
+        the shutdown gate closed while a mutation was inside its critical
+        section, so the final flush either already ran (bounded lock
+        acquire timed out against us — with finding 2b it drained NOTHING,
+        so the ids are still marked) or is blocked waiting on our lock.
+        Drain + save the dirty set NOW, before releasing the lock: state
+        published by this mutation is persisted deterministically rather
+        than relying on an atexit backstop racing an external kill
+        deadline. Failures re-mark and never propagate (they must not mask
+        the mutation's own outcome).
+
+        Codex round 7, finding 2c: RESCAN until a pass observes an empty
+        dirty set (bounded — see _SELF_FLUSH_MAX_PASSES). A single drain
+        could race a lock-free dirty marker: an id published into the set
+        AFTER the drain but BEFORE this method returned was stranded dirty
+        forever (this is the LAST flush that can ever see it — the final
+        flush has already run or will skip on our lock). BEST-EFFORT, not
+        a guarantee the set is empty at return (codex round 9 nit): a
+        lock-free ``update_session_messages`` recency touch can re-mark an
+        id right AFTER the final scan, and nothing re-checks past it.
+        Acknowledged-benign: substantive generation state is already
+        marked dirty at session INSTALLATION and thus drained by an
+        earlier pass — a post-scan touch can strand only recency
+        metadata."""
+        try:
+            failed: set[str] = set()
+            for _pass in range(self._SELF_FLUSH_MAX_PASSES):
+                with self._dirty_lock:
+                    to_save = set(self._dirty_sessions) - failed
+                    self._dirty_sessions -= to_save
+                if not to_save:
+                    return
+                logger.warning(
+                    f"[Shutdown] {what}: mutation finished after the "
+                    f"shutdown gate closed — self-flushing {len(to_save)} "
+                    f"dirty session(s) before releasing the engine lock "
+                    f"(pass {_pass + 1})"
+                )
+                for sid in to_save:
+                    session = self._sessions.get(sid)
+                    if session is None:
+                        continue
+                    try:
+                        self._save_session_to_disk(sid, session)
+                    except Exception as e:  # noqa: BLE001 — keep saving the rest
+                        logger.error(
+                            f"[Shutdown] self-flush save failed for {sid}: {e}"
+                        )
+                        failed.add(sid)
+                        with self._dirty_lock:
+                            self._dirty_sessions.add(sid)
+            with self._dirty_lock:
+                leftover = len(self._dirty_sessions - failed)
+            if leftover:
+                logger.error(
+                    f"[Shutdown] self-flush rescan bound "
+                    f"({self._SELF_FLUSH_MAX_PASSES} passes) reached with "
+                    f"{leftover} session(s) still dirty — a marker kept "
+                    f"re-dirtying during shutdown"
+                )
+        except Exception:  # noqa: BLE001 — never mask the mutation's outcome
+            logger.exception("[Shutdown] self-flush-on-exit failed")
+
+    def wait_mutations_settled(self, timeout_s: float = 5.0) -> int:
+        """Bounded wait for in-flight ``_mutate_locked`` sections to drain
+        (codex round 5, finding 3a — server shutdown step between
+        ``begin_shutdown`` and the final flush). Returns the number still
+        in flight at the deadline (0 = settled); any remainder is covered
+        by the stragglers' self-flush-on-exit."""
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while True:
+            remaining = int(getattr(self, "_mutations_in_flight", 0))
+            if remaining <= 0:
+                return 0
+            if time.monotonic() >= deadline:
+                return remaining
+            time.sleep(0.05)
 
     def _generate_locked(
         self,
@@ -4522,6 +4985,7 @@ class MLXEngine:
             session_id=session_id,
             total_prompt_tokens=total_prompt_tokens,
             response_format=response_format,
+            cancel_event=cancel_event,
         )
 
         # Configurable progress log interval (tokens between INFO snapshots)
@@ -4887,6 +5351,23 @@ class MLXEngine:
                 "disconnected (stream torn down)", commit=True,
             )
             raise
+        except GenerationCancelled as _prefill_cancel:
+            # U13: cancel observed BETWEEN PREFILL CHUNKS (before any token
+            # reached the client). Route into the NORMAL cancel path below:
+            # the reconcile trims token_ids back to the cache's true offset
+            # and the HIT commit applies the C1 fail-closed rules (verified
+            # roll-back of the partially prefilled suffix, or invalidation);
+            # a MISS's partially-filled FRESH cache is simply discarded
+            # (never persisted). On the QwenMTP path the runner's own
+            # corruption callback already invalidated the session cache
+            # (target+head advanced mid-prefill cannot be verifiably
+            # rewound) — the cancel commit's Path 0 then leaves the stale
+            # messages harmless.
+            logger.info(
+                f"[Generate] session={session_id} | CANCELLED during prefill "
+                f"({_prefill_cancel}) — aborting before first token"
+            )
+            cancelled = True
         except BaseException:
             # Fail-closed consistency guard: an exception escaping the loop
             # leaves the HIT session's in-place-advanced cache unreconciled
@@ -5096,6 +5577,15 @@ class MLXEngine:
                 thinking=use_thinking,
                 prompt_fingerprint=_incoming_fp,
             )
+            # Codex round 5, finding 1a: mark dirty HERE, atomically with the
+            # install (this thread holds the engine lock). Persistence used to
+            # depend on the API layer's post-stream update_session_messages
+            # call — if that call was dropped (saturated long pool, client
+            # disconnect tearing the SSE generator down before its post-loop),
+            # the freshly extended cache was never marked and could never be
+            # flushed. The API call remains (session touch + the terminal-log
+            # contract) but is bookkeeping only now.
+            self._mark_dirty(session_id)
 
             logger.debug(
                 f"[KV Cache] session={session_id} | SAVED | "
@@ -5107,10 +5597,12 @@ class MLXEngine:
         # the final yield below finds a consistent session.
         _turn_committed = True
 
-        # Auto-register base cache on miss
+        # Auto-register base cache on miss. F4: cancel_event threads into the
+        # secondary system-prompt prefill so a disconnect aborts it too.
         if cache_mode in ("miss", "retry") and messages:
             self._maybe_register_base_cache(
                 messages, prompt_token_ids, tools=tools, thinking=use_thinking,
+                cancel_event=cancel_event,
             )
 
         # Determine finish reason (parsed_tool_calls computed above).
@@ -5149,6 +5641,7 @@ class MLXEngine:
         session_id,
         total_prompt_tokens,
         response_format=None,
+        cancel_event=None,
     ):
         """Backend dispatcher. Returns `(gen_iter, prompt_cache_or_none)`.
 
@@ -5163,6 +5656,12 @@ class MLXEngine:
         construction. Other `self._use_vlm` references gate orthogonal
         concerns (load path, kv_bits warning, structured-output incompat
         warning) and remain in place.
+
+        U13: ``cancel_event`` makes the mlx-lm path's chunked prefill
+        cancel-aware (progress-callback hook / qwen_mtp / PLD prefill
+        loops). mlx-vlm's generate_step exposes NO prompt-progress hook, so
+        the vlm path's prefill cancel stays token-granular (first check at
+        the first yielded token).
         """
         if self._use_vlm:
             return (
@@ -5188,6 +5687,7 @@ class MLXEngine:
             sampler=sampler,
             logits_processors=logits_processors,
             response_format=response_format,
+            cancel_event=cancel_event,
         )
 
     def _run_vlm(
@@ -5455,6 +5955,7 @@ class MLXEngine:
         sampler,
         logits_processors,
         response_format=None,
+        cancel_event=None,
     ):
         """mlx-lm legacy path. Manages a local `prompt_cache` because
         mlx-lm mutates the cache list in place during prefix-trim +
@@ -5462,6 +5963,12 @@ class MLXEngine:
         after the stream loop completes.
 
         Returns `(gen_iter, prompt_cache)`.
+
+        U13: ``cancel_event`` is threaded into every prefill loop this path
+        can dispatch to (plain mlx-lm via ``prompt_progress_callback``,
+        qwen_mtp, PLD) so a disconnect during a huge prefill aborts between
+        chunks (``GenerationCancelled`` — the stream loop converts it into
+        the normal cancel reconcile).
         """
         # Drafter dispatch by kind: qwen3_5_mtp heads ("qwen_mtp") run
         # NATIVELY on this mlx-lm path (engine/qwen_mtp.py); every other
@@ -5734,6 +6241,15 @@ class MLXEngine:
                         prompt_cache
                     )
 
+            # Codex round 7, finding 1: shared close-reason cell between the
+            # runner and its adapter. The adapter marks it NATURAL once the
+            # EOS frame went out, so the teardown close (engine cancel-break
+            # / disconnect rescue arriving AFTER the EOS was delivered) still
+            # runs the finalize forwards — cache offset == recorded ids. The
+            # engine's cancel-driven close of a MID-stream adapter leaves the
+            # cell unmarked; the runner then keeps the round-6 inference
+            # (GeneratorExit + event set -> cancel, finalize skipped).
+            _mtp_close_reason = qwen_mtp_mod.GeneratorCloseReason()
             gen_iter = _pld_response_adapter(
                 qwen_mtp_mod.qwen_mtp_generate_step(
                     prompt=mx.array(prompt_token_ids),
@@ -5751,9 +6267,12 @@ class MLXEngine:
                     on_cache_corruption=_on_mtp_cache_corruption,
                     on_finalize=_on_mtp_finalize,
                     resume_hidden=_mtp_resume_hidden,
+                    cancel_event=cancel_event,
+                    close_reason=_mtp_close_reason,
                 ),
                 tokenizer=self.tokenizer,
                 label="QwenMTP",
+                close_reason=_mtp_close_reason,
             )
             return gen_iter, prompt_cache
 
@@ -5764,6 +6283,16 @@ class MLXEngine:
             "prefill_step_size": self.cfg.prefill_step_size,
             "logits_processors": logits_processors if logits_processors else None,
         }
+        if cancel_event is not None:
+            # U13: mlx-lm's generate_step invokes this between prefill
+            # chunks — raising here aborts the prefill within one chunk of
+            # the disconnect instead of finishing the whole prompt.
+            def _abort_prefill_on_cancel(processed, total):
+                if cancel_event.is_set():
+                    raise GenerationCancelled(
+                        f"prefill cancelled at {processed}/{total} prompt tokens"
+                    )
+            lm_kwargs["prompt_progress_callback"] = _abort_prefill_on_cancel
         if self.cfg.kv_bits:
             lm_kwargs["kv_bits"] = self.cfg.kv_bits
             lm_kwargs["kv_group_size"] = self.cfg.kv_group_size
@@ -5846,6 +6375,7 @@ class MLXEngine:
                     quantized_kv_start=self.cfg.quantized_kv_start,
                     ngram_k=self.cfg.pld_ngram_k,
                     on_cache_corruption=_on_pld_cache_corruption,
+                    cancel_event=cancel_event,
                 ),
                 tokenizer=self.tokenizer,
             )
@@ -6228,6 +6758,11 @@ class MLXEngine:
                 else self._prompt_fingerprint(tools_canonical, use_thinking)
             ),
         )
+        # Codex round 5, finding 1a: an interrupted commit is exactly the
+        # case where the API layer NEVER reaches its post-stream
+        # update_session_messages (the client is gone) — mark dirty at the
+        # install or the committed turn is unflushable.
+        self._mark_dirty(session_id)
         logger.info(
             f"[KV Cache] session={session_id} | {reason} on HIT | committed "
             f"interrupted turn ({len(new_messages)} new + 1 assistant msg, "
@@ -6283,8 +6818,22 @@ class MLXEngine:
         prompt_tokens: list[int],
         tools: list | None = None,
         thinking: bool = True,
+        cancel_event: threading.Event | None = None,
     ):
-        """Register a base cache for the system prompt if not already cached."""
+        """Register a base cache for the system prompt if not already cached.
+
+        F4 (codex batch-3 review): ``cancel_event`` threads through to the
+        secondary system-prompt prefill (``mtp_prefill_base`` /
+        ``_prefill_cache``) — a client disconnect during this potentially
+        large prefill aborts between chunks instead of running to
+        completion. Round 2 residual: the between-chunk checks miss a
+        disconnect DURING the final chunk, so both prefill helpers check
+        once more after their last chunk AND this method re-checks right
+        before ``_register_base_cache`` — a dead request never proceeds to
+        registration or any follow-up work. The base cache is an
+        optimization, never worth blocking cancellation: on
+        ``GenerationCancelled`` registration is simply skipped (the
+        partially filled fresh cache is discarded)."""
         has_system_or_rotating = (
             (messages and messages[0].get("role") in ("system", "developer"))
             or self._has_rotating_cache
@@ -6324,12 +6873,32 @@ class MLXEngine:
                         prompt_cache=base_cache,
                         n_target_layers=len(self._language_model.layers),
                         prefill_step_size=self.cfg.prefill_step_size,
+                        cancel_event=cancel_event,
                     )
                 else:
-                    self._prefill_cache(base_cache, system_tokens)
+                    self._prefill_cache(
+                        base_cache, system_tokens, cancel_event=cancel_event,
+                    )
+                # F4 (round 2): a disconnect DURING the prefill's final
+                # chunk slips past the between-chunk checks — verify once
+                # more BEFORE registering, so a dead request does no
+                # follow-up work (the partial fresh cache is discarded with
+                # this frame). Covers the plain AND MTP branches uniformly.
+                if cancel_event is not None and cancel_event.is_set():
+                    raise GenerationCancelled(
+                        "base cache prefill finished after client disconnect"
+                    )
                 self._register_base_cache(
                     messages, base_cache, system_tokens, tools=tools,
                     mtp_resume_hidden=mtp_hidden,
+                )
+            except GenerationCancelled:
+                # F4/U13: client disconnected mid-prefill — skip registration
+                # (the partial fresh cache is dropped with this frame). Must
+                # precede the generic handler below and never propagate: the
+                # base cache is best-effort.
+                logger.debug(
+                    "[Base Cache] registration skipped: cancelled mid-prefill"
                 )
             except Exception as e:
                 logger.warning(f"[Base Cache] registration failed: {e}")
@@ -6454,7 +7023,7 @@ class MLXEngine:
         tool schema from the cached prefix, so every later HIT turn would
         answer without the tools in context.
         """
-        with self._lock:
+        with self._mutate_locked("compact_session"):
             self._touch_gpu()
             t0 = time.perf_counter()
 
@@ -6486,7 +7055,16 @@ class MLXEngine:
                 feed_tokens = prompt_tokens
 
             if feed_tokens:
-                self._prefill_cache(prompt_cache, feed_tokens)
+                # Finding 3a (codex round 5): shutdown gate as cooperative
+                # cancel — begin_shutdown() aborts this minutes-scale prefill
+                # between chunks. Nothing new was published yet (the prelude
+                # only re-published the disk-loaded PREV session, which equals
+                # its disk copy), so aborting is mutation-free and the
+                # compaction simply reruns after restart.
+                self._prefill_cache(
+                    prompt_cache, feed_tokens,
+                    cancel_event=getattr(self, "_shutdown_cancel_event", None),
+                )
             self._eval_cache(prompt_cache)
 
             new_offset = self._get_cache_offset(prompt_cache)
@@ -6517,9 +7095,12 @@ class MLXEngine:
                 f"{elapsed:.2f}s"
             )
 
-            # Auto-register base cache
+            # Auto-register base cache. Finding 3a: shutdown-gated cancel
+            # threads into the secondary prefill too (registration is
+            # best-effort and skips silently on cancel).
             self._maybe_register_base_cache(
                 messages, prompt_tokens, tools=sess_tools, thinking=sess_thinking,
+                cancel_event=getattr(self, "_shutdown_cancel_event", None),
             )
 
             self._mark_dirty(session_id)
@@ -6536,52 +7117,214 @@ class MLXEngine:
                 "processing_time_ms": round(elapsed * 1000),
             }
 
+    # Defensive bound on the safetensors JSON header read by the preflight's
+    # metadata parse — a corrupt length prefix must never trigger a giant
+    # allocation (real session-cache headers are tens of KB).
+    _SAFETENSORS_HEADER_MAX_BYTES = 100 * 1024 * 1024
+
+    @staticmethod
+    def _read_safetensors_metadata(path: str) -> dict | None:
+        """Read ONLY the ``__metadata__`` block of a safetensors file with
+        plain Python file IO — the format is a little-endian 8-byte header
+        length followed by a JSON header; tensor data is never touched and
+        NO MLX call is involved (F5 round 2: the preflight must not create
+        arrays on a non-owning thread). Returns None on any read/parse
+        failure (fail-closed advisory)."""
+        try:
+            with open(path, "rb") as f:
+                raw_len = f.read(8)
+                if len(raw_len) != 8:
+                    return None
+                header_len = int.from_bytes(raw_len, "little")
+                if not 0 < header_len <= MLXEngine._SAFETENSORS_HEADER_MAX_BYTES:
+                    return None
+                raw = f.read(header_len)
+                if len(raw) != header_len:
+                    # Short read == truncated file (codex round 3, finding
+                    # 6): the available prefix may still parse as JSON, but
+                    # the file is provably damaged — fail closed rather than
+                    # report a disk hit from a header we only partially saw.
+                    return None
+                header = json.loads(raw)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(header, dict):
+            return None
+        meta = header.get("__metadata__")
+        return meta if isinstance(meta, dict) else None
+
+    def session_cache_preflight(self, session_id: str, messages: list[dict]) -> dict:
+        """Web-chat cache preflight: ADVISORY report of whether this
+        session's next turn will reuse its KV cache (and how). Returns
+        ``{"cache_hit": bool, "cache_info": dict}`` — informational only
+        (the generation itself re-resolves — and actually loads — the cache
+        under its own lock, on its own thread).
+
+        F5 (codex batch-3 review, round 2): METADATA-ONLY. The round-1
+        shape ran ``_load_session_from_disk`` (mx.load + KV-cache object
+        construction) on the ``engine-read`` executor thread and published
+        the result into ``_sessions`` — generation later consumed those
+        arrays on the engine's owning thread, violating the same-thread
+        rule documented at ``_save_session_to_disk`` (VLM thread
+        ownership) — and it held the engine lock across the whole disk
+        load. Now:
+
+        - the bounded ``_read_locked`` acquire (EngineBusyError on expiry,
+          callers degrade like every other busy path) covers ONLY in-memory
+          dict lookups + shallow snapshot copies — never disk IO, never MLX;
+        - the disk fallback parses ONLY the safetensors JSON header
+          (``_read_safetensors_metadata``, plain file IO) AFTER the lock is
+          released — a stale answer is acceptable for an advisory preflight;
+        - ``_sessions`` is never written; the authoritative disk load stays
+          where it always ran: on the generation thread during the request.
+
+        Callers run it off the event loop (reads executor); the process-mode
+        proxy has no such method and callers report a neutral marker."""
+        # Phase 1 — SHORT bounded lock: in-memory presence only (dict
+        # lookups + shallow copies; the messages list is copied so the
+        # match below never walks a list a generation is appending to).
+        stored_messages: list | None = None
+        cached_tokens = 0
+        cache_live = False
+        with self._read_locked("cache preflight"):
+            session_state = self._sessions.get(session_id)
+            if session_state is not None:
+                stored_messages = list(session_state.messages)
+                cached_tokens = session_state.total_cache_tokens
+                cache_live = (
+                    session_state.cache_state is not None
+                    and session_state.cache_state.cache is not None
+                )
+            check_disk = session_state is None and self._has_disk_cache(session_id)
+
+        if session_state is not None:
+            source = "memory"
+        elif check_disk:
+            # Phase 2 — disk fallback WITHOUT the engine lock: header-only
+            # metadata parse (no mx.load, no cache objects, no _sessions
+            # write).
+            meta = self._read_safetensors_metadata(
+                self._session_cache_path(session_id)
+            )
+            if meta is not None:
+                try:
+                    stored_messages = json.loads(meta.get("messages", "[]"))
+                    cached_tokens = int(meta.get("total_cache_tokens", "0"))
+                except (ValueError, TypeError):
+                    stored_messages = None
+            if not isinstance(stored_messages, list):
+                return {
+                    "cache_hit": False,
+                    "cache_info": {
+                        "type": "none",
+                        "detail": (
+                            "Disk cache present but metadata unreadable — "
+                            "cache state unknown"
+                        ),
+                    },
+                }
+            # A persisted file implies a reloadable cache (the generation
+            # thread performs — and verifies — the actual load).
+            cache_live = True
+            source = "disk"
+        else:
+            return {
+                "cache_hit": False,
+                "cache_info": {"type": "none", "detail": "New session"},
+            }
+
+        # Phase 3 — pure-Python match on the snapshots (no lock, no MLX).
+        cache_hit = False
+        if self._messages_match(stored_messages, messages):
+            cache_hit = cache_live
+            new_msgs = messages[len(stored_messages):]
+            suffix_desc = (
+                f"{len(new_msgs)} new message(s)" if new_msgs else "retry"
+            )
+            cache_info = {
+                "type": "kv_cache_hit" if cache_hit else "kv_cache_rebuild",
+                "detail": (
+                    f"KV Cache reuse ({source}): {cached_tokens} tokens "
+                    f"cached, {suffix_desc}"
+                    if cache_hit
+                    else f"Rebuilding KV cache for {len(messages)} messages"
+                ),
+                "cached_tokens": cached_tokens,
+                "stored_msgs": len(stored_messages),
+                "source": source,
+            }
+        else:
+            cache_info = {
+                "type": "kv_cache_miss",
+                "detail": (
+                    f"Conversation changed, reprocessing "
+                    f"{len(messages)} messages"
+                ),
+                "stored_msgs": len(stored_messages),
+                "incoming_msgs": len(messages),
+            }
+        return {"cache_hit": cache_hit, "cache_info": cache_info}
+
     def list_sessions(self) -> list[dict]:
-        """List all active sessions."""
-        result = []
-        for sid, s in self._sessions.items():
-            entry = {
-                "session_id": sid,
+        """List all active sessions.
+
+        U15: reads ``_sessions`` under the engine lock (bounded read
+        acquire) — a generation mutates SessionState/_sessions in place, so
+        an unlocked iteration could observe (or crash on) mid-mutation
+        state."""
+        with self._read_locked("session list"):
+            result = []
+            for sid, s in self._sessions.items():
+                entry = {
+                    "session_id": sid,
+                    "messages": len(s.messages),
+                    "cache_tokens": s.total_cache_tokens,
+                    "last_used": s.last_used,
+                }
+                if s.drafter_stats is not None:
+                    entry["drafter_stats"] = s.drafter_stats
+                result.append(entry)
+            return sorted(result, key=lambda x: x["last_used"], reverse=True)
+
+    def get_session(self, session_id: str) -> dict | None:
+        """Get details for a specific session. U15: locked read (bounded)."""
+        with self._read_locked("session details"):
+            s = self._sessions.get(session_id)
+            if not s:
+                return None
+            info = {
+                "session_id": session_id,
                 "messages": len(s.messages),
                 "cache_tokens": s.total_cache_tokens,
                 "last_used": s.last_used,
             }
             if s.drafter_stats is not None:
-                entry["drafter_stats"] = s.drafter_stats
-            result.append(entry)
-        return sorted(result, key=lambda x: x["last_used"], reverse=True)
-
-    def get_session(self, session_id: str) -> dict | None:
-        """Get details for a specific session."""
-        s = self._sessions.get(session_id)
-        if not s:
-            return None
-        info = {
-            "session_id": session_id,
-            "messages": len(s.messages),
-            "cache_tokens": s.total_cache_tokens,
-            "last_used": s.last_used,
-        }
-        if s.drafter_stats is not None:
-            info["drafter_stats"] = s.drafter_stats
-        return info
+                info["drafter_stats"] = s.drafter_stats
+            return info
 
     def delete_session(self, session_id: str) -> bool:
-        """Delete a session and its cache."""
-        with self._dirty_lock:
-            self._dirty_sessions.discard(session_id)
-        if session_id in self._sessions:
-            del self._sessions[session_id]
-        # Anon-provenance hygiene (best-effort; stale ids are harmless).
-        if hasattr(self, "_anon_minted_ids"):
-            self._anon_minted_ids.discard(session_id)
-        path = self._session_cache_path(session_id)
-        if os.path.exists(path):
-            os.remove(path)
-        if hasattr(self, "_disk_session_ids"):
-            self._disk_session_ids.discard(session_id)
-        logger.info(f"[Session] DELETED | session={session_id}")
-        return True
+        """Delete a session and its cache.
+
+        U15: takes the engine lock UNBOUNDED (mutating admin op — it must
+        not race a generation that is advancing this session's KV cache in
+        place; the busy wait is bounded by that generation's length and
+        U14's to_thread wrappers keep the event loop free meanwhile).
+        NOT re-entrant: no engine-internal caller holds the lock here."""
+        with self._mutate_locked("delete_session"):
+            with self._dirty_lock:
+                self._dirty_sessions.discard(session_id)
+            if session_id in self._sessions:
+                del self._sessions[session_id]
+            # Anon-provenance hygiene (best-effort; stale ids are harmless).
+            if hasattr(self, "_anon_minted_ids"):
+                self._anon_minted_ids.discard(session_id)
+            path = self._session_cache_path(session_id)
+            if os.path.exists(path):
+                os.remove(path)
+            if hasattr(self, "_disk_session_ids"):
+                self._disk_session_ids.discard(session_id)
+            logger.info(f"[Session] DELETED | session={session_id}")
+            return True
 
     async def generate_stream_async(
         self,
@@ -6836,6 +7579,14 @@ class MLXEngine:
             raise
 
     # --- Truncation & Regeneration ---
+    #
+    # Codex round 5, finding 3b: these wrappers used to run their PRELUDE
+    # (inspect _sessions, disk-load, PUBLISH the loaded session into
+    # _sessions) BEFORE reaching the gated _rebuild_session — post-shutdown
+    # calls mutated _sessions outside the gate. The gate now wraps the
+    # ENTIRE operation: each public wrapper takes _mutate_locked at entry
+    # and delegates to a lock-free ``*_locked`` body (the engine lock is
+    # non-reentrant, so inner calls must never re-gate).
 
     def branch_from_turn(
         self,
@@ -6844,7 +7595,24 @@ class MLXEngine:
         branch_turn: int,
         branch_messages: list[dict] | None = None,
     ) -> dict:
-        """Branch a new session by building cache from scratch."""
+        """Branch a new session by building cache from scratch.
+
+        Whole-op gate (finding 3b): the prelude's disk reload publishes the
+        SOURCE session into ``_sessions`` — that publication must be inside
+        the shutdown gate too, not only the inner rebuild."""
+        with self._mutate_locked("branch_from_turn"):
+            return self._branch_from_turn_locked(
+                source_session_id, new_session_id, branch_turn,
+                branch_messages,
+            )
+
+    def _branch_from_turn_locked(
+        self,
+        source_session_id: str,
+        new_session_id: str,
+        branch_turn: int,
+        branch_messages: list[dict] | None = None,
+    ) -> dict:
         source = self._sessions.get(source_session_id)
         if not source and self._has_disk_cache(source_session_id):
             source = self._load_session_from_disk(source_session_id)
@@ -6860,7 +7628,7 @@ class MLXEngine:
 
         # U3: the branch inherits the SOURCE session's prompt contract; a
         # message-only branch (no source) has no contract to inherit.
-        return self._rebuild_session(
+        return self._rebuild_session_locked(
             new_session_id,
             engine_messages,
             tools=getattr(source, "tools", None) if source else None,
@@ -6868,30 +7636,44 @@ class MLXEngine:
         )
 
     def prepare_regenerate(self, session_id: str) -> dict:
-        """Remove last assistant message and restore cache."""
-        session = self._sessions.get(session_id)
-        # An active-LRU-evicted session is no longer in _sessions but persisted
-        # to disk — reload it transparently (mirrors truncate_session /
-        # branch_from_turn) before inspecting its messages.
-        if not session and self._has_disk_cache(session_id):
-            session = self._load_session_from_disk(session_id)
-            if session:
-                self._sessions[session_id] = session
-        if not session or len(session.messages) < 2:
-            return {"error": "nothing to regenerate"}
+        """Remove last assistant message and restore cache.
 
-        last_msg = session.messages[-1]
-        if last_msg.get("role") != "assistant":
-            return {"error": "last message is not assistant"}
+        Whole-op gate (finding 3b): the prelude's disk reload publishes
+        into ``_sessions`` before the inner truncate — gate at entry."""
+        with self._mutate_locked("prepare_regenerate"):
+            session = self._sessions.get(session_id)
+            # An active-LRU-evicted session is no longer in _sessions but
+            # persisted to disk — reload it transparently (mirrors
+            # truncate_session / branch_from_turn) before inspecting its
+            # messages.
+            if not session and self._has_disk_cache(session_id):
+                session = self._load_session_from_disk(session_id)
+                if session:
+                    self._sessions[session_id] = session
+            if not session or len(session.messages) < 2:
+                return {"error": "nothing to regenerate"}
 
-        restore_to = len(session.messages) - 2  # before user msg
-        result = self.truncate_session(session_id, restore_to)
-        if result.get("status") == "ok":
-            result["turn"] = restore_to
-        return result
+            last_msg = session.messages[-1]
+            if last_msg.get("role") != "assistant":
+                return {"error": "last message is not assistant"}
+
+            restore_to = len(session.messages) - 2  # before user msg
+            result = self._truncate_session_locked(session_id, restore_to)
+            if result.get("status") == "ok":
+                result["turn"] = restore_to
+            return result
 
     def truncate_session(self, session_id: str, target_msg_count: int) -> dict:
-        """Truncate session to target_msg_count messages, rebuilding cache."""
+        """Truncate session to target_msg_count messages, rebuilding cache.
+
+        Whole-op gate (finding 3b): prelude disk reload + publication run
+        inside the gate."""
+        with self._mutate_locked("truncate_session"):
+            return self._truncate_session_locked(session_id, target_msg_count)
+
+    def _truncate_session_locked(
+        self, session_id: str, target_msg_count: int,
+    ) -> dict:
         session = self._sessions.get(session_id)
         if not session and self._has_disk_cache(session_id):
             session = self._load_session_from_disk(session_id)
@@ -6904,7 +7686,7 @@ class MLXEngine:
 
         restore_messages = session.messages[:target_msg_count]
         # U3: rebuild under the session's own prompt contract.
-        return self._rebuild_session(
+        return self._rebuild_session_locked(
             session_id,
             restore_messages,
             tools=getattr(session, "tools", None),
@@ -6918,54 +7700,75 @@ class MLXEngine:
         tools: list | None = None,
         thinking: bool = True,
     ) -> dict:
-        """Build a fresh KV cache for the given messages.
+        """Gated entry point kept for direct callers/tests; the public
+        wrappers above gate at THEIR entry and call the lock-free body."""
+        with self._mutate_locked("session rebuild (truncate/branch)"):
+            return self._rebuild_session_locked(
+                session_id, messages, tools=tools, thinking=thinking,
+            )
+
+    def _rebuild_session_locked(
+        self,
+        session_id: str,
+        messages: list[dict],
+        tools: list | None = None,
+        thinking: bool = True,
+    ) -> dict:
+        """Build a fresh KV cache for the given messages (caller holds the
+        engine lock via a ``_mutate_locked`` wrapper).
 
         U3: ``tools``/``thinking`` are the session's stored prompt contract
         (callers pass the source SessionState's fields) so the rebuilt
         prefix keeps the tool schema in context — a bare re-tokenization
         would silently drop it for every later HIT turn."""
-        with self._lock:
-            self._touch_gpu()
-            t0 = time.perf_counter()
+        self._touch_gpu()
+        t0 = time.perf_counter()
 
-            prompt_tokens = self._tokenize_prompt(
-                messages, thinking=thinking, tools=tools,
+        prompt_tokens = self._tokenize_prompt(
+            messages, thinking=thinking, tools=tools,
+        )
+
+        # Try base cache first
+        prompt_cache = None
+        base = self._find_base_cache(messages, tools=tools)
+        feed_tokens = prompt_tokens
+        if base and len(prompt_tokens) >= base.token_count:
+            if prompt_tokens[:base.token_count] == base.tokens:
+                prompt_cache = self._clone_base_cache(base)
+                feed_tokens = prompt_tokens[base.token_count:]
+        if prompt_cache is None:
+            prompt_cache = make_prompt_cache(self._language_model)
+
+        if feed_tokens:
+            # Finding 3a: the shutdown gate doubles as a cooperative cancel
+            # source — begin_shutdown() aborts this prefill between chunks
+            # (GenerationCancelled) instead of delaying shutdown by minutes.
+            # Nothing was published yet, so aborting here is mutation-free.
+            self._prefill_cache(
+                prompt_cache, feed_tokens,
+                cancel_event=getattr(self, "_shutdown_cancel_event", None),
             )
 
-            # Try base cache first
-            prompt_cache = None
-            base = self._find_base_cache(messages, tools=tools)
-            feed_tokens = prompt_tokens
-            if base and len(prompt_tokens) >= base.token_count:
-                if prompt_tokens[:base.token_count] == base.tokens:
-                    prompt_cache = self._clone_base_cache(base)
-                    feed_tokens = prompt_tokens[base.token_count:]
-            if prompt_cache is None:
-                prompt_cache = make_prompt_cache(self._language_model)
+        new_offset = self._get_cache_offset(prompt_cache)
+        elapsed = time.perf_counter() - t0
 
-            if feed_tokens:
-                self._prefill_cache(prompt_cache, feed_tokens)
+        cache_state = PromptCacheState()
+        cache_state.cache = prompt_cache
+        cache_state.token_ids = prompt_tokens
 
-            new_offset = self._get_cache_offset(prompt_cache)
-            elapsed = time.perf_counter() - t0
+        self._sessions[session_id] = SessionState(
+            cache_state=cache_state,
+            messages=messages,
+            total_cache_tokens=new_offset,
+            pending_build_time=elapsed,
+            tools=tools,
+            thinking=thinking,
+            prompt_fingerprint=self._prompt_fingerprint(tools, thinking),
+        )
+        self._mark_dirty(session_id)
 
-            cache_state = PromptCacheState()
-            cache_state.cache = prompt_cache
-            cache_state.token_ids = prompt_tokens
-
-            self._sessions[session_id] = SessionState(
-                cache_state=cache_state,
-                messages=messages,
-                total_cache_tokens=new_offset,
-                pending_build_time=elapsed,
-                tools=tools,
-                thinking=thinking,
-                prompt_fingerprint=self._prompt_fingerprint(tools, thinking),
-            )
-            self._mark_dirty(session_id)
-
-            # New resident cache added — keep total under memory_budget_gb.
-            self._evict_active_sessions_if_needed(protect_session_id=session_id)
+        # New resident cache added — keep total under memory_budget_gb.
+        self._evict_active_sessions_if_needed(protect_session_id=session_id)
 
         logger.info(
             f"[Rebuild] session={session_id} | "
@@ -6980,17 +7783,19 @@ class MLXEngine:
         }
 
     def session_stats(self) -> dict:
-        return {
-            "active_sessions": len(self._sessions),
-            "sessions": {
-                sid: {
-                    "messages": len(s.messages),
-                    "cache_tokens": s.total_cache_tokens,
-                    "last_used": s.last_used,
-                }
-                for sid, s in self._sessions.items()
-            },
-        }
+        # U15: locked read (bounded) — same rationale as list_sessions.
+        with self._read_locked("session stats"):
+            return {
+                "active_sessions": len(self._sessions),
+                "sessions": {
+                    sid: {
+                        "messages": len(s.messages),
+                        "cache_tokens": s.total_cache_tokens,
+                        "last_used": s.last_used,
+                    }
+                    for sid, s in self._sessions.items()
+                },
+            }
 
     # --- Admin: cache overview + reset (process-mode-safe) ---------------
     #
@@ -7004,7 +7809,16 @@ class MLXEngine:
     def cache_overview(self) -> dict:
         """Serializable per-engine cache overview (memory sessions, base
         caches, cache-manager stats, disk files). Used by /api/admin/cache
-        and /api/cache/stats. Reads in-memory + disk state directly."""
+        and /api/cache/stats. Reads in-memory + disk state directly.
+
+        U15: the whole snapshot is built under the engine lock (bounded read
+        acquire — EngineBusyError while a generation runs) so the session /
+        base-cache / memory numbers are mutually consistent and the size
+        estimation never walks a cache list mid-mutation."""
+        with self._read_locked("cache overview"):
+            return self._cache_overview_locked()
+
+    def _cache_overview_locked(self) -> dict:
         sessions = []
         total_memory_bytes = 0
         for sid, s in self._sessions.items():
@@ -7127,38 +7941,44 @@ class MLXEngine:
 
     def clear_caches(self) -> dict:
         """Clear all KV caches (memory sessions + base caches + cache_manager +
-        disk files). Returns counts cleared. Used by /api/admin/cache/reset."""
-        cleared = {"memory_sessions": 0, "disk_files": 0, "base_caches": 0}
+        disk files). Returns counts cleared. Used by /api/admin/cache/reset.
 
-        with self._dirty_lock:
-            self._dirty_sessions.clear()
+        U15: takes the engine lock UNBOUNDED (mutating admin op — clearing
+        ``_sessions``/``_base_caches`` under a running generation would pull
+        the live cache out from under it). Not re-entrant: ``reset()`` is
+        the only internal caller and holds no lock."""
+        with self._mutate_locked("clear_caches"):
+            cleared = {"memory_sessions": 0, "disk_files": 0, "base_caches": 0}
 
-        cleared["memory_sessions"] += len(self._sessions)
-        self._sessions.clear()
-        # Anon-provenance hygiene: no sessions remain → no minted ids remain.
-        if hasattr(self, "_anon_minted_ids"):
-            self._anon_minted_ids.clear()
+            with self._dirty_lock:
+                self._dirty_sessions.clear()
 
-        cleared["base_caches"] += len(self._base_caches)
-        self._base_caches.clear()
+            cleared["memory_sessions"] += len(self._sessions)
+            self._sessions.clear()
+            # Anon-provenance hygiene: no sessions remain → no minted ids remain.
+            if hasattr(self, "_anon_minted_ids"):
+                self._anon_minted_ids.clear()
 
-        self.cache_manager.memory_caches.clear()
-        self.cache_manager.disk_index.clear()
+            cleared["base_caches"] += len(self._base_caches)
+            self._base_caches.clear()
 
-        cache_dir = self.cfg.cache_dir
-        if os.path.isdir(cache_dir):
-            for fname in os.listdir(cache_dir):
-                if fname.endswith(".safetensors"):
-                    try:
-                        os.remove(os.path.join(cache_dir, fname))
-                        cleared["disk_files"] += 1
-                    except OSError:
-                        pass
+            self.cache_manager.memory_caches.clear()
+            self.cache_manager.disk_index.clear()
 
-        if hasattr(self, "_disk_session_ids"):
-            self._disk_session_ids.clear()
+            cache_dir = self.cfg.cache_dir
+            if os.path.isdir(cache_dir):
+                for fname in os.listdir(cache_dir):
+                    if fname.endswith(".safetensors"):
+                        try:
+                            os.remove(os.path.join(cache_dir, fname))
+                            cleared["disk_files"] += 1
+                        except OSError:
+                            pass
 
-        return cleared
+            if hasattr(self, "_disk_session_ids"):
+                self._disk_session_ids.clear()
+
+            return cleared
 
     # Alias: codex spec mentions reset(...); admin uses clear_caches semantics.
     def reset(self) -> dict:

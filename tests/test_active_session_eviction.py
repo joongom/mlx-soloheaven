@@ -72,6 +72,9 @@ def _make_engine(budget_gb: float) -> MLXEngine:
     eng._dirty_lock = threading.Lock()
     eng._busy_sessions = set()
     eng._busy_lock = threading.Lock()
+    # Codex round 5, finding 3b: truncate/branch/regenerate now take the
+    # whole-op mutation gate (_mutate_locked) at entry.
+    eng._lock = threading.Lock()
     # Real CacheManager — its _estimate_cache_size / _memory_usage_gb are used.
     eng.cache_manager = CacheManager(
         memory_budget_gb=budget_gb, disk_budget_gb=100.0, cache_dir="/tmp/sh-test-cache"
@@ -291,8 +294,10 @@ def test_prepare_regenerate_resumes_evicted_session(monkeypatch):
     eng = _make_engine(budget_gb=1.5)
     reloaded = _evict_then_setup_disk_reload(eng, monkeypatch)
 
-    # _rebuild_session needs the model; mock it to a success + record the call.
-    # (U3: the rebuild now receives the session's prompt contract too.)
+    # The rebuild body needs the model; mock it to a success + record the
+    # call. (U3: the rebuild now receives the session's prompt contract
+    # too; round 5 finding 3b: the whole op is gated at wrapper entry, so
+    # the inner call is the lock-free _rebuild_session_locked.)
     rebuilt: list[tuple[str, list]] = []
 
     def _fake_rebuild(session_id, messages, tools=None, thinking=True):
@@ -300,7 +305,7 @@ def test_prepare_regenerate_resumes_evicted_session(monkeypatch):
         eng._sessions[session_id] = reloaded  # rebuilt session is resident
         return {"status": "ok", "cached_tokens": 1}
 
-    monkeypatch.setattr(eng, "_rebuild_session", _fake_rebuild)
+    monkeypatch.setattr(eng, "_rebuild_session_locked", _fake_rebuild)
 
     result = eng.prepare_regenerate("A")
 
@@ -336,12 +341,14 @@ def test_truncate_session_resumes_evicted_session(monkeypatch):
     rebuilt: list[tuple[str, list]] = []
 
     # U3: the rebuild now receives the session's prompt contract too.
+    # Round 5 finding 3b: whole-op gate at wrapper entry — the inner call
+    # is the lock-free _rebuild_session_locked.
     def _fake_rebuild(session_id, messages, tools=None, thinking=True):
         rebuilt.append((session_id, list(messages)))
         eng._sessions[session_id] = reloaded
         return {"status": "ok", "cached_tokens": 1}
 
-    monkeypatch.setattr(eng, "_rebuild_session", _fake_rebuild)
+    monkeypatch.setattr(eng, "_rebuild_session_locked", _fake_rebuild)
 
     # Truncate 'A' (2 msgs after reload) down to 1 message.
     result = eng.truncate_session("A", target_msg_count=1)

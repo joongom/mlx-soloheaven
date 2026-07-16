@@ -12,6 +12,8 @@ from typing import AsyncGenerator
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 
+from mlx_soloheaven.engine.types import EngineBusyError
+from mlx_soloheaven.executors import run_long, run_read
 from mlx_soloheaven.storage import database as db
 
 router = APIRouter(prefix="/api/admin")
@@ -131,7 +133,10 @@ async def models_overview():
     Includes the process-mode proxy's liveness snapshot (alive / respawning /
     respawn attempts) so a dead or restarting child worker is visible in the
     admin UI. session_stats is an RPC to the child in process mode — guard it
-    so this overview still renders while the child is dead/respawning."""
+    so this overview still renders while the child is dead/respawning, and
+    run it off the event loop (U14: a blocking RPC here would freeze every
+    in-flight SSE stream); a busy engine (generation in flight) degrades to
+    sessions=None like a dead one."""
     models = []
     for model_id, engine in _engines.items():
         cfg = engine.cfg
@@ -142,8 +147,10 @@ async def models_overview():
             except Exception:  # noqa: BLE001
                 liveness = None
         try:
-            sessions = engine.session_stats().get("active_sessions", 0)
-        except Exception:  # noqa: BLE001 — dead child: keep the page alive
+            # F2: bounded read -> reserved reads executor.
+            stats = await run_read(engine.session_stats)
+            sessions = stats.get("active_sessions", 0)
+        except Exception:  # noqa: BLE001 — dead/busy child: keep the page alive
             sessions = None
         models.append({
             "model_id": engine.model_id,
@@ -182,7 +189,11 @@ async def cache_overview():
 
     Reads each engine's cache state via ``engine.cache_overview()`` so the
     same code path works for in-process engines AND process-mode proxies (the
-    proxy RPCs this to the child, the authoritative cache owner)."""
+    proxy RPCs this to the child, the authoritative cache owner).
+
+    U14: the overview call runs off the event loop with a bounded wait — a
+    generation in flight degrades that engine's entry to ``{"busy": true}``
+    instead of hanging the whole admin page (and every SSE stream with it)."""
     result = {
         "engines": {},
         "disk_files": [],
@@ -191,7 +202,12 @@ async def cache_overview():
     }
 
     for model_id, engine in _engines.items():
-        ov = engine.cache_overview()
+        try:
+            # F2: bounded read -> reserved reads executor.
+            ov = await run_read(engine.cache_overview)
+        except EngineBusyError:
+            result["engines"][model_id] = {"busy": True}
+            continue
         result["engines"][model_id] = {
             "model_id": ov.get("model_id"),
             "enable_thinking": ov.get("enable_thinking"),
@@ -272,7 +288,14 @@ async def reset_cache():
     cleared = {"memory_sessions": 0, "disk_files": 0, "base_caches": 0}
 
     for model_id, engine in _engines.items():
-        c = engine.clear_caches()
+        # U14: mutating admin op — full wait, but off the event loop.
+        # F2: mutating RPC -> long-ops executor.
+        # Codex round 11, finding 1 (audit): NO admission reservation here —
+        # no DB mutation precedes this run_long, and a saturation rejection
+        # mid-loop leaves at worst a PARTIAL multi-engine clear, which is
+        # harmless: clear_caches is idempotent (converges to the empty
+        # state), so the client's 503-driven retry completes the rest.
+        c = await run_long(engine.clear_caches)
         cleared["memory_sessions"] += c.get("memory_sessions", 0)
         cleared["base_caches"] += c.get("base_caches", 0)
         cleared["disk_files"] += c.get("disk_files", 0)

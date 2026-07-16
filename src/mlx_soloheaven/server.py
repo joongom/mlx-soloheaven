@@ -45,13 +45,23 @@ def engine_unavailable_response(exc: Exception):
 
 
 def register_engine_error_handlers(app: FastAPI):
-    """Map EngineRestartingError -> HTTP 503 for all non-streaming endpoints.
+    """Map EngineRestartingError / EngineBusyError -> HTTP 503 for all
+    non-streaming endpoints.
 
     The process-mode proxy fails FAST with EngineRestartingError while its
     child worker is dead or respawning (Metal GPU aborts kill the child
     uncatchably; model reload takes ~1-3 min). process_client is mlx-free, so
-    importing it here keeps the parent clean under --engine-mode process."""
+    importing it here keeps the parent clean under --engine-mode process.
+
+    EngineBusyError (codex batch-3, round 2): most read paths already catch
+    it locally and answer a "busy" placeholder; this app-level handler is
+    the backstop for the paths that don't — notably run_long/run_read
+    submissions rejected by the executors module's admission/shutdown gate
+    — so they degrade to a retryable 503 instead of a 500."""
+    from fastapi.responses import JSONResponse
+
     from mlx_soloheaven.engine.process_client import EngineRestartingError
+    from mlx_soloheaven.engine.types import EngineBusyError
 
     @app.exception_handler(EngineRestartingError)
     async def _engine_restarting_handler(request, exc):
@@ -59,6 +69,21 @@ def register_engine_error_handlers(app: FastAPI):
             f"[503] {request.method} {request.url.path} — engine unavailable: {exc}"
         )
         return engine_unavailable_response(exc)
+
+    @app.exception_handler(EngineBusyError)
+    async def _engine_busy_handler(request, exc):
+        logger.warning(
+            f"[503] {request.method} {request.url.path} — engine busy: {exc}"
+        )
+        return JSONResponse(
+            status_code=503,
+            content={"error": {
+                "message": "engine busy, retry shortly",
+                "type": "engine_busy",
+                "detail": str(exc),
+            }},
+            headers={"Retry-After": "5"},
+        )
 
 
 def create_app(cfg: Config) -> FastAPI:
@@ -308,9 +333,90 @@ def create_app(cfg: Config) -> FastAPI:
         still alive; the engine's own atexit/SIGTERM registration remains the
         backstop (the flush re-reads the live dirty set on every call).
 
+        EXECUTOR LIFECYCLE (codex batch-3 review, rounds 2+3). Ordering:
+
+        1. executor quiesce — admission stops (new submissions fail fast,
+           503-style), queued not-yet-started work is CANCELLED, and
+           running calls get a bounded grace, all atomically against new
+           admissions (round 3, finding 1).
+        2. the engine-side mutation gate closes on every IN-PROCESS engine
+           (round 3, finding 2). The quiesce's bounded wait cannot stop a
+           worker that already STARTED but is BLOCKED on the engine lock
+           behind a generation; such a straggler would otherwise acquire
+           the lock AFTER the flush below, mutate session state, mark it
+           dirty — and nothing would flush again. With the gate set, every
+           post-flush mutating lock acquisition aborts with EngineBusyError
+           WITHOUT mutating. The gate is set for ALL engines BEFORE the
+           first flush (the flush is classmethod-wide). The flush itself is
+           exempt from the gate (it must run); the process-mode proxy has
+           no gate (the child's serial main loop + its own shutdown flush
+           make the ordering safe child-side). begin_shutdown also fires
+           the engine's cooperative cancel event, aborting an in-flight
+           compaction/rebuild prefill between chunks (round 5, finding 3a).
+        3. bounded drain of ALREADY-ENTERED mutations (round 5, finding
+           3a): an op inside its _mutate_locked section when the gate
+           closed can outlive quiesce and time out the flush's bounded
+           lock acquire, then publish + mark dirty AFTER the final flush.
+           wait_mutations_settled() waits (bounded) for in-flight
+           mutations to drain; any straggler that remains is covered
+           deterministically by the engine-side self-flush-on-exit — its
+           _mutate_locked exit path flushes its own dirty sessions before
+           releasing the lock, so nothing dirty survives un-persisted.
+        4. the engine flush / proxy close.
+        5. backstop pool teardown LAST.
+
+        Every step is idempotent (the executors module's atexit backstop
+        may re-run the same sequence).
+
         Fail-closed: a failed flush logs and continues — it must never block
         or corrupt server shutdown.
         """
+        from mlx_soloheaven import executors
+
+        try:
+            drained = executors.quiesce()
+            if (
+                drained.get("cancelled")
+                or drained.get("poisoned_critical")
+                or drained.get("still_running")
+            ):
+                logger.info(f"[Shutdown] executors quiesced: {drained}")
+        except Exception:  # noqa: BLE001 — never block server shutdown
+            logger.exception("[Shutdown] executor quiesce failed (continuing)")
+
+        # Close the engine-side mutation gate on EVERY in-process engine
+        # BEFORE the first flush (see the ordering rationale above).
+        for model_id, engine in engines.items():
+            try:
+                if hasattr(engine, "begin_shutdown"):
+                    engine.begin_shutdown()
+            except Exception:  # noqa: BLE001 — never block server shutdown
+                logger.exception(
+                    f"[Shutdown] engine {model_id} shutdown gate failed "
+                    f"(continuing)"
+                )
+
+        # Bounded drain of already-entered mutations BEFORE the flush
+        # (round 5, finding 3a). Stragglers past the bound self-flush on
+        # exit — see the ordering rationale above. (Process-mode proxies
+        # have no such method: the child's serial loop cannot interleave a
+        # mutation with its own shutdown flush.)
+        for model_id, engine in engines.items():
+            try:
+                if hasattr(engine, "wait_mutations_settled"):
+                    remaining = engine.wait_mutations_settled(5.0)
+                    if remaining:
+                        logger.warning(
+                            f"[Shutdown] engine {model_id}: {remaining} "
+                            f"mutation(s) still in flight after bounded "
+                            f"drain — relying on self-flush-on-exit"
+                        )
+            except Exception:  # noqa: BLE001 — never block server shutdown
+                logger.exception(
+                    f"[Shutdown] engine {model_id} mutation drain failed "
+                    f"(continuing)"
+                )
+
         for model_id, engine in engines.items():
             try:
                 if hasattr(engine, "load_model"):
@@ -326,18 +432,38 @@ def create_app(cfg: Config) -> FastAPI:
                     f"[Shutdown] engine {model_id} flush failed (continuing)"
                 )
 
+        # Backstop pool teardown AFTER the flush (idempotent).
+        try:
+            executors.shutdown_pools()
+        except Exception:  # noqa: BLE001 — never block server shutdown
+            logger.exception("[Shutdown] executor pool teardown failed")
+
     @app.get("/health")
     async def health():
-        return {
-            "status": "ok",
-            "models": {
-                model_id: {
-                    "model_id": engine.model_id,
-                    "sessions": engine.session_stats(),
-                }
-                for model_id, engine in engines.items()
-            },
-        }
+        # U14: session_stats is a synchronous engine RPC (process mode: the
+        # child serves it only between generations; in-process: bounded read
+        # lock). Run it off the event loop and degrade to a "busy"/"error"
+        # marker so /health ALWAYS answers — even mid-generation or with a
+        # dead child. F2: on the RESERVED reads executor (not to_thread's
+        # shared default pool), so the bounded read always gets a worker
+        # even when concurrent generations/mutating RPCs occupy every
+        # long-ops worker — otherwise the 10s bound never even starts.
+        from mlx_soloheaven.engine.types import EngineBusyError
+        from mlx_soloheaven.executors import run_read
+
+        models = {}
+        for model_id, engine in engines.items():
+            try:
+                sessions = await run_read(engine.session_stats)
+            except EngineBusyError:
+                sessions = {"busy": True}
+            except Exception:  # noqa: BLE001 — dead child: health stays up
+                sessions = {"error": True}
+            models[model_id] = {
+                "model_id": engine.model_id,
+                "sessions": sessions,
+            }
+        return {"status": "ok", "models": models}
 
     app.include_router(openai_compat.router)
     app.include_router(chat.router)

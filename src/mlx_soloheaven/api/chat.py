@@ -14,6 +14,14 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from mlx_soloheaven.engine.process_client import EngineRestartingError
+from mlx_soloheaven.engine.types import EngineBusyError
+from mlx_soloheaven.executors import (
+    LongReservation,
+    reserve_long_slot,
+    run_critical,
+    run_long,
+    run_read,
+)
 from mlx_soloheaven.engine.tool_parser import (
     CHANNEL_REASONING,
     ThinkingRouter,
@@ -96,7 +104,16 @@ async def list_sessions():
     # multi-model deployments still surface stats for the active engine.
     engine_stats: dict[str, dict] = {}
     for eng in (_engines.values() if _engines else [engine] if engine else []):
-        for entry in eng.list_sessions():
+        # U14: engine read off the event loop, bounded — a busy engine
+        # (generation in flight) just skips the drafter-stats enrichment.
+        # F2: reserved reads executor.
+        try:
+            entries = await run_read(eng.list_sessions)
+        except EngineBusyError:
+            continue
+        except Exception:  # noqa: BLE001 — dead child: keep the page alive
+            continue
+        for entry in entries:
             ds = entry.get("drafter_stats")
             if ds is not None:
                 engine_stats[entry["session_id"]] = ds
@@ -170,6 +187,37 @@ async def chat(session_id: str, req: SendMessageRequest):
     if ensure_available is not None:
         ensure_available()
 
+    # Codex round 11, finding 1: the NON-STREAMING path submits the whole
+    # generation through run_long AFTER the user message is persisted, and
+    # ensure_available() does NOT reserve executor capacity — a saturated
+    # long pool used to answer 503 with the message already in the DB (a
+    # retry duplicates it). Reserve the admission slot BEFORE the mutation;
+    # busy → clean 503 with the DB untouched. The streaming path bypasses
+    # run_long entirely (the engine's own async plumbing), so no
+    # reservation there.
+    slot: LongReservation | None = None
+    if not req.stream:
+        slot = reserve_long_slot()
+    try:
+        return await _chat_after_admission(session_id, req, session, use_engine, slot)
+    finally:
+        # No-op once run_long consumed the reservation; releases the slot
+        # when anything between the reserve and the submit threw.
+        if slot is not None:
+            slot.release()
+
+
+async def _chat_after_admission(
+    session_id: str,
+    req: SendMessageRequest,
+    session: dict,
+    use_engine: "MLXEngine",
+    slot: "LongReservation | None",
+):
+    """Body of the chat endpoint AFTER the availability preflight and the
+    (non-streaming) admission reservation — split out so the reservation's
+    try/finally in ``chat`` covers every DB mutation below (codex round 11,
+    finding 1)."""
     # Add user message
     await db.add_message(session_id, "user", content=req.content)
 
@@ -256,7 +304,7 @@ async def chat(session_id: str, req: SendMessageRequest):
             },
         )
     else:
-        return await _sync_chat(session_id, messages, use_engine)
+        return await _sync_chat(session_id, messages, use_engine, reservation=slot)
 
 
 async def _stream_chat(
@@ -331,58 +379,42 @@ async def _stream_chat_body(
     token_count = 0
 
     # Cache info for stats.
-    # In process mode the engine is an EngineProcessProxy: the parent holds NO
-    # session/KV-cache state (the child owns it), so the in-memory/disk peek
-    # below would raise AttributeError on ._sessions / ._has_disk_cache. Web
-    # chat is not a Stage-1 process-mode target; skip the preflight (the child
-    # still reuses its own cache) and report a neutral cache_info.
+    # F5 (codex batch-3 review, round 2): the preflight is an ENGINE method
+    # (session_cache_preflight) called on the reserved reads executor, and
+    # it is METADATA-ONLY — a short bounded lock over in-memory dict
+    # lookups, plus a lock-free plain-IO safetensors-header parse for the
+    # disk fallback. It never loads KV caches (mx.load on a non-owning
+    # thread violates the VLM thread-ownership rule) and never writes
+    # _sessions; the authoritative load happens on the generation thread.
+    # The old inline shape read/wrote eng._sessions and did disk loading
+    # directly in this async stream: it blocked the event loop and raced an
+    # in-process generation (bypassing U14/U15).
+    # In process mode the engine is an EngineProcessProxy without the
+    # method: the parent holds NO session/KV-cache state (the child owns
+    # it) — skip the preflight (the child still reuses its own cache) and
+    # report a neutral cache_info. A busy engine degrades like every other
+    # busy path (the preflight is informational only — the generation
+    # itself re-resolves the cache under its own lock).
     t_cache_check = time.perf_counter()
-    in_process_engine = hasattr(eng, "_sessions") and hasattr(eng, "_has_disk_cache")
-    session_state = None
-    if in_process_engine:
-        session_state = eng._sessions.get(session_id)
-        if not session_state and eng._has_disk_cache(session_id):
-            session_state = eng._load_session_from_disk(session_id)
-            if session_state:
-                eng._sessions[session_id] = session_state
     cache_hit = False
-    cache_info = (
-        {"type": "none", "detail": "New session"}
-        if in_process_engine
-        else {"type": "process", "detail": "Cache managed by generation process"}
-    )
-    if session_state:
-        if eng._messages_match(session_state.messages, messages):
-            cache_hit = (
-                session_state.cache_state is not None
-                and session_state.cache_state.cache is not None
-            )
-            cached_tokens = session_state.total_cache_tokens
-            new_msgs = messages[len(session_state.messages):]
-            suffix_desc = f"{len(new_msgs)} new message(s)" if new_msgs else "retry"
-            from_disk = (
-                session_id not in eng._sessions
-                or eng._sessions.get(session_id) is not session_state
-            )
-            source = "disk -> memory" if from_disk else "memory"
+    preflight = getattr(eng, "session_cache_preflight", None)
+    if preflight is None:
+        cache_info = {"type": "process", "detail": "Cache managed by generation process"}
+    else:
+        try:
+            pf = await run_read(preflight, session_id, messages)
+            cache_hit = bool(pf.get("cache_hit"))
+            cache_info = pf.get("cache_info") or {"type": "none", "detail": "New session"}
+        except EngineBusyError:
             cache_info = {
-                "type": "kv_cache_hit" if cache_hit else "kv_cache_rebuild",
-                "detail": (
-                    f"KV Cache reuse ({source}): {cached_tokens} tokens cached, {suffix_desc}"
-                    if cache_hit
-                    else f"Rebuilding KV cache for {len(messages)} messages"
-                ),
-                "cached_tokens": cached_tokens,
-                "stored_msgs": len(session_state.messages),
-                "source": source,
+                "type": "busy",
+                "detail": "Engine busy (generation in flight) — cache state unknown",
             }
-        else:
-            cache_info = {
-                "type": "kv_cache_miss",
-                "detail": f"Conversation changed, reprocessing {len(messages)} messages",
-                "stored_msgs": len(session_state.messages),
-                "incoming_msgs": len(messages),
-            }
+        except Exception:  # noqa: BLE001 — preflight is informational only
+            logger.exception(
+                f"[Stream] session={session_id} | cache preflight failed (ignored)"
+            )
+            cache_info = {"type": "none", "detail": "Cache preflight unavailable"}
     t_cache_done = time.perf_counter()
 
     start_event = json.dumps(
@@ -650,7 +682,23 @@ async def _stream_chat_body(
         )
 
         updated_messages = messages + [{"role": "assistant", "content": content}]
-        eng.update_session_messages(session_id, updated_messages)
+        # U14: synchronous engine RPC — keep it off the event loop.
+        # Codex round 5, finding 1: this commit runs BETWEEN the last
+        # streamed token and the terminal "done" event — a saturated long
+        # pool used to reject it (EngineBusyError escaped mid-stream, no
+        # done event, and pre-1a no dirty-mark for the fresh cache). It now
+        # rides the guaranteed critical lane, and ANY failure is log-only:
+        # the engine already marked the session dirty at install (finding
+        # 1a), so the terminal event below must be unconditional.
+        try:
+            await run_critical(
+                eng.update_session_messages, session_id, updated_messages
+            )
+        except Exception:  # noqa: BLE001 — terminal event must still go out
+            logger.exception(
+                f"[Stream] session={session_id} | post-stream session commit "
+                f"failed (persistence already guaranteed engine-side)"
+            )
 
         # Update session total tokens
         new_total = await db.get_session_total_tokens(session_id)
@@ -687,10 +735,21 @@ async def _stream_chat_body(
     yield f"data: {done_event}\n\n"
 
 
-async def _sync_chat(session_id: str, messages: list[dict], eng: "MLXEngine | None" = None) -> dict:
-    """Non-streaming chat response."""
+async def _sync_chat(
+    session_id: str,
+    messages: list[dict],
+    eng: "MLXEngine | None" = None,
+    reservation: "LongReservation | None" = None,
+) -> dict:
+    """Non-streaming chat response. ``reservation`` is the admission slot
+    the chat endpoint acquired BEFORE persisting the user message (codex
+    round 11, finding 1) — consumed by the run_long below."""
     eng = eng or engine
-    result = eng.complete(messages, session_id=session_id)
+    # U14: complete() blocks for the WHOLE generation — off the event loop.
+    # F2: non-streaming generation -> bounded long-ops executor.
+    result = await run_long(
+        eng.complete, messages, session_id=session_id, reservation=reservation
+    )
 
     # U6/F1: corruption-terminated — return an error, persist nothing.
     if result.finish_reason == "error":
@@ -708,7 +767,21 @@ async def _sync_chat(session_id: str, messages: list[dict], eng: "MLXEngine | No
     )
 
     updated_messages = messages + [{"role": "assistant", "content": result.content}]
-    eng.update_session_messages(session_id, updated_messages)
+    # U14: synchronous engine RPC — keep it off the event loop.
+    # Codex round 5, finding 1 (same shape as the streaming path): the
+    # generation COMPLETED — failing the whole response over this
+    # bookkeeping call would drop finished work, and the engine-side
+    # dirty-mark (finding 1a) already guarantees persistence. Critical
+    # lane + log-only failure.
+    try:
+        await run_critical(
+            eng.update_session_messages, session_id, updated_messages
+        )
+    except Exception:  # noqa: BLE001 — the completed response must go out
+        logger.exception(
+            f"[Chat] session={session_id} | post-completion session commit "
+            f"failed (persistence already guaranteed engine-side)"
+        )
 
     # Update session total tokens
     new_total = await db.get_session_total_tokens(session_id)
@@ -746,46 +819,60 @@ async def branch_session(session_id: str, req: BranchRequest):
     source_messages = await db.get_messages(session_id)
     branch_messages = source_messages[:req.turn]
 
-    title = (source.get("title", "New Chat") + " (branch)")[:50]
-    new_session = await db.create_session(
-        title=title,
-        system_prompt=source.get("system_prompt", ""),
-        branched_from=session_id,
-        branch_turn=req.turn,
-    )
-    new_id = new_session["id"]
-
-    for msg in branch_messages:
-        await db.add_message(
-            new_id, msg["role"],
-            content=msg.get("content"),
-            tool_calls=msg.get("tool_calls"),
-            tool_call_id=msg.get("tool_call_id"),
-            thinking=msg.get("thinking"),
-            token_count=msg.get("token_count", 0),
-            stats=msg.get("stats"),
+    # Codex round 11, finding 1: reserve the long-pool admission slot BEFORE
+    # the durable session copy — ensure_available() does NOT reserve
+    # executor capacity, so a saturated long pool used to reject run_long
+    # only AFTER the branch session + messages were created (orphan
+    # half-built session, zero engine calls). Busy now answers 503 with the
+    # DB untouched; the context manager releases the slot if anything
+    # before the submit throws.
+    with reserve_long_slot() as slot:
+        title = (source.get("title", "New Chat") + " (branch)")[:50]
+        new_session = await db.create_session(
+            title=title,
+            system_prompt=source.get("system_prompt", ""),
+            branched_from=session_id,
+            branch_turn=req.turn,
         )
+        new_id = new_session["id"]
 
-    # Build engine messages (with system prompt, same format as chat endpoint)
-    engine_msgs = []
-    system_prompt = source.get("system_prompt", "")
-    if system_prompt:
-        engine_msgs.append({"role": "system", "content": system_prompt})
-    for msg in branch_messages:
-        m = {"role": msg["role"]}
-        if msg.get("content"):
-            m["content"] = msg["content"]
-        if msg.get("tool_calls"):
-            m["tool_calls"] = msg["tool_calls"]
-        if msg.get("tool_call_id"):
-            m["tool_call_id"] = msg["tool_call_id"]
-        engine_msgs.append(m)
+        for msg in branch_messages:
+            await db.add_message(
+                new_id, msg["role"],
+                content=msg.get("content"),
+                tool_calls=msg.get("tool_calls"),
+                tool_call_id=msg.get("tool_call_id"),
+                thinking=msg.get("thinking"),
+                token_count=msg.get("token_count", 0),
+                stats=msg.get("stats"),
+            )
 
-    # Engine branch: checkpoint restore (fast) or build from scratch (slow)
-    # (engine resolved + availability preflighted at the top, before the DB
-    # mutations above)
-    engine_turn = len(engine_msgs)
-    result = eng.branch_from_turn(session_id, new_id, engine_turn, branch_messages=engine_msgs)
+        # Build engine messages (with system prompt, same format as chat endpoint)
+        engine_msgs = []
+        system_prompt = source.get("system_prompt", "")
+        if system_prompt:
+            engine_msgs.append({"role": "system", "content": system_prompt})
+        for msg in branch_messages:
+            m = {"role": msg["role"]}
+            if msg.get("content"):
+                m["content"] = msg["content"]
+            if msg.get("tool_calls"):
+                m["tool_calls"] = msg["tool_calls"]
+            if msg.get("tool_call_id"):
+                m["tool_call_id"] = msg["tool_call_id"]
+            engine_msgs.append(m)
+
+        # Engine branch: checkpoint restore (fast) or build from scratch (slow)
+        # (engine resolved + availability preflighted at the top, before the DB
+        # mutations above)
+        engine_turn = len(engine_msgs)
+        # U14: heavy synchronous engine call — keep it off the event loop.
+        # F2: mutating RPC -> long-ops executor (consumes the reservation).
+        result = await run_long(
+            eng.branch_from_turn, session_id, new_id, engine_turn,
+            branch_messages=engine_msgs,
+            reservation=slot,
+        )
 
     return {
         "session_id": new_id,
@@ -815,35 +902,46 @@ async def delete_last_turn(session_id: str):
     last_content = messages[-1].get("content", "") or ""
     is_compaction = last_content.startswith("The conversation history before this point was compacted")
 
-    if is_compaction:
-        # Compaction message: delete just this one
-        await db.delete_last_message(session_id)
-    else:
-        # Normal turn: delete assistant + user pair
-        if len(messages) < 2:
-            raise HTTPException(400, "Not enough messages to delete")
-        await db.delete_last_message(session_id)
-        await db.delete_last_message(session_id)
+    # Codex round 11, finding 1: reserve the long-pool admission slot BEFORE
+    # deleting DB messages — a saturated pool used to reject run_long only
+    # AFTER 1-2 messages were already removed (DB/engine desync; a client
+    # retry deletes a SECOND turn). Busy now answers 503 with the DB
+    # untouched.
+    with reserve_long_slot() as slot:
+        if is_compaction:
+            # Compaction message: delete just this one
+            await db.delete_last_message(session_id)
+        else:
+            # Normal turn: delete assistant + user pair
+            if len(messages) < 2:
+                raise HTTPException(400, "Not enough messages to delete")
+            await db.delete_last_message(session_id)
+            await db.delete_last_message(session_id)
 
-    # Build engine messages for remaining
-    source = await db.get_session(session_id)
-    remaining_db = messages[:-2]
-    engine_msgs = []
-    system_prompt = source.get("system_prompt", "") if source else ""
-    if system_prompt:
-        engine_msgs.append({"role": "system", "content": system_prompt})
-    for msg in remaining_db:
-        m = {"role": msg["role"]}
-        if msg.get("content"):
-            m["content"] = msg["content"]
-        if msg.get("tool_calls"):
-            m["tool_calls"] = msg["tool_calls"]
-        if msg.get("tool_call_id"):
-            m["tool_call_id"] = msg["tool_call_id"]
-        engine_msgs.append(m)
+        # Build engine messages for remaining
+        source = await db.get_session(session_id)
+        remaining_db = messages[:-2]
+        engine_msgs = []
+        system_prompt = source.get("system_prompt", "") if source else ""
+        if system_prompt:
+            engine_msgs.append({"role": "system", "content": system_prompt})
+        for msg in remaining_db:
+            m = {"role": msg["role"]}
+            if msg.get("content"):
+                m["content"] = msg["content"]
+            if msg.get("tool_calls"):
+                m["tool_calls"] = msg["tool_calls"]
+            if msg.get("tool_call_id"):
+                m["tool_call_id"] = msg["tool_call_id"]
+            engine_msgs.append(m)
 
-    # Truncate engine session (engine resolved + preflighted at the top)
-    result = eng.truncate_session(session_id, len(engine_msgs))
+        # Truncate engine session (engine resolved + preflighted at the top)
+        # U14: heavy synchronous engine call — keep it off the event loop.
+        # F2: mutating RPC -> long-ops executor (consumes the reservation).
+        result = await run_long(
+            eng.truncate_session, session_id, len(engine_msgs),
+            reservation=slot,
+        )
 
     return {
         "status": "ok",
@@ -869,14 +967,24 @@ async def regenerate_session(session_id: str):
     if ensure_available is not None:
         ensure_available()
 
-    # Delete assistant message
-    await db.delete_last_message(session_id)
+    # Codex round 11, finding 1: reserve the long-pool admission slot BEFORE
+    # deleting the assistant message — a saturated pool used to reject
+    # run_long only AFTER the delete (codex reproduced: the session was
+    # left with a dangling user turn and zero engine calls; a retry deletes
+    # yet more). Busy now answers 503 with the DB untouched.
+    with reserve_long_slot() as slot:
+        # Delete assistant message
+        await db.delete_last_message(session_id)
 
-    # Restore engine cache
-    result = eng.prepare_regenerate(session_id)
+        # Restore engine cache
+        # U14: heavy synchronous engine call — keep it off the event loop.
+        # F2: mutating RPC -> long-ops executor (consumes the reservation).
+        result = await run_long(
+            eng.prepare_regenerate, session_id, reservation=slot
+        )
 
-    # Delete user message (frontend will re-send it)
-    await db.delete_last_message(session_id)
+        # Delete user message (frontend will re-send it)
+        await db.delete_last_message(session_id)
 
     return {"status": "ok", "remaining_messages": len(messages) - 2, **result}
 
@@ -904,7 +1012,14 @@ async def search_memories(q: str):
 
 @router.get("/cache/stats")
 async def cache_stats():
-    return {
-        **engine.cache_manager.stats(),
-        **engine.session_stats(),
-    }
+    # U14: engine reads off the event loop, bounded — a busy engine
+    # (generation in flight) answers {"busy": true} instead of hanging
+    # (process mode: cache_manager is the proxy shim whose stats() RPCs the
+    # child's cache_overview; in-process: session_stats takes the bounded
+    # read lock). F2: reserved reads executor.
+    try:
+        cm_stats = await run_read(engine.cache_manager.stats)
+        sess_stats = await run_read(engine.session_stats)
+    except EngineBusyError:
+        return {"busy": True}
+    return {**cm_stats, **sess_stats}

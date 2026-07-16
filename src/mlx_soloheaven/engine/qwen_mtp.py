@@ -85,6 +85,8 @@ import mlx.nn as nn
 from mlx_lm.generate import generation_stream
 from mlx_lm.models.cache import KVCache, make_prompt_cache
 
+from mlx_soloheaven.engine.types import GenerationCancelled
+
 logger = logging.getLogger(__name__)
 
 QWEN_MTP_MODEL_TYPE = "qwen3_5_mtp"
@@ -95,6 +97,49 @@ class MTPCacheCorruption(RuntimeError):
     the expected per-layer offsets (or a round invariant broke). The runner
     TERMINATES the stream at the corruption point (U6) and fires
     ``on_cache_corruption`` so the caller invalidates the session cache."""
+
+
+class GeneratorCloseReason:
+    """Explicit close-reason channel between a WRAPPER that closes the
+    runner generator and the runner's finally-time finalize decision (codex
+    round 7, finding 1).
+
+    Why inference alone is not enough: the runner's ``except GeneratorExit``
+    used to infer "cancellation-driven close" from the live cancel_event.
+    But the production path wraps the runner in ``_pld_response_adapter``,
+    and the adapter can be torn down AFTER it already yielded the turn's
+    EOS frame (engine delivered it, client disconnects, engine closes the
+    adapter): the adapter teardown then GeneratorExit-closes the INNER
+    runner while the event is set, the runner misclassified the close as a
+    cancel and skipped finalization — the cache landed one token short of
+    the recorded ids while the COMPLETE assistant message was persisted
+    (silent next-HIT suffix corruption).
+
+    The rule encoded here: if the turn's EOS was already produced, the turn
+    is COMPLETE and finalization must run, regardless of the cancel_event.
+    The wrapper that observed the EOS marks the cell NATURAL before closing
+    the runner; a cancel-driven closer may mark CANCEL. An UNMARKED cell
+    falls back to the round-6 inference (GeneratorExit + event set ->
+    cancel), preserving the engine's rescue-path semantics for closers that
+    do not know the stream state."""
+
+    NATURAL = "natural"
+    CANCEL = "cancel"
+
+    __slots__ = ("reason",)
+
+    def __init__(self) -> None:
+        self.reason: Optional[str] = None
+
+    def mark_natural(self) -> None:
+        """The turn completed (EOS/final frame already produced) — the
+        upcoming close is teardown of a FINISHED stream, not a cancel."""
+        self.reason = self.NATURAL
+
+    def mark_cancel(self) -> None:
+        """The upcoming close is cancellation-driven — skip the finalize
+        forwards even if the cancel_event is not (yet) set."""
+        self.reason = self.CANCEL
 
 
 # ---------------------------------------------------------------------------
@@ -566,6 +611,7 @@ def mtp_prefill_base(
     n_target_layers: int,
     prefill_step_size: int = 2048,
     ops: Optional[Any] = None,
+    cancel_event: Optional[Any] = None,
 ) -> mx.array:
     """Prefill a FRESH ``n_target + n_head``-entry cache over ``tokens``
     into the FINALIZED shape and return the boundary hidden.
@@ -582,6 +628,16 @@ def mtp_prefill_base(
     Used by the engine to build MTP-reusable BASE caches (shared system
     prefixes) outside generation. Per-chunk eval + clear_cache bound memory
     on long prefixes; everything runs on ``generation_stream``.
+
+    U13: ``cancel_event`` (optional) is checked BETWEEN chunks; when set the
+    prefill aborts with ``GenerationCancelled``. The partially filled
+    ``prompt_cache`` is a FRESH cache owned by the caller — discard it (it
+    never met the finalized-shape post-condition).
+
+    F4 (codex batch-3 review, round 2): checked once more AFTER the final
+    chunk — a disconnect DURING the last chunk otherwise slips through into
+    the held-out-token forward and on to base-cache registration (the
+    engine additionally re-checks right before registering).
     """
     if prompt_cache is None or n_target_layers <= 0:
         raise ValueError("mtp_prefill_base requires an explicit prompt_cache")
@@ -600,6 +656,11 @@ def mtp_prefill_base(
     rem = mx.array(list(tokens), mx.uint32)
     with mx.stream(generation_stream):
         while int(rem.size) > 1:
+            if cancel_event is not None and cancel_event.is_set():
+                raise GenerationCancelled(
+                    f"mtp base prefill cancelled with {int(rem.size)}/"
+                    f"{len(tokens)} tokens remaining"
+                )
             n = min(prefill_step_size, int(rem.size) - 1)
             chunk = rem[:n]
             hid_chunk = ops.target_hidden(chunk[None], target_cache)
@@ -607,6 +668,14 @@ def mtp_prefill_base(
             _eval_cache_states(prompt_cache)
             rem = rem[n:]
             mx.clear_cache()
+        if cancel_event is not None and cancel_event.is_set():
+            # F4 (round 2): disconnect DURING the final chunk — stop before
+            # the held-out-token forward (further model work for a dead
+            # request; registration is also aborted by this raise).
+            raise GenerationCancelled(
+                f"mtp base prefill cancelled after final chunk "
+                f"({len(tokens)} tokens)"
+            )
         hid_last = ops.target_hidden(rem[None], target_cache)
     hid = hid_last[:, -1:, :]
     _eval_cache_states(prompt_cache)
@@ -653,6 +722,8 @@ def qwen_mtp_generate_step(
     on_finalize: Optional[Callable[[Optional[int], Optional[mx.array]], None]] = None,
     resume_hidden: Optional[mx.array] = None,
     ops: Optional[Any] = None,
+    cancel_event: Optional[Any] = None,
+    close_reason: Optional[GeneratorCloseReason] = None,
 ) -> Generator[Tuple[int, Any, bool], None, None]:
     """MTP speculative decoding round loop. Yields ``(token, logprobs,
     from_draft)`` triples (same shape as ``pld_generate_step`` — adapt with
@@ -693,7 +764,24 @@ def qwen_mtp_generate_step(
     yielded token and lands at head_offset == target_offset - 1 (the lazy
     last slot). ``on_finalize(final_token, final_hidden)`` hands the caller
     the hidden needed for next turn's lazy commit (None/None on a broken or
-    empty stream -> next turn cold-fills).
+    empty stream -> next turn cold-fills). On a CANCELLATION-driven close —
+    the generator receives GeneratorExit WHILE ``cancel_event`` is set (the
+    engine sets the event before closing) — the settle still runs —
+    cache-state consistency requires it — but the finalize forwards are
+    skipped and ``on_finalize(None, None)`` is reported (F4, codex round
+    3). A stream that exhausts NATURALLY always finalizes, even when the
+    event was set late (after the last frame was delivered): the engine has
+    recorded the full history on that path and a skipped finalize would
+    leave the cache one token short of it (codex round 5, finding 2; see
+    the ``finally`` comments).
+
+    ``close_reason`` (codex round 7, finding 1) is the EXPLICIT close-reason
+    channel for wrappers that close this generator: a marked-NATURAL close
+    always finalizes and a marked-CANCEL close always skips the finalize
+    forwards, OVERRIDING the cancel_event inference above. An unmarked cell
+    (or ``close_reason=None``) keeps the round-6 inference as the fallback.
+    ``_pld_response_adapter`` marks NATURAL when it already yielded the EOS
+    frame — the turn is complete regardless of a late-set cancel_event.
     """
     if prompt_cache is None or n_target_layers <= 0:
         raise ValueError("qwen_mtp_generate_step requires an explicit prompt_cache")
@@ -887,6 +975,18 @@ def qwen_mtp_generate_step(
     stats = {"rounds": 0, "drafted": 0, "accepted": 0, "emitted": 0}
     broken = False  # fail-closed: plain decode for the rest of the stream
     fatal = False  # unexpected exception: skip finally settle/finalize
+    # Codex round 5, finding 2: True ONLY when the generator was CLOSED
+    # (GeneratorExit) while cancel_event was set — i.e. the engine observed
+    # the cancel and closed this generator. The finally consults THIS flag,
+    # never the raw event: a stream that exhausts NATURALLY (EOS/max_tokens
+    # fully delivered and recorded by the engine) must ALWAYS finalize, even
+    # if a late client disconnect set the event between the last frame and
+    # the exhaustion. Pre-fix the finally read the live event, skipped the
+    # finalize forwards, and the engine's NORMAL persistence then truncated
+    # recorded ids to the one-short cache while saving the COMPLETE
+    # assistant text — the next HIT's suffix splice silently dropped the
+    # final token (stored ids must end WITH the stop token on ChatML).
+    closed_by_cancel = False
     round_ctx: Optional[dict] = None
     cur_hid: Optional[mx.array] = None  # hidden after the last FORWARDED token
     cur_b: Optional[int] = None  # pending token (yielded, not yet forwarded)
@@ -897,6 +997,18 @@ def qwen_mtp_generate_step(
         rem = y
         with mx.stream(generation_stream):
             while int(rem.size) > 1:
+                if cancel_event is not None and cancel_event.is_set():
+                    # U13: disconnect during a long prefill — abort between
+                    # chunks. Raising here lands in the BaseException handler
+                    # below (fatal + on_cache_corruption): the target+head
+                    # caches are mid-prefill and cannot be verifiably
+                    # rewound, so the fail-closed outcome is INVALIDATE (the
+                    # engine's cancel commit then takes its Path 0 — stale
+                    # messages harmless, next turn cold-fills honestly).
+                    raise GenerationCancelled(
+                        f"mtp prefill cancelled with {int(rem.size)} suffix "
+                        f"tokens remaining"
+                    )
                 n = min(prefill_step_size, int(rem.size) - 1)
                 chunk = rem[:n]
                 hid_chunk = ops.target_hidden(chunk[None], target_cache)
@@ -904,6 +1016,17 @@ def qwen_mtp_generate_step(
                 _eval_cache_states(prompt_cache)
                 rem = rem[n:]
                 mx.clear_cache()
+            if cancel_event is not None and cancel_event.is_set():
+                # F4 (codex round 3): a disconnect DURING the final prefill
+                # chunk passes every between-chunk check above — abort here,
+                # BEFORE the held-out bootstrap forward runs more model work
+                # for a dead request. Same fail-closed outcome as the
+                # in-loop raise (fatal + invalidate via the BaseException
+                # handler below).
+                raise GenerationCancelled(
+                    "mtp prefill cancelled during final chunk (before the "
+                    "held-out bootstrap forward)"
+                )
             # ---- bootstrap: forward the held-out last suffix token ----
             hid_last = ops.target_hidden(rem[None], target_cache)
             logits0 = ops.target_logits(hid_last[:, -1:, :])
@@ -1064,7 +1187,35 @@ def qwen_mtp_generate_step(
             if stats["rounds"] % 64 == 0:
                 mx.clear_cache()
     except GeneratorExit:
-        raise  # normal early close (EOS/cancel) — finally settles exactly
+        # Early close (EOS-break teardown / engine cancel close). Decide
+        # whether it is CANCELLATION-driven so the finally can distinguish
+        # it from a completed turn's teardown:
+        #
+        # Codex round 7, finding 1 — the EXPLICIT channel wins. The
+        # production wrapper (_pld_response_adapter) marks the shared
+        # ``close_reason`` cell NATURAL once it yielded the turn's EOS
+        # frame: a close arriving after that point is teardown of a
+        # COMPLETE turn (the engine recorded + delivered the EOS), and the
+        # finalize forwards MUST run even though a client disconnect set
+        # cancel_event in between — pre-fix the event inference below
+        # misread that close as a cancel, skipped finalization, and the
+        # cache landed one token short of the recorded ids while the
+        # complete assistant message was persisted (silent next-HIT suffix
+        # corruption). A marked-CANCEL cell forces the skip symmetrically.
+        #
+        # UNMARKED cell (or no cell): fall back to the round-5/6 inference
+        # — the engine sets cancel_event before gen.close() on its
+        # cancel-break and disconnect-rescue paths, so GeneratorExit + event
+        # set -> cancel. Then re-raise per the generator protocol; the
+        # finally settles exactly.
+        _explicit = close_reason.reason if close_reason is not None else None
+        if _explicit == GeneratorCloseReason.NATURAL:
+            closed_by_cancel = False
+        elif _explicit == GeneratorCloseReason.CANCEL:
+            closed_by_cancel = True
+        else:
+            closed_by_cancel = cancel_event is not None and cancel_event.is_set()
+        raise
     except BaseException:
         # Unexpected failure mid-mutation: the cache cannot be trusted.
         fatal = True
@@ -1072,6 +1223,46 @@ def qwen_mtp_generate_step(
         raise
     finally:
         if not fatal:
+            # F4 (codex round 3): distinguish a CANCELLATION-driven close
+            # (the engine observed cancel_event and closed this generator)
+            # from a normal EOS/max_tokens close. On cancel, skip the model
+            # forwards the close path does not need — but keep the ones
+            # cache-state consistency REQUIRES:
+            #
+            # Codex round 5, finding 2: "cancellation-driven" is decided by
+            # ``closed_by_cancel`` (GeneratorExit received WITH the event
+            # set — set in the except handler above), NOT by re-reading the
+            # live event here. Interleaving that forced this: the engine
+            # records + delivers the last frame, the client disconnects
+            # (event set), the engine requests the next frame and the
+            # runner exhausts NATURALLY into this finally — the engine's
+            # cancel check never runs again (no further frame), so it takes
+            # the NORMAL persistence path with the full recorded history;
+            # skipping the finalize here would leave the cache one token
+            # short of that history (silent next-turn suffix corruption).
+            # Natural exhaustion therefore ALWAYS finalizes; only a real
+            # close-after-cancel skips the forwards (and still settles).
+            #   * the finally-settle below is KEPT even on cancel: it
+            #     reconciles a mid-round cache to exactly prompt + yielded
+            #     - 1 tokens (snapshot restore + a replay forward of at most
+            #     block_size+1 tokens — cheap) and re-establishes the
+            #     head == target - 1 invariant. Skipping it would leave
+            #     verify-advanced ghost tokens in the target, and the
+            #     engine's C1 commit/reconcile would be forced to invalidate
+            #     the whole session cache instead of reusing it.
+            #   * the FINALIZE forwards (pending-pair head commit + the
+            #     pending-token target forward) are SKIPPED on cancel: they
+            #     exist solely to land the finalized MTP-resume contract for
+            #     the NEXT turn, but the engine breaks its stream loop
+            #     before recording the pending token on a cancel, so the
+            #     finalized cache would sit one token AHEAD of the recorded
+            #     ids — on this hybrid (untrimmable ArraysCache) target the
+            #     reconcile then INVALIDATES it. Skipping leaves the settled
+            #     cache exactly matching the recorded history instead, and
+            #     on_finalize(None, None) honestly reports that no resume
+            #     hidden exists (next turn plans the plain fallback /
+            #     strip-head path, never a bogus MTP resume).
+            _cancelled = closed_by_cancel
             try:
                 if round_ctx is not None and not broken:
                     cur_hid, cur_b = _settle_round(round_ctx)
@@ -1081,7 +1272,12 @@ def qwen_mtp_generate_step(
                 broken = True
                 _fire_corruption()
             try:
-                if not broken and cur_hid is not None and cur_b is not None:
+                if (
+                    not broken
+                    and not _cancelled
+                    and cur_hid is not None
+                    and cur_b is not None
+                ):
                     # Finalize: (1) commit the pending pair into the head,
                     # (2) forward the pending (final/stop) token through the
                     # TARGET — mirroring plain mlx-lm's lookahead

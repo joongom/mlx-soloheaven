@@ -86,6 +86,71 @@ def register_engine_error_handlers(app: FastAPI):
         )
 
 
+def build_per_model_config(cfg: Config, mcfg, *, engine_mode: str | None = None) -> Config:
+    """Per-model Config: the model's own settings + every GLOBAL server flag
+    an engine reads off its cfg.
+
+    U27: the process-mode and in-process multi-model builders used to be two
+    hand-maintained copies of this kwargs list, and the in-process (--models)
+    copy dropped ``stream_coalesce_n``/``stream_coalesce_ms`` — the
+    --stream-coalesce-n/ms flags silently reset to the dataclass defaults
+    (4/30) for every per-model engine. One shared, module-level (hermetically
+    testable) builder makes that class of drift impossible. ``engine_mode``
+    is the only caller-divergent field (process mode pins "process"; the
+    in-process path keeps the dataclass default, matching its historical
+    construction)."""
+    kwargs = dict(
+        model_path=mcfg.model_path,
+        host=cfg.host,
+        port=cfg.port,
+        default_temperature=mcfg.default_temperature,
+        default_top_p=mcfg.default_top_p,
+        default_min_p=mcfg.default_min_p,
+        default_top_k=mcfg.default_top_k,
+        # Carry the CLI-pinned marker so each per-model engine knows which
+        # sampling fields must NOT be overridden by generation_config.json.
+        cli_set_sampling=mcfg.cli_set_sampling,
+        default_repetition_penalty=mcfg.default_repetition_penalty,
+        default_max_tokens=mcfg.default_max_tokens,
+        thinking_budget=mcfg.thinking_budget,
+        enable_thinking=mcfg.enable_thinking,
+        memory_budget_gb=cfg.memory_budget_gb,
+        disk_budget_gb=cfg.disk_budget_gb,
+        # Carry the MLX Metal buffer-reuse pool cap so each engine honours
+        # --mlx-cache-limit-gb / SOLOHEAVEN_MLX_CACHE_LIMIT_GB instead of
+        # silently falling back to the dataclass default.
+        mlx_cache_limit_gb=cfg.mlx_cache_limit_gb,
+        data_dir=cfg.data_dir,
+        verbose=cfg.verbose,
+        gpu_keepalive=cfg.gpu_keepalive,
+        # Carry over tuning flags from top-level cfg
+        kv_bits=cfg.kv_bits,
+        kv_group_size=cfg.kv_group_size,
+        quantized_kv_start=cfg.quantized_kv_start,
+        prefill_step_size=cfg.prefill_step_size,
+        pld_enabled=cfg.pld_enabled,
+        pld_num_draft_tokens=cfg.pld_num_draft_tokens,
+        pld_ngram_k=cfg.pld_ngram_k,
+        # Speculative-decoding drafter (MTP / DFlash) — must be propagated to
+        # the per-model Config or `MLXEngine.load_model` silently skips
+        # drafter wiring. Without this, `--draft-model` at the CLI never
+        # reaches the engine and MTP is a no-op.
+        draft_model=cfg.draft_model,
+        draft_kind=cfg.draft_kind,
+        draft_block_size=cfg.draft_block_size,
+        # U27: stream-coalescing knobs — the engine reads them off ITS OWN
+        # cfg in _run's post-loop (and the process worker off its snapshot).
+        stream_coalesce_n=cfg.stream_coalesce_n,
+        stream_coalesce_ms=cfg.stream_coalesce_ms,
+        # Carry the backend selection so each per-model engine's load_model
+        # gate routes mlx-lm vs mlx-vlm correctly (else it defaults to "auto").
+        backend=mcfg.backend,
+    )
+    if engine_mode is not None:
+        kwargs["engine_mode"] = engine_mode
+    return Config(**kwargs)
+
+
 def create_app(cfg: Config) -> FastAPI:
     """Build the FastAPI application with all routes and middleware."""
     # NOTE: do NOT import mlx_engine (or anything pulling in mlx.core/mlx_vlm)
@@ -152,48 +217,7 @@ def create_app(cfg: Config) -> FastAPI:
         from mlx_soloheaven.engine.process_client import EngineProcessProxy
 
         mcfg = cfg.models[0]
-        model_cfg = Config(
-            model_path=mcfg.model_path,
-            host=cfg.host,
-            port=cfg.port,
-            default_temperature=mcfg.default_temperature,
-            default_top_p=mcfg.default_top_p,
-            default_min_p=mcfg.default_min_p,
-            default_top_k=mcfg.default_top_k,
-            # Carry the CLI-pinned marker so the child engine knows which
-            # sampling fields must NOT be overridden by generation_config.json.
-            cli_set_sampling=mcfg.cli_set_sampling,
-            default_repetition_penalty=mcfg.default_repetition_penalty,
-            default_max_tokens=mcfg.default_max_tokens,
-            thinking_budget=mcfg.thinking_budget,
-            enable_thinking=mcfg.enable_thinking,
-            memory_budget_gb=cfg.memory_budget_gb,
-            disk_budget_gb=cfg.disk_budget_gb,
-            # Carry the MLX Metal buffer-reuse pool cap; process mode is the
-            # default for a single --model, so without this the child engine
-            # silently falls back to the dataclass default and ignores
-            # --mlx-cache-limit-gb / SOLOHEAVEN_MLX_CACHE_LIMIT_GB.
-            mlx_cache_limit_gb=cfg.mlx_cache_limit_gb,
-            data_dir=cfg.data_dir,
-            verbose=cfg.verbose,
-            gpu_keepalive=cfg.gpu_keepalive,
-            kv_bits=cfg.kv_bits,
-            kv_group_size=cfg.kv_group_size,
-            quantized_kv_start=cfg.quantized_kv_start,
-            prefill_step_size=cfg.prefill_step_size,
-            pld_enabled=cfg.pld_enabled,
-            pld_num_draft_tokens=cfg.pld_num_draft_tokens,
-            pld_ngram_k=cfg.pld_ngram_k,
-            draft_model=cfg.draft_model,
-            draft_kind=cfg.draft_kind,
-            draft_block_size=cfg.draft_block_size,
-            stream_coalesce_n=cfg.stream_coalesce_n,
-            stream_coalesce_ms=cfg.stream_coalesce_ms,
-            engine_mode="process",
-            # Carry the backend selection so the child engine's load_model gate
-            # routes mlx-lm vs mlx-vlm correctly (else it defaults to "auto").
-            backend=mcfg.backend,
-        )
+        model_cfg = build_per_model_config(cfg, mcfg, engine_mode="process")
         engines[mcfg.model_id] = EngineProcessProxy(model_cfg)  # type: ignore[assignment]
         logger.info(
             f"[engine-mode] PROCESS mode enabled for single model "
@@ -214,51 +238,10 @@ def create_app(cfg: Config) -> FastAPI:
         # process.
         from mlx_soloheaven.engine.mlx_engine import MLXEngine
         for mcfg in cfg.models:
-            # Create a Config per model with shared server settings
-            model_cfg = Config(
-                model_path=mcfg.model_path,
-                host=cfg.host,
-                port=cfg.port,
-                default_temperature=mcfg.default_temperature,
-                default_top_p=mcfg.default_top_p,
-                default_min_p=mcfg.default_min_p,
-                default_top_k=mcfg.default_top_k,
-                # Carry the CLI-pinned marker so each per-model engine knows
-                # which sampling fields must NOT be overridden by
-                # generation_config.json.
-                cli_set_sampling=mcfg.cli_set_sampling,
-                default_repetition_penalty=mcfg.default_repetition_penalty,
-                default_max_tokens=mcfg.default_max_tokens,
-                thinking_budget=mcfg.thinking_budget,
-                enable_thinking=mcfg.enable_thinking,
-                memory_budget_gb=cfg.memory_budget_gb,
-                disk_budget_gb=cfg.disk_budget_gb,
-                # Carry the MLX Metal buffer-reuse pool cap so each per-model
-                # engine honours --mlx-cache-limit-gb instead of the dataclass
-                # default.
-                mlx_cache_limit_gb=cfg.mlx_cache_limit_gb,
-                data_dir=cfg.data_dir,
-                verbose=cfg.verbose,
-                gpu_keepalive=cfg.gpu_keepalive,
-                # Carry over tuning flags from top-level cfg
-                kv_bits=cfg.kv_bits,
-                kv_group_size=cfg.kv_group_size,
-                quantized_kv_start=cfg.quantized_kv_start,
-                prefill_step_size=cfg.prefill_step_size,
-                pld_enabled=cfg.pld_enabled,
-                pld_num_draft_tokens=cfg.pld_num_draft_tokens,
-                pld_ngram_k=cfg.pld_ngram_k,
-                # Speculative-decoding drafter (MTP / DFlash) — must be
-                # propagated to the per-model Config or `MLXEngine.load_model`
-                # silently skips drafter wiring. Without this, `--draft-model`
-                # at the CLI never reaches the engine and MTP is a no-op.
-                draft_model=cfg.draft_model,
-                draft_kind=cfg.draft_kind,
-                draft_block_size=cfg.draft_block_size,
-                # Carry the backend selection so each per-model engine's
-                # load_model gate routes mlx-lm vs mlx-vlm correctly.
-                backend=mcfg.backend,
-            )
+            # Create a Config per model with shared server settings (U27: one
+            # shared builder — global flags can no longer be dropped from one
+            # of the two hand-maintained copies).
+            model_cfg = build_per_model_config(cfg, mcfg)
             engine = MLXEngine(model_cfg)
             engines[mcfg.model_id] = engine
     else:

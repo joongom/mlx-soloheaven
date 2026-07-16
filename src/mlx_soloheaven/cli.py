@@ -90,11 +90,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Default top-k sampling (unset: use model generation_config, "
              "then fallback 0=disabled)",
     )
+    # U23: same None sentinel as the sampling flags above — a hardcoded
+    # argparse default (previously 1.0) is ALWAYS supplied by argparse, so it
+    # unconditionally clobbered the Config dataclass default (1.05, the gemma4
+    # anti-repetition FIX 2), making that default dead code. Precedence with
+    # the sentinel: CLI/env explicitly set > dataclass default (1.05). The
+    # generation_config.json auto-apply is INTENTIONALLY not a layer for this
+    # field (see _load_generation_config_sampling: HF's value — often
+    # 1.0/absent — would silently disable the gemma4 mitigation).
+    _rep_env = _env("REPETITION_PENALTY")
     p.add_argument(
         "--repetition-penalty",
         type=float,
-        default=float(_env("REPETITION_PENALTY", "1.0")),
-        help="Default repetition penalty (default: 1.0, disabled)",
+        default=float(_rep_env) if _rep_env is not None else None,
+        help="Default repetition penalty (unset: config default 1.05; "
+             "1.0 disables). Sane range: 1.0-1.5.",
     )
     p.add_argument(
         "--max-tokens",

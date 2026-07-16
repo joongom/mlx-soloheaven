@@ -43,6 +43,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import AsyncGenerator, Generator, Optional
@@ -64,6 +65,7 @@ from mlx_vlm.generate import (
 
 from mlx_soloheaven.config import Config
 from mlx_soloheaven.engine.thinking import (
+    ForceDeferralGate,
     ThinkingBudgetProcessor,
     RepetitionPenaltyProcessor,
     initial_think_state,
@@ -87,6 +89,16 @@ logger = logging.getLogger(__name__)
 # accepted). A mean below 0.5 means more than 75% of drafted tokens are
 # being rejected — at that rate the drafter is typically net negative.
 _DRAFTER_LOW_ACCEPT_THRESHOLD = 0.5
+
+# U26 round 2 (codex F5a): cap on the per-session drafter-stats registry.
+# The registry is pruned by delete_session/clear_caches, but sessions deleted
+# through OTHER lifecycles (or never deleted at all) used to accumulate one
+# entry per unique session id for the life of the process. LRU-bounded:
+# evicting an old entry is SAFE because the stats are purely advisory
+# (admin/list_sessions display) — losing one merely restarts that session's
+# cumulative counters. Each entry is a 3-int dict, so 512 entries is a few
+# tens of KB.
+_DRAFTER_STATS_MAX = 512
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +230,11 @@ def _make_eager_sampler(
             logprobs = _eager_apply_top_p(logprobs, top_p)
         if min_p != 0.0:
             logprobs = _eager_apply_min_p(logprobs, min_p, min_tokens_to_keep)
-        if top_k > 0:
+        # U20: cap top_k to the vocab defensively — _eager_apply_top_k raises
+        # for top_k >= vocab_size (mid-generation ValueError on the plain
+        # decode path). top_k >= vocab keeps every token, i.e. the filter is
+        # a no-op, so skip it instead of erroring.
+        if 0 < top_k < logprobs.shape[-1]:
             logprobs = _eager_apply_top_k(logprobs, top_k)
         # EAGER final draw — advances mx.random.state on the calling thread.
         return mx.random.categorical(logprobs * inv_temp)
@@ -688,11 +704,20 @@ _MTP_TOKEN_HISTORY_SEED = None
 # START ONLY (mirrors ThinkingRouter FIX 4 — a literal ``thought\n`` mid-content
 # does NOT falsely open thinking). Empty/None => bare detection off => no-op.
 #   _MTP_THINK_BARE_OPEN_TOKENS: list[int] | None
+#
+# U22 round 2 (codex batch-5 F4a): the tokenizer backing the request's
+# ThinkingBudgetProcessor, threaded so the clone's history-derived force site
+# applies the SAME bounded UTF-8 boundary deferral (ForceDeferralGate) as the
+# plain path — the clone used to force ``think_end`` mid multi-byte character
+# (trailing U+FFFD in reasoning_content on the gemma4 MTP path). None =>
+# immediate force (historical behaviour).
+#   _MTP_THINK_TOKENIZER: tokenizer | None
 _MTP_THINK_BUDGET = None
 _MTP_THINK_END_TOKEN = None
 _MTP_THINK_START_TOKEN = None
 _MTP_THINK_FAMILY = None
 _MTP_THINK_BARE_OPEN_TOKENS = None
+_MTP_THINK_TOKENIZER = None
 
 # Post-wrap drafter gate (plain-decode fallback). SUPERSEDED by the B4
 # RoPE-frame fix, which restores post-wrap drafter acceptance (~1.1) so the
@@ -1054,6 +1079,22 @@ def _install_mtp_wrap_patches() -> bool:
             _think_bare_open = tuple(_MTP_THINK_BARE_OPEN_TOKENS or ())
             _think_active = _think_budget > 0 and _think_end_tok >= 0
 
+            # U22 round 2 (codex F4a): bounded UTF-8 boundary deferral at
+            # THIS force site, mirroring ThinkingBudgetProcessor. The gate
+            # defers the forced close (skips the logit override) while the
+            # emitted byte tail ends mid multi-byte character, up to 4
+            # consults, then forces regardless. ``_think_tail`` tracks the
+            # EMITTED token ids (python ints, bounded window) so the byte
+            # check never syncs an mx array; per verify-position the pending
+            # draft prefix is appended by the caller (extra_tail). No
+            # tokenizer stashed => gate None => immediate force (historical).
+            _think_gate = (
+                ForceDeferralGate(_MTP_THINK_TOKENIZER)
+                if (_think_active and _MTP_THINK_TOKENIZER is not None)
+                else None
+            )
+            _think_tail = None
+
             _seed = _MTP_TOKEN_HISTORY_SEED or []
             # Running token history as a 1-D mx.array (processor contract).
             # Seeded with the prompt ids + the first bonus (already yielded by
@@ -1062,6 +1103,16 @@ def _install_mtp_wrap_patches() -> bool:
                 _hist = mx.array(list(_seed) + [int(b)], dtype=token_dtype)
             else:
                 _hist = None
+
+            # U22 round 2: emitted-token tail for the deferral gate's byte
+            # check — seeded like the thinking state (prompt tail + the
+            # already-yielded first bonus). Bounded deque: O(1) appends, and
+            # the byte check only ever inspects the last few ids.
+            if _think_gate is not None:
+                _think_tail = deque(
+                    [int(t) for t in list(_seed)[-16:]], maxlen=16
+                )
+                _think_tail.append(int(b))
 
             # Incremental thinking state derived ONLY from emitted tokens. Seed
             # by folding over the prompt seed + the already-emitted first bonus,
@@ -1136,15 +1187,79 @@ def _install_mtp_wrap_patches() -> bool:
                         think_end_token=_think_end_tok,
                         bare_open_tokens=_think_bare_open,
                     )
+                    if _think_tail is not None:
+                        # U22 round 2: track the emitted tail for the byte
+                        # check; a closed block re-arms the deferral budget
+                        # (parity with ThinkingBudgetProcessor's close reset).
+                        _think_tail.append(int(tok))
+                        if int(tok) == _think_end_tok and _think_gate is not None:
+                            _think_gate.rearm()
 
-            def _force_think(logits, state):
+            # Batch-5 round 6 (codex round-5 P2): preview-local deferral EPOCH
+            # for the speculative verify loop. Sequential semantics grant a
+            # REOPENED thinking block a fresh deferral allowance (the gate
+            # re-arms on think_end), but the round-4 previews consulted
+            # ``self.deferrals + sum(defer_events)`` for the WHOLE block — a
+            # mid-block provisional think_end left the pre-close usage counted
+            # against post-reopen positions, hard-forcing the close mid
+            # multi-byte character ('�</think>') in the reopened cycle. The
+            # verify loop snapshots the committed count into
+            # ``_pos_defer_base`` at block start, counts provisional grants in
+            # ``_pos_defer_pending``, and RESETS BOTH to 0 whenever the
+            # provisional accepted prefix folds a think_end — mirroring,
+            # preview-side only, the rearm the emitted-fold replay performs
+            # for committed state. A provisionally folded think_end that is
+            # ultimately REJECTED never touches the gate (previews are pure);
+            # the post-walk replay recomputes committed truth and the next
+            # block re-snapshots the true carried-over count.
+            _pos_defer_base = 0
+            _pos_defer_pending = 0
+
+            def _force_think(logits, state, extra_tail=(), defer_events=None):
+                nonlocal _pos_defer_pending
                 # If the budget is reached and we're still inside thinking, force
                 # the think_end token (logit -> 1e9) so it is sampled next —
                 # exactly what ThinkingBudgetProcessor does. ``state`` is the
                 # thinking state DERIVED from the cumulative history up to (but
                 # excluding) the position being sampled. Returns ``logits``.
+                # U22 round 2: before forcing, consult the deferral gate — if
+                # the byte stream at this position (emitted tail + the pending
+                # draft prefix ``extra_tail``) ends mid multi-byte character,
+                # SKIP the override this round (bounded: the gate hard-forces
+                # after 4 skips). Identical semantics to the plain path's
+                # _apply_forced_close.
+                # Batch-5 round 4 (codex finding 1): at PROVISIONAL block-verify
+                # positions acceptance is not known yet, so the gate must not be
+                # mutated — pass ``defer_events`` (one bool appended per call:
+                # True == deferral granted) to PREVIEW the decision instead;
+                # earlier provisional grants of the same block count toward the
+                # bound via ``pending``. The caller replays ``commit_deferral``
+                # after the accept/reject walk for the EMITTED positions only,
+                # so rejected drafts never consume the shared 4-deferral budget.
+                # ``defer_events=None`` (plain step / call==emit sites) keeps
+                # the historical consult-and-consume behaviour.
+                deferred = False
                 if _think_active and force_end_from_state(state, _think_budget):
-                    logits[:, _think_end_tok] = 1e9
+                    if _think_gate is not None:
+                        tail = list(_think_tail) + [int(t) for t in extra_tail]
+                        if defer_events is None:
+                            deferred = _think_gate.should_defer(tail)
+                        else:
+                            # Round 6: preview against the EPOCH accounting
+                            # (base + pending since the last provisional
+                            # think_end), not the whole-block sum — see the
+                            # _pos_defer_base/_pos_defer_pending comment.
+                            deferred = _think_gate.should_defer_preview(
+                                tail,
+                                pending=_pos_defer_pending,
+                                base=_pos_defer_base,
+                            )
+                    if not deferred:
+                        logits[:, _think_end_tok] = 1e9
+                if defer_events is not None:
+                    defer_events.append(deferred)
+                    if deferred:
+                        _pos_defer_pending += 1
                 return logits
 
             def _apply_procs(procs, logits, hist):
@@ -1276,11 +1391,39 @@ def _install_mtp_wrap_patches() -> bool:
                         # Position 0 is conditioned on the prefix ending at b,
                         # which is already folded into _think_state.
                         _pos_think = _think_state
+                        # Batch-5 round 4 (codex finding 1): per-position gate
+                        # decisions are PREVIEWED into this event list (one
+                        # bool per position) and committed after the walk for
+                        # emitted positions only — rejected positions must not
+                        # consume the shared UTF-8 deferral budget.
+                        _pos_defer_events = (
+                            [] if _think_gate is not None else None
+                        )
+                        # Round 6: fresh preview epoch per verify block — the
+                        # committed count is re-snapshotted here (commits only
+                        # happen in the post-walk replay, never mid-block, so
+                        # the snapshot equals the live count for the whole
+                        # per-position loop until a provisional think_end
+                        # resets it).
+                        _pos_defer_base = (
+                            _think_gate.deferrals
+                            if _think_gate is not None
+                            else 0
+                        )
+                        _pos_defer_pending = 0
                         for i in range(_bs):
                             li = vl[:, i, :]
                             if _block_procs:
                                 li = _apply_procs(_block_procs, li, _pos_hist)
-                            li = _force_think(li, _pos_think)
+                            # U22 round 2: position i's byte tail includes the
+                            # draft tokens accepted-so-far in this block
+                            # (positions 0..i-1) — thread them to the gate.
+                            li = _force_think(
+                                li,
+                                _pos_think,
+                                extra_tail=_draft_list[:i],
+                                defer_events=_pos_defer_events,
+                            )
                             _per_pos.append(sampler(li))
                             # Extend per-position context with the DRAFT token at
                             # position i for the NEXT position (mirrors the
@@ -1294,6 +1437,19 @@ def _install_mtp_wrap_patches() -> bool:
                                         mx.array([_dtok], dtype=token_dtype),
                                     ])
                                 if _think_active:
+                                    # Round 6: a provisionally folded
+                                    # think_end closes the block for
+                                    # SUBSEQUENT previews — reset the preview
+                                    # epoch so the reopened cycle sees a fresh
+                                    # deferral allowance (preview-side parity
+                                    # with the emitted-fold rearm; committed
+                                    # state is untouched here).
+                                    if (
+                                        _think_gate is not None
+                                        and _dtok == _think_end_tok
+                                    ):
+                                        _pos_defer_base = 0
+                                        _pos_defer_pending = 0
                                     _pos_think = advance_think_state(
                                         _pos_think,
                                         _dtok,
@@ -1327,8 +1483,21 @@ def _install_mtp_wrap_patches() -> bool:
                 # target bonus), so the next block's position-0 force decision
                 # uses the true thinking count — no over-count from rejected
                 # drafts (those were only tried per-position, never folded in).
+                # Batch-5 round 4 (codex finding 1): replay the gate commits for
+                # the emitted positions here — position i's previewed deferral
+                # is committed right before its token is folded, exactly the
+                # sequential (plain-path) order, so a think_end in new_tokens
+                # re-arms AFTER the commits that preceded it. Positions past
+                # len(new_tokens) (rejected drafts) are dropped: their previews
+                # never touched the gate.
                 if _think_active and new_tokens:
-                    for _ntok in new_tokens:
+                    for _idx, _ntok in enumerate(new_tokens):
+                        if (
+                            _pos_defer_events is not None
+                            and _idx < len(_pos_defer_events)
+                            and _pos_defer_events[_idx]
+                        ):
+                            _think_gate.commit_deferral()
                         _advance_think(_ntok)
 
                 try:
@@ -1453,6 +1622,13 @@ class BaseCacheEntry:
     token_count: int
     created: float = field(default_factory=time.time)
     hit_count: int = 0
+    # U2: byte-accounted LRU bookkeeping. ``size_bytes`` is measured once at
+    # registration (the snapshot is immutable afterwards — clones deep-copy);
+    # ``last_used`` is touched on every clone so the eviction sweep
+    # (_evict_active_sessions_if_needed) can drop base caches LRU-first when
+    # the shared memory_budget_gb is exceeded.
+    size_bytes: int = 0
+    last_used: float = field(default_factory=time.time)
     # MTP-finalized layout marker (qwen_mtp servers only): the cache holds
     # n_target + n_head entries with the head trailing by the lazy last
     # slot (head_offset == token_count - 1), and mtp_resume_hidden is the
@@ -1627,6 +1803,21 @@ class MLXEngine:
 
         # Base cache pool: system_hash -> BaseCacheEntry
         self._base_caches: dict[str, BaseCacheEntry] = {}
+
+        # U26: cumulative per-session drafter acceptance stats, keyed OUTSIDE
+        # SessionState. Every turn installs a brand-new SessionState (the
+        # post-generation save, the interrupted-turn commit, compact/rebuild),
+        # so an accumulator kept on the state object was reset each turn —
+        # and the post-stream finalize runs BEFORE the install, so a brand-new
+        # session's first turn was dropped entirely. This registry is the
+        # single source of truth; installs stamp the CURRENT dict onto the new
+        # SessionState (same object — in-place finalize updates stay visible
+        # to the admin readers that surface s.drafter_stats). Pruned on
+        # delete_session/clear_caches; entries survive active-LRU eviction so
+        # a disk-reloaded session reclaims its stats. Mutated under self._lock.
+        # U26 round 2 (F5a): LRU-ordered and bounded at _DRAFTER_STATS_MAX
+        # (see _accumulate_drafter_stats).
+        self._session_drafter_stats: "OrderedDict[str, dict]" = OrderedDict()
 
         # Dirty session tracking for idle-time disk save
         self._dirty_sessions: set[str] = set()
@@ -2586,6 +2777,91 @@ class MLXEngine:
             self._session_cache_bytes(s) for s in self._sessions.values()
         ) / 1e9
 
+    def _base_caches_memory_gb(self) -> float:
+        """Total resident bytes (GB) held by the base-cache pool (U2).
+
+        Sizes are measured once at registration (entries are immutable
+        snapshots), so this is a cheap sum, not a re-walk."""
+        base_caches = getattr(self, "_base_caches", None)
+        if not base_caches:
+            return 0.0
+        return sum(e.size_bytes for e in base_caches.values()) / 1e9
+
+    def _evict_base_caches_lru(
+        self, over_gb_fn, *, mru_allowance_gb: "float | None" = None,
+    ) -> tuple[int, int]:
+        """Evict base caches LRU-first while ``over_gb_fn()`` is True (U2).
+
+        MRU protection is CONDITIONAL (round 2, codex F3): the single
+        most-recently-used entry is kept while it can actually FIT the
+        budget — base caches are auto re-registered with a FULL secondary
+        system-prompt prefill on the next MISS, so evicting an entry the
+        active workload is using would thrash (register -> evict ->
+        re-prefill every turn). But an UNCONDITIONAL keep-MRU defeats the
+        budget entirely: a single base entry larger than the budget left
+        ZERO eviction candidates, and the next clone could OOM.
+        ``mru_allowance_gb`` is the budget headroom left for the MRU entry
+        after everything this sweep can never reclaim (the protected/MRU
+        session + the prefix pool — see the caller); if we are STILL over
+        budget after the LRU pass and the MRU entry exceeds that allowance,
+        it is evicted too (loud WARNING). ``mru_allowance_gb=None`` keeps
+        the historical unconditional protection (direct callers without
+        budget context). Base caches are memory-only derived state (never
+        persisted), so eviction is a plain drop.
+
+        Caller MUST hold ``self._lock`` — the same lock that guards
+        registration (_register_base_cache runs under _generate_locked /
+        _mutate_locked), so eviction never races a half-built entry.
+
+        Returns (evicted_count, freed_bytes)."""
+        base_caches = getattr(self, "_base_caches", None)
+        if not base_caches:
+            return 0, 0
+        # LRU first; the last (MRU) entry is protected during this pass.
+        by_recency = sorted(base_caches.items(), key=lambda kv: kv[1].last_used)
+        lru_hashes = [h for h, _ in by_recency[:-1]]
+        mru_hash = by_recency[-1][0]
+        evicted = 0
+        freed_bytes = 0
+        for h in lru_hashes:
+            if not over_gb_fn():
+                break
+            entry = base_caches.pop(h, None)
+            if entry is None:
+                continue
+            evicted += 1
+            freed_bytes += entry.size_bytes
+            logger.info(
+                f"[Base Cache] EVICTED (LRU, over budget) | hash={h} | "
+                f"{entry.token_count} tokens | {entry.size_bytes / 1e6:.1f}MB "
+                f"| hits={entry.hit_count}"
+            )
+        # Round 2 (codex F3): waive the MRU anti-thrash protection when the
+        # entry provably cannot fit — still over budget after shedding every
+        # other entry, and the MRU alone exceeds the remaining allowance.
+        # When it FITS, MRU stays protected (anti-thrash intent preserved).
+        if (
+            mru_allowance_gb is not None
+            and mru_hash in base_caches
+            and over_gb_fn()
+        ):
+            entry = base_caches[mru_hash]
+            entry_gb = entry.size_bytes / 1e9
+            if entry_gb > mru_allowance_gb:
+                base_caches.pop(mru_hash, None)
+                evicted += 1
+                freed_bytes += entry.size_bytes
+                logger.warning(
+                    f"[Base Cache] EVICTED MRU entry (budget cannot fit it) | "
+                    f"hash={mru_hash} | {entry.token_count} tokens | "
+                    f"{entry.size_bytes / 1e6:.1f}MB "
+                    f"({entry_gb:.2f} GB > allowance "
+                    f"{max(mru_allowance_gb, 0.0):.2f} GB) | anti-thrash "
+                    f"protection waived — it will re-prefill on the next MISS; "
+                    f"raise memory_budget_gb to keep it resident"
+                )
+        return evicted, freed_bytes
+
     def _mark_session_busy(self, session_id: str | None):
         if not session_id:
             return
@@ -2606,16 +2882,74 @@ class MLXEngine:
         with lock:
             busy.discard(session_id)
 
+    # --- Drafter acceptance stats (U26) --------------------------------------
+
+    def _accumulate_drafter_stats(
+        self, session_id: str | None, n_rounds: int, total_accepted: int,
+    ) -> None:
+        """Fold one request's drafter acceptance numbers into the session's
+        cumulative stats (U26). Keyed in ``_session_drafter_stats`` so the
+        accumulation survives the per-turn SessionState reinstall; the live
+        SessionState (when present) is pointed at the SAME dict so admin
+        readers (list_sessions/get_session) surface it without change.
+        Caller holds the engine lock (post-stream finalize / generation).
+
+        Round 2 (codex F5a): the registry is a BOUNDED LRU
+        (_DRAFTER_STATS_MAX) — deletes through non-engine lifecycles (or no
+        delete at all) no longer grow it for the life of the process. Safe
+        to evict: the stats are advisory display data (see the constant)."""
+        if not session_id:
+            return
+        registry = getattr(self, "_session_drafter_stats", None)
+        if registry is None or not isinstance(registry, OrderedDict):
+            # Fresh (or legacy plain-dict — e.g. shell engines in tests):
+            # promote to the LRU-ordered form preserving existing entries.
+            registry = self._session_drafter_stats = OrderedDict(registry or {})
+        stats = registry.setdefault(session_id, {
+            "requests": 0,
+            "total_rounds": 0,
+            "total_accepted": 0,
+        })
+        registry.move_to_end(session_id)
+        while len(registry) > _DRAFTER_STATS_MAX:
+            old_sid, _ = registry.popitem(last=False)
+            logger.debug(
+                f"[Drafter] stats registry over cap "
+                f"({_DRAFTER_STATS_MAX}) — evicted LRU entry "
+                f"session={old_sid} (advisory stats only)"
+            )
+        stats["requests"] += 1
+        stats["total_rounds"] += n_rounds
+        stats["total_accepted"] += total_accepted
+        session = self._sessions.get(session_id)
+        if session is not None:
+            session.drafter_stats = stats
+
+    def _drafter_stats_for(self, session_id: str | None) -> dict | None:
+        """The session's cumulative drafter stats dict (or None). Used by the
+        SessionState install sites to carry the accumulator across the
+        per-turn reinstall (U26)."""
+        if not session_id:
+            return None
+        registry = getattr(self, "_session_drafter_stats", None)
+        if not registry:
+            return None
+        return registry.get(session_id)
+
     def _evict_active_sessions_if_needed(self, protect_session_id: str | None = None):
         """Best-effort bound on total resident KV memory toward memory_budget_gb.
 
         Active per-session KV caches (self._sessions) are the dominant memory
         consumer but were previously unbounded — only delete_session removed
         them. This evicts the LEAST-RECENTLY-USED idle session when the active
-        KV total PLUS the separate LRU prefix-reuse pool exceeds the budget:
-        the session is persisted to disk (so its next request transparently
-        reloads it) and then dropped from self._sessions so MLX frees the
-        buffers.
+        KV total PLUS the separate LRU prefix-reuse pool PLUS the base-cache
+        pool (U2) exceeds the budget: the session is persisted to disk (so its
+        next request transparently reloads it) and then dropped from
+        self._sessions so MLX frees the buffers. Base caches are shed FIRST
+        (LRU, CONDITIONAL keep-MRU — see _evict_base_caches_lru; round 2,
+        codex F3: the MRU base entry is evicted too when it cannot fit the
+        budget allowance left after the unevictable sessions): they are
+        memory-only derived state, auto re-registered on the next MISS.
 
         Never evicts:
           - a session with an in-flight generation (_busy_sessions),
@@ -2644,10 +2978,65 @@ class MLXEngine:
 
         pool_gb = self.cache_manager._memory_usage_gb()
 
+        # U2: base caches are charged against the SAME memory_budget_gb as
+        # the active sessions + the prefix-reuse pool — they are the third
+        # (previously unaccounted, unbounded) resident-KV consumer.
         def _total_gb() -> float:
-            return self._active_sessions_memory_gb() + pool_gb
+            return (
+                self._active_sessions_memory_gb()
+                + pool_gb
+                + self._base_caches_memory_gb()
+            )
 
         if _total_gb() <= budget_gb:
+            return
+
+        # U2: shed base caches FIRST (LRU, conditional keep-MRU) — they are
+        # memory-only derived state, auto re-registered from the next MISS's
+        # prefill, while evicting a session costs a disk save + reload. Only
+        # if the total is still over budget does the session sweep below run.
+        #
+        # Round 2 (codex F3): the MRU base entry's protection is conditional
+        # on it FITTING. Its allowance = budget minus everything this sweep
+        # can never reclaim: the prefix pool plus the session(s) the session
+        # sweep below always keeps resident (the protected just-used session
+        # and the MRU session — often the same one). A base entry larger
+        # than that allowance would leave the sweep permanently over budget
+        # with zero candidates (the original U2 hole: an 80GB lone base
+        # cache under a 64GB budget was never evictable), so it is evicted
+        # too — see _evict_base_caches_lru.
+        unevictable_gb = pool_gb
+        if self._sessions:
+            protected_sids = {
+                max(
+                    self._sessions.items(), key=lambda kv: kv[1].last_used
+                )[0]
+            }
+            if protect_session_id and protect_session_id in self._sessions:
+                protected_sids.add(protect_session_id)
+            unevictable_gb += sum(
+                self._session_cache_bytes(self._sessions[sid])
+                for sid in protected_sids
+            ) / 1e9
+        base_evicted, base_freed = self._evict_base_caches_lru(
+            lambda: _total_gb() > budget_gb,
+            mru_allowance_gb=budget_gb - unevictable_gb,
+        )
+        if base_evicted:
+            logger.info(
+                f"[Base Cache] evicted {base_evicted} entr"
+                f"{'y' if base_evicted == 1 else 'ies'}, freed "
+                f"~{base_freed / 1e9:.2f} GB (over memory budget)"
+            )
+        if _total_gb() <= budget_gb:
+            if base_evicted:
+                # Base-cache shedding alone brought us under budget — release
+                # the now-unreferenced Metal buffers before returning.
+                try:
+                    if hasattr(mx, "clear_cache"):
+                        mx.clear_cache()
+                except Exception:  # noqa: BLE001
+                    pass
             return
 
         with self._busy_lock:
@@ -2749,18 +3138,22 @@ class MLXEngine:
                 f"[Active LRU] evicted {evicted} idle session(s), "
                 f"freed ~{freed_bytes / 1e9:.2f} GB | "
                 f"active KV now {self._active_sessions_memory_gb():.2f} GB "
-                f"+ pool {pool_gb:.2f} GB / budget {budget_gb:.1f} GB"
+                f"+ pool {pool_gb:.2f} GB "
+                f"+ base {self._base_caches_memory_gb():.2f} GB "
+                f"/ budget {budget_gb:.1f} GB"
             )
 
         # Best-effort, not a hard cap: the protected / MRU / last-remaining
-        # session is never evicted. If that un-evictable residue alone still
-        # exceeds the budget, surface it loudly rather than silently lying.
+        # session (and the MRU base cache) is never evicted. If that
+        # un-evictable residue alone still exceeds the budget, surface it
+        # loudly rather than silently lying.
         if _total_gb() > budget_gb:
             logger.warning(
                 f"[Active LRU] still OVER budget after sweep: resident "
                 f"{_total_gb():.2f} GB > budget {budget_gb:.1f} GB "
-                f"(protected/MRU/last session is un-evictable) — "
-                f"raise memory_budget_gb or reduce concurrent long sessions"
+                f"(protected/MRU/last session + MRU base cache are "
+                f"un-evictable) — raise memory_budget_gb or reduce "
+                f"concurrent long sessions"
             )
 
     def _mark_dirty(self, session_id: str):
@@ -3059,6 +3452,9 @@ class MLXEngine:
                 tools=sess_tools,
                 thinking=sess_thinking,
                 prompt_fingerprint=sess_fp,
+                # U26: a disk-reloaded session reclaims its in-memory drafter
+                # stats (the registry outlives active-LRU eviction).
+                drafter_stats=self._drafter_stats_for(session_id),
             )
 
             fsize = os.path.getsize(path) / 1e6
@@ -3215,6 +3611,16 @@ class MLXEngine:
         import copy
         base_snapshot = copy.deepcopy(cache)
         self._eval_cache(base_snapshot)
+        # U2: measure the entry once at registration — the same helper that
+        # byte-counts session caches for the memory budget. The MTP boundary
+        # hidden is tiny (1,1,H) but counted for honesty. getattr guard:
+        # partially-constructed shell engines (unit tests via __new__) have no
+        # cache_manager — size 0 there, never a registration failure.
+        _cm = getattr(self, "cache_manager", None)
+        size_bytes = _cm._estimate_cache_size(base_snapshot) if _cm else 0
+        hidden_nbytes = getattr(mtp_resume_hidden, "nbytes", 0)
+        if isinstance(hidden_nbytes, int):
+            size_bytes += hidden_nbytes
         entry = BaseCacheEntry(
             system_hash=h,
             cache=base_snapshot,
@@ -3222,11 +3628,13 @@ class MLXEngine:
             token_count=len(system_tokens),
             mtp_layout=mtp_resume_hidden is not None,
             mtp_resume_hidden=mtp_resume_hidden,
+            size_bytes=size_bytes,
         )
         self._base_caches[h] = entry
         logger.debug(
             f"[Base Cache] REGISTERED | hash={h} | {len(system_tokens)} tokens | "
-            f"mtp={entry.mtp_layout} | pool_size={len(self._base_caches)}"
+            f"{size_bytes / 1e6:.1f}MB | mtp={entry.mtp_layout} | "
+            f"pool_size={len(self._base_caches)}"
         )
 
     def _clone_base_cache(self, base: BaseCacheEntry) -> list:
@@ -3236,6 +3644,9 @@ class MLXEngine:
         # Force evaluation of cloned arrays to avoid lazy-eval aliasing issues
         self._eval_cache(cloned)
         base.hit_count += 1
+        # U2: LRU touch — every actual use (clone) marks recency for the
+        # budget-driven base-cache eviction sweep.
+        base.last_used = time.time()
         logger.debug(
             f"[Base Cache] CLONE | hash={base.system_hash} | "
             f"{base.token_count} tokens | hits={base.hit_count}"
@@ -3256,6 +3667,9 @@ class MLXEngine:
                     "hit_count": e.hit_count,
                     "created": e.created,
                     "mtp": e.mtp_layout,
+                    # U2: byte accounting + LRU recency.
+                    "size_mb": round(e.size_bytes / 1e6, 1),
+                    "last_used": e.last_used,
                 }
                 for e in self._base_caches.values()
             ]
@@ -5236,6 +5650,21 @@ class MLXEngine:
         new_token_count = total_prompt_tokens - reused
 
         # Build logits processors
+        # U20: defensive clamp — a non-positive repetition penalty divides
+        # positive logits by zero (inf/NaN cascade in the penalty processor).
+        # The API boundary 400s these; any internal caller that slips one
+        # through gets a no-op penalty instead of corrupted logits.
+        # Round 2 (codex F6): NaN passes every comparison (``nan <= 0`` is
+        # False) — treat any non-finite value as invalid too.
+        if repetition_penalty is not None and (
+            not math.isfinite(repetition_penalty) or repetition_penalty <= 0
+        ):
+            logger.warning(
+                f"[Generate] repetition_penalty={repetition_penalty} is "
+                f"invalid (must be a finite number > 0) — clamping to 1.0 "
+                f"(disabled)"
+            )
+            repetition_penalty = 1.0
         logits_processors = []
         if repetition_penalty != 1.0:
             logits_processors.append(RepetitionPenaltyProcessor(penalty=repetition_penalty))
@@ -5261,6 +5690,10 @@ class MLXEngine:
                 think_start_token=think_start,
                 model_family=self.model_family,
                 bare_open_tokens=bare_open_tokens,
+                # U22: enables the bounded UTF-8 boundary deferral — never
+                # force the close mid multi-byte character (U+FFFD would land
+                # at the end of reasoning_content).
+                tokenizer=self.tokenizer,
             ))
         # Structured output (response_format) via FSM-based logits masking.
         # Works on both mlx-vlm and mlx-lm paths (same logits_processors contract).
@@ -5394,6 +5827,7 @@ class MLXEngine:
         global _MTP_LOGITS_PROCESSORS, _MTP_TOKEN_HISTORY_SEED
         global _MTP_THINK_BUDGET, _MTP_THINK_END_TOKEN, _MTP_THINK_START_TOKEN
         global _MTP_THINK_FAMILY, _MTP_THINK_BARE_OPEN_TOKENS
+        global _MTP_THINK_TOKENIZER
         # ------------------------------------------------------------------
         # A3 (GeneratorExit safety): the post-stream reconcile + the HIT-turn
         # commit must NOT live only on the straight-line path after the loop.
@@ -6132,6 +6566,7 @@ class MLXEngine:
             _MTP_THINK_START_TOKEN = None
             _MTP_THINK_FAMILY = None
             _MTP_THINK_BARE_OPEN_TOKENS = None
+            _MTP_THINK_TOKENIZER = None
         # U24: resolve the held-back scan buffer at stream end (exhaustion /
         # EOS reached with text still held). Finding 2: a COMPLETED match may
         # be sitting in the buffer, held only because an earlier viable
@@ -6420,6 +6855,10 @@ class MLXEngine:
                 tools=_tools_canonical,
                 thinking=use_thinking,
                 prompt_fingerprint=_incoming_fp,
+                # U26: carry the cumulative drafter stats — this install used
+                # to reset them every turn (the finalize above wrote to the
+                # OLD state object this line replaces).
+                drafter_stats=self._drafter_stats_for(session_id),
             )
             # Codex round 5, finding 1a: mark dirty HERE, atomically with the
             # install (this thread holds the engine lock). Persistence used to
@@ -6553,6 +6992,46 @@ class MLXEngine:
             cancel_event=cancel_event,
         )
 
+    def _sampling_vocab_size(self) -> "int | None":
+        """Vocabulary size used to normalize ``top_k`` for the mlx-vlm
+        backend (U20 round 2). Derived from the tokenizer (``len`` includes
+        added tokens); the model's logits width is padded UP from this, so a
+        ``top_k`` at or beyond the tokenizer vocab is keep-all regardless of
+        padding. Returns None when no usable surface exists (clamp then
+        passes the value through unchanged)."""
+        tok = getattr(self, "tokenizer", None)
+        if tok is None:
+            return None
+        hf = getattr(tok, "_tokenizer", tok)
+        for probe in (hf, tok):
+            try:
+                n = len(probe)
+                if n and n > 0:
+                    return int(n)
+            except Exception:  # noqa: BLE001 — try the next surface
+                pass
+            vs = getattr(probe, "vocab_size", None)
+            if isinstance(vs, int) and vs > 0:
+                return vs
+        return None
+
+    def _clamp_vlm_top_k(self, top_k) -> int:
+        """U20 round 2 (codex F1): map an oversized ``top_k`` to upstream's
+        keep-all sentinel (0 = filter disabled) BEFORE it reaches mlx-vlm.
+        mlx_lm.sample_utils.apply_top_k raises for top_k >= vocab_size, and
+        the raise would land mid-generation; top_k >= vocab keeps every
+        token, i.e. it is semantically identical to the disabled filter."""
+        if not top_k or top_k <= 0:
+            return 0
+        vocab = self._sampling_vocab_size()
+        if vocab is not None and top_k >= vocab:
+            logger.info(
+                f"[Generate] top_k={top_k} >= vocab ({vocab}) — keep-all; "
+                f"normalized to 0 (filter disabled) for the mlx-vlm sampler"
+            )
+            return 0
+        return int(top_k)
+
     def _run_vlm(
         self,
         *,
@@ -6589,6 +7068,16 @@ class MLXEngine:
             )
             cache_state.cache = None
             cache_state.token_ids = None
+
+        # U20 round 2 (codex F1): the API deliberately accepts an oversized
+        # top_k (excess == keep-all, capped engine-side), but only the mlx-lm
+        # eager sampler clamped it. mlx-vlm builds its sampler via
+        # mlx_lm.sample_utils.make_sampler, whose apply_top_k RAISES for
+        # top_k >= vocab_size MID-STREAM. Normalize here — the single point
+        # where the vlm path's sampling kwargs are assembled — mapping the
+        # keep-all excess to upstream's keep-all sentinel (top_k=0 disables
+        # the filter entirely, exactly the keep-all semantics).
+        top_k = self._clamp_vlm_top_k(top_k)
 
         input_ids = mx.array([prompt_token_ids])
 
@@ -6666,6 +7155,7 @@ class MLXEngine:
         global _HOT_PATH_FAST, _MTP_LOGITS_PROCESSORS, _MTP_TOKEN_HISTORY_SEED
         global _MTP_THINK_BUDGET, _MTP_THINK_END_TOKEN, _MTP_THINK_START_TOKEN
         global _MTP_THINK_FAMILY, _MTP_THINK_BARE_OPEN_TOKENS
+        global _MTP_THINK_TOKENIZER
         _HOT_PATH_FAST = not wrap_possible
         # FIX 2: stash the per-request logits_processors + prompt-token-history
         # seed so the MTP clone (_patched_mtp_rounds_v2) can apply them — the
@@ -6713,12 +7203,17 @@ class MLXEngine:
                 _MTP_THINK_BARE_OPEN_TOKENS = (
                     list(_tbp.bare_open_tokens) or None
                 )
+                # U22 round 2 (codex F4a): thread the processor's tokenizer so
+                # the clone's force site applies the same bounded UTF-8
+                # boundary deferral (None keeps the immediate force).
+                _MTP_THINK_TOKENIZER = _tbp._tokenizer
             else:
                 _MTP_THINK_BUDGET = None
                 _MTP_THINK_END_TOKEN = None
                 _MTP_THINK_START_TOKEN = None
                 _MTP_THINK_FAMILY = None
                 _MTP_THINK_BARE_OPEN_TOKENS = None
+                _MTP_THINK_TOKENIZER = None
             gen_kwargs["draft_model"] = drafter
             gen_kwargs["draft_kind"] = getattr(self, "_draft_kind", None)
             if self.cfg.draft_block_size:
@@ -6735,6 +7230,7 @@ class MLXEngine:
             _MTP_THINK_START_TOKEN = None
             _MTP_THINK_FAMILY = None
             _MTP_THINK_BARE_OPEN_TOKENS = None
+            _MTP_THINK_TOKENIZER = None
 
         # F3: generation_stream is installed ONCE on the dedicated
         # _vlm_executor worker thread during engine __init__. Per-call
@@ -6789,17 +7285,11 @@ class MLXEngine:
                         f"drafter may be net negative; consider --draft-block-size 2 "
                         f"or different drafter weights"
                     )
-                session = self._sessions.get(_sid)
-                if session is not None:
-                    stats = session.drafter_stats or {
-                        "requests": 0,
-                        "total_rounds": 0,
-                        "total_accepted": 0,
-                    }
-                    stats["requests"] += 1
-                    stats["total_rounds"] += n_rounds
-                    stats["total_accepted"] += total_accepted
-                    session.drafter_stats = stats
+                # U26: accumulate into the session-keyed registry — this
+                # finalize runs BEFORE the post-generation SessionState
+                # install, which used to replace the state object (and with
+                # it the stats written here) every turn.
+                self._accumulate_drafter_stats(_sid, n_rounds, total_accepted)
             else:
                 logger.debug(
                     f"[Drafter] session={_sid} no rounds recorded "
@@ -7620,6 +8110,9 @@ class MLXEngine:
                 if prompt_fingerprint is not None
                 else self._prompt_fingerprint(tools_canonical, use_thinking)
             ),
+            # U26: the interrupted commit is a reinstall too — keep the
+            # session's cumulative drafter stats.
+            drafter_stats=self._drafter_stats_for(session_id),
         )
         # Codex round 5, finding 1a: an interrupted commit is exactly the
         # case where the API layer NEVER reaches its post-stream
@@ -7989,6 +8482,9 @@ class MLXEngine:
                 prompt_fingerprint=self._prompt_fingerprint(
                     sess_tools, sess_thinking,
                 ),
+                # U26: compaction rebuilds the cache, not the session identity
+                # — keep the cumulative drafter stats.
+                drafter_stats=self._drafter_stats_for(session_id),
             )
 
             logger.info(
@@ -8193,7 +8689,12 @@ class MLXEngine:
                     "last_used": s.last_used,
                 }
                 if s.drafter_stats is not None:
-                    entry["drafter_stats"] = s.drafter_stats
+                    # U26 round 2 (codex F5b): SNAPSHOT the shared mutable
+                    # stats dict — the reference escapes the lock, and an
+                    # in-process JSON serialization after release could
+                    # otherwise observe torn counter updates from the next
+                    # generation's accumulate.
+                    entry["drafter_stats"] = dict(s.drafter_stats)
                 result.append(entry)
             return sorted(result, key=lambda x: x["last_used"], reverse=True)
 
@@ -8210,7 +8711,8 @@ class MLXEngine:
                 "last_used": s.last_used,
             }
             if s.drafter_stats is not None:
-                info["drafter_stats"] = s.drafter_stats
+                # U26 round 2 (F5b): snapshot — see list_sessions.
+                info["drafter_stats"] = dict(s.drafter_stats)
             return info
 
     def delete_session(self, session_id: str) -> bool:
@@ -8229,6 +8731,10 @@ class MLXEngine:
             # Anon-provenance hygiene (best-effort; stale ids are harmless).
             if hasattr(self, "_anon_minted_ids"):
                 self._anon_minted_ids.discard(session_id)
+            # U26: drop the session's cumulative drafter stats (bounds the
+            # registry — deleted sessions never come back under this id).
+            if hasattr(self, "_session_drafter_stats"):
+                self._session_drafter_stats.pop(session_id, None)
             path = self._session_cache_path(session_id)
             if os.path.exists(path):
                 os.remove(path)
@@ -8679,6 +9185,9 @@ class MLXEngine:
             tools=tools,
             thinking=thinking,
             prompt_fingerprint=self._prompt_fingerprint(tools, thinking),
+            # U26: rebuild reinstalls the state — keep the cumulative
+            # drafter stats.
+            drafter_stats=self._drafter_stats_for(session_id),
         )
         self._mark_dirty(session_id)
 
@@ -8756,9 +9265,13 @@ class MLXEngine:
                 "token_count": bc.token_count,
                 "hit_count": bc.hit_count,
                 "created": bc.created,
+                # U2: per-entry bytes + LRU recency for the admin overview.
+                "size_mb": round(bc.size_bytes / 1e6, 1),
+                "last_used": bc.last_used,
             }
             for h, bc in self._base_caches.items()
         ]
+        total_base_bytes = sum(bc.size_bytes for bc in self._base_caches.values())
 
         disk_files = []
         total_disk_bytes = 0
@@ -8791,9 +9304,12 @@ class MLXEngine:
 
         active_sessions_kv_gb = round(total_memory_bytes / 1e9, 2)
         pool_kv_gb = round(self.cache_manager._memory_usage_gb(), 2)
+        # U2: base caches are the third resident-KV consumer charged against
+        # the shared budget (previously invisible + unbounded).
+        base_kv_gb = round(total_base_bytes / 1e9, 2)
         budget_gb = float(getattr(self.cfg, "memory_budget_gb", 0) or 0)
 
-        total_kv_gb = round(active_sessions_kv_gb + pool_kv_gb, 2)
+        total_kv_gb = round(active_sessions_kv_gb + pool_kv_gb + base_kv_gb, 2)
         # The active-session LRU never evicts the protected / MRU / last-
         # remaining session, so the budget is BEST-EFFORT, not a hard cap. When
         # the lone un-evictable session alone exceeds the budget, the sweep
@@ -8812,7 +9328,21 @@ class MLXEngine:
             )
         except Exception:  # noqa: BLE001
             largest_session_gb = 0.0
-        irreducible_kv_gb = round(largest_session_gb + pool_kv_gb, 2)
+        # U2: the base-cache sweep keeps the single MRU entry resident, so it
+        # is part of the un-evictable residue alongside the largest session +
+        # the always-present prefix pool.
+        try:
+            mru_base = max(
+                self._base_caches.values(),
+                key=lambda bc: bc.last_used,
+                default=None,
+            )
+            mru_base_gb = round(
+                (mru_base.size_bytes if mru_base else 0) / 1e9, 2,
+            )
+        except Exception:  # noqa: BLE001
+            mru_base_gb = 0.0
+        irreducible_kv_gb = round(largest_session_gb + pool_kv_gb + mru_base_gb, 2)
         over_budget = total_kv_gb > budget_gb if budget_gb > 0 else False
         budget_unmet = over_budget and irreducible_kv_gb > budget_gb
 
@@ -8822,6 +9352,10 @@ class MLXEngine:
             "active_sessions_kv_gb": active_sessions_kv_gb,
             # Separate LRU prefix-reuse pool (cache_manager.memory_caches).
             "prefix_pool_kv_gb": pool_kv_gb,
+            # U2: base-cache pool — byte-accounted + LRU-evicted against the
+            # same budget as the sessions/pool above.
+            "base_caches_kv_gb": base_kv_gb,
+            "base_cache_count": len(self._base_caches),
             # What the eviction sweep compares against the budget.
             "total_kv_gb": total_kv_gb,
             "budget_gb": budget_gb,
@@ -8873,6 +9407,9 @@ class MLXEngine:
             # Anon-provenance hygiene: no sessions remain → no minted ids remain.
             if hasattr(self, "_anon_minted_ids"):
                 self._anon_minted_ids.clear()
+            # U26: no sessions remain → no cumulative drafter stats remain.
+            if hasattr(self, "_session_drafter_stats"):
+                self._session_drafter_stats.clear()
 
             cleared["base_caches"] += len(self._base_caches)
             self._base_caches.clear()

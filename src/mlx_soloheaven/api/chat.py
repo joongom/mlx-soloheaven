@@ -142,6 +142,27 @@ async def update_session(session_id: str, req: CreateSessionRequest):
 
 @router.delete("/sessions/{session_id}")
 async def delete_session(session_id: str):
+    # U26 round 2 (codex F5a): the web delete used to remove ONLY the SQLite
+    # rows — the engine kept the session's resident KV cache, its disk cache
+    # file, AND its drafter-stats registry entry alive until process restart
+    # (the registry is pruned only by engine delete_session/clear_caches).
+    # Delete the engine-side session too, on EVERY engine (multi-model: the
+    # session lives on whichever engine served it; same merge the
+    # list_sessions enrichment uses). Best-effort and BEFORE the DB delete:
+    # if the engine call fails (busy/dead child) the DB delete still
+    # proceeds — the stale engine state then degrades to an honest MISS on
+    # any future request, exactly like the mid-generation invalidation path.
+    for eng in (_engines.values() if _engines else [engine] if engine else []):
+        try:
+            # U14/F2: synchronous mutating engine RPC — off the event loop,
+            # long-ops lane (same as the OpenAI-compat delete route).
+            await run_long(eng.delete_session, session_id)
+        except Exception:  # noqa: BLE001 — the DB delete must still proceed
+            logger.exception(
+                f"[Session] engine-side delete failed for session="
+                f"{session_id} (DB delete proceeds; stale engine state "
+                f"degrades to an honest MISS)"
+            )
     await db.delete_session(session_id)
     return {"ok": True}
 
@@ -282,13 +303,23 @@ async def _chat_after_admission(
 
     # Get generation parameters from session (engine resolved + availability
     # preflighted above, BEFORE the user message was persisted).
-    temperature = session.get("temperature", use_engine.cfg.default_temperature)
-    top_p = session.get("top_p", use_engine.cfg.default_top_p)
-    min_p = session.get("min_p", use_engine.cfg.default_min_p)
-    top_k = session.get("top_k", use_engine.cfg.default_top_k)
-    repetition_penalty = session.get("repetition_penalty", use_engine.cfg.default_repetition_penalty)
-    thinking_budget = session.get("thinking_budget", use_engine.cfg.thinking_budget)
-    max_tokens = session.get("max_tokens", use_engine.cfg.default_max_tokens)
+    # Batch-5 F7: the sampling columns exist in the sessions schema now, so
+    # ``dict.get(key, default)`` no longer falls back for an uncustomized
+    # session — the key is present with a NULL/None value. Coalesce None to
+    # the engine config default explicitly (NULL = "not customized").
+    def _session_value(key: str, default):
+        v = session.get(key)
+        return default if v is None else v
+
+    temperature = _session_value("temperature", use_engine.cfg.default_temperature)
+    top_p = _session_value("top_p", use_engine.cfg.default_top_p)
+    min_p = _session_value("min_p", use_engine.cfg.default_min_p)
+    top_k = _session_value("top_k", use_engine.cfg.default_top_k)
+    repetition_penalty = _session_value(
+        "repetition_penalty", use_engine.cfg.default_repetition_penalty
+    )
+    thinking_budget = _session_value("thinking_budget", use_engine.cfg.thinking_budget)
+    max_tokens = _session_value("max_tokens", use_engine.cfg.default_max_tokens)
 
     if req.stream:
         return StreamingResponse(
@@ -311,8 +342,19 @@ async def _chat_after_admission(
             },
         )
     else:
+        # Batch-5 round 4 (codex finding 2): the non-streaming branch must
+        # forward the SAME resolved session settings as the streaming branch
+        # above — pre-fix it passed only session_id, so every customized
+        # sampling setting fell back to the engine config default.
         return await _sync_chat(
             session_id, messages, use_engine, reservation=slot,
+            temperature=temperature,
+            top_p=top_p,
+            min_p=min_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            thinking_budget=thinking_budget,
+            max_tokens=max_tokens,
             user_message_id=user_message_id,
         )
 
@@ -863,18 +905,44 @@ async def _sync_chat(
     messages: list[dict],
     eng: "MLXEngine | None" = None,
     reservation: "LongReservation | None" = None,
+    temperature: float = 0.6,
+    top_p: float = 1.0,
+    min_p: float = 0.0,
+    top_k: int = 0,
+    repetition_penalty: float = 1.0,
+    thinking_budget: int = 8192,
+    max_tokens: int = 32768,
     user_message_id: str | None = None,
 ) -> dict:
     """Non-streaming chat response. ``reservation`` is the admission slot
     the chat endpoint acquired BEFORE persisting the user message (codex
     round 11, finding 1) — consumed by the run_long below.
     ``user_message_id`` gates the assistant persist on the originating user
-    row (codex round 3, finding 2 — see ``_persist_assistant_turn``)."""
+    row (codex round 3, finding 2 — see ``_persist_assistant_turn``).
+
+    Batch-5 round 4 (codex finding 2): the resolved session sampling
+    settings (same names/shape as ``_stream_chat``) are threaded through to
+    ``eng.complete`` — pre-fix the call passed only session_id, so a
+    PATCHed session setting (e.g. top_k=1) reached the engine as None and
+    silently resolved to the config default on the non-streaming path. In
+    process mode ``complete`` is a generic RPC, so the kwargs pass through
+    to the child identically."""
     eng = eng or engine
     # U14: complete() blocks for the WHOLE generation — off the event loop.
     # F2: non-streaming generation -> bounded long-ops executor.
+    # ``reservation`` is consumed by run_long itself, never forwarded to
+    # complete().
     result = await run_long(
-        eng.complete, messages, session_id=session_id, reservation=reservation
+        eng.complete, messages,
+        session_id=session_id,
+        temperature=temperature,
+        top_p=top_p,
+        min_p=min_p,
+        top_k=top_k,
+        repetition_penalty=repetition_penalty,
+        thinking_budget=thinking_budget,
+        max_tokens=max_tokens,
+        reservation=reservation,
     )
 
     # U6/F1: corruption-terminated — return an error, persist nothing.

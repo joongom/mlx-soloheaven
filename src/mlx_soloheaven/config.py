@@ -229,6 +229,15 @@ class Config:
             for _name, field_name, val in _sampling_args
             if val is not None
         }
+        # U23: --repetition-penalty shares the None sentinel. An always-present
+        # argparse default (1.0) used to clobber the dataclass default (1.05,
+        # gemma4 FIX 2) on every startup — dead config. It is NOT recorded in
+        # cli_set_sampling: that marker exists solely for the
+        # generation_config.json auto-apply, which intentionally never reads
+        # repetition_penalty (see _load_generation_config_sampling). Effective
+        # precedence: CLI/env explicitly set > dataclass default (1.05).
+        if args.repetition_penalty is not None:
+            sampling_kwargs["default_repetition_penalty"] = args.repetition_penalty
 
         models = []
         if args.models:
@@ -257,7 +266,6 @@ class Config:
                     # model's generation_config.json can fill them at load time.
                     **sampling_kwargs,
                     cli_set_sampling=cli_set_sampling,
-                    default_repetition_penalty=args.repetition_penalty,
                     default_max_tokens=args.max_tokens,
                     thinking_budget=args.thinking_budget,
                     enable_thinking=enable_thinking,
@@ -271,7 +279,6 @@ class Config:
                 backend=getattr(args, "backend", "auto"),
                 **sampling_kwargs,
                 cli_set_sampling=cli_set_sampling,
-                default_repetition_penalty=args.repetition_penalty,
                 default_max_tokens=args.max_tokens,
                 thinking_budget=args.thinking_budget,
                 enable_thinking=not args.no_thinking,
@@ -289,7 +296,6 @@ class Config:
             backend=getattr(args, "backend", "auto"),
             **sampling_kwargs,
             cli_set_sampling=cli_set_sampling,
-            default_repetition_penalty=args.repetition_penalty,
             default_max_tokens=args.max_tokens,
             thinking_budget=args.thinking_budget,
             enable_thinking=not args.no_thinking,

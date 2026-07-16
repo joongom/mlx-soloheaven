@@ -416,6 +416,7 @@ def _clear_stash():
     mlx_engine_module._MTP_THINK_START_TOKEN = None
     mlx_engine_module._MTP_THINK_FAMILY = None
     mlx_engine_module._MTP_THINK_BARE_OPEN_TOKENS = None
+    mlx_engine_module._MTP_THINK_TOKENIZER = None
     mlx_engine_module._MTP_TOKEN_HISTORY_SEED = None
     mlx_engine_module._MTP_LOGITS_PROCESSORS = None
 

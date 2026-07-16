@@ -6,6 +6,7 @@ GET  /v1/models
 
 import asyncio
 import json
+import math
 import time
 import uuid
 import logging
@@ -106,6 +107,93 @@ class _Gemma4ThinkingStripper:
         )
 
 
+def _invalid_request(message: str) -> JSONResponse:
+    """OpenAI-style 400 invalid_request_error envelope (U24/U20 shape)."""
+    return JSONResponse(
+        status_code=400,
+        content={"error": {
+            "message": message,
+            "type": "invalid_request_error",
+        }},
+    )
+
+
+def _validate_sampling_params(request: ChatCompletionRequest) -> Optional[JSONResponse]:
+    """U20: validate sampling parameters at the API boundary.
+
+    Unvalidated values reached the engine unclamped: repetition_penalty=0
+    divides logits by zero (inf/NaN cascade), top_k > vocab raised inside the
+    compiled top-k filter mid-generation, negative temperature inverts the
+    distribution. Reject with a 400 + OpenAI error envelope HERE (before any
+    stream starts); the engine additionally keeps cheap defensive clamps
+    (top_k capped to vocab in the eager sampler, non-positive
+    repetition_penalty neutralized) for non-API callers.
+
+    Returns a 400 JSONResponse on the first violation, else None. Ranges:
+      temperature >= 0; top_p in (0, 1]; min_p in [0, 1]; top_k >= 0 (excess
+      is capped to vocab engine-side, not an error); repetition_penalty > 0
+      (multiplicative — sane range ~0.1-2.0, 1.0 disables);
+      frequency/presence_penalty in [-2, 2] (OpenAI); max_tokens /
+      max_completion_tokens >= 1.
+
+    Round 2 (codex F6): every float param is FIRST required to be finite —
+    Python's json parser (via Starlette) accepts the NaN/Infinity literals
+    and pydantic floats admit them, and NaN sails through every comparison
+    below (``nan < 0`` is False), reaching the engine as a poisoned
+    temperature/penalty. Non-finite => 400.
+    """
+    for name, val in (
+        ("temperature", request.temperature),
+        ("top_p", request.top_p),
+        ("min_p", request.min_p),
+        ("repetition_penalty", request.repetition_penalty),
+        ("frequency_penalty", request.frequency_penalty),
+        ("presence_penalty", request.presence_penalty),
+    ):
+        if val is not None and not math.isfinite(val):
+            return _invalid_request(
+                f"'{name}': must be a finite number, got {val}"
+            )
+    if request.temperature is not None and request.temperature < 0:
+        return _invalid_request(
+            f"'temperature': must be >= 0, got {request.temperature}"
+        )
+    if request.top_p is not None and not (0 < request.top_p <= 1):
+        return _invalid_request(
+            f"'top_p': must be in (0, 1], got {request.top_p}"
+        )
+    if request.min_p is not None and not (0 <= request.min_p <= 1):
+        return _invalid_request(
+            f"'min_p': must be in [0, 1], got {request.min_p}"
+        )
+    if request.top_k is not None and request.top_k < 0:
+        return _invalid_request(
+            f"'top_k': must be >= 0, got {request.top_k}"
+        )
+    if request.repetition_penalty is not None and request.repetition_penalty <= 0:
+        return _invalid_request(
+            f"'repetition_penalty': must be > 0 (multiplicative; 1.0 "
+            f"disables, sane range 0.1-2.0), got {request.repetition_penalty}"
+        )
+    for name, val in (
+        ("frequency_penalty", request.frequency_penalty),
+        ("presence_penalty", request.presence_penalty),
+    ):
+        if val is not None and not (-2 <= val <= 2):
+            return _invalid_request(
+                f"'{name}': must be in [-2, 2], got {val}"
+            )
+    for name, val in (
+        ("max_tokens", request.max_tokens),
+        ("max_completion_tokens", request.max_completion_tokens),
+    ):
+        if val is not None and val < 1:
+            return _invalid_request(
+                f"'{name}': must be >= 1, got {val}"
+            )
+    return None
+
+
 # --- POST /v1/chat/completions ---
 
 @router.post("/v1/chat/completions")
@@ -119,6 +207,12 @@ async def chat_completions(request: ChatCompletionRequest):
     ensure_available = getattr(engine, "ensure_available", None)
     if ensure_available is not None:
         ensure_available()
+
+    # U20: sampling parameters are validated up front (before any streaming
+    # response starts) — see _validate_sampling_params for the ranges.
+    sampling_error = _validate_sampling_params(request)
+    if sampling_error is not None:
+        return sampling_error
 
     # U24: validate the ``stop`` parameter early (OpenAI: a string or an
     # array of up to 4 non-empty strings). Anything else is a 400, matching
@@ -258,9 +352,11 @@ def _sync_completion(request: ChatCompletionRequest, engine: "MLXEngine"):
     rep_penalty = request.repetition_penalty
     if rep_penalty is None and (request.frequency_penalty or request.presence_penalty):
         # Approximate: OpenAI penalties are additive [-2,2], repetition_penalty is multiplicative [0.1, 2.0]
+        # U20: floor at 0.1 — fp+pp == -4 (both at the OpenAI minimum) would
+        # map to exactly 0, which divides logits by zero in the penalty.
         fp = request.frequency_penalty or 0.0
         pp = request.presence_penalty or 0.0
-        rep_penalty = 1.0 + (fp + pp) * 0.25  # rough mapping
+        rep_penalty = max(0.1, 1.0 + (fp + pp) * 0.25)  # rough mapping
 
     result = engine.complete(
         messages,
@@ -449,9 +545,11 @@ async def _stream_completion_body(
     # Map OpenAI frequency/presence_penalty to repetition_penalty if not explicitly set
     rep_penalty = request.repetition_penalty
     if rep_penalty is None and (request.frequency_penalty or request.presence_penalty):
+        # U20: floor at 0.1 — fp+pp == -4 would map to a zero penalty (see
+        # the identical clamp in _sync_completion).
         fp = request.frequency_penalty or 0.0
         pp = request.presence_penalty or 0.0
-        rep_penalty = 1.0 + (fp + pp) * 0.25
+        rep_penalty = max(0.1, 1.0 + (fp + pp) * 0.25)
 
     model_family = engine.model_family
 

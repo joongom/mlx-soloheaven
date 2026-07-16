@@ -1038,7 +1038,9 @@ class _LiveEngineStub:
         self.calls.append("branch_from_turn")
         return {"cached_tokens": 0, "method": "none"}
 
-    def complete(self, messages, session_id=None):
+    def complete(self, messages, session_id=None, **kwargs):
+        # Batch-5 round 4 (codex finding 2): the non-streaming chat path now
+        # forwards the resolved session sampling settings as kwargs.
         self.calls.append("complete")
         return SimpleNamespace(
             finish_reason="stop", content="hi", thinking=None,

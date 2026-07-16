@@ -163,17 +163,27 @@ def test_server_propagates_draft_config_to_per_model_config():
     `draft_block_size`. Without this, `--draft-model` at the CLI is
     silently dropped before reaching `MLXEngine.load_model`, so MTP is a
     no-op even when the CLI flag is set.
+
+    U27 update: the rebuild now lives in the shared, hermetically-testable
+    ``server.build_per_model_config`` (one copy for the process-mode AND the
+    in-process multi-model paths), so assert on its actual OUTPUT instead of
+    the old create_app source-string scrape.
     """
-    import inspect
+    from mlx_soloheaven.config import Config, ModelConfig
+    from mlx_soloheaven.server import build_per_model_config
 
-    from mlx_soloheaven import server
-
-    src = inspect.getsource(server.create_app)
-    # The per-model Config(...) rebuild must reference draft_model.
-    # We assert on the source string rather than running the whole
-    # FastAPI bootstrap, which would require loading a real model.
-    assert "draft_model=cfg.draft_model" in src, (
-        "server.create_app must propagate draft_model into the per-model Config"
+    cfg = Config(
+        models=[ModelConfig(model_path="/tmp/m")],
+        model_path="/tmp/m",
+        draft_model="/tmp/drafter",
+        draft_kind="mtp",
+        draft_block_size=3,
     )
-    assert "draft_kind=cfg.draft_kind" in src
-    assert "draft_block_size=cfg.draft_block_size" in src
+    for engine_mode in (None, "process"):
+        kwargs = {} if engine_mode is None else {"engine_mode": engine_mode}
+        model_cfg = build_per_model_config(cfg, cfg.models[0], **kwargs)
+        assert model_cfg.draft_model == "/tmp/drafter", (
+            "per-model Config must propagate draft_model"
+        )
+        assert model_cfg.draft_kind == "mtp"
+        assert model_cfg.draft_block_size == 3

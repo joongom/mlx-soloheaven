@@ -33,6 +33,15 @@ async def init_db():
                 title TEXT DEFAULT 'New Chat',
                 system_prompt TEXT DEFAULT '',
                 temperature REAL DEFAULT 0.6,
+                -- Batch-5 F7: sampling params the settings PATCH accepts
+                -- (SessionSettings) — the dynamic UPDATE failed on a fresh
+                -- DB without these columns. NULL = "not customized": the
+                -- chat endpoint falls back to the engine config default
+                -- (per-deployment, so no concrete SQL default is baked in).
+                top_p REAL,
+                min_p REAL,
+                top_k INTEGER,
+                repetition_penalty REAL,
                 thinking_budget INTEGER DEFAULT 8192,
                 max_tokens INTEGER DEFAULT 32768,
                 context_window_limit INTEGER DEFAULT 100000,
@@ -98,6 +107,33 @@ async def init_db():
         
         try:
             await db.execute("ALTER TABLE sessions ADD COLUMN thinking_budget INTEGER DEFAULT 8192")
+            await db.commit()
+        except Exception:
+            pass
+
+        # Batch-5 F7: sampling columns backing the SessionSettings PATCH
+        # (top_p/min_p/top_k/repetition_penalty). NULL = "not customized"
+        # (the chat endpoint falls back to the engine config default).
+        try:
+            await db.execute("ALTER TABLE sessions ADD COLUMN top_p REAL")
+            await db.commit()
+        except Exception:
+            pass
+
+        try:
+            await db.execute("ALTER TABLE sessions ADD COLUMN min_p REAL")
+            await db.commit()
+        except Exception:
+            pass
+
+        try:
+            await db.execute("ALTER TABLE sessions ADD COLUMN top_k INTEGER")
+            await db.commit()
+        except Exception:
+            pass
+
+        try:
+            await db.execute("ALTER TABLE sessions ADD COLUMN repetition_penalty REAL")
             await db.commit()
         except Exception:
             pass

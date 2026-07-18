@@ -1074,13 +1074,17 @@ def _reservation_test_client(monkeypatch, stub_db, engine):
     ("/api/sessions/s1/delete-last", None),
     ("/api/sessions/s1/branch", {"turn": 2}),
 ])
-def test_endpoint_saturated_503_db_untouched(monkeypatch, endpoint, payload):
+def test_endpoint_saturated_queue_full_db_untouched(monkeypatch, endpoint, payload):
     """CODEX ROUND 11 HIGH repro: with the long pool saturated, the three
-    mutate-then-submit endpoints must answer a clean 503 BEFORE touching
-    the DB. Pre-fix, admission failed only at the run_long AFTER the
+    mutate-then-submit endpoints must answer a clean rejection BEFORE
+    touching the DB. Pre-fix, admission failed only at the run_long AFTER the
     mutations: regenerate stranded a dangling user turn, delete-last
     removed a pair a retry would double-delete, branch orphaned a durable
-    half-built session — all with ZERO engine calls."""
+    half-built session — all with ZERO engine calls.
+
+    BATCH B CONTRACT CHANGE: admission/pool saturation is now HTTP 429
+    queue_full (+ Retry-After), not the old 503 engine_busy — the engine is
+    UP, just out of capacity."""
     stub_db = _EndpointStubDB()
     eng = _LiveEngineStub()
     client = _reservation_test_client(monkeypatch, stub_db, eng)
@@ -1091,18 +1095,23 @@ def test_endpoint_saturated_503_db_untouched(monkeypatch, endpoint, payload):
         else:
             r = client.post(endpoint, json=payload)
 
-    assert r.status_code == 503
-    assert r.json()["error"]["type"] == "engine_busy"
+    assert r.status_code == 429
+    assert r.json()["error"]["type"] == "queue_full"
+    assert r.json()["error"]["code"] == "queue_full"
+    assert r.headers.get("Retry-After") is not None
     assert stub_db.writes == []  # DB untouched (pre-fix: mutations landed)
     assert eng.calls == []  # zero engine calls
     assert executors._long_admitted == 0  # rejected reserve counted nothing
 
 
-def test_chat_nonstream_saturated_503_user_message_not_persisted(monkeypatch):
+def test_chat_nonstream_saturated_queue_full_user_message_not_persisted(monkeypatch):
     """Round 11 finding 1 audit: the NON-STREAMING chat path persists the
     user message and only then submits the whole generation through
-    run_long — saturation used to answer 503 with the message already in
-    the DB (a retry duplicates it). The reservation now runs first."""
+    run_long — saturation used to answer with the message already in
+    the DB (a retry duplicates it). The reservation now runs first.
+
+    BATCH B CONTRACT CHANGE: saturation -> HTTP 429 queue_full (+ Retry-After),
+    not the old 503 engine_busy."""
     stub_db = _EndpointStubDB()
     eng = _LiveEngineStub()
     client = _reservation_test_client(monkeypatch, stub_db, eng)
@@ -1112,8 +1121,10 @@ def test_chat_nonstream_saturated_503_user_message_not_persisted(monkeypatch):
             "/api/sessions/s1/chat", json={"content": "hi", "stream": False}
         )
 
-    assert r.status_code == 503
-    assert r.json()["error"]["type"] == "engine_busy"
+    assert r.status_code == 429
+    assert r.json()["error"]["type"] == "queue_full"
+    assert r.json()["error"]["code"] == "queue_full"
+    assert r.headers.get("Retry-After") is not None
     assert stub_db.writes == []  # user message NOT persisted
     assert eng.calls == []
     assert executors._long_admitted == 0

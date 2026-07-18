@@ -184,7 +184,9 @@ def test_tokenize_engine_restarting_maps_to_503():
     client = _client(_DeadEngine())
     r = client.post("/tokenize", json={"content": "hello"})
     assert r.status_code == 503
-    assert r.json()["error"]["type"] == "engine_restarting"
+    # BATCH B CONTRACT CHANGE: EngineRestartingError -> type "engine_not_ready"
+    # (renamed from "engine_restarting"); the app handler maps it.
+    assert r.json()["error"]["type"] == "engine_not_ready"
 
 
 # --------------------------------------------------------------------------

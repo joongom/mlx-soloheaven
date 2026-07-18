@@ -15,13 +15,37 @@ class EngineBusyError(RuntimeError):
     """A READ-ONLY engine query could not be served within its bounded wait
     because a generation currently owns the engine (in-process mode: the
     global engine lock; process mode: the child worker services RPCs only
-    BETWEEN generations).
+    BETWEEN generations) — OR admission/shutdown rejected a submission.
 
     Raised instead of hanging for the full generation so API callers can
     DEGRADE (admin/stats endpoints answer with a "busy" placeholder, session
-    reads answer 503 "retry shortly") — U14/U15. Lives here (no mlx imports)
+    reads answer "retry shortly") — U14/U15. Lives here (no mlx imports)
     so the parent-process proxy, the in-process engine, and the API layer all
-    share one exception type."""
+    share one exception type.
+
+    Batch B — HTTP-status discriminator. A single EngineBusyError used to be
+    raised for BOTH admission/pool saturation AND shutdown/not-ready, and the
+    app mapped every one to 503. The downstream contract now splits them, so
+    ``reason`` tells the app-level handler which HTTP status to assign:
+
+      REASON_QUEUE_FULL       -> 429 queue_full: the engine is UP but out of
+                                 capacity (pool/backlog saturated, read-lock
+                                 not acquired within its bound, read-RPC timed
+                                 out on a busy child). Retry shortly.
+      REASON_ENGINE_NOT_READY -> 503 engine_not_ready: the engine is not
+                                 accepting work (admission stopped / shutting
+                                 down, shutdown gate closed, pools torn down).
+
+    The default is ENGINE_NOT_READY so any raise site that omits ``reason``
+    keeps the pre-Batch-B behavior (503). Local degrade sites that merely
+    ``except EngineBusyError`` are unaffected by the discriminator."""
+
+    REASON_QUEUE_FULL = "queue_full"
+    REASON_ENGINE_NOT_READY = "engine_not_ready"
+
+    def __init__(self, *args, reason: str = REASON_ENGINE_NOT_READY):
+        super().__init__(*args)
+        self.reason = reason
 
 
 class GenerationCancelled(Exception):

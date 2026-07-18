@@ -18,6 +18,10 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from mlx_soloheaven.api.errors import (
+    engine_not_ready_response,
+    invalid_request_response,
+)
 from mlx_soloheaven.executors import run_read
 
 if TYPE_CHECKING:
@@ -40,29 +44,16 @@ def set_engines(engines: "dict[str, MLXEngine]", default: "MLXEngine"):
 
 
 def _invalid_request(message: str) -> JSONResponse:
-    """OpenAI-style 400 invalid_request_error envelope — byte-identical to the
-    shape openai_compat._invalid_request emits (do not invent a new shape)."""
-    return JSONResponse(
-        status_code=400,
-        content={"error": {
-            "message": message,
-            "type": "invalid_request_error",
-        }},
-    )
+    """OpenAI-style 400 invalid_request_error envelope — shares the canonical
+    {message,type,code} builder with openai_compat (batch B: adds ``code``)."""
+    return invalid_request_response(message)
 
 
 def _not_ready_response() -> JSONResponse:
-    """503 envelope for a not-yet-ready engine (model/tokenizer not loaded, or
-    a process-mode child that is dead/respawning). Batch B finalizes the
-    429/503 vocabulary; for now: type ``engine_not_ready`` + Retry-After."""
-    return JSONResponse(
-        status_code=503,
-        content={"error": {
-            "message": "engine not ready",
-            "type": "engine_not_ready",
-        }},
-        headers={"Retry-After": "5"},
-    )
+    """503 engine_not_ready envelope for a not-yet-ready engine (model/
+    tokenizer not loaded, or a process-mode child dead/respawning). Batch B:
+    canonical {message,type,code} + Retry-After via the shared builder."""
+    return engine_not_ready_response("engine not ready")
 
 
 class TokenizeRequest(BaseModel):

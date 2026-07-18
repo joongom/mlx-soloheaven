@@ -25,28 +25,25 @@ logger = logging.getLogger("soloheaven")
 
 
 def engine_unavailable_response(exc: Exception):
-    """503 body for a dead/respawning process-mode engine.
+    """503 engine_not_ready body for a dead/respawning process-mode engine.
 
     Module-level (and dependency-light) so it is hermetically testable and
     reusable by any router. The SSE paths can't use this (headers already
     sent) — they emit an in-band error frame instead (see openai_compat/chat).
-    """
-    from fastapi.responses import JSONResponse
 
-    return JSONResponse(
-        status_code=503,
-        content={"error": {
-            "message": "engine restarting, retry shortly",
-            "type": "engine_restarting",
-            "detail": str(exc),
-        }},
-        headers={"Retry-After": "30"},
-    )
+    Batch B: the canonical {message, type, code} envelope, NO ``detail:
+    str(exc)`` (the exception is logged by the handler, never returned in the
+    body), and the ``engine_not_ready`` vocabulary (renamed from the old
+    ``engine_restarting``). ``exc`` is accepted for signature compatibility
+    with existing callers/tests but is deliberately not echoed."""
+    from mlx_soloheaven.api.errors import engine_not_ready_response
+
+    return engine_not_ready_response()
 
 
 def register_engine_error_handlers(app: FastAPI):
-    """Map EngineRestartingError / EngineBusyError -> HTTP 503 for all
-    non-streaming endpoints.
+    """Map EngineRestartingError / EngineBusyError -> the Batch B HTTP status
+    contract for all non-streaming endpoints.
 
     The process-mode proxy fails FAST with EngineRestartingError while its
     child worker is dead or respawning (Metal GPU aborts kill the child
@@ -56,10 +53,20 @@ def register_engine_error_handlers(app: FastAPI):
     EngineBusyError (codex batch-3, round 2): most read paths already catch
     it locally and answer a "busy" placeholder; this app-level handler is
     the backstop for the paths that don't — notably run_long/run_read
-    submissions rejected by the executors module's admission/shutdown gate
-    — so they degrade to a retryable 503 instead of a 500."""
-    from fastapi.responses import JSONResponse
+    submissions rejected by the executors module's admission/shutdown gate.
 
+    Batch B status contract (downstream-confirmed):
+      - EngineRestartingError (dead/respawning/reloading/shutdown child)
+        -> 503 engine_not_ready (+ Retry-After 30).
+      - EngineBusyError with reason=QUEUE_FULL (admission/pool saturation,
+        read-lock/read-RPC busy) -> 429 queue_full (+ Retry-After 1).
+      - EngineBusyError with reason=ENGINE_NOT_READY (admission stopped /
+        shutting down / pools torn down) -> 503 engine_not_ready.
+    NO ``detail: str(exc)`` in any body; the exception is logged only."""
+    from mlx_soloheaven.api.errors import (
+        engine_not_ready_response,
+        queue_full_response,
+    )
     from mlx_soloheaven.engine.process_client import EngineRestartingError
     from mlx_soloheaven.engine.types import EngineBusyError
 
@@ -68,21 +75,59 @@ def register_engine_error_handlers(app: FastAPI):
         logger.warning(
             f"[503] {request.method} {request.url.path} — engine unavailable: {exc}"
         )
-        return engine_unavailable_response(exc)
+        return engine_not_ready_response()
 
     @app.exception_handler(EngineBusyError)
     async def _engine_busy_handler(request, exc):
+        reason = getattr(exc, "reason", EngineBusyError.REASON_ENGINE_NOT_READY)
+        if reason == EngineBusyError.REASON_QUEUE_FULL:
+            logger.warning(
+                f"[429] {request.method} {request.url.path} — queue full: {exc}"
+            )
+            return queue_full_response()
         logger.warning(
-            f"[503] {request.method} {request.url.path} — engine busy: {exc}"
+            f"[503] {request.method} {request.url.path} — engine not ready: {exc}"
         )
-        return JSONResponse(
-            status_code=503,
-            content={"error": {
-                "message": "engine busy, retry shortly",
-                "type": "engine_busy",
-                "detail": str(exc),
-            }},
-            headers={"Retry-After": "5"},
+        return engine_not_ready_response()
+
+
+def register_validation_error_handler(app: FastAPI):
+    """Normalize FastAPI's default 422 body to the canonical envelope (Batch B).
+
+    FastAPI's built-in RequestValidationError handler returns
+    ``{"detail": [<per-field errors>]}`` — a different shape from every other
+    error path AND one that echoes field-level input back to the caller. This
+    replaces it with the canonical ``{error:{message,type,code}}`` envelope
+    (type invalid_request_error, code invalid_request) and a GENERIC message
+    that does NOT echo the request body or ``exc.errors()``. The detail is
+    still LOGGED server-side for debugging (body-scrubbing of the log is a
+    Batch D concern — no NEW echoing is introduced here). Module-level and
+    dependency-light so it is hermetically testable."""
+    from fastapi.exceptions import RequestValidationError
+
+    from mlx_soloheaven.api.errors import (
+        CODE_INVALID_REQUEST,
+        TYPE_INVALID_REQUEST,
+        error_response,
+    )
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_handler(request, exc):
+        body = None
+        try:
+            body = await request.body()
+            body = body.decode("utf-8", errors="replace")[:2000]
+        except Exception:
+            pass
+        logger.error(
+            f"[422] {request.method} {request.url.path} | "
+            f"errors={exc.errors()} | body={body}"
+        )
+        return error_response(
+            422,
+            "request validation failed: one or more fields are invalid",
+            TYPE_INVALID_REQUEST,
+            CODE_INVALID_REQUEST,
         )
 
 
@@ -180,26 +225,9 @@ def create_app(cfg: Config) -> FastAPI:
         allow_headers=["*"],
     )
 
-    # Log validation errors with request body for debugging
-    from fastapi.exceptions import RequestValidationError
-    from fastapi.responses import JSONResponse as _JSONResponse
-
-    @app.exception_handler(RequestValidationError)
-    async def validation_error_handler(request, exc):
-        body = None
-        try:
-            body = await request.body()
-            body = body.decode("utf-8", errors="replace")[:2000]
-        except Exception:
-            pass
-        logger.error(
-            f"[422] {request.method} {request.url.path} | "
-            f"errors={exc.errors()} | body={body}"
-        )
-        return _JSONResponse(
-            status_code=422,
-            content={"detail": exc.errors()},
-        )
+    # Batch B: normalize FastAPI's default 422 body to the canonical envelope
+    # (no request-body / field-error echo in the response; logged only).
+    register_validation_error_handler(app)
 
     # Dead/respawning process-mode child -> 503 with a JSON error body.
     register_engine_error_handlers(app)

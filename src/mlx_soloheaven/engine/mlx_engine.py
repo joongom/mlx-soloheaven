@@ -3392,9 +3392,13 @@ class MLXEngine(SessionCacheMixin):
         so a post-flush read is harmless — and /health should stay live
         through a graceful shutdown."""
         if not self._lock.acquire(timeout=self._READ_LOCK_TIMEOUT_S):
+            # Engine is UP but a generation holds the lock -> 429 queue_full
+            # (batch B) when this propagates to the app handler (most read
+            # callers degrade locally instead).
             raise EngineBusyError(
                 f"engine busy (generation in flight) — {what} not served "
-                f"within {self._READ_LOCK_TIMEOUT_S:.0f}s, retry shortly"
+                f"within {self._READ_LOCK_TIMEOUT_S:.0f}s, retry shortly",
+                reason=EngineBusyError.REASON_QUEUE_FULL,
             )
         try:
             yield
@@ -3462,9 +3466,11 @@ class MLXEngine(SessionCacheMixin):
         once ``begin_shutdown()`` ran. Callers MUST invoke this immediately
         after acquiring the engine lock and before any mutation."""
         if getattr(self, "_shutting_down", False):
+            # Shutdown gate closed -> 503 engine_not_ready (batch B).
             raise EngineBusyError(
                 f"engine shutting down — {what} rejected (state already "
-                f"flushed; no further mutations accepted)"
+                f"flushed; no further mutations accepted)",
+                reason=EngineBusyError.REASON_ENGINE_NOT_READY,
             )
 
     @contextlib.contextmanager

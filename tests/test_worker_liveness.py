@@ -868,9 +868,15 @@ def test_engine_restarting_maps_to_503_json():
     r = client.get("/boom")
     assert r.status_code == 503
     body = r.json()
-    assert body["error"]["message"] == "engine restarting, retry shortly"
-    assert body["error"]["type"] == "engine_restarting"
-    assert "resp pipe EOF" in body["error"]["detail"]
+    # BATCH B CONTRACT CHANGE: EngineRestartingError now maps to the canonical
+    # {message,type,code} envelope with type "engine_not_ready" (renamed from
+    # "engine_restarting"), and the body NO LONGER echoes str(exc) — the
+    # "resp pipe EOF" internal text must NOT leak into the response.
+    assert body["error"]["message"] == "engine not ready, retry shortly"
+    assert body["error"]["type"] == "engine_not_ready"
+    assert body["error"]["code"] == "engine_not_ready"
+    assert "detail" not in body["error"]
+    assert "resp pipe EOF" not in json.dumps(body)
     assert r.headers.get("retry-after") == "30"
 
 
@@ -880,7 +886,10 @@ def test_engine_unavailable_response_shape():
     resp = engine_unavailable_response(EngineRestartingError("x"))
     assert resp.status_code == 503
     body = json.loads(resp.body)
-    assert body["error"]["message"] == "engine restarting, retry shortly"
+    # BATCH B CONTRACT CHANGE: engine_not_ready envelope (see above).
+    assert body["error"]["message"] == "engine not ready, retry shortly"
+    assert body["error"]["type"] == "engine_not_ready"
+    assert body["error"]["code"] == "engine_not_ready"
 
 
 # --- API layer: started SSE streams emit an in-band error frame -----------------
@@ -934,11 +943,16 @@ def test_openai_stream_emits_error_frame_then_done_on_death():
     # The partial content that made it out is still there...
     assert any('"partial ' in c for c in chunks)
     # ...then a proper in-band error frame, then a terminating [DONE].
-    error_chunks = [c for c in chunks if '"engine_restarting"' in c]
+    # BATCH B CONTRACT CHANGE: the in-band frame now uses type/code
+    # "engine_not_ready" (renamed from "engine_restarting") and code is a
+    # string (was the int 503). The frame still fires under the SAME
+    # mid-stream death condition.
+    error_chunks = [c for c in chunks if '"engine_not_ready"' in c]
     assert len(error_chunks) == 1
     err = json.loads(error_chunks[0].removeprefix("data: "))
-    assert err["error"]["message"] == "engine restarting, retry shortly"
-    assert err["error"]["code"] == 503
+    assert err["error"]["message"] == "engine not ready, retry shortly"
+    assert err["error"]["type"] == "engine_not_ready"
+    assert err["error"]["code"] == "engine_not_ready"
     assert chunks[-1] == "data: [DONE]\n\n"
 
 
@@ -1108,7 +1122,8 @@ def test_chat_dead_engine_503_before_user_message_persisted(monkeypatch):
     r = client.post("/api/sessions/s1/chat", json={"content": "hi"})
 
     assert r.status_code == 503
-    assert r.json()["error"]["type"] == "engine_restarting"
+    # BATCH B CONTRACT CHANGE: EngineRestartingError -> type "engine_not_ready".
+    assert r.json()["error"]["type"] == "engine_not_ready"
     assert stub_db.writes == []  # NO user message persisted
 
 
@@ -1181,7 +1196,8 @@ def test_compaction_dead_engine_503_preflight(monkeypatch):
     r = client.post("/api/sessions/s1/compact", json={})
 
     assert r.status_code == 503
-    assert r.json()["error"]["type"] == "engine_restarting"
+    # BATCH B CONTRACT CHANGE: EngineRestartingError -> type "engine_not_ready".
+    assert r.json()["error"]["type"] == "engine_not_ready"
     assert stub_db.writes == []
 
 

@@ -857,10 +857,13 @@ class EngineProcessProxy:
                     if busy_on_timeout:
                         # Read-only RPC: a busy child is the diagnosis; the
                         # tombstone guarantees the stale read never runs.
+                        # Engine is UP but generating -> 429 queue_full (batch
+                        # B) if this propagates to the app handler.
                         raise EngineBusyError(
                             f"engine busy (generation in flight) — RPC "
                             f"{method!r} not served within {timeout}s, "
-                            f"retry shortly"
+                            f"retry shortly",
+                            reason=EngineBusyError.REASON_QUEUE_FULL,
                         )
                     # F5 (round 2): a MUTATING RPC that timed out is
                     # OUTCOME-UNKNOWN — the tombstone only stops a

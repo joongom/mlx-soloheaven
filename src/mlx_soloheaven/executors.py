@@ -274,8 +274,10 @@ def _check_admission(kind: str):
     admission section (finding 1), so it can never race quiesce's flag+
     snapshot."""
     if _admission_stopped:
+        # Shutdown stopped admission — the engine is not accepting work (503).
         raise EngineBusyError(
-            f"server shutting down — {kind} engine call rejected"
+            f"server shutting down — {kind} engine call rejected",
+            reason=EngineBusyError.REASON_ENGINE_NOT_READY,
         )
 
 
@@ -384,9 +386,11 @@ def reserve_long_slot() -> LongReservation:
     with _executor_lock:
         _check_admission("long")
         if _long_admitted >= LONG_ADMISSION_LIMIT:
+            # Admission/pool saturation -> 429 queue_full (engine is UP).
             raise EngineBusyError(
                 f"engine busy — long-ops pool saturated "
-                f"({LONG_ADMISSION_LIMIT} calls in flight), retry shortly"
+                f"({LONG_ADMISSION_LIMIT} calls in flight), retry shortly",
+                reason=EngineBusyError.REASON_QUEUE_FULL,
             )
         _long_admitted += 1
         return LongReservation()
@@ -426,9 +430,11 @@ async def run_long(fn, /, *args, reservation: LongReservation | None = None,
         _check_admission("long")
         if reservation is None:
             if _long_admitted >= LONG_ADMISSION_LIMIT:
+                # Admission/pool saturation -> 429 queue_full (engine is UP).
                 raise EngineBusyError(
                     f"engine busy — long-ops pool saturated "
-                    f"({LONG_ADMISSION_LIMIT} calls in flight), retry shortly"
+                    f"({LONG_ADMISSION_LIMIT} calls in flight), retry shortly",
+                    reason=EngineBusyError.REASON_QUEUE_FULL,
                 )
             fut = get_long_executor().submit(call)
             _long_admitted += 1
@@ -472,9 +478,11 @@ async def run_read(fn, /, *args, **kwargs):
     with _executor_lock:
         _check_admission("read")
         if _read_admitted >= READ_ADMISSION_LIMIT:
+            # Admission/pool saturation -> 429 queue_full (engine is UP).
             raise EngineBusyError(
                 f"engine busy — read pool saturated ({READ_ADMISSION_LIMIT} "
-                f"reads in flight), retry shortly"
+                f"reads in flight), retry shortly",
+                reason=EngineBusyError.REASON_QUEUE_FULL,
             )
         fut = get_read_executor().submit(call)
         _read_admitted += 1
@@ -508,9 +516,11 @@ async def run_read(fn, /, *args, **kwargs):
         # cancel() succeeds for a not-yet-started pool future — the done
         # callback then frees its admission slot and it NEVER runs late.
         fut.cancel()
+        # Read expired in the queue under saturation -> 429 queue_full.
         raise EngineBusyError(
             f"engine busy — read not served within {READ_DEADLINE_S:.0f}s "
-            f"of submission (queue wait + execution), retry shortly"
+            f"of submission (queue wait + execution), retry shortly",
+            reason=EngineBusyError.REASON_QUEUE_FULL,
         ) from None
 
 
@@ -584,9 +594,11 @@ async def run_critical(fn, /, *args, **kwargs):
 
     with _executor_lock:
         if _pools_shut_down:
+            # Pools torn down during shutdown -> 503 engine_not_ready.
             raise EngineBusyError(
                 "server shut down — critical engine commit rejected "
-                "(pools already torn down; state already flushed)"
+                "(pools already torn down; state already flushed)",
+                reason=EngineBusyError.REASON_ENGINE_NOT_READY,
             )
         fut = get_critical_executor().submit(_critical_wrapper)
         setattr(fut, _CRITICAL_CELL_ATTR, cell)
@@ -608,8 +620,12 @@ async def run_critical(fn, /, *args, **kwargs):
     except _ShutdownRejected as exc:
         # Shutdown rejected the queued commit BEFORE it started: degrade to
         # the EngineBusyError shape every caller already logs-and-continues
-        # on, so the stream's terminal event still goes out.
-        raise EngineBusyError(str(exc)) from None
+        # on, so the stream's terminal event still goes out. Shutdown-origin
+        # -> 503 engine_not_ready (never reaches an HTTP status in practice:
+        # callers log-and-continue their already-started stream).
+        raise EngineBusyError(
+            str(exc), reason=EngineBusyError.REASON_ENGINE_NOT_READY
+        ) from None
 
 
 # --- server shutdown lifecycle (codex batch-3 review, rounds 2+3) ----------

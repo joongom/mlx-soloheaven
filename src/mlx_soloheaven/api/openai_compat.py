@@ -32,6 +32,21 @@ from mlx_soloheaven.api.schemas import (
     FunctionCall,
     UsageInfo,
 )
+from mlx_soloheaven.api.errors import (
+    error_dict,
+    error_response,
+    invalid_request_response,
+    structured_output_unavailable_response,
+    CODE_ENGINE_BUSY,
+    CODE_ENGINE_NOT_READY,
+    CODE_NOT_FOUND,
+    CODE_SERVER_ERROR,
+    RETRY_AFTER_ENGINE_NOT_READY,
+    TYPE_ENGINE_BUSY,
+    TYPE_ENGINE_NOT_READY,
+    TYPE_NOT_FOUND,
+    TYPE_SERVER_ERROR,
+)
 from mlx_soloheaven.engine.process_client import EngineRestartingError
 from mlx_soloheaven.engine.types import EngineBusyError
 from mlx_soloheaven.executors import run_critical, run_long, run_read
@@ -108,14 +123,58 @@ class _Gemma4ThinkingStripper:
 
 
 def _invalid_request(message: str) -> JSONResponse:
-    """OpenAI-style 400 invalid_request_error envelope (U24/U20 shape)."""
-    return JSONResponse(
-        status_code=400,
-        content={"error": {
-            "message": message,
-            "type": "invalid_request_error",
-        }},
-    )
+    """OpenAI-style 400 invalid_request_error envelope (U24/U20 shape).
+
+    Batch B: delegates to the shared builder so every 400 carries the same
+    {message, type, code} shape (code="invalid_request")."""
+    return invalid_request_response(message)
+
+
+def _compile_response_format_schema(schema: dict) -> None:
+    """Compile a ``response_format`` json_schema up front to validate it.
+
+    Isolated into a named module-level function for two reasons:
+      1. The compile dependency stays a LOCAL import. Importing the mlx-backed
+         ``engine.structured`` module here would pull ``mlx.core`` into the
+         process-mode PARENT process, defeating the isolation the TYPE_CHECKING
+         import guard preserves — so we call ``outlines_core`` directly, which
+         needs no mlx and no tokenizer for the regex-compile validation.
+      2. Tests can monkeypatch this single entry point to exercise the
+         acceptance / dependency-missing / malformed-schema branches
+         deterministically, without the optional ``outlines_core`` package.
+
+    Distinguishable failure classes (the CALLER maps them to statuses):
+      - ImportError / ModuleNotFoundError -> the optional ``outlines_core``
+        dependency is absent: a SERVER setup condition, not a client error.
+      - any other exception (ValueError, ...) -> the schema itself is invalid.
+    """
+    from outlines_core.json_schema import build_regex_from_schema
+    build_regex_from_schema(json.dumps(schema))
+
+
+def _effective_thinking(request: ChatCompletionRequest, default: bool) -> bool:
+    """Resolve the ONE effective thinking flag from every input the request
+    can carry (batch B item 3).
+
+    Two inputs can drive thinking on/off:
+      - the top-level ``thinking`` flag (this API's native switch), and
+      - ``chat_template_kwargs.enable_thinking`` (the nested form spec clients
+        such as bultagi send: {"chat_template_kwargs":{"enable_thinking":false}}).
+
+    PRECEDENCE (documented): an explicit top-level ``thinking`` wins when BOTH
+    are set (it is this API's first-class parameter); otherwise a boolean
+    ``chat_template_kwargs.enable_thinking`` drives it; otherwise the server
+    default. Both inputs are normalized to one bool HERE so every downstream
+    consumer (prompt render, history strip, reasoning router) sees a single
+    contract — the top-level flag and the nested flag behave identically."""
+    if request.thinking is not None:
+        return bool(request.thinking)
+    ctk = request.chat_template_kwargs
+    if ctk:
+        et = ctk.get("enable_thinking")
+        if isinstance(et, bool):
+            return et
+    return bool(default)
 
 
 def _validate_sampling_params(request: ChatCompletionRequest) -> Optional[JSONResponse]:
@@ -220,47 +279,79 @@ async def chat_completions(request: ChatCompletionRequest):
     if request.stop is not None:
         stops = [request.stop] if isinstance(request.stop, str) else list(request.stop)
         if len(stops) > 4:
-            return JSONResponse(
-                status_code=400,
-                content={"error": {
-                    "message": "'stop': maximum of 4 stop sequences allowed",
-                    "type": "invalid_request_error",
-                }},
-            )
+            return _invalid_request("'stop': maximum of 4 stop sequences allowed")
         if any(not isinstance(s, str) or not s for s in stops):
-            return JSONResponse(
-                status_code=400,
-                content={"error": {
-                    "message": "'stop': stop sequences must be non-empty strings",
-                    "type": "invalid_request_error",
-                }},
+            return _invalid_request(
+                "'stop': stop sequences must be non-empty strings"
             )
 
-    # Validate response_format.json_schema early — return 400 on malformed
-    # schemas (matches OpenAI's behavior; avoids silent fallback to
-    # unconstrained generation).
-    if request.response_format and request.response_format.type == "json_schema":
-        js = request.response_format.json_schema
-        if not js or not js.schema_:
-            return JSONResponse(
-                status_code=400,
-                content={"error": {
-                    "message": "response_format.json_schema.schema is required when type=json_schema",
-                    "type": "invalid_request_error",
-                }},
+    # Validate response_format up front (batch B item 4). ``type`` is now a
+    # plain string in the schema (not a pydantic Literal), so an unsupported
+    # value reaches here as data instead of tripping FastAPI's 422 — reject it
+    # with an explicit 400 (spec: unsupported options must be 400, not a 422
+    # nor a silent ignore). Also reject tools+response_format explicitly
+    # instead of silently DROPPING response_format (the old behavior).
+    rf = request.response_format
+    if rf is not None:
+        supported_types = ("text", "json_object", "json_schema")
+        if rf.type not in supported_types:
+            return _invalid_request(
+                f"response_format.type {rf.type!r} is not supported "
+                f"(supported: {', '.join(supported_types)})"
             )
-        try:
-            from outlines_core.json_schema import build_regex_from_schema
-            import json as _json
-            build_regex_from_schema(_json.dumps(js.schema_))
-        except Exception as e:
-            return JSONResponse(
-                status_code=400,
-                content={"error": {
-                    "message": f"Invalid JSON schema in response_format: {e}",
-                    "type": "invalid_request_error",
-                }},
+        # tools + a JSON-constraining response_format are mutually exclusive:
+        # a grammar FSM and free-form tool-call emission cannot both drive the
+        # decoder. type="text" imposes no constraint, so it is harmless with
+        # tools and stays allowed.
+        if request.tools and rf.type in ("json_object", "json_schema"):
+            return _invalid_request(
+                "response_format and tools are mutually exclusive: send one "
+                "or the other (response_format.type='text' is unconstrained "
+                "and may be combined with tools)"
             )
+        # json_schema requires a schema, and the schema must compile — 400 on
+        # malformed input (matches OpenAI; avoids a silent fallback to
+        # unconstrained generation).
+        if rf.type == "json_schema":
+            js = rf.json_schema
+            if not js or not js.schema_:
+                return _invalid_request(
+                    "response_format.json_schema.schema is required when "
+                    "type=json_schema"
+                )
+            try:
+                _compile_response_format_schema(js.schema_)
+            except (ModuleNotFoundError, ImportError):
+                # DEPENDENCY / SETUP failure — NOT the client's fault. The
+                # optional ``outlines_core`` schema compiler is not installed,
+                # so a perfectly VALID json_schema request cannot be honored.
+                # The old f-string returned a 400 that both (a) wrongly blamed
+                # the client and (b) leaked "No module named 'outlines_core'"
+                # into the body. 501 Not Implemented is the honest status: the
+                # feature is unsupported on THIS server, and retrying will not
+                # make the package appear (no Retry-After). It is deliberately
+                # NOT 503 engine_not_ready — the engine IS ready; only this
+                # optional capability is missing. The real ImportError is
+                # logged server-side, never sent to the client.
+                logger.warning(
+                    "[Structured] json_schema requested but the outlines_core "
+                    "schema compiler is unavailable — returning 501",
+                    exc_info=True,
+                )
+                return structured_output_unavailable_response()
+            except Exception:
+                # MALFORMED CLIENT SCHEMA — the compiler (dependency present)
+                # rejected an actually-invalid schema. 400 with a GENERIC
+                # message; the raw compiler exception is logged server-side but
+                # NEVER echoed into the response body (Batch B no-str(exc)
+                # contract — the raw text can carry internal detail).
+                logger.warning(
+                    "[Structured] invalid json_schema in response_format",
+                    exc_info=True,
+                )
+                return _invalid_request(
+                    "Invalid JSON schema in response_format"
+                )
 
     # Build message preview for logging
     msg_preview = []
@@ -309,7 +400,9 @@ def _sync_completion(request: ChatCompletionRequest, engine: "MLXEngine"):
     Returns a ChatCompletionResponse, or a 500 JSONResponse error object
     when the engine terminated the stream fail-closed (U6/F1: 'error' is an
     engine-internal reason, never a valid OpenAI finish_reason)."""
-    enable_thinking = request.thinking if request.thinking is not None else engine.cfg.enable_thinking
+    # Batch B item 3: normalize top-level `thinking` and the nested
+    # chat_template_kwargs.enable_thinking to ONE effective bool.
+    enable_thinking = _effective_thinking(request, engine.cfg.enable_thinking)
     tools = [t.model_dump() for t in request.tools] if request.tools else None
 
     response_format = request.response_format
@@ -383,17 +476,13 @@ def _sync_completion(request: ChatCompletionRequest, engine: "MLXEngine"):
             f"[Request] user={request.user!r} | generation terminated by "
             f"cache corruption — returning 500 error object"
         )
-        return JSONResponse(
-            status_code=500,
-            content={"error": {
-                "message": (
-                    "generation terminated: session cache corruption "
-                    "detected; partial output is unreliable and was not "
-                    "persisted — retry the request"
-                ),
-                "type": "server_error",
-                "code": 500,
-            }},
+        return error_response(
+            500,
+            "generation terminated: session cache corruption detected; "
+            "partial output is unreliable and was not persisted — retry the "
+            "request",
+            TYPE_SERVER_ERROR,
+            CODE_SERVER_ERROR,
         )
 
     msg = ResponseMessage(content=result.content)
@@ -458,14 +547,15 @@ async def _stream_completion(
         logger.error(
             f"[Stream] user={request.user!r} | engine unavailable mid-stream: {exc}"
         )
-        err = {
-            "error": {
-                "message": "engine restarting, retry shortly",
-                "type": "engine_restarting",
-                "code": 503,
-                "detail": str(exc),
-            }
-        }
+        # Batch B: canonical {message,type,code} envelope; type renamed to
+        # engine_not_ready; NO detail:str(exc) leak (exc is logged above). The
+        # in-band frame fires under the SAME condition as before — only the
+        # shape changed.
+        err = error_dict(
+            "engine not ready, retry shortly",
+            TYPE_ENGINE_NOT_READY,
+            CODE_ENGINE_NOT_READY,
+        )
         yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
 
@@ -477,7 +567,9 @@ async def _stream_completion_body(
     """Streaming SSE completion with tool call detection."""
     # Determine thinking mode (moved above the input-history strip — codex
     # round 7, finding 3: the strip needs the request's thinking contract).
-    enable_thinking = request.thinking if request.thinking is not None else engine.cfg.enable_thinking
+    # Batch B item 3: top-level `thinking` and nested
+    # chat_template_kwargs.enable_thinking normalize to ONE effective bool.
+    enable_thinking = _effective_thinking(request, engine.cfg.enable_thinking)
     thinking_budget = request.thinking_budget
 
     tools = [t.model_dump() for t in request.tools] if request.tools else None
@@ -836,17 +928,16 @@ async def _stream_completion_body(
             f"cache corruption after {token_count} tokens — emitting error "
             f"envelope (no tool_calls, nothing persisted)"
         )
-        err = {
-            "error": {
-                "message": (
-                    "generation terminated: session cache corruption "
-                    "detected mid-stream; partial output is unreliable and "
-                    "was not persisted — retry the request"
-                ),
-                "type": "server_error",
-                "code": 500,
-            }
-        }
+        # Batch B: canonical {message,type,code} envelope (code now a string).
+        # U6/F1 fail-closed semantics unchanged — same terminal condition,
+        # same suppression of tool_calls/persistence; only the shape changed.
+        err = error_dict(
+            "generation terminated: session cache corruption detected "
+            "mid-stream; partial output is unreliable and was not persisted "
+            "— retry the request",
+            TYPE_SERVER_ERROR,
+            CODE_SERVER_ERROR,
+        )
         yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
         return
@@ -1090,13 +1181,22 @@ async def get_session(session_id: str):
         # F2: bounded read -> reserved reads executor.
         info = await run_read(_default_engine.get_session, session_id)
     except EngineBusyError:
-        # U14: generation in flight — honest 503 instead of a long hang.
-        return JSONResponse(
-            status_code=503,
-            content={"error": "engine busy (generation in progress), retry shortly"},
+        # U14: generation in flight — honest 503 instead of a long hang. This
+        # is a LOCAL degrade (the endpoint answers rather than propagating to
+        # the app handler), so it stays 503 (not the 429 saturation contract).
+        # Batch B: envelope the old bare-string body into {message,type,code}.
+        return error_response(
+            503,
+            "engine busy (generation in progress), retry shortly",
+            TYPE_ENGINE_BUSY,
+            CODE_ENGINE_BUSY,
+            retry_after=RETRY_AFTER_ENGINE_NOT_READY,
         )
     if not info:
-        return JSONResponse(status_code=404, content={"error": "session not found"})
+        # Batch B: envelope the old bare-string body into {message,type,code}.
+        return error_response(
+            404, "session not found", TYPE_NOT_FOUND, CODE_NOT_FOUND
+        )
     return info
 
 

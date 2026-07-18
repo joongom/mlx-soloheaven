@@ -52,8 +52,13 @@ class ResponseFormat(BaseModel):
     - {"type": "text"}: no constraint (default)
     - {"type": "json_object"}: loose JSON mode (any valid JSON object)
     - {"type": "json_schema", "json_schema": {name, schema, strict}}: strict schema
+
+    Batch B item 4: ``type`` is a plain ``str`` (NOT a pydantic Literal) on
+    purpose — an unsupported value must surface as a clean HTTP 400
+    invalid_request (validated explicitly in openai_compat.chat_completions),
+    not FastAPI's generic 422, and never be silently ignored.
     """
-    type: Literal["text", "json_object", "json_schema"] = "text"
+    type: str = "text"
     json_schema: Optional[JsonSchemaSpec] = None
 
 
@@ -72,6 +77,12 @@ class ChatCompletionRequest(BaseModel):
     seed: Optional[int] = None
     user: Optional[str] = None
     thinking: Optional[bool] = None  # Enable/disable thinking (default: server config)
+    # Batch B item 3: nested chat-template controls. Spec clients (bultagi)
+    # send {"chat_template_kwargs":{"enable_thinking":false}}; without this
+    # field pydantic silently drops it. A boolean ``enable_thinking`` here
+    # drives thinking exactly like the top-level ``thinking`` flag (top-level
+    # wins if BOTH are set — see openai_compat._effective_thinking).
+    chat_template_kwargs: Optional[dict] = None
     thinking_budget: Optional[int] = None  # Override thinking token budget
     # Extended sampling parameters
     top_k: Optional[int] = None

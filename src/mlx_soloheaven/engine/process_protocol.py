@@ -148,6 +148,7 @@ def make_rpc_cancel(request_id: str) -> dict:
 def make_ready(
     model_id, model_family, enable_thinking, think_end_token, cfg=None,
     is_translation_template=False,
+    context_length=None,
 ) -> dict:
     return {
         "type": "ready",
@@ -155,6 +156,7 @@ def make_ready(
         "model_family": model_family,
         "enable_thinking": enable_thinking,
         "think_end_token": think_end_token,
+        "context_length": context_length,
         "cfg": cfg or {},
         "is_translation_template": is_translation_template,
     }

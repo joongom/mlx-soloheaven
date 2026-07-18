@@ -117,6 +117,10 @@ class EngineProcessProxy:
         # translation-schema chat template (translategemma) whose user content
         # must stay a structured list (see MLXEngine._is_translation_template).
         self._is_translation_template = False
+        # Max context length (tokens) reported by the child's ready frame;
+        # None until the child is ready / when its config doesn't declare it.
+        # Exposed by GET /ready without an RPC (read straight off the proxy).
+        self.max_context_length: int | None = None
 
         # Parent-side cache_manager shim (chat.py reads .cache_manager.stats()).
         self.cache_manager = _CacheManagerShim(self)
@@ -761,6 +765,8 @@ class EngineProcessProxy:
             self._is_translation_template = bool(
                 frame.get("is_translation_template", False)
             )
+            ctx = frame.get("context_length")
+            self.max_context_length = int(ctx) if isinstance(ctx, int) else None
             # Refresh cfg view from the child's authoritative post-load
             # snapshot so the API's default_*/thinking/token-id reads match
             # the child.
@@ -858,10 +864,13 @@ class EngineProcessProxy:
                     if busy_on_timeout:
                         # Read-only RPC: a busy child is the diagnosis; the
                         # tombstone guarantees the stale read never runs.
+                        # Engine is UP but generating -> 429 queue_full (batch
+                        # B) if this propagates to the app handler.
                         raise EngineBusyError(
                             f"engine busy (generation in flight) — RPC "
                             f"{method!r} not served within {timeout}s, "
-                            f"retry shortly"
+                            f"retry shortly",
+                            reason=EngineBusyError.REASON_QUEUE_FULL,
                         )
                     # F5 (round 2): a MUTATING RPC that timed out is
                     # OUTCOME-UNKNOWN — the tombstone only stops a
@@ -1097,6 +1106,40 @@ class EngineProcessProxy:
     def base_cache_stats(self):
         # Read-only: bounded wait, EngineBusyError while generating (U14).
         return self._rpc_read("base_cache_stats")
+
+    # --- tokenization + readiness ----------------------------------------
+
+    def tokenize(self, content, add_special=False, with_pieces=False):
+        """POST /tokenize in process mode: forward to the child via the
+        generic RPC (the worker dispatches getattr(engine, "tokenize")). The
+        tokenizer lives in the child, so this must round-trip. Read-only:
+        bounded wait + EngineBusyError while the child is mid-generation (U14),
+        EngineRestartingError (fail fast -> 503) when the child is dead."""
+        return self._rpc_read(
+            "tokenize", content,
+            add_special=add_special, with_pieces=with_pieces,
+        )
+
+    def is_ready(self) -> bool:
+        """GET /ready in process mode. Ready == the child reached its first
+        `ready` frame and is not dead / permanently dead / closed / respawning.
+        Reads ONLY proxy-side liveness state (no RPC, no GPU lock), so /ready
+        stays non-blocking and independent of queue saturation."""
+        with self._state_lock:
+            return (
+                self._ever_ready
+                and not self._dead
+                and not self._permanently_dead
+                and not self._closed
+                and not self._respawning
+            )
+
+    def active_request_count(self) -> int:
+        """Best-effort in-flight streaming request count for GET /ready
+        (Batch C adds a real queue). Non-blocking read of the inflight
+        counter."""
+        with self._inflight_lock:
+            return self._inflight
 
     # --- admin cache overview / reset (synchronous RPCs) -----------------
 

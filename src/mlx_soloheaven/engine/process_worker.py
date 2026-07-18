@@ -419,6 +419,7 @@ def worker_main(cfg_dict, cmd_conn, resp_conn, ctrl_conn):
         think_end_token=engine.cfg.think_end_token,
         cfg=_cfg_snapshot(engine.cfg),
         is_translation_template=getattr(engine, "_is_translation_template", False),
+        context_length=getattr(engine, "max_context_length", None),
     ))
 
     # Coalescing config (mirrors generate_stream_batches_async).

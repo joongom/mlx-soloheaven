@@ -1514,6 +1514,30 @@ def _maybe_load_drafter(
     return (model, resolved_kind)
 
 
+def _extract_max_context_length(model_config: dict) -> int | None:
+    """Best-effort max context length (tokens) from an HF model config dict.
+
+    Reads ``max_position_embeddings`` at the top level, then from the nested
+    ``text_config`` / ``llm_config`` blocks that VLM configs use for their
+    language-model fields. Returns ``None`` when no positive integer is found
+    (the caller — GET /ready — then reports ``context_length: null``).
+    """
+    if not isinstance(model_config, dict):
+        return None
+    candidates = [model_config]
+    for nested_key in ("text_config", "llm_config"):
+        nested = model_config.get(nested_key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+    for cfg in candidates:
+        val = cfg.get("max_position_embeddings")
+        if isinstance(val, bool):  # bool is a subclass of int — reject it
+            continue
+        if isinstance(val, int) and val > 0:
+            return int(val)
+    return None
+
+
 class MLXEngine(SessionCacheMixin):
     """MLX model engine with session-based KV cache reuse."""
 
@@ -1574,6 +1598,12 @@ class MLXEngine(SessionCacheMixin):
             cache_dir=cfg.cache_dir,
         )
         self.model_id = ""
+
+        # Max context length (tokens), best-effort from the HF model config at
+        # load_model time; None when the config does not declare it. Read-only,
+        # exposed by GET /ready. Initialized here so readiness probes before a
+        # completed load never AttributeError.
+        self.max_context_length: int | None = None
 
         # Session-based cache: session_id -> SessionState
         self._sessions: dict[str, SessionState] = {}
@@ -1800,6 +1830,11 @@ class MLXEngine(SessionCacheMixin):
         # Derive model ID from directory name
         self.model_id = os.path.basename(self.cfg.model_path.rstrip("/"))
         logger.info(f"Model loaded in {elapsed:.1f}s — {self.model_id}")
+
+        # Max context length (best-effort, from the HF model config). Exposed
+        # by GET /ready; stays None when the config does not declare it. VLM
+        # configs nest the language-model fields under text_config/llm_config.
+        self.max_context_length = _extract_max_context_length(model_config)
 
         # Detect model family
         self.model_family = self._detect_model_family()
@@ -3411,9 +3446,13 @@ class MLXEngine(SessionCacheMixin):
         so a post-flush read is harmless — and /health should stay live
         through a graceful shutdown."""
         if not self._lock.acquire(timeout=self._READ_LOCK_TIMEOUT_S):
+            # Engine is UP but a generation holds the lock -> 429 queue_full
+            # (batch B) when this propagates to the app handler (most read
+            # callers degrade locally instead).
             raise EngineBusyError(
                 f"engine busy (generation in flight) — {what} not served "
-                f"within {self._READ_LOCK_TIMEOUT_S:.0f}s, retry shortly"
+                f"within {self._READ_LOCK_TIMEOUT_S:.0f}s, retry shortly",
+                reason=EngineBusyError.REASON_QUEUE_FULL,
             )
         try:
             yield
@@ -3481,9 +3520,11 @@ class MLXEngine(SessionCacheMixin):
         once ``begin_shutdown()`` ran. Callers MUST invoke this immediately
         after acquiring the engine lock and before any mutation."""
         if getattr(self, "_shutting_down", False):
+            # Shutdown gate closed -> 503 engine_not_ready (batch B).
             raise EngineBusyError(
                 f"engine shutting down — {what} rejected (state already "
-                f"flushed; no further mutations accepted)"
+                f"flushed; no further mutations accepted)",
+                reason=EngineBusyError.REASON_ENGINE_NOT_READY,
             )
 
     @contextlib.contextmanager
@@ -7324,6 +7365,85 @@ class MLXEngine(SessionCacheMixin):
             "cached_tokens": new_offset,
             "messages": len(messages),
         }
+
+    # --- Tokenization + readiness (pure / lock-free) --------------------
+    #
+    # POST /tokenize and GET /ready reach these. They are read-only and touch
+    # NEITHER the engine mutation lock NOR the GPU: tokenizer.encode is a pure
+    # CPU op (thread-safe for encode/decode) and the readiness probe only reads
+    # already-published attributes. Deliberately lock-free so /ready stays
+    # non-blocking even while a generation holds the GPU lock (queue saturation
+    # is not a readiness failure — Batch A policy). In process mode the parent
+    # proxy forwards ``tokenize`` via the generic RPC and answers is_ready /
+    # active_request_count from its own liveness/inflight state (see
+    # EngineProcessProxy) — these methods run in the CHILD only for tokenize.
+
+    def tokenize(
+        self,
+        content: str,
+        add_special: bool = False,
+        with_pieces: bool = False,
+    ) -> dict:
+        """Tokenize ``content`` with the loaded tokenizer.
+
+        Returns ``{"tokens": [int, ...], "count": int}`` and, when
+        ``with_pieces`` is set, ``"pieces": [{"id": int, "piece": str}, ...]``
+        aligned 1:1 with ``tokens``. ``add_special`` toggles the tokenizer's
+        special/BOS-EOS tokens (passed straight to ``encode``). Pure/read-only
+        — no engine lock, no GPU.
+        """
+        if self.tokenizer is None:
+            raise RuntimeError("tokenizer not loaded")
+        ids = self.tokenizer.encode(content, add_special_tokens=add_special)
+        tokens = [int(t) for t in ids]
+        result: dict = {"tokens": tokens, "count": len(tokens)}
+        if with_pieces:
+            result["pieces"] = self._token_pieces(tokens)
+        return result
+
+    def _token_pieces(self, tokens: list[int]) -> list[dict]:
+        """Per-token id->piece mapping aligned with ``tokens``.
+
+        Prefers the tokenizer's ``convert_ids_to_tokens`` (raw subword pieces);
+        falls back to decoding each id individually when it is unavailable or
+        raises. Always returns one entry per input token.
+        """
+        tok = self.tokenizer
+        convert = getattr(tok, "convert_ids_to_tokens", None)
+        if callable(convert):
+            try:
+                pieces = convert(tokens)
+                if pieces is not None and len(pieces) == len(tokens):
+                    return [
+                        {"id": int(t), "piece": p if isinstance(p, str) else str(p)}
+                        for t, p in zip(tokens, pieces)
+                    ]
+            except Exception:  # noqa: BLE001 — fall back to per-token decode
+                pass
+        out: list[dict] = []
+        for t in tokens:
+            try:
+                piece = tok.decode([t])
+            except Exception:  # noqa: BLE001 — best-effort piece
+                piece = ""
+            out.append({"id": int(t), "piece": piece})
+        return out
+
+    def is_ready(self) -> bool:
+        """True when the model AND tokenizer are loaded and can serve a
+        request. Lock-free attribute read — deliberately independent of whether
+        a generation currently holds the GPU lock (busy != not-ready)."""
+        return self.tokenizer is not None and self._language_model is not None
+
+    def active_request_count(self) -> int:
+        """Best-effort in-flight indicator for GET /ready. In-process there is
+        no real request queue yet (Batch C adds one), so this reports whether a
+        generation currently holds the shared GPU lock (1) or not (0). Never
+        blocks — ``Lock.locked()`` is a non-acquiring probe."""
+        try:
+            return 1 if self._lock.locked() else 0
+        except Exception:  # noqa: BLE001 — never let a probe raise
+            return 0
 
     def session_stats(self) -> dict:
         # U15: locked read (bounded) — same rationale as list_sessions.

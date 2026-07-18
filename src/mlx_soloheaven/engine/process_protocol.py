@@ -146,7 +146,8 @@ def make_rpc_cancel(request_id: str) -> dict:
 # --- response frames (CHILD -> PARENT) -----------------------------------
 
 def make_ready(
-    model_id, model_family, enable_thinking, think_end_token, cfg=None
+    model_id, model_family, enable_thinking, think_end_token, cfg=None,
+    context_length=None,
 ) -> dict:
     return {
         "type": "ready",
@@ -154,6 +155,7 @@ def make_ready(
         "model_family": model_family,
         "enable_thinking": enable_thinking,
         "think_end_token": think_end_token,
+        "context_length": context_length,
         "cfg": cfg or {},
     }
 

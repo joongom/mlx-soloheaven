@@ -158,7 +158,7 @@ def create_app(cfg: Config) -> FastAPI:
     # only in the child. The in-process path imports MLXEngine lazily, inside
     # its construction branch below.
     from mlx_soloheaven.storage import database as db
-    from mlx_soloheaven.api import openai_compat, chat, admin, settings, compaction
+    from mlx_soloheaven.api import openai_compat, chat, admin, settings, compaction, tokenize
 
     # Set engine logger level based on verbose flag
     engine_logger = logging.getLogger("mlx_soloheaven.engine.mlx_engine")
@@ -277,6 +277,7 @@ def create_app(cfg: Config) -> FastAPI:
         openai_compat.set_engines(engines, default_engine)
         chat.set_engines(engines, default_engine)
         admin.set_engines(engines, default_engine)
+        tokenize.set_engines(engines, default_engine)
         compaction.set_engine(default_engine)
         admin.install_log_handler()
 
@@ -453,6 +454,7 @@ def create_app(cfg: Config) -> FastAPI:
     app.include_router(settings.router)
     app.include_router(compaction.router)
     app.include_router(admin.router)
+    app.include_router(tokenize.router)
 
     # Serve web UI static files (must be last — catches all unmatched routes)
     web_dir = os.path.join(os.path.dirname(__file__), "web")

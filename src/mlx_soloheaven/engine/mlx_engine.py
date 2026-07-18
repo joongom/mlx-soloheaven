@@ -1887,6 +1887,20 @@ class MLXEngine(SessionCacheMixin):
         self.model_family = self._detect_model_family()
         logger.info(f"Model family: {self.model_family}")
 
+        # Batch D (spec item 9): compute a stable per-model-build identity ONCE,
+        # here, from model_id + abspath(model_path) + config.json hash. It is
+        # folded into the prompt-contract fingerprint (so an in-memory session
+        # and the disk cache both carry it) and stamped in disk metadata, so a
+        # KV built by THIS model can never be silently reused by a DIFFERENT
+        # model sharing a data_dir + session_id. Cheap: computed at load, read
+        # per request. '' when it cannot be derived (falls back to the existing
+        # layer/type checks — no regression).
+        self._model_identity_str = self._compute_model_identity(model_config)
+        logger.info(
+            f"[{self.model_id}] model identity: "
+            f"{self._model_identity_str or '(unavailable)'}"
+        )
+
         # Auto-detect thinking end token (needed for SSE thinking_done signal)
         self._detect_special_tokens()
 
@@ -3350,6 +3364,7 @@ class MLXEngine(SessionCacheMixin):
                     self._canonical_tools(tools),
                     _fp_thinking,
                     template_rev=self._suffix_template_rev(),
+                    model_identity=self._model_identity(),
                 ),
             )
             logger.debug(f"[Queue] session={sid} | lock acquired | waited={wait_ms:.0f}ms")
@@ -3769,6 +3784,7 @@ class MLXEngine(SessionCacheMixin):
         _incoming_fp = self._prompt_fingerprint(
             _tools_canonical, use_thinking,
             template_rev=self._suffix_template_rev(),
+            model_identity=self._model_identity(),
         )
         _reusable = (
             session is not None
@@ -4636,10 +4652,13 @@ class MLXEngine(SessionCacheMixin):
                 if cancel_event is not None and cancel_event.is_set():
                     # Report last token state when cancelled so we can see
                     # where generation was when the client disconnected.
-                    tail = ("".join(text_parts))[-200:].replace('\n', '\\n')
+                    # LOG-LEAK SCRUB (Batch D): NEVER interpolate generated text
+                    # — every log record is broadcast to the admin log SSE via
+                    # the root LogBuffer. Emit safe metadata (char count) only.
+                    _gen_chars = sum(len(p) for p in text_parts)
                     _logger.info(
                         f"[Generate] session={session_id} | CANCELLED at token {gen_token_count} | "
-                        f"last_tps={last_gen_tps:.1f} | tail={tail!r}"
+                        f"last_tps={last_gen_tps:.1f} | generated_chars={_gen_chars} (content redacted)"
                     )
                     cancelled = True
                     break
@@ -4759,18 +4778,29 @@ class MLXEngine(SessionCacheMixin):
                 # unless DEBUG logging is actually enabled. The default --verbose
                 # off case skips the f-string entirely.
                 if _debug_enabled:
+                    # LOG-LEAK SCRUB (Batch D, finding 1): NEITHER the
+                    # detokenized token text NOR the numeric token ID may be
+                    # logged. The text is generated OUTPUT, and the token ID is a
+                    # REVERSIBLE encoding of that same output for anyone holding
+                    # the tokenizer — and every record here is captured by the
+                    # admin LogBuffer / SSE. Emit only the position (token index)
+                    # + char count as diagnostics; no token id, no text.
                     _logger.debug(
-                        f"[Token] session={session_id} | n={gen_token_count} id={token} text={text!r}"
+                        f"[Token] session={session_id} | n={gen_token_count} "
+                        f"chars={len(text)} (id+text redacted)"
                     )
 
                 # Periodic INFO snapshot (every 50 tokens) so we can see progress
-                # when verbose is off
+                # when verbose is off. LOG-LEAK SCRUB (Batch D): this is an INFO
+                # line — it leaks even when --verbose is OFF — and the old
+                # ``tail`` echoed generated text into the root LogBuffer / admin
+                # SSE. Report only the char count (safe progress metadata).
                 if gen_token_count % progress_interval == 0:
-                    tail = ("".join(text_parts[-40:]))[-120:].replace('\n', '\\n')
+                    _gen_chars = sum(len(p) for p in text_parts)
                     _logger.info(
                         f"[Generate] session={session_id} | "
                         f"tokens={gen_token_count} | tps={gen_tps:.1f} | "
-                        f"tail={tail!r}"
+                        f"generated_chars={_gen_chars} (content redacted)"
                     )
 
                 last_gen_tps = gen_tps
@@ -4782,6 +4812,9 @@ class MLXEngine(SessionCacheMixin):
                     completion_tokens=gen_token_count,
                     prompt_tps=prompt_tps,
                     generation_tps=gen_tps,
+                    # Finding 4: a genuine generated token this frame (even when
+                    # ``text`` is empty-detok) — anchors TTFT, never a keepalive.
+                    token_produced=True,
                 )
 
                 if _stop_hit:
@@ -4919,13 +4952,14 @@ class MLXEngine(SessionCacheMixin):
             )
         )
 
-        # Log generated text for debugging
+        # Log generation summary for debugging. LOG-LEAK SCRUB (Batch D): the
+        # old ``preview`` echoed generated OUTPUT into the log (captured by the
+        # root LogBuffer -> admin SSE). Emit safe metadata (char count) only.
         if accumulated_text:
-            preview = accumulated_text[:200].replace('\n', '\\n')
             logger.debug(
                 f"[Generate] session={session_id} | "
                 f"tokens={gen_token_count} | cancelled={cancelled} | "
-                f"text={preview!r}"
+                f"generated_chars={len(accumulated_text)} (content redacted)"
             )
 
         if cancelled:
@@ -5028,6 +5062,10 @@ class MLXEngine(SessionCacheMixin):
                         text=_stop_flush_text,
                         prompt_tokens=total_prompt_tokens,
                         completion_tokens=gen_token_count,
+                        # Finding 4: this frame carries REAL generated output
+                        # (the held stop-pending tail), not a keepalive — mark it
+                        # so the chat keepalive gate never drops its content.
+                        token_produced=True,
                     )
                 yield GenerationResult(
                     text="",
@@ -5197,6 +5235,9 @@ class MLXEngine(SessionCacheMixin):
                 text=_stop_flush_text,
                 prompt_tokens=total_prompt_tokens,
                 completion_tokens=gen_token_count,
+                # Finding 4: real generated output (held stop-pending tail),
+                # not a keepalive.
+                token_produced=True,
             )
 
         # Determine finish reason (parsed_tool_calls computed above).
@@ -6421,6 +6462,7 @@ class MLXEngine(SessionCacheMixin):
                 else self._prompt_fingerprint(
                     tools_canonical, use_thinking,
                     template_rev=self._suffix_template_rev(),
+                    model_identity=self._model_identity(),
                 )
             ),
             # U26: the interrupted commit is a reinstall too — keep the
@@ -6782,6 +6824,7 @@ class MLXEngine(SessionCacheMixin):
                 prompt_fingerprint=self._prompt_fingerprint(
                     sess_tools, sess_thinking,
                     template_rev=self._suffix_template_rev(),
+                    model_identity=self._model_identity(),
                 ),
                 # U26: compaction rebuilds the cache, not the session identity
                 # — keep the cumulative drafter stats.
@@ -7398,6 +7441,7 @@ class MLXEngine(SessionCacheMixin):
             thinking=thinking,
             prompt_fingerprint=self._prompt_fingerprint(
                 tools, thinking, template_rev=self._suffix_template_rev(),
+                model_identity=self._model_identity(),
             ),
             # U26: rebuild reinstalls the state — keep the cumulative
             # drafter stats.

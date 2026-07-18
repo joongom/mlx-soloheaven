@@ -54,16 +54,18 @@ THINK_END_TOKEN = 999
 
 
 def _make_results():
+    # Finding 4: real token frames carry token_produced=True (the chat/openai
+    # stream readers now key their keepalive/anchor logic off this flag).
     return [
         GenerationResult(status="generating"),
-        GenerationResult(text="Hello", token=1),
-        GenerationResult(text=" world", token=2),
-        GenerationResult(text="</think>", token=THINK_END_TOKEN),
-        GenerationResult(text="A", token=3),
-        GenerationResult(text="B", token=4),
-        GenerationResult(text="C", token=5),
-        GenerationResult(text="D", token=6),
-        GenerationResult(text="E", token=7),
+        GenerationResult(text="Hello", token=1, token_produced=True),
+        GenerationResult(text=" world", token=2, token_produced=True),
+        GenerationResult(text="</think>", token=THINK_END_TOKEN, token_produced=True),
+        GenerationResult(text="A", token=3, token_produced=True),
+        GenerationResult(text="B", token=4, token_produced=True),
+        GenerationResult(text="C", token=5, token_produced=True),
+        GenerationResult(text="D", token=6, token_produced=True),
+        GenerationResult(text="E", token=7, token_produced=True),
         GenerationResult(
             text="", finish_reason="stop", prompt_tokens=10, completion_tokens=8
         ),

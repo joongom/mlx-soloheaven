@@ -28,6 +28,7 @@ from mlx_soloheaven.engine.tool_parser import (
     thinking_router_active,
 )
 from mlx_soloheaven import inference_queue
+from mlx_soloheaven.api import metrics
 from mlx_soloheaven.api.gate_stream import (
     SlotStreamingResponse,
     closed_stream_response,
@@ -69,6 +70,43 @@ def _get_engine(model: str | None) -> "MLXEngine":
         if model_lower in key.lower() or model_lower in eng.model_id.lower():
             return eng
     return engine
+
+
+def _record_chat_metrics(
+    eng, *, finish_reason, error_code, cache_info, queue_wait,
+    ttft=None, generation_time=None, prompt_tokens=0, completion_tokens=0,
+    sink=None,
+) -> None:
+    """Record the Batch D per-request metric for a web-chat generation.
+    Defensive: never raises (metrics must not break a response).
+
+    Finding 3(b): when ``sink`` is a ``DeferredRequestMetric`` the (lock-taking)
+    record is ARMED here and FIRED later — after the inference lease is released
+    (SlotStreamingResponse.on_release for streaming, the chat endpoint's finally
+    for non-streaming) — so metrics recording never sits inside the lease
+    window. Without a sink it records immediately."""
+    try:
+        cache_result, reused = metrics.cache_result_from_info(cache_info)
+        kwargs = dict(
+            model=getattr(eng, "model_id", None),
+            finish_reason=finish_reason,
+            error_code=error_code,
+            cache_result=cache_result,
+            reused_tokens=reused,
+            queue_wait=queue_wait,
+            ttft=ttft,
+            generation_time=generation_time,
+            prompt_tokens=prompt_tokens or 0,
+            completion_tokens=completion_tokens or 0,
+        )
+        if sink is not None:
+            # Finding 3: MERGE onto the early-armed baseline (arm-at-start) so a
+            # terminal record enriches it; the fire happens after lease release.
+            sink.update(**kwargs)
+        else:
+            metrics.observe_request(**kwargs)
+    except Exception:  # noqa: BLE001 — metrics must never break the response
+        logger.debug("metrics: chat record failed (ignored)", exc_info=True)
 
 
 # --- Request models ---
@@ -230,6 +268,9 @@ async def chat(session_id: str, req: SendMessageRequest, request: Request = None
     # engine — the gate ticket is dropped and we return a closed stream.
     gate = inference_queue.get_inference_gate()
     receive = request.receive if request is not None else None
+    # Batch D metrics: queue_wait == the gate acquire duration (threaded down to
+    # the generation body, which records the per-request metric at completion).
+    _t_acquire = time.perf_counter()
     try:
         lease = await inference_queue.acquire_or_disconnect(gate, receive)
     except inference_queue.ClientDisconnected:
@@ -238,7 +279,25 @@ async def chat(session_id: str, req: SendMessageRequest, request: Request = None
             f"on the inference gate — not generating, no user row persisted"
         )
         return closed_stream_response()
+    queue_wait = time.perf_counter() - _t_acquire
     gate_handed_off = False
+    # Finding 3: ARM the deferred metric at generation START (right after the
+    # slot is acquired) so EVERY admitted request records exactly one metric even
+    # when it dies before the generation's explicit terminal record — a streaming
+    # disconnect (which returns before the terminal record) or a non-streaming
+    # post-admission exception. The default terminal depends on the mode
+    # (streaming most-commonly ends early via a client CANCEL; non-streaming via
+    # an ERROR). The generation UPDATEs ttft/tokens/finish/cache/error as data
+    # arrives. It is FIRED strictly AFTER the lease release — by
+    # SlotStreamingResponse.on_release (streaming) or this endpoint's finally
+    # (non-streaming) — so metrics recording never sits inside the lease window.
+    metric_sink = metrics.DeferredRequestMetric()
+    metric_sink.arm(
+        model=getattr(use_engine, "model_id", None),
+        queue_wait=queue_wait,
+        finish_reason="cancel" if req.stream else "error",
+        error_code="cancel" if req.stream else "server_error",
+    )
     try:
         # Codex round 11, finding 1: the NON-STREAMING path submits the whole
         # generation through run_long AFTER the user message is persisted, and
@@ -253,7 +312,8 @@ async def chat(session_id: str, req: SendMessageRequest, request: Request = None
             slot = reserve_long_slot()
         try:
             response = await _chat_after_admission(
-                session_id, req, session, use_engine, slot, gate, lease
+                session_id, req, session, use_engine, slot, gate, lease,
+                queue_wait=queue_wait, metric_sink=metric_sink,
             )
         finally:
             # No-op once run_long consumed the reservation; releases the slot
@@ -263,12 +323,40 @@ async def chat(session_id: str, req: SendMessageRequest, request: Request = None
         if req.stream:
             # SlotStreamingResponse now owns the gate lease and releases it
             # (after closing the inner stream's U13/C1 teardown) when the
-            # stream ends — this function must not release it.
+            # stream ends — this function must not release it (and it fires the
+            # deferred metric via on_release, after that release).
             gate_handed_off = True
         return response
+    except EngineRestartingError:
+        if not gate_handed_off:
+            metric_sink.update(finish_reason="error", error_code="engine_not_ready")
+        raise
+    except EngineBusyError as exc:
+        if not gate_handed_off:
+            reason = getattr(exc, "reason", EngineBusyError.REASON_ENGINE_NOT_READY)
+            metric_sink.update(
+                finish_reason="error",
+                error_code=(
+                    "queue_full"
+                    if reason == EngineBusyError.REASON_QUEUE_FULL
+                    else "engine_not_ready"
+                ),
+            )
+        raise
+    except Exception:
+        # Finding 3: any other post-admission exception on the NON-streaming path
+        # (the streaming path already handed the lease off) still emits one metric
+        # — error_code=server_error — fired after the lease release below.
+        if not gate_handed_off:
+            metric_sink.update(finish_reason="error", error_code="server_error")
+        raise
     finally:
         if not gate_handed_off:
             gate.release(lease)
+            # Finding 3(b): non-streaming path — fire the deferred metric AFTER
+            # the lease is released (the arm-at-start baseline guarantees a record
+            # even if the generation never reached its own terminal record).
+            metric_sink.fire()
 
 
 async def _chat_after_admission(
@@ -279,6 +367,8 @@ async def _chat_after_admission(
     slot: "LongReservation | None",
     gate: "inference_queue.InferenceGate",
     lease: "inference_queue.Lease",
+    queue_wait: float = 0.0,
+    metric_sink=None,
 ):
     """Body of the chat endpoint AFTER the availability preflight, the FIFO
     inference-queue admission (Batch C) and the (non-streaming) long-pool
@@ -410,7 +500,11 @@ async def _chat_after_admission(
                 thinking_budget=thinking_budget,
                 max_tokens=max_tokens,
                 user_message_id=user_message_id,
+                queue_wait=queue_wait,
+                metric_sink=metric_sink,
             ),
+            # Finding 3(b): fire the deferred metric AFTER the lease is released.
+            on_release=metric_sink.fire if metric_sink is not None else None,
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -433,6 +527,8 @@ async def _chat_after_admission(
             thinking_budget=thinking_budget,
             max_tokens=max_tokens,
             user_message_id=user_message_id,
+            queue_wait=queue_wait,
+            metric_sink=metric_sink,
         )
 
 
@@ -511,6 +607,8 @@ async def _stream_chat(
     thinking_budget: int = 8192,
     max_tokens: int = 32768,
     user_message_id: str | None = None,
+    queue_wait: float = 0.0,
+    metric_sink=None,
 ) -> AsyncGenerator[str, None]:
     """Stream chat response with real-time stats.
 
@@ -522,7 +620,10 @@ async def _stream_chat(
     Finding 1(a): the inner body generator is closed in a ``finally`` so an
     ``aclose()`` of this wrapper (client disconnect) CASCADES GeneratorExit into
     it — ``async for`` alone does NOT close a nested async generator, so without
-    this the engine stream's C1 teardown would run only later (on GC)."""
+    this the engine stream's C1 teardown would run only later (on GC).
+
+    ``metric_sink`` (finding 3b): the deferred per-request metric the body arms
+    at its terminal frame; SlotStreamingResponse fires it after lease release."""
     body = _stream_chat_body(
         session_id, messages, eng,
         temperature=temperature,
@@ -533,6 +634,8 @@ async def _stream_chat(
         thinking_budget=thinking_budget,
         max_tokens=max_tokens,
         user_message_id=user_message_id,
+        gate_queue_wait=queue_wait,
+        metric_sink=metric_sink,
     )
     try:
         async for chunk in body:
@@ -541,6 +644,14 @@ async def _stream_chat(
         logger.error(
             f"[Stream] session={session_id} | engine unavailable mid-stream: {exc}"
         )
+        # Finding 3: the engine died mid-stream — the body's terminal record was
+        # never reached, so UPDATE the early-armed (cancel/cancel) metric to an
+        # error terminal (fired once via on_release after the lease release).
+        # Mirrors the OpenAI streaming path (openai_compat._stream_completion).
+        if metric_sink is not None:
+            metric_sink.update(
+                finish_reason="error", error_code="engine_not_ready",
+            )
         event = json.dumps(
             {
                 "type": "error",
@@ -567,8 +678,14 @@ async def _stream_chat_body(
     thinking_budget: int = 8192,
     max_tokens: int = 32768,
     user_message_id: str | None = None,
+    gate_queue_wait: float = 0.0,
+    metric_sink=None,
 ) -> AsyncGenerator[str, None]:
     """Stream chat response with real-time stats.
+
+    ``gate_queue_wait`` is the Batch-C inference-gate acquire duration (distinct
+    from the engine-lock ``queue_wait`` shown in per-turn stats) — recorded as
+    the Batch D queue_wait metric.
 
     ``user_message_id`` is the row id of the user message this turn
     originates from (codex round 3, finding 2): the assistant persist below
@@ -752,13 +869,19 @@ async def _stream_chat_body(
                     finished = True
                     break
 
-                if not (result.text or result.token):
-                    # Empty heartbeat from engine during long prefill — forward
-                    # as SSE comment to keep client connection alive
+                if not result.token_produced:
+                    # Finding 4: a keepalive / no-token frame (empty heartbeat
+                    # during long prefill) — forward as an SSE comment to keep
+                    # the connection alive. The old ``not (text or token)`` check
+                    # misread a REAL empty-detok token whose id is 0 as a
+                    # keepalive (``token == 0`` is both the sentinel and a valid
+                    # id); ``token_produced`` is the explicit discriminator.
                     yield ": keepalive\n\n"
                     continue
 
                 token_count += 1
+                # Finding 4/7: anchor TTFT on the first ACTUAL token frame (incl.
+                # empty-detok), never on a keepalive — matches the OpenAI path.
                 if t_first_token is None:
                     t_first_token = time.perf_counter()
 
@@ -808,11 +931,14 @@ async def _stream_chat_body(
                 break
     except (asyncio.CancelledError, GeneratorExit) as exc:
         client_disconnected = True
-        tail = ("".join(acc_parts))[-200:].replace('\n', '\\n')
+        # Batch D log-leak scrub: do NOT log the generated-output tail (it is
+        # conversation content, broadcast to the admin log SSE). Log only the
+        # safe token count + generated char length.
+        gen_len = len("".join(acc_parts))
         logger.info(
             f"[Stream] session={session_id} | client disconnected "
             f"({type(exc).__name__}) after {token_count} tokens | "
-            f"tail={tail!r}"
+            f"generated_chars={gen_len} (content redacted)"
         )
     finally:
         # Finding 1(a): drive the engine generator's GeneratorExit rescue (C1
@@ -849,6 +975,12 @@ async def _stream_chat_body(
             f"[Stream] session={session_id} | generation terminated by "
             f"cache corruption after {token_count} tokens — nothing persisted"
         )
+        _record_chat_metrics(
+            eng, finish_reason="error", error_code="server_error",
+            cache_info=engine_cache_info, queue_wait=gate_queue_wait,
+            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+            sink=metric_sink,
+        )
         if not client_disconnected:
             error_event = json.dumps(
                 {
@@ -866,6 +998,12 @@ async def _stream_chat_body(
 
     t_end = time.perf_counter()
     engine_ttft = (t_first_token - (t_gen_actual or t_gen_start)) if t_first_token else 0
+    # Finding 7: the RECORDED metric TTFT is anchored at BODY start (t_start) —
+    # first token frame minus body start — measured the SAME way as the OpenAI
+    # streaming path and matching the ttft histogram HELP. The per-turn
+    # ``engine_ttft`` stat below stays engine-only for the UI (time from the
+    # engine-lock grant to first token, excluding the queue/lock waits).
+    metric_ttft = (t_first_token - t_start) if t_first_token else None
     total_time = t_end - t_start
 
     # PERF: single join at end of loop — replaces O(N^2) accumulation.
@@ -971,6 +1109,20 @@ async def _stream_chat_body(
                     await db.update_session(session_id, title=title)
 
     if client_disconnected:
+        # Finding 3: a disconnect returns BEFORE the terminal record below — so
+        # enrich the early-armed (cancel) metric here with what streamed. It
+        # stays finish_reason/error_code=cancel and fires exactly once via
+        # on_release AFTER the lease release.
+        if metric_sink is not None:
+            metric_sink.update(
+                finish_reason="cancel",
+                error_code="cancel",
+                queue_wait=gate_queue_wait,
+                ttft=(t_first_token - t_start) if t_first_token else None,
+                generation_time=time.perf_counter() - t_start,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
         return
 
     # Check if compaction is needed
@@ -982,6 +1134,18 @@ async def _stream_chat_body(
             window_limit = session_data.get("context_window_limit", 100000)
             if window_limit > 0 and current_tokens >= window_limit * 0.9:
                 needs_compaction = True
+
+    # Batch D metrics: record the completed streaming web-chat request. Finding
+    # 7: TTFT = metric_ttft (first token frame - body start, same anchor as the
+    # OpenAI path); generation_time = total_time; queue_wait = the inference-gate
+    # acquire duration. Finding 3(b): armed here, fired after the lease release.
+    _record_chat_metrics(
+        eng, finish_reason=final_finish_reason or "stop", error_code="none",
+        cache_info=engine_cache_info, queue_wait=gate_queue_wait,
+        ttft=metric_ttft, generation_time=total_time,
+        prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+        sink=metric_sink,
+    )
 
     done_event = json.dumps(
         {
@@ -1013,6 +1177,8 @@ async def _sync_chat(
     thinking_budget: int = 8192,
     max_tokens: int = 32768,
     user_message_id: str | None = None,
+    queue_wait: float = 0.0,
+    metric_sink=None,
 ) -> dict:
     """Non-streaming chat response. ``reservation`` is the admission slot
     the chat endpoint acquired BEFORE persisting the user message (codex
@@ -1032,6 +1198,7 @@ async def _sync_chat(
     # F2: non-streaming generation -> bounded long-ops executor.
     # ``reservation`` is consumed by run_long itself, never forwarded to
     # complete().
+    _t_gen = time.perf_counter()
     result = await run_long(
         eng.complete, messages,
         session_id=session_id,
@@ -1044,13 +1211,32 @@ async def _sync_chat(
         max_tokens=max_tokens,
         reservation=reservation,
     )
+    _gen_time = time.perf_counter() - _t_gen
 
     # U6/F1: corruption-terminated — return an error, persist nothing.
     if result.finish_reason == "error":
+        _record_chat_metrics(
+            eng, finish_reason="error", error_code="server_error",
+            cache_info=getattr(result, "cache_info", None), queue_wait=queue_wait,
+            generation_time=_gen_time,
+            sink=metric_sink,
+        )
         return {"error": (
             "generation terminated: session cache corruption detected; "
             "partial output was not saved — please retry"
         )}
+
+    # Batch D metrics: record the completed non-streaming web-chat request.
+    # Finding 3(b): armed here; fired by the chat endpoint's finally AFTER the
+    # lease is released.
+    _record_chat_metrics(
+        eng, finish_reason=result.finish_reason, error_code="none",
+        cache_info=getattr(result, "cache_info", None), queue_wait=queue_wait,
+        generation_time=_gen_time,
+        prompt_tokens=result.prompt_tokens,
+        completion_tokens=result.completion_tokens,
+        sink=metric_sink,
+    )
 
     # Codex round 3, finding 2: conditional persist (see the streaming path
     # — same contract). Parent gone → no orphan row, engine session

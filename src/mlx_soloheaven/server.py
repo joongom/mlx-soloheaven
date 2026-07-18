@@ -91,6 +91,118 @@ def register_engine_error_handlers(app: FastAPI):
         return engine_not_ready_response()
 
 
+_KNOWN_LOC_FIELD_NAMES: frozenset[str] | None = None
+
+
+def _known_loc_field_names() -> frozenset[str]:
+    """The set of loc string components that are SAFE to log verbatim: the
+    request-location markers FastAPI prepends ("body"/"query"/...) plus every
+    field NAME/alias declared on our request pydantic models.
+
+    Batch D log-leak scrub (finding 2): a pydantic ``loc`` tuple can contain
+    ATTACKER-CONTROLLED dict KEYS — e.g. ``MessageToolCall.function`` is
+    ``dict[str, str]`` (schemas.py), so a body ``{"function":{"SUPERSECRET":…}}``
+    puts ``SUPERSECRET`` into loc. Any loc string NOT in this known set is an
+    arbitrary user key and gets redacted before logging. Derived from the models
+    themselves so it can never drift out of date. Cached (the model set is static
+    once imported).
+
+    Finding 5 (Batch D round 2): the set is scanned from EVERY api module's
+    pydantic models, not just ``api.schemas`` — the request bodies for
+    chat/tokenize/compaction/settings (``CompactRequest``, ``TokenizeRequest``,
+    ``SessionSettings``, ``CreateSessionRequest``, …) live in their own modules,
+    so a schemas-only scan OVER-redacted their legitimate fields (``system_prompt``,
+    ``add_special``, ``with_pieces``, ``keep_recent_turns``,
+    ``context_window_limit``, …). Scanning the whole api package keeps those
+    field names diagnostic while still redacting genuinely-unknown string
+    components (arbitrary user dict keys)."""
+    global _KNOWN_LOC_FIELD_NAMES
+    if _KNOWN_LOC_FIELD_NAMES is not None:
+        return _KNOWN_LOC_FIELD_NAMES
+    import importlib
+    import pkgutil
+
+    from pydantic import BaseModel
+
+    # Location markers FastAPI/pydantic prepend, plus pydantic's root marker.
+    names: set[str] = {"body", "query", "path", "header", "cookie", "__root__"}
+    # Nit (Batch D round 3): DISCOVER every module in the api package GENERICALLY
+    # (pkgutil) rather than a hardcoded module list — so a NEW api module that
+    # declares a request model has its field names covered automatically and can
+    # never drift into over-redaction of its legitimate fields. This is safe and
+    # cheap: all api modules are mlx-free and already imported at server startup,
+    # so each import here is a sys.modules cache hit; discovery / import failures
+    # are ignored (they just yield a smaller allowlist — fail-safe, never raises).
+    # Memoized (computed once) via ``_KNOWN_LOC_FIELD_NAMES``.
+    try:
+        import mlx_soloheaven.api as api_pkg
+
+        module_names = [
+            info.name
+            for info in pkgutil.iter_modules(
+                api_pkg.__path__, api_pkg.__name__ + "."
+            )
+        ]
+    except Exception:  # noqa: BLE001 — a discovery failure must never break scrub.
+        module_names = []
+    for mod_name in module_names:
+        try:
+            module = importlib.import_module(mod_name)
+        except Exception:  # noqa: BLE001 — a missing/optional module must never
+            # break loc sanitization (it just yields a smaller allowlist).
+            continue
+        for obj in vars(module).values():
+            if isinstance(obj, type) and issubclass(obj, BaseModel):
+                for fname, field in obj.model_fields.items():
+                    names.add(fname)
+                    alias = getattr(field, "alias", None)
+                    if alias:
+                        names.add(alias)
+    _KNOWN_LOC_FIELD_NAMES = frozenset(names)
+    return _KNOWN_LOC_FIELD_NAMES
+
+
+def _sanitize_loc(loc) -> list:
+    """Redact user-controlled components of a pydantic error ``loc`` for logging.
+
+    Keeps int indices (array positions) and KNOWN schema field-name/alias
+    components (which field failed — the diagnostic value); replaces every other
+    string component (an arbitrary dict key a caller can name freely) with a
+    ``"<redacted>"`` marker so a prompt/secret smuggled as a JSON key can never
+    reach the operational log (and thus the admin log SSE). Never raises.
+
+    Finding 5 (Batch D round 2): ``loc`` is NORMALIZED to an iterable first — the
+    "never raises" contract was false for a non-iterable ``loc`` (a bare int/str
+    reached ``for comp in loc`` and a non-string/non-int raised ``TypeError``).
+    A non-iterable (or a bare string, which would otherwise iterate per-char) is
+    wrapped into a single-element list so it is sanitized as one component.
+
+    Nit (Batch D round 3): the normalization must NOT gate on truthiness — a bare
+    ``loc == 0`` (a legitimate index-0 array position) is falsy, so the old
+    ``if not loc: return []`` dropped it entirely. Normalize by TYPE instead so
+    ``_sanitize_loc(0)`` -> ``[0]`` (int indices, including 0, survive) while
+    ``None`` / an unexpected object is wrapped and safely redacted, and an empty
+    list/tuple still yields ``[]`` (the loop produces nothing)."""
+    # Normalize a non-iterable (or a bare str, which would iterate per-CHARACTER)
+    # into a one-element sequence so a component is treated as a whole. Gate on
+    # TYPE, never truthiness, so a falsy-but-valid index (0) is preserved.
+    if isinstance(loc, (str, bytes)) or not isinstance(loc, (list, tuple)):
+        loc = [loc]
+    known = _known_loc_field_names()
+    out: list = []
+    for comp in loc:
+        if isinstance(comp, bool):
+            # bool is an int subclass but never a valid loc index — redact.
+            out.append("<redacted>")
+        elif isinstance(comp, int):
+            out.append(comp)
+        elif isinstance(comp, str) and comp in known:
+            out.append(comp)
+        else:
+            out.append("<redacted>")
+    return out
+
+
 def register_validation_error_handler(app: FastAPI):
     """Normalize FastAPI's default 422 body to the canonical envelope (Batch B).
 
@@ -99,10 +211,12 @@ def register_validation_error_handler(app: FastAPI):
     error path AND one that echoes field-level input back to the caller. This
     replaces it with the canonical ``{error:{message,type,code}}`` envelope
     (type invalid_request_error, code invalid_request) and a GENERIC message
-    that does NOT echo the request body or ``exc.errors()``. The detail is
-    still LOGGED server-side for debugging (body-scrubbing of the log is a
-    Batch D concern — no NEW echoing is introduced here). Module-level and
-    dependency-light so it is hermetically testable."""
+    that does NOT echo the request body or ``exc.errors()``. Batch D log-leak
+    scrub: the server-side LOG now records only each error's ``type`` + ``loc``
+    (never the raw body nor pydantic's input-echoing ``input``/``ctx`` fields),
+    so a prompt/secret in an invalid request cannot leak into the operational
+    log (or the admin log SSE fed from it). Module-level and dependency-light so
+    it is hermetically testable."""
     from fastapi.exceptions import RequestValidationError
 
     from mlx_soloheaven.api.errors import (
@@ -113,15 +227,25 @@ def register_validation_error_handler(app: FastAPI):
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(request, exc):
-        body = None
+        # Batch D log-leak scrub: NEVER log the raw request body — it can carry
+        # prompts / PII / secrets, and every log record is broadcast to the admin
+        # log SSE. pydantic's ``exc.errors()`` ALSO echoes the offending input
+        # (the ``input`` field, and ``ctx`` can embed values), so log only the
+        # ``type`` + a SANITIZED ``loc`` of each error — enough to debug which
+        # field was invalid, with no input values. Finding 2: ``loc`` itself can
+        # embed attacker-controlled dict KEYS (``MessageToolCall.function`` is
+        # ``dict[str, str]``), so ``_sanitize_loc`` redacts any component that is
+        # not an int index or a known schema field name.
         try:
-            body = await request.body()
-            body = body.decode("utf-8", errors="replace")[:2000]
-        except Exception:
-            pass
+            safe_errors = [
+                {"type": e.get("type"), "loc": _sanitize_loc(e.get("loc"))}
+                for e in exc.errors()
+            ]
+        except Exception:  # noqa: BLE001 — never let logging break the handler
+            safe_errors = []
         logger.error(
             f"[422] {request.method} {request.url.path} | "
-            f"errors={exc.errors()} | body={body}"
+            f"errors={safe_errors}"
         )
         return error_response(
             422,
@@ -129,6 +253,33 @@ def register_validation_error_handler(app: FastAPI):
             TYPE_INVALID_REQUEST,
             CODE_INVALID_REQUEST,
         )
+
+
+def register_uncaught_error_handler(app: FastAPI):
+    """Ensure an UNCAUGHT exception yields the canonical 500 envelope AND carries
+    ``X-Request-ID`` (Batch D, finding 6).
+
+    Starlette's outermost ``ServerErrorMiddleware`` generates a 500 for any
+    exception that escapes the user middleware — OUTSIDE ``RequestIDMiddleware``'s
+    send-wrapper — so an uncaught 500 would otherwise ship WITHOUT the correlation
+    header. Registering an ``Exception`` handler routes those 500s through here:
+    it logs the exception (never echoing it in the body — Batch B), returns the
+    canonical ``server_error`` envelope, and stamps ``X-Request-ID`` read from the
+    ASGI scope (the ContextVar is already reset by the time this outer handler
+    runs, but the middleware also stashed the id on the shared scope)."""
+    from mlx_soloheaven.api.errors import server_error_response
+    from mlx_soloheaven.api.request_id import request_id_from_scope
+
+    @app.exception_handler(Exception)
+    async def _uncaught_exception_handler(request, exc):
+        logger.exception(
+            f"[500] {request.method} {request.url.path} — uncaught exception"
+        )
+        response = server_error_response()
+        rid = request_id_from_scope(request.scope)
+        if rid:
+            response.headers["X-Request-ID"] = rid
+        return response
 
 
 def build_per_model_config(cfg: Config, mcfg, *, engine_mode: str | None = None) -> Config:
@@ -203,7 +354,10 @@ def create_app(cfg: Config) -> FastAPI:
     # only in the child. The in-process path imports MLXEngine lazily, inside
     # its construction branch below.
     from mlx_soloheaven.storage import database as db
-    from mlx_soloheaven.api import openai_compat, chat, admin, settings, compaction, tokenize
+    from mlx_soloheaven.api import (
+        openai_compat, chat, admin, settings, compaction, tokenize, metrics,
+    )
+    from mlx_soloheaven.api.request_id import RequestIDMiddleware
     from mlx_soloheaven import inference_queue
 
     # Batch C: wire the configured bound into the parent-side FIFO inference
@@ -231,12 +385,23 @@ def create_app(cfg: Config) -> FastAPI:
         allow_headers=["*"],
     )
 
+    # Batch D (observability): assign/propagate X-Request-ID and expose it via a
+    # ContextVar for handler/log correlation. Pure-ASGI, mlx-free — no per-request
+    # task overhead, and it stamps the header on JSON and streaming responses
+    # alike.
+    app.add_middleware(RequestIDMiddleware)
+
     # Batch B: normalize FastAPI's default 422 body to the canonical envelope
     # (no request-body / field-error echo in the response; logged only).
     register_validation_error_handler(app)
 
     # Dead/respawning process-mode child -> 503 with a JSON error body.
     register_engine_error_handlers(app)
+
+    # Batch D (finding 6): an UNCAUGHT exception -> canonical 500 envelope that
+    # still carries X-Request-ID (ServerErrorMiddleware generates 500s outside
+    # the request-id send-wrapper).
+    register_uncaught_error_handler(app)
 
     # Build per-model configs and engines. Annotated as the union of the
     # in-process engine and its process-mode proxy; kept as a string so this
@@ -501,6 +666,10 @@ def create_app(cfg: Config) -> FastAPI:
     app.include_router(compaction.router)
     app.include_router(admin.router)
     app.include_router(tokenize.router)
+    # Batch D (observability): GET /metrics (Prometheus text). A read endpoint —
+    # NOT fronted by the inference gate, so scraping never queues behind a
+    # generation holding the single GPU slot.
+    app.include_router(metrics.router)
 
     # Serve web UI static files (must be last — catches all unmatched routes)
     web_dir = os.path.join(os.path.dirname(__file__), "web")

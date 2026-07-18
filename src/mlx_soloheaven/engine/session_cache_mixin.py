@@ -72,6 +72,7 @@ class SessionCacheMixin:
     @staticmethod
     def _prompt_fingerprint(
         tools_canonical: list | None, thinking: bool, template_rev: str = "",
+        model_identity: str = "",
     ) -> str:
         """Hash of everything that alters the tokenized prompt prefix
         OUTSIDE the messages: the canonical tool schema + the thinking flag.
@@ -86,10 +87,23 @@ class SessionCacheMixin:
         hash and the established U21/F5 gate demotes every pre-fix session
         to ONE honest MISS rebuild that restamps the new contract. The key
         is omitted when empty so families without a revision (chatml,
-        gemma4) keep their historical fingerprints — no spurious rebuilds."""
+        gemma4) keep their historical fingerprints — no spurious rebuilds.
+
+        ``model_identity`` (Batch D, spec item 9) is a stable per-model-build
+        identity (see ``_model_identity``). It participates in the contract so a
+        KV built by model A can NEVER be reused by a DIFFERENT model B that
+        shares a data_dir + session_id (same architecture, different weights):
+        the incoming fingerprint carries B's identity, the stored one carries
+        A's, and the existing U21/F5 gate demotes the mismatch to an honest MISS
+        rebuild. Like ``template_rev`` it is OMITTED when empty, so callers that
+        never resolve a model identity (tests, legacy caches) keep their
+        historical fingerprints and a legacy cache takes exactly one cold
+        rebuild that restamps the current identity."""
         payload_obj: dict = {"tools": tools_canonical, "thinking": bool(thinking)}
         if template_rev:
             payload_obj["template_rev"] = template_rev
+        if model_identity:
+            payload_obj["model_identity"] = model_identity
         payload = json.dumps(
             payload_obj,
             sort_keys=True,
@@ -117,6 +131,252 @@ class SessionCacheMixin:
         if getattr(self, "model_family", None) == "glm":
             return self._GLM_SUFFIX_REV
         return ""
+
+    def _model_identity(self) -> str:
+        """Stable per-model-build identity for the cache-safety gate (Batch D,
+        spec item 9). '' = unknown (no model loaded — e.g. a test shell engine),
+        which keeps the historical fingerprint and disk metadata unchanged.
+
+        Computed ONCE at model load (``_compute_model_identity``) and stashed on
+        ``_model_identity_str`` — this is a cheap per-request read. A missing
+        attribute (shell engine that never loaded a real model) returns '', so
+        every existing test and every legacy cache behaves exactly as before."""
+        return getattr(self, "_model_identity_str", "") or ""
+
+    # Bytes sampled from each end of the first shard's tensor-data region for
+    # the value-change digest (finding 2) — 64KB head + 64KB tail == ~128KB
+    # total read, NOT the multi-GB weights.
+    _WEIGHT_DATA_SAMPLE_BYTES = 64 * 1024
+    # A safetensors header is small (tensor metadata JSON); reject an absurd
+    # length prefix so a corrupt/non-safetensors file can never trigger a huge
+    # read.
+    _SAFETENSORS_HEADER_MAX = 100_000_000
+
+    @staticmethod
+    def _safetensors_header_sha256(path: str) -> "str | None":
+        """sha256 over a safetensors file's HEADER ONLY — the 8-byte
+        little-endian length prefix plus that many JSON bytes (tensor names,
+        dtypes, shapes, data_offsets, ``__metadata__``). Catches architecture /
+        quantization / dtype / tensor-layout changes WITHOUT reading any weight
+        DATA. Returns None on any IO error or an implausible header length (a
+        fail-closed signal to the caller)."""
+        try:
+            with open(path, "rb") as f:
+                len_bytes = f.read(8)
+                if len(len_bytes) != 8:
+                    return None
+                header_len = int.from_bytes(len_bytes, "little")
+                if header_len <= 0 or header_len > SessionCacheMixin._SAFETENSORS_HEADER_MAX:
+                    return None
+                header = f.read(header_len)
+                if len(header) != header_len:
+                    return None
+            h = hashlib.sha256()
+            h.update(len_bytes)
+            h.update(header)
+            return h.hexdigest()
+        except OSError:
+            return None
+
+    @staticmethod
+    def _safetensors_data_sample_sha256(path: str) -> "str | None":
+        """sha256 of a bounded SAMPLE of a safetensors file's tensor-DATA region
+        (the first + last ``_WEIGHT_DATA_SAMPLE_BYTES`` after the header). Catches
+        VALUE-only weight changes of an otherwise identical layout/size — where
+        the header hash and file size are unchanged but the bytes differ. Total
+        read is ~128KB, never the whole weights. Returns None on any IO error (a
+        fail-closed signal)."""
+        sample = SessionCacheMixin._WEIGHT_DATA_SAMPLE_BYTES
+        try:
+            with open(path, "rb") as f:
+                len_bytes = f.read(8)
+                if len(len_bytes) != 8:
+                    return None
+                header_len = int.from_bytes(len_bytes, "little")
+                if header_len < 0 or header_len > SessionCacheMixin._SAFETENSORS_HEADER_MAX:
+                    return None
+                size = os.fstat(f.fileno()).st_size
+                data_start = 8 + header_len
+                data_len = size - data_start
+                if data_len <= 0:
+                    return None
+                h = hashlib.sha256()
+                f.seek(data_start)
+                h.update(f.read(min(sample, data_len)))
+                if data_len > sample:
+                    # Also fold in the LAST ``sample`` bytes of the data region.
+                    f.seek(size - sample)
+                    h.update(f.read(sample))
+            return h.hexdigest()
+        except OSError:
+            return None
+
+    @staticmethod
+    def _weight_build_marker(model_path: str) -> "str | None":
+        """A BEST-EFFORT STRONG fingerprint of the on-disk weight BUILD (Batch D,
+        finding 2). NOT an absolute content hash — a full-weight digest is
+        intentionally avoided for cost — but strong enough that any realistic
+        weight swap changes it with high probability. It folds, per shard:
+
+          - ``st_mtime_ns`` (nanosecond mtime — ANY in-place write bumps it,
+            unlike the old second-truncated ``int(st_mtime)`` that a same-second
+            replacement or a timestamp-preserving copy left unchanged) + size;
+          - a sha256 of the safetensors HEADER (architecture / quant / dtype /
+            layout changes — value-independent);
+
+        plus a sampled DATA digest of the FIRST shard (first + last 64KB of the
+        tensor-data region) to catch VALUE-only changes of the same layout/size.
+        Total read is ~128KB + N small headers, NOT the multi-GB weights. It is:
+
+          - STABLE across restarts of the SAME build (untouched files -> identical
+            mtime_ns/size/header/data-sample), so a same-model reboot still HITs
+            (NOT a cold rebuild every boot);
+          - CHANGED by an in-place write (mtime_ns), a layout/quant/dtype swap
+            (header hash), or a value-only swap of identical layout (data sample).
+
+        Returns None when it CANNOT be computed reliably — the dir is unreadable,
+        holds no safetensors, or a shard header/data read fails. The caller then
+        FAILS CLOSED (a unique-per-load identity, never a weak path+config
+        fallback that a different model at the same path could silently share)."""
+        try:
+            shards: list[tuple[str, str, int, int]] = []
+            index_files: list[tuple[str, int, int]] = []
+            with os.scandir(model_path) as it:
+                for e in it:
+                    name = e.name
+                    if name.endswith(".safetensors"):
+                        st = e.stat()
+                        shards.append(
+                            (name, e.path, int(st.st_size), int(st.st_mtime_ns))
+                        )
+                    elif name.endswith(".safetensors.index.json"):
+                        st = e.stat()
+                        index_files.append(
+                            (name, int(st.st_size), int(st.st_mtime_ns))
+                        )
+            if not shards:
+                # No weights to verify -> cannot vouch for the build. Fail closed.
+                return None
+            shards.sort()
+            index_files.sort()
+            shard_entries: list = []
+            for name, fpath, size, mtime_ns in shards:
+                header_hash = SessionCacheMixin._safetensors_header_sha256(fpath)
+                if header_hash is None:
+                    return None  # unreadable/corrupt header -> fail closed
+                shard_entries.append([name, size, mtime_ns, header_hash])
+            data_sample = SessionCacheMixin._safetensors_data_sample_sha256(
+                shards[0][1]
+            )
+            if data_sample is None:
+                return None  # unreadable data region -> fail closed
+            return json.dumps(
+                {
+                    "shards": shard_entries,
+                    "index": index_files,
+                    "data_sample": data_sample,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        except OSError:
+            return None
+
+    def _compute_model_identity(self, model_config: dict | None) -> str:
+        """Derive a BEST-EFFORT STRONG identity string for the currently-loaded
+        model build. Called once at load. Combines:
+
+          - the model id (alias / directory basename),
+          - the ABSOLUTE model path (two different model DIRECTORIES — the common
+            multi-model / A-vs-B case — differ here),
+          - a hash of config.json (architecture / vocab / tokenizer / dtype
+            changes differ here), and
+          - a WEIGHT-BUILD marker (``_weight_build_marker``) — mtime_ns + size +
+            a safetensors-HEADER hash per shard + a sampled DATA digest of the
+            first shard — so weights swapped IN PLACE at a stable path (value-only
+            OR layout change), or a retargeted symlink, with an unchanged
+            config.json still produce a DIFFERENT identity (finding 2).
+
+        Returned as a short sha256 hex. Deliberately NOT a full hash of the weight
+        BYTES (too expensive): this is a strong best-effort build identity
+        (header + sampled data + metadata), so it can miss a change only outside
+        the sampled window with unchanged header/size/mtime_ns — do NOT read it as
+        an absolute "never".
+
+        Behaviour by case:
+          - NO real model dir (shell/test engine with no ``cfg.model_path``):
+            returns '' — UNKNOWN identity. '' keeps the historical fingerprint +
+            disk metadata unchanged and leaves cross-model safety to the existing
+            layer/type checks, so every legacy cache and shell-engine test behaves
+            exactly as before.
+          - a readable real model: a STABLE strong identity (a same-build restart
+            still HITs — no cold rebuild every boot).
+          - a real model dir whose build CANNOT be verified (unreadable / no
+            safetensors / corrupt header): FAIL-CLOSED to a UNIQUE-per-load
+            identity. The safe tradeoff (documented): an unverifiable model dir
+            causes a cold KV rebuild rather than risking a silent CROSS-MODEL KV
+            reuse that a weak path+config fallback would permit for a different
+            model sitting at the same path with the same config."""
+        path = ""
+        try:
+            if getattr(self, "cfg", None) and self.cfg.model_path:
+                path = os.path.abspath(self.cfg.model_path)
+        except Exception:  # noqa: BLE001 — a bad cfg must not break model load
+            path = ""
+        if not path:
+            # Shell/test engine — no real model. Historical UNKNOWN identity.
+            return ""
+        try:
+            model_id = getattr(self, "model_id", "") or ""
+            config_blob = json.dumps(
+                model_config or {}, sort_keys=True, ensure_ascii=False
+            )
+            marker = self._weight_build_marker(path)
+            if marker is None:
+                # FAIL-CLOSED: a real model dir we cannot vouch for. Mint a
+                # unique-per-load identity so this load never HITs another
+                # build's cache (and will cold-rebuild every boot until the dir
+                # is readable) — never a weak path+config identity a DIFFERENT
+                # model at the same path+config would share.
+                logger.warning(
+                    "[KV Cache] weight-build marker unavailable for %r — using a "
+                    "fail-closed UNIQUE-per-load model identity (cross-model KV "
+                    "reuse refused; this load cold-rebuilds). Fix the model dir "
+                    "to restore stable same-build cache reuse.",
+                    path,
+                )
+                payload = json.dumps(
+                    {
+                        "model_id": model_id,
+                        "path": path,
+                        "config": config_blob,
+                        "weights_unverified": uuid.uuid4().hex,
+                    },
+                    sort_keys=True,
+                    ensure_ascii=False,
+                )
+                return hashlib.sha256(payload.encode()).hexdigest()[:16]
+            payload = json.dumps(
+                {
+                    "model_id": model_id,
+                    "path": path,
+                    "config": config_blob,
+                    "weights": marker,
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+            return hashlib.sha256(payload.encode()).hexdigest()[:16]
+        except Exception:  # noqa: BLE001 — identity must never break model load
+            # A REAL model dir whose identity computation itself failed — fail
+            # closed to unique (never a cross-model-shareable fallback).
+            logger.warning(
+                "[KV Cache] model identity compute failed for a loaded model — "
+                "using a fail-closed UNIQUE-per-load identity (cross-model reuse "
+                "refused)",
+                exc_info=True,
+            )
+            return hashlib.sha256(uuid.uuid4().hex.encode()).hexdigest()[:16]
 
     # --- Base cache pool ---
 
@@ -1270,6 +1530,11 @@ class SessionCacheMixin:
             "tools": json.dumps(_sess_tools, ensure_ascii=False) if _sess_tools else "",
             "thinking": "1" if getattr(session, "thinking", True) else "0",
             "prompt_fingerprint": getattr(session, "prompt_fingerprint", None) or "",
+            # Batch D (spec item 9): stamp THIS model's identity so a loader on a
+            # DIFFERENT model refuses to reuse the cache (see
+            # _load_session_from_disk). '' for a shell engine with no identity
+            # (legacy-equivalent — one cold rebuild on first reuse).
+            "model_identity": self._model_identity(),
         }
         def _do_save():
             # WHY: VLM KV-cache tensors are lazy and bound to the
@@ -1565,6 +1830,26 @@ class SessionCacheMixin:
         if not os.path.exists(path):
             return None
         try:
+            # Batch D (finding 5) — refuse a DIFFERENT-model cache CHEAPLY:
+            # parse ONLY the safetensors JSON header (no KV tensors constructed)
+            # and compare the stamped model identity BEFORE load_prompt_cache
+            # builds the (potentially huge) KV. A mismatched model then costs a
+            # plain-IO header read instead of a full tensor load. The post-load
+            # check below stays as a belt-and-braces fallback for the rare case
+            # where the header read failed but load_prompt_cache still parsed
+            # metadata.
+            current_identity = self._model_identity()
+            if current_identity:
+                _stamped = self._stamped_model_identity_from_header(path)
+                if _stamped and _stamped != current_identity:
+                    logger.warning(
+                        f"[KV Cache] session={session_id} | DISK LOAD "
+                        f"REFUSED (header-only) | cache built by a DIFFERENT "
+                        f"model (stamped identity {_stamped} != current "
+                        f"{current_identity}) — honest MISS / cold rebuild, "
+                        f"no KV tensors loaded"
+                    )
+                    return None
             t0 = time.perf_counter()
             cache, metadata = load_prompt_cache(path, return_metadata=True)
             messages = json.loads(metadata.get("messages", "[]"))
@@ -1579,6 +1864,30 @@ class SessionCacheMixin:
             sess_tools = json.loads(_tools_meta) if _tools_meta else None
             sess_thinking = metadata.get("thinking", "1") != "0"
             sess_fp = metadata.get("prompt_fingerprint") or None
+
+            # Batch D (spec item 9) — cross-model cache safety, IN ADDITION to
+            # the layer-count / cache-type checks below. cache_dir is shared
+            # across models and files are keyed only by session_id, so a KV
+            # built by model A and a same-architecture model B could otherwise
+            # pass the type check and silently reuse A's KV. Refuse a cache whose
+            # STAMPED model identity differs from THIS engine's — an honest MISS
+            # / cold rebuild. A legacy file with NO stamp ('' ) takes one cold
+            # rebuild via the existing U21/F5 fingerprint gate (which now carries
+            # model identity too), so it is allowed through here.
+            sess_model_identity = metadata.get("model_identity") or ""
+            current_identity = self._model_identity()
+            if (
+                sess_model_identity
+                and current_identity
+                and sess_model_identity != current_identity
+            ):
+                logger.warning(
+                    f"[KV Cache] session={session_id} | DISK LOAD REFUSED | "
+                    f"cache built by a DIFFERENT model "
+                    f"(stamped identity {sess_model_identity} != current "
+                    f"{current_identity}) — honest MISS / cold rebuild"
+                )
+                return None
 
             # Verify loaded cache matches model structure (leading slice).
             # MTP-finalized sessions (qwen_mtp) persist n_target + n_head
@@ -1773,6 +2082,32 @@ class SessionCacheMixin:
             return None
         meta = header.get("__metadata__")
         return meta if isinstance(meta, dict) else None
+
+    @staticmethod
+    def _stamped_model_identity_from_header(path: str) -> str | None:
+        """The ``model_identity`` stamped in a session cache's safetensors
+        header, read HEADER-ONLY (no KV tensors) — for the finding-5 cheap
+        cross-model refusal.
+
+        ``save_prompt_cache`` writes the user metadata as element 1 of a
+        ``[cache_info, metadata, classes]`` list via ``tree_flatten``, so the raw
+        header ``__metadata__`` carries the key as ``"1.model_identity"`` (NOT
+        the un-prefixed ``model_identity`` that ``load_prompt_cache`` returns
+        after ``tree_unflatten``). Match the dotted-suffix so this stays correct
+        regardless of the metadata's list index, and tolerate a flat writer.
+        Returns '' when stamped-but-empty (legacy/shell), or None when the header
+        is unreadable / carries no identity key (caller then falls back to the
+        post-load check)."""
+        meta = SessionCacheMixin._read_safetensors_metadata(path)
+        if not isinstance(meta, dict):
+            return None
+        direct = meta.get("model_identity")
+        if isinstance(direct, str):
+            return direct
+        for key, value in meta.items():
+            if key == "model_identity" or key.endswith(".model_identity"):
+                return value if isinstance(value, str) else ""
+        return None
 
     # --- Active-session memory bounding (LRU eviction) ----------------------
 
@@ -2187,6 +2522,7 @@ class SessionCacheMixin:
                 self._canonical_tools(None),
                 bool(getattr(getattr(self, "cfg", None), "enable_thinking", True)),
                 template_rev=self._suffix_template_rev(),
+                model_identity=self._model_identity(),
             )
         except Exception:  # noqa: BLE001 — advisory: any failure => MISS
             _incoming_fp = None

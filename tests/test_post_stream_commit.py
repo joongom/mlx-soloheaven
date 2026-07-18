@@ -74,6 +74,9 @@ class _Result:
         self.prompt_tps = 10.0
         self.generation_tps = 20.0
         self.cache_info = None
+        # Finding 4: a CONTENT frame (no finish_reason) is a real token; a
+        # terminal frame is not (never a keepalive in this stub).
+        self.token_produced = finish_reason is None
 
 
 class _StreamEngine:

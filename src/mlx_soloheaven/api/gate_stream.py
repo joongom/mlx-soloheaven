@@ -36,7 +36,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable, Optional
 
 from starlette.responses import Response, StreamingResponse
 
@@ -62,12 +62,19 @@ class SlotStreamingResponse(StreamingResponse):
         gate: InferenceGate,
         lease: Lease,
         inner: AsyncIterator[str],
+        *,
+        on_release: Optional[Callable[[], None]] = None,
         **kwargs,
     ) -> None:
         self._gate = gate
         self._lease = lease
         self._inner = inner
         self._released = False
+        # Finding 3(b): fired ONCE, strictly AFTER the lease is released, so the
+        # per-request metric record (which takes the metrics lock) can never sit
+        # inside — or extend — the batch-C inference lease window. The streaming
+        # body ARMS the deferred metric at its terminal frame; this fires it.
+        self._on_release = on_release
         # The body iterator wraps ``inner`` so a NORMAL end (or a direct
         # ``body_iterator`` consumer) also runs the close-then-release path.
         super().__init__(self._slot_body(inner), **kwargs)
@@ -148,6 +155,19 @@ class SlotStreamingResponse(StreamingResponse):
             # idempotent, and this finally guarantees it runs exactly once.
             self._released = True
             self._gate.release(self._lease)
+        # Finding 3(b): record the deferred per-request metric AFTER the lease is
+        # released — strictly OUTSIDE the lease window (the batch-C invariant:
+        # metrics recording is never inside the window where the lease is held).
+        # Fired at most once (guarded), and never allowed to break teardown.
+        on_release = self._on_release
+        self._on_release = None
+        if on_release is not None:
+            try:
+                on_release()
+            except Exception:  # noqa: BLE001 — metrics must never break teardown
+                logger.exception(
+                    "inference gate: on_release (deferred metric) hook failed"
+                )
         if cancelled_exc is not None:
             raise cancelled_exc
 

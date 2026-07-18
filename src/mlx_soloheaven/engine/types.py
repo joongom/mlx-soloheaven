@@ -75,6 +75,14 @@ class GenerationResult:
     generation_tps: float = 0.0
     status: Optional[str] = None  # "generating" when lock acquired
     cache_info: Optional[dict] = None  # cache hit/miss details
+    # Finding 4 (Batch D): an EXPLICIT "a real token was produced this frame"
+    # signal. ``token == 0`` is BOTH the no-token sentinel AND a valid token id,
+    # and empty ``text`` can be either an empty-detok REAL token (one frame per
+    # token — the MTP contract) or a KEEPALIVE emitted during long prefill. This
+    # flag disambiguates: the engine sets it True ONLY for a genuine generated
+    # token (incl. empty-detok), and False on keepalive / status / finish frames.
+    # TTFT is anchored on the first frame with ``token_produced=True``.
+    token_produced: bool = False
 
     def to_dict(self) -> dict:
         """Serialize to a plain dict for IPC (picklable, JSON-compatible)."""
@@ -93,6 +101,9 @@ class GenerationResult:
             generation_tps=d.get("generation_tps", 0.0),
             status=d.get("status"),
             cache_info=d.get("cache_info"),
+            # Finding 4: thread the token-produced signal through process-mode IPC
+            # so process mode distinguishes keepalive from a real token too.
+            token_produced=d.get("token_produced", False),
         )
 
 

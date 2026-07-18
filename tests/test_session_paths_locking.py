@@ -219,6 +219,18 @@ def test_mutating_paths_wait_for_generation(tmp_path):
 # _sessions — the authoritative load stays on the generation thread.)
 
 
+def _preflight_fp(eng) -> str:
+    """The prompt-contract fingerprint session_cache_preflight computes for a
+    web-chat request on this engine (tools=None, thinking=cfg.enable_thinking,
+    the family suffix revision). A session/disk file must carry it to be
+    reported as a HIT under the U18-round-3 fingerprint gate."""
+    return eng._prompt_fingerprint(
+        eng._canonical_tools(None),
+        bool(eng.cfg.enable_thinking),
+        template_rev=eng._suffix_template_rev(),
+    )
+
+
 def _preflight_engine(tmp_path, *, match=True, with_cache=True):
     eng = _shell_engine(tmp_path)
     eng._has_disk_cache = lambda sid: False
@@ -228,6 +240,10 @@ def _preflight_engine(tmp_path, *, match=True, with_cache=True):
         eng._sessions["s1"].cache_state = SimpleNamespace(
             cache=object(), token_ids=[1, 2, 3],
         )
+        # U18 round 3: a genuinely reusable session carries the matching
+        # prompt-contract fingerprint (a live session built by generation
+        # always stamps one) so the new fingerprint gate reports a HIT.
+        eng._sessions["s1"].prompt_fingerprint = _preflight_fp(eng)
     return eng
 
 
@@ -315,6 +331,7 @@ def test_preflight_disk_is_metadata_only_never_loads_cache(tmp_path, monkeypatch
     _write_session_cache_file(tmp_path, "s2", {
         "messages": json.dumps(stored),
         "total_cache_tokens": "42",
+        "prompt_fingerprint": _preflight_fp(eng),
     })
     eng._has_disk_cache = lambda sid: sid == "s2"
     eng._load_session_from_disk = lambda sid: pytest.fail(
@@ -349,6 +366,7 @@ def test_preflight_disk_io_runs_outside_engine_lock(tmp_path):
         return {
             "messages": json.dumps([{"role": "user", "content": "u1"}]),
             "total_cache_tokens": "3",
+            "prompt_fingerprint": _preflight_fp(eng),
         }
 
     eng._read_safetensors_metadata = _meta

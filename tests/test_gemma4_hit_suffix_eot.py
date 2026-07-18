@@ -44,6 +44,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from test_qwen_mtp import (  # noqa: E402
     MockKV,
     _generate_engine,
+    _restamp_contract,
     _scripted_lm_stream,
 )
 
@@ -70,7 +71,13 @@ def _tokenizer_present(rel: str) -> bool:
 
 def _gemma4_hit_engine(stored, suffix):
     """HIT-capable mlx-lm-path harness re-labeled gemma4, with a vocab that
-    resolves <turn|> so _gemma4_turn_end_id detects it."""
+    resolves <turn|> so _gemma4_turn_end_id detects it.
+
+    Finding B: gemma4 HITs are only reachable with thinking=True (the
+    thinking=False gate demotes to an honest MISS — see
+    test_gemma4_nothink_hit_gate.py), so the session contract is restamped
+    for thinking=True and the drives below pass thinking=True
+    (cfg.think_end_token=-1 keeps the budget processor out of the way)."""
     cache = [MockKV() for _ in range(5)]
     for c in cache:
         c.offset = len(stored)
@@ -82,6 +89,7 @@ def _gemma4_hit_engine(stored, suffix):
         get_vocab=lambda: {"<turn|>": EOT},
         encode=lambda text, add_special_tokens=False: [],
     )
+    _restamp_contract(eng, thinking=True)
     return eng, cs, messages
 
 
@@ -94,7 +102,7 @@ def _drive(eng, messages, *, max_tokens=8):
             session_id="s",
             tools=None,
             cancel_event=None,
-            thinking=False,
+            thinking=True,
             thinking_budget=0,
             top_p=1.0,
             min_p=0.0,

@@ -3112,6 +3112,14 @@ class MLXEngine:
             anon_ids = getattr(self, "_anon_minted_ids", None)
             if anon_ids is not None:
                 anon_ids.discard(sid)
+            # Same hygiene for the gemma4 nothink log-once set (U18
+            # follow-up round 2): it keys on session ids and is pure
+            # observability — without this discard, sessionless gemma
+            # traffic grows it without bound. Worst case the demotion logs
+            # once more if this session is ever reloaded.
+            nothink_logged = getattr(self, "_gemma4_nothink_miss_logged", None)
+            if nothink_logged is not None:
+                nothink_logged.discard(sid)
             evicted += 1
             freed_bytes += sess_bytes
             if not saved:
@@ -3504,18 +3512,53 @@ class MLXEngine:
         return [t.model_dump() if hasattr(t, "model_dump") else t for t in tools]
 
     @staticmethod
-    def _prompt_fingerprint(tools_canonical: list | None, thinking: bool) -> str:
+    def _prompt_fingerprint(
+        tools_canonical: list | None, thinking: bool, template_rev: str = "",
+    ) -> str:
         """Hash of everything that alters the tokenized prompt prefix
         OUTSIDE the messages: the canonical tool schema + the thinking flag.
         Compared on every HIT (U21) — a mismatch means the cached prefix was
         built under a different contract and reuse would silently keep the
-        stale schema in context, so the turn takes an honest MISS instead."""
+        stale schema in context, so the turn takes an honest MISS instead.
+
+        ``template_rev`` (GLM natural-EOS fix) is the suffix-builder revision
+        for families whose builder semantics changed: sessions whose stored
+        token_ids were spliced by an OLD builder must not mix old and new
+        renderings in one KV, so the revision participates in the contract
+        hash and the established U21/F5 gate demotes every pre-fix session
+        to ONE honest MISS rebuild that restamps the new contract. The key
+        is omitted when empty so families without a revision (chatml,
+        gemma4) keep their historical fingerprints — no spurious rebuilds."""
+        payload_obj: dict = {"tools": tools_canonical, "thinking": bool(thinking)}
+        if template_rev:
+            payload_obj["template_rev"] = template_rev
         payload = json.dumps(
-            {"tools": tools_canonical, "thinking": bool(thinking)},
+            payload_obj,
             sort_keys=True,
             ensure_ascii=False,
         )
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+    # GLM suffix-builder revision (bump on any change to what
+    # _suffix_tokens_glm / the GLM HIT reconciliation splices): v2 = official
+    # GLM-4.7-Flash template semantics — tool turns open with
+    # ``<|observation|>`` (one marker per run, no newline padding),
+    # thinking=False generation prompt renders ``<|assistant|></think>``,
+    # and the recorded chat-EOS tail is reconciled at HIT time
+    # (_reconcile_glm_recorded_eos). Pre-v2 glm sessions spliced drifted
+    # token streams (doubled ``<|user|>`` after a natural stop, ``<|user|>``
+    # where the template renders ``<|observation|>``, missing ``</think>``)
+    # — their stored ids already diverged from full retokenization, so the
+    # only honest continuation is a one-time MISS rebuild (see
+    # _prompt_fingerprint's template_rev doc).
+    _GLM_SUFFIX_REV = "glm-suffix-v2"
+
+    def _suffix_template_rev(self) -> str:
+        """Suffix-builder revision that participates in the prompt-contract
+        fingerprint for the current model family ('' = no revision)."""
+        if getattr(self, "model_family", None) == "glm":
+            return self._GLM_SUFFIX_REV
+        return ""
 
     # --- Base cache pool ---
 
@@ -4984,6 +5027,14 @@ class MLXEngine:
         verified against the real gemma-4-31B tokenizer in
         tests/test_gemma4_hit_suffix_eot.py — ``<turn|>`` is a special
         token, so dropping suffix[0] equals encoding without the closer).
+
+        ``thinking`` is intentionally unused: thinking=False gemma4 never
+        reaches this builder — the template forces an empty
+        ``<|channel>thought\\n<channel|>`` block at the generation prompt
+        AND strips it from history on retokenization, so no suffix can keep
+        a cached session byte-exact; the HIT gate demotes those turns to an
+        honest MISS/rebuild instead (finding B — see the gate in
+        _generate_locked and tests/test_gemma4_nothink_hit_gate.py).
         """
         parts = ["<turn|>"]
         for msg in new_messages:
@@ -5083,8 +5134,32 @@ class MLXEngine:
     def _suffix_tokens_glm(
         self, new_messages: list[dict], thinking: bool,
     ) -> list[int]:
-        """GLM suffix: <|user|>{content}<|assistant|><think>"""
+        """GLM suffix mirroring the official GLM-4.7-Flash chat template
+        (verified against huggingface.co/zai-org/GLM-4.7-Flash
+        chat_template.jinja, rendered with transformers' trim_blocks +
+        lstrip_blocks environment):
+
+        - user turn:  ``<|user|>{content}``
+        - tool turn:  ``<|observation|>`` opens a RUN of consecutive tool
+          messages (the template emits the marker only when the previous
+          message is not also a tool message), each message rendered as
+          ``<tool_response>{content}</tool_response>`` with NO newline
+          padding. (Historical builder rendered ``<|user|>`` and padded the
+          content with newlines — token drift vs full retokenization.)
+        - generation prompt: ``<|assistant|><think>`` when thinking, else
+          ``<|assistant|></think>`` (the template primes a CLOSED think
+          block when enable_thinking is false; the historical builder
+          emitted the bare role marker, letting the model open a thought).
+
+        NATURAL-EOS NOTE: GLM's chat EOS set is {<|endoftext|>, <|user|>,
+        <|observation|>} — a natural stop RECORDS one of them as the stored
+        tail (mlx-lm terminal frame + lookahead, same shape as gemma4 U18).
+        The HIT path runs the built suffix through
+        _reconcile_glm_recorded_eos, which dedupes a duplicate leading role
+        marker, trims a foreign recorded eos, or demotes to an honest MISS.
+        """
         parts = []
+        prev_role = None
         for msg in new_messages:
             role = msg.get("role", "user")
             content = msg.get("content", "") or ""
@@ -5100,12 +5175,153 @@ class MLXEngine:
                 # makes spliced model turns template-risky).
                 continue
             elif role == "tool":
-                parts.append(f"<|user|><tool_response>\n{content}\n</tool_response>")
+                if prev_role != "tool":
+                    parts.append("<|observation|>")
+                parts.append(f"<tool_response>{content}</tool_response>")
             else:
                 parts.append(f"<|user|>{content}")
-        gen_prompt = "<|assistant|><think>" if thinking else "<|assistant|>"
+            prev_role = role
+        gen_prompt = "<|assistant|><think>" if thinking else "<|assistant|></think>"
         parts.append(gen_prompt)
         return self.tokenizer.encode("".join(parts), add_special_tokens=False)
+
+    # GLM turn markers (also chat EOS ids — GLM-4.7-Flash generation_config
+    # eos_token_id covers all three) probed lazily from the vocab.
+    _GLM_MARKER_USER = "<|user|>"
+    _GLM_MARKER_OBSERVATION = "<|observation|>"
+    _GLM_MARKER_ENDOFTEXT = "<|endoftext|>"
+
+    def _glm_marker_ids(self) -> dict[str, int]:
+        """Lazily detected ids of the GLM markers involved in recorded-EOS
+        reconciliation. Memoized — _detect_token_id builds the full vocab
+        dict, too costly per HIT. Missing tokens map to -1 (the reconcile
+        then fails open to the historical splice, mirroring U18's detection
+        policy: never drop/trim a token it cannot verify)."""
+        cached = getattr(self, "_glm_marker_id_cache", None)
+        if cached is None:
+            cached = {}
+            for name in (
+                self._GLM_MARKER_USER,
+                self._GLM_MARKER_OBSERVATION,
+                self._GLM_MARKER_ENDOFTEXT,
+            ):
+                try:
+                    cached[name] = _detect_token_id(self.tokenizer, name)
+                except Exception:  # noqa: BLE001 — vocab probing must never break a HIT
+                    cached[name] = -1
+            self._glm_marker_id_cache = cached
+        return cached
+
+    def _reconcile_glm_recorded_eos(
+        self, suffix: list[int], cache_state, session_id: str | None,
+    ) -> list[int] | None:
+        """GLM natural-EOS reconciliation at HIT-splice time (finding A —
+        the role/EOS-aware analog of U18's gemma4 dedupe).
+
+        On the mlx-lm backend a NATURAL stop records the fired chat-EOS
+        token into cache_state.token_ids (the terminal frame carries
+        token=eos and generate_step's lookahead already forwarded it through
+        the KV). GLM-4.7-Flash's eos set is {<|endoftext|>, <|user|>,
+        <|observation|>}, and full retokenization renders NONE of them as a
+        terminator — the next turn simply OPENS with its own role marker:
+
+        - recorded eos == the marker the suffix leads with (<|user|> before
+          a user turn, <|observation|> before a tool turn): the suffix's
+          leading token is a DUPLICATE — drop it (the U18 shape; the markers
+          are special tokens, so dropping suffix[0] is token-exact
+          equivalent to encoding the suffix without it).
+        - any OTHER recorded eos (<|endoftext|> always; a role marker that
+          mismatches the next turn's role): FOREIGN — full retokenization
+          renders no token at that position, and no suffix can account for a
+          token that must not exist. Reconcile by TRIMMING that single
+          trailing token out of the cache, reusing the C1 machinery: every
+          flattened leaf must be positively trimmable (_leaf_trimmable) and
+          every offset-bearing leaf must verify at len(token_ids) - 1 after
+          the trim; on success the recorded id is popped and the suffix
+          splices byte-exact. An untrimmable cache demotes to an honest
+          MISS (returns None — the cache is left intact and coherent; the
+          rebuild's save replaces it). A trim/verify FAILURE invalidates the
+          session cache fail-closed (layers may be half-rewound).
+
+        A tail that is NOT a known eos id is the interrupted-turn shape
+        (content tail, C1 NOT_REQUIRED) — the suffix splices untouched.
+        Detection failure (markers missing from the vocab AND no eos ids
+        exposed) fails open to the historical splice, mirroring U18.
+
+        INVARIANT PRESERVED: spliced ids == full retokenization, byte-exact
+        at the turn boundary (tests/test_glm_hit_suffix_eos.py proves it on
+        a tokenizer whose apply_chat_template mirrors the official jinja).
+        """
+        if self.model_family != "glm" or not suffix:
+            return suffix
+        ids = cache_state.token_ids
+        if not ids:
+            return suffix
+        markers = self._glm_marker_ids()
+        role_marker_ids = {
+            m for m in (
+                markers[self._GLM_MARKER_USER],
+                markers[self._GLM_MARKER_OBSERVATION],
+            ) if m >= 0
+        }
+        eos_ids = set(role_marker_ids)
+        if markers[self._GLM_MARKER_ENDOFTEXT] >= 0:
+            eos_ids.add(markers[self._GLM_MARKER_ENDOFTEXT])
+        try:
+            eos_ids |= _collect_eos_ids(self.tokenizer)
+        except Exception:  # noqa: BLE001 — eos probing must never break a HIT
+            pass
+        tail = int(ids[-1])
+        if tail not in eos_ids:
+            # Interrupted turn (no eos recorded) — the suffix's leading role
+            # marker is what opens the next turn; splice as built.
+            return suffix
+        if suffix[0] == tail:
+            # Natural stop whose recorded eos IS the next turn's opening
+            # role marker — drop the duplicate (U18 shape).
+            return suffix[1:]
+        # FOREIGN recorded eos: trim it out of the cache or demote.
+        flat = self._flatten_cache_layers(cache_state.cache)
+        if not flat or not all(self._leaf_trimmable(c) for c in flat):
+            logger.info(
+                f"[KV Cache] session={session_id} | glm recorded eos "
+                f"(token {tail}) is foreign to the next turn's rendering "
+                f"and the cache has untrimmable layers — honest MISS "
+                f"(rebuild replaces the cache)"
+            )
+            return None
+        from mlx_soloheaven.engine.pld import _layer_offsets
+        target_len = len(ids) - 1
+        trim_exc = False
+        for c in cache_state.cache:
+            try:
+                c.trim(1)
+            except Exception:  # noqa: BLE001
+                trim_exc = True
+                logger.exception(
+                    "[KV Cache] glm foreign-eos cache trim failed"
+                )
+        bad_layers = [
+            (i, off)
+            for i, off in enumerate(_layer_offsets(flat))
+            if off is not None and off != target_len
+        ]
+        if trim_exc or bad_layers:
+            logger.warning(
+                f"[KV Cache] session={session_id} | glm foreign-eos trim to "
+                f"{target_len} failed (exception={trim_exc}, layers off "
+                f"target: {bad_layers[:8]}) — INVALIDATING session cache "
+                f"(next turn cold-fills)"
+            )
+            self._invalidate_cache_state(cache_state)
+            return None
+        cache_state.token_ids = list(ids[:-1])
+        logger.info(
+            f"[KV Cache] session={session_id} | glm recorded eos "
+            f"(token {tail}) trimmed before splice — suffix now byte-exact "
+            f"vs full retokenization"
+        )
+        return suffix
 
     def generate_stream(
         self,
@@ -5174,6 +5390,7 @@ class MLXEngine:
                 prompt_fingerprint=self._prompt_fingerprint(
                     self._canonical_tools(tools),
                     _fp_thinking,
+                    template_rev=self._suffix_template_rev(),
                 ),
             )
             logger.debug(f"[Queue] session={sid} | lock acquired | waited={wait_ms:.0f}ms")
@@ -5584,12 +5801,53 @@ class MLXEngine:
         #      are not token-exact vs apply_chat_template (F4) → the shape
         #      is a divergence → honest MISS on ALL templates.
         _tools_canonical = self._canonical_tools(tools)
-        _incoming_fp = self._prompt_fingerprint(_tools_canonical, use_thinking)
+        _incoming_fp = self._prompt_fingerprint(
+            _tools_canonical, use_thinking,
+            template_rev=self._suffix_template_rev(),
+        )
         _reusable = (
             session is not None
             and session.cache_state is not None
             and session.cache_state.cache is not None
         )
+        if _reusable and self.model_family == "gemma4" and not use_thinking:
+            # FINDING B — gemma4 thinking=False forced-thought gap. The
+            # installed gemma4 templates append '<|channel>thought\n
+            # <channel|>' AFTER the generation marker when thinking is
+            # disabled, and STRIP that block from PAST assistant turns on
+            # full retokenization (strip_thinking macro): the block exists
+            # only at the CURRENT generation prompt. A cached session
+            # physically retains the forced block in the KV at every PAST
+            # generation point, so cached ids can NEVER equal full
+            # retokenization — no suffix can remove tokens mid-sequence —
+            # and the naive suffix additionally omitted the block for the
+            # NEW turn, silently un-suppressing thinking on every HIT
+            # (structured-output requests reach this path too, via the U9
+            # suppression above). Design decision (option ii of the triage):
+            # fail-closed honest MISS/rebuild for every thinking=False
+            # gemma4 turn — full retokenization is correct by construction
+            # (history rendered without the block, current prompt with it).
+            # Rejected alternatives: (i)/(iii) a cache-canonical invariant
+            # that blesses the stale historical blocks would have to be
+            # threaded through C1/reconcile/matching everywhere, and the
+            # template's strip_thinking + trim means retokenization can
+            # never be made to agree with the cache. Cost: prefill-only TTFT
+            # for non-thinking gemma4 sessions (base-cache seeding below
+            # still softens it). Logged once per session.
+            _reusable = False
+            _logged = getattr(self, "_gemma4_nothink_miss_logged", None)
+            if _logged is None:
+                _logged = set()
+                self._gemma4_nothink_miss_logged = _logged
+            if session_id not in _logged:
+                _logged.add(session_id)
+                logger.info(
+                    f"[KV Cache] session={session_id} | gemma4 with "
+                    f"thinking disabled cannot reuse a cached prefix "
+                    f"(template forces an empty thought block at the "
+                    f"generation prompt only; cached history retains stale "
+                    f"blocks) — every turn takes an honest MISS/rebuild"
+                )
         if _reusable:
             _stored_fp = getattr(session, "prompt_fingerprint", None)
             # F5: a legacy session (fp=None — pre-fingerprint disk file or
@@ -5638,13 +5896,10 @@ class MLXEngine:
                     f"discarding cache, re-processing {len(messages)} messages"
                 )
             else:
-                # Cache hit: extend stored token_ids with suffix for new messages.
-                # This avoids full re-tokenization which breaks special token
-                # round-trip (e.g. Gemma 4 <|channel>/<channel|>).
-                cache_mode = "hit"
-                cache_state = session.cache_state
-                _hit_prior_len = len(cache_state.token_ids or [])
-                cached_tokens = session.total_cache_tokens
+                # Cache hit (candidate): extend stored token_ids with suffix
+                # for new messages. This avoids full re-tokenization which
+                # breaks special token round-trip (e.g. Gemma 4
+                # <|channel>/<channel|>).
                 suffix = self._suffix_tokens(new_messages, thinking=use_thinking)
                 # U18: gemma4's suffix leads with the <turn|> closer for the
                 # C1 interrupted-turn contract, but a natural mlx-lm EOS
@@ -5654,15 +5909,33 @@ class MLXEngine:
                 # apply_chat_template; no-op for other families and for
                 # interrupted turns whose tail is not the closer).
                 suffix = self._dedupe_gemma4_turn_closer(
-                    suffix, cache_state.token_ids,
+                    suffix, session.cache_state.token_ids,
                 )
-                prompt_token_ids = list(cache_state.token_ids or []) + suffix
-                logger.info(
-                    f"[KV Cache] session={session_id} | HIT | "
-                    f"reusing {cached_tokens} cached tokens + "
-                    f"{len(suffix)} suffix tokens"
-                )
-        else:
+                if self.model_family == "glm":
+                    # Finding A: GLM records one of ITS chat-EOS ids
+                    # (<|endoftext|>/<|user|>/<|observation|>) at a natural
+                    # stop — dedupe a duplicated leading role marker, trim a
+                    # foreign recorded eos out of the cache, or demote to an
+                    # honest MISS (None) when the splice cannot be made
+                    # byte-exact vs full retokenization.
+                    suffix = self._reconcile_glm_recorded_eos(
+                        suffix, session.cache_state, session_id,
+                    )
+                if suffix is None:
+                    _reusable = False
+                    new_messages = []
+                else:
+                    cache_mode = "hit"
+                    cache_state = session.cache_state
+                    _hit_prior_len = len(cache_state.token_ids or [])
+                    cached_tokens = session.total_cache_tokens
+                    prompt_token_ids = list(cache_state.token_ids or []) + suffix
+                    logger.info(
+                        f"[KV Cache] session={session_id} | HIT | "
+                        f"reusing {cached_tokens} cached tokens + "
+                        f"{len(suffix)} suffix tokens"
+                    )
+        if not _reusable:
             # Cache miss — seed from base cache if available
             prev_cached = session.total_cache_tokens if session else 0
             base = self._find_base_cache(messages, tools=tools)
@@ -7845,7 +8118,10 @@ class MLXEngine:
     # per-turn terminator that the interrupted turn would be missing.
     # (U18: on a NATURAL gemma4 EOS the closer IS recorded as the stored
     # tail, so the HIT path dedupes the suffix's leading closer — see
-    # _dedupe_gemma4_turn_closer.)
+    # _dedupe_gemma4_turn_closer. Finding A: GLM analogously records one of
+    # its chat-EOS ids (<|endoftext|>/<|user|>/<|observation|>) at a natural
+    # stop; the HIT path reconciles it — dedupe/trim/honest MISS — in
+    # _reconcile_glm_recorded_eos.)
     _CHATML_TURN_END = "<|im_end|>"
     # gemma4 end-of-turn token — the template's per-turn closer AND the chat
     # EOS recorded by the mlx-lm terminal frame at a natural stop (U18).
@@ -8177,7 +8453,10 @@ class MLXEngine:
             prompt_fingerprint=(
                 prompt_fingerprint
                 if prompt_fingerprint is not None
-                else self._prompt_fingerprint(tools_canonical, use_thinking)
+                else self._prompt_fingerprint(
+                    tools_canonical, use_thinking,
+                    template_rev=self._suffix_template_rev(),
+                )
             ),
             # U26: the interrupted commit is a reinstall too — keep the
             # session's cumulative drafter stats.
@@ -8550,6 +8829,7 @@ class MLXEngine:
                 thinking=sess_thinking,
                 prompt_fingerprint=self._prompt_fingerprint(
                     sess_tools, sess_thinking,
+                    template_rev=self._suffix_template_rev(),
                 ),
                 # U26: compaction rebuilds the cache, not the session identity
                 # — keep the cumulative drafter stats.
@@ -8656,6 +8936,7 @@ class MLXEngine:
         cached_tokens = 0
         cache_live = False
         stored_thinking = True
+        stored_fingerprint: str | None = None
         with self._read_locked("cache preflight"):
             session_state = self._sessions.get(session_id)
             if session_state is not None:
@@ -8666,6 +8947,13 @@ class MLXEngine:
                     and session_state.cache_state.cache is not None
                 )
                 stored_thinking = bool(getattr(session_state, "thinking", True))
+                # U18 follow-up round 3: capture the stored prompt-contract
+                # fingerprint so the gate below mirrors generation
+                # (_generate_locked ~5852). None == a legacy/hand-built
+                # session with an unknown contract (fail-closed to a MISS).
+                stored_fingerprint = getattr(
+                    session_state, "prompt_fingerprint", None
+                )
             check_disk = session_state is None and self._has_disk_cache(session_id)
 
         if session_state is not None:
@@ -8678,6 +8966,21 @@ class MLXEngine:
                 self._session_cache_path(session_id)
             )
             if meta is not None:
+                # U18 follow-up round 2: the save path persists the
+                # session's thinking contract ("thinking" metadata key, see
+                # _save_session_to_disk) — parse it exactly like
+                # _load_session_from_disk so the advisory match and the
+                # gemma4 gate below run under the STORED contract instead
+                # of the previous hard-coded True.
+                stored_thinking = meta.get("thinking", "1") != "0"
+                # U18 follow-up round 3: parse the persisted prompt-contract
+                # fingerprint (the "prompt_fingerprint" key _save_session_to_disk
+                # writes, read exactly like _load_session_from_disk — an empty
+                # string is a legacy, pre-fingerprint file == None). The gate
+                # below then reports the same MISS generation takes for a
+                # pre-revision GLM file (glm-suffix-v2) or a tools/thinking-
+                # changed contract, instead of advertising a stale HIT.
+                stored_fingerprint = meta.get("prompt_fingerprint") or None
                 try:
                     stored_messages = json.loads(meta.get("messages", "[]"))
                     cached_tokens = int(meta.get("total_cache_tokens", "0"))
@@ -8706,13 +9009,96 @@ class MLXEngine:
 
         # Phase 3 — pure-Python match on the snapshots (no lock, no MLX).
         # Round 3, finding 4: advisory match runs under the stored session's
-        # thinking contract (disk fallback keeps the default — informational
-        # only; the generation re-resolves authoritatively).
+        # thinking contract (BOTH sources now — memory from SessionState,
+        # disk from the persisted "thinking" metadata; the generation
+        # re-resolves authoritatively).
+        #
+        # U18 follow-up round 2 — mirror of the generation-time gemma4
+        # fail-closed gate (FINDING B in _generate_locked): gemma4 with
+        # thinking disabled NEVER reuses a cached prefix (the template's
+        # forced empty-thought block makes cached ids unreconcilable with
+        # full retokenization), but this preflight used to compute
+        # cache_hit = cache_live without that rule, so the web stream's
+        # "start" event advertised a HIT the generation then demoted.
+        # Effective thinking mirrors the generation's derivation for this
+        # caller: the preflight receives neither a per-request ``thinking``
+        # override nor the request's response_format (the web chat sends
+        # only session_id + messages, and passes neither to generation
+        # either), so the engine default ``cfg.enable_thinking`` IS the
+        # request's effective flag here. BOUNDARY: the U9 structured-output
+        # suppression (response_format forcing thinking off for one
+        # request) cannot be mirrored without that context — should a
+        # future caller add it, this advisory may still report a HIT that
+        # the generation (authoritative) demotes to a MISS; the residual
+        # error is report-only and never fail-open on the actual cache
+        # decision. Applied at this convergence point so it covers the
+        # memory AND disk branches identically.
+        _gemma4_nothink = (
+            getattr(self, "model_family", None) == "gemma4"
+            and not bool(
+                getattr(getattr(self, "cfg", None), "enable_thinking", True)
+            )
+        )
+        # U18 follow-up round 3 (codex, FINDING) — mirror the generation-time
+        # prompt-contract fingerprint gate (_generate_locked ~5804/~5852).
+        # GENERATION rejects a HIT whenever the STORED fingerprint != the
+        # INCOMING EFFECTIVE fingerprint, and a legacy session with NO stored
+        # fingerprint takes ONE unconditional cold rebuild (U21/U3/F5). This
+        # advisory used to decide the HIT purely from message-match + liveness
+        # (+ the gemma-nothink gate), so a pre-v2 GLM disk session (revisionless
+        # fingerprint), or any tools/thinking-changed session, was advertised
+        # as a HIT the generation then correctly demoted — the web stream's
+        # "start" event (chat.py) was observably wrong.
+        #
+        # The incoming effective fingerprint is computed from what THIS caller
+        # sees. The web chat passes only session_id + messages and drives
+        # generation with tools=None / response_format=None, so the effective
+        # contract here is (tools=None, thinking=cfg.enable_thinking,
+        # template_rev=family rev) — exactly what generation computes for the
+        # same request, covering the glm-suffix-v2 and gemma-nothink cases.
+        # Fail-CLOSED: any uncertainty (missing/unreadable stored fp, or an
+        # incoming fp we cannot compute) reports MISS — an advisory MISS only
+        # makes the UI show a cold-fill and generation re-resolves
+        # authoritatively.
+        # BOUNDARY: a future caller routing per-request tools or a
+        # response_format thinking override THROUGH this preflight without
+        # passing them here could still see an advisory HIT the generation
+        # demotes; that residual error is report-only (never fail-open on the
+        # actual cache decision), and structured-output OpenAI requests do not
+        # use this preflight at all.
+        try:
+            _incoming_fp: str | None = self._prompt_fingerprint(
+                self._canonical_tools(None),
+                bool(getattr(getattr(self, "cfg", None), "enable_thinking", True)),
+                template_rev=self._suffix_template_rev(),
+            )
+        except Exception:  # noqa: BLE001 — advisory: any failure => MISS
+            _incoming_fp = None
+        _contract_ok = (
+            stored_fingerprint is not None
+            and _incoming_fp is not None
+            and stored_fingerprint == _incoming_fp
+        )
+
         cache_hit = False
+        gate_demoted = False
+        fp_demoted = False
         if self._messages_match(
             stored_messages, messages, thinking_active=stored_thinking,
         ):
             cache_hit = cache_live
+            if cache_hit and _gemma4_nothink:
+                # Same rule, same direction as the generation gate: report
+                # the honest MISS/rebuild it will actually take.
+                cache_hit = False
+                gate_demoted = True
+            if cache_hit and not _contract_ok:
+                # Prompt contract diverged (or unknown for a legacy session):
+                # the same honest MISS/rebuild the generation fingerprint gate
+                # takes. Checked after the gemma gate so a gemma-nothink miss
+                # keeps its more specific reason.
+                cache_hit = False
+                fp_demoted = True
             new_msgs = messages[len(stored_messages):]
             suffix_desc = (
                 f"{len(new_msgs)} new message(s)" if new_msgs else "retry"
@@ -8723,7 +9109,18 @@ class MLXEngine:
                     f"KV Cache reuse ({source}): {cached_tokens} tokens "
                     f"cached, {suffix_desc}"
                     if cache_hit
-                    else f"Rebuilding KV cache for {len(messages)} messages"
+                    else (
+                        f"gemma4 with thinking disabled never reuses a "
+                        f"cached prefix — rebuilding {len(messages)} messages"
+                        if gate_demoted
+                        else (
+                            f"prompt contract "
+                            f"{'unknown (legacy)' if stored_fingerprint is None else 'changed'}"
+                            f" — rebuilding {len(messages)} messages"
+                            if fp_demoted
+                            else f"Rebuilding KV cache for {len(messages)} messages"
+                        )
+                    )
                 ),
                 "cached_tokens": cached_tokens,
                 "stored_msgs": len(stored_messages),
@@ -8800,6 +9197,11 @@ class MLXEngine:
             # Anon-provenance hygiene (best-effort; stale ids are harmless).
             if hasattr(self, "_anon_minted_ids"):
                 self._anon_minted_ids.discard(session_id)
+            # Gemma4 nothink log-once hygiene (U18 follow-up round 2) —
+            # same pattern as _anon_minted_ids: drop the deleted session's
+            # id so the set only tracks live sessions.
+            if hasattr(self, "_gemma4_nothink_miss_logged"):
+                self._gemma4_nothink_miss_logged.discard(session_id)
             # U26: drop the session's cumulative drafter stats (bounds the
             # registry — deleted sessions never come back under this id).
             if hasattr(self, "_session_drafter_stats"):
@@ -9253,7 +9655,9 @@ class MLXEngine:
             pending_build_time=elapsed,
             tools=tools,
             thinking=thinking,
-            prompt_fingerprint=self._prompt_fingerprint(tools, thinking),
+            prompt_fingerprint=self._prompt_fingerprint(
+                tools, thinking, template_rev=self._suffix_template_rev(),
+            ),
             # U26: rebuild reinstalls the state — keep the cumulative
             # drafter stats.
             drafter_stats=self._drafter_stats_for(session_id),
@@ -9476,6 +9880,10 @@ class MLXEngine:
             # Anon-provenance hygiene: no sessions remain → no minted ids remain.
             if hasattr(self, "_anon_minted_ids"):
                 self._anon_minted_ids.clear()
+            # Gemma4 nothink log-once hygiene (U18 follow-up round 2): no
+            # sessions remain → no logged ids remain.
+            if hasattr(self, "_gemma4_nothink_miss_logged"):
+                self._gemma4_nothink_miss_logged.clear()
             # U26: no sessions remain → no cumulative drafter stats remain.
             if hasattr(self, "_session_drafter_stats"):
                 self._session_drafter_stats.clear()

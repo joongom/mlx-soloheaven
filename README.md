@@ -23,7 +23,7 @@ SoloHeaven turns your Mac into a personal AI server with sub-second response tim
 - **KV cache quantization** — Optional 4/8-bit KV quant (mlx-lm path)
 - **Budget-based cache eviction** — No time-based TTL, evicts LRU only when memory/disk budget exceeded; disk files auto-pruned when exceeding `--disk-budget-gb`
 - **GPU keepalive** — Optional Metal idle prevention with periodic micro-computations (`--gpu-keepalive`)
-- **OpenAI-compatible API** — Streaming SSE, tool calling, `developer` role, `response_format`, `/v1/chat/completions`, `/v1/models` (note: `stop`/`seed`/`tool_choice` are accepted in the request schema but not yet enforced)
+- **OpenAI-compatible API** — Streaming SSE, tool calling, `developer` role, `response_format`, `stop` sequences, `/v1/chat/completions`, `/v1/models` (note: `seed`/`tool_choice` are accepted in the request schema but not yet enforced)
 - **Built-in web UI** — Chat interface with model selector, live thinking display, TPS stats, cache hit indicators, branch/regenerate/delete controls
 - **Admin dashboard** — Real-time log viewer, cache/DB overview, and reset controls at `/admin`
 - **Conversation branching** — Fork any conversation at any turn; the new session's KV cache is rebuilt by reprocessing the truncated history (no checkpoint restore)
@@ -31,6 +31,10 @@ SoloHeaven turns your Mac into a personal AI server with sub-second response tim
 - **Disk persistence** — KV caches survive server restarts via safetensors serialization
 - **Client disconnect handling** — Frees the generation lock immediately, tolerates content mismatches on reconnect
 - **Base cache pool** — System prompt KV caches shared across sessions for fast cold starts
+- **Zombie-server auto-recovery** — In the default process mode the parent detects an uncatchable worker crash (e.g. a Metal GPU abort), fails in-flight requests cleanly, auto-respawns the worker, and returns `503` + `Retry-After` while restarting instead of a `200` with a dead stream
+- **Transactional mutations** — Branch / regenerate / delete-last / compaction reserve engine capacity before the DB write, so a busy or restarting engine returns a clean `503` with the database untouched; a cancelled or disconnected turn commits-or-invalidates the cache instead of leaving it advanced past the stored messages
+- **Request validation** — Out-of-range / non-finite sampling params are rejected `4xx` at the API boundary; `top_k` beyond the vocabulary is clamped rather than crashing mid-generation
+- **Stop sequences & finish_reason** — The `stop` parameter is honored engine-side (cross-token holdback, cache-consistent truncation); `finish_reason` correctly reports `length` on `max_tokens` truncation (with the detokenizer tail flushed) and `stop` on a stop-sequence hit
 
 ## Supported Model Families
 
@@ -488,7 +492,7 @@ Options:
   --top-p               Nucleus sampling top-p (default: 1.0, disabled)
   --min-p               Min-p sampling threshold (default: 0.0, disabled)
   --top-k               Top-k sampling (default: 0, disabled)
-  --repetition-penalty  Repetition penalty (default: 1.0, disabled)
+  --repetition-penalty  Default repetition penalty (unset: config default 1.05; 1.0 disables)
   --max-tokens          Default max generation tokens (default: 32768)
   --thinking-budget     Max thinking tokens before forcing </think> (default: 8192, 0=unlimited)
   --memory-budget-gb    In-memory KV cache budget in GB (default: 200)
@@ -536,9 +540,13 @@ Default sampling parameters applied to all generation requests. Each can be over
 | `top_p` | 1.0 | Nucleus sampling. 1.0 = disabled, lower values focus on high-probability tokens |
 | `min_p` | 0.0 | Minimum probability threshold (scaled by top token). 0.0 = disabled |
 | `top_k` | 0 | Top-k sampling. 0 = disabled, positive values limit token candidates |
-| `repetition_penalty` | 1.0 | Penalizes repeated tokens. 1.0 = disabled, >1.0 discourages repetition |
+| `repetition_penalty` | 1.05 | Penalizes repeated tokens (config default; light anti-loop). 1.0 = disabled, >1.0 discourages repetition |
 
 Configure via CLI (`--temperature 0.6`), environment variables (`SOLOHEAVEN_TEMPERATURE=0.6`), or `.env` file.
+
+> **Validation.** Out-of-range or non-finite (`NaN`/`Inf`) sampling values are rejected with a `400` at the API boundary *before* generation starts, rather than crashing mid-stream. `top_k` larger than the model's vocabulary is clamped (treated as a no-op that keeps every token) instead of erroring.
+>
+> **`repetition_penalty` precedence.** An explicit `--repetition-penalty` / `SOLOHEAVEN_REPETITION_PENALTY` takes precedence; otherwise the config default (`1.05`, a light anti-loop bias) applies. Previously an always-present CLI default silently overrode the config default — that dead-code override is fixed, so the `1.05` default is now actually in effect.
 
 Per-request override via the OpenAI API:
 
@@ -573,8 +581,9 @@ whether they're on or off.
 | `--kv-bits 0\|4\|8` | 0 (off) | mlx-lm path only | Quantize KV cache to reduce memory. **Skip for MLA models** (GLM-5.1, DeepSeek): KV is already compressed via `kv_lora_rank`. Skip for small-KV-head models (Qwen3.5 MoE has only 2 KV heads per layer — overhead dominates). Useful for standard dense/MoE models with large KV heads at long context. |
 | `--kv-group-size N` | 64 | with `--kv-bits` | Quantization group size. |
 | `--quantized-kv-start N` | 0 | with `--kv-bits` | Skip quant for first N tokens. |
-| `--memory-budget-gb N` | 200 | always | In-memory KV cache budget before LRU eviction to disk. |
+| `--memory-budget-gb N` | 200 | always | In-memory KV cache budget before LRU eviction to disk. Also caps the base-cache pool, which is now byte-accounted and LRU-evicted against this same budget (previously unbounded). |
 | `--disk-budget-gb N` | 100 | always | On-disk cache budget. **Now actually enforced**: when `_save_session_to_disk` exceeds this, oldest session files are deleted (protecting active sessions). |
+| `--gpu-keepalive` | off | process & inprocess | Keeps Metal warm with a periodic (~1s) micro-computation from the worker loop. **Latency only, not throughput**: it removes the idle-wakeup penalty so the first token after the server has been idle isn't slow — it does *not* change decode or prefill tok/s. Works in both engine modes. |
 
 #### Prompt Lookup Decoding (PLD)
 
@@ -836,6 +845,10 @@ SoloHeaven handles common quirks of OpenAI-compatible clients:
 - Strips `<think>` tags from incoming assistant messages to prevent accumulation
 - Tolerates client-side content modifications (cleared tool results, truncated assistant messages)
 - Supports `developer` role (mapped to `system` for non-OpenAI models)
+- Reports `finish_reason: "length"` on `max_tokens` truncation (with the detokenizer tail flushed so no trailing characters are lost) and `"stop"` on a stop-sequence match
+- Accepts dashes and dots in tool / function names (e.g. `my-tool`, `my.tool`) instead of silently dropping the call
+- Parses tool calls from the content channel only — a call "rehearsed" inside `<think>` reasoning is ignored
+- With `response_format`, suppresses thinking so the JSON lands in `content`, not `reasoning_content`
 
 ## Architecture
 
@@ -903,7 +916,7 @@ SoloHeaven runs the MLX engine in one of two modes (`--engine-mode`, default
 | Mode | Where generation runs | When to use |
 |------|----------------------|-------------|
 | **`process`** (default) | A **child process**, on its **main thread** (`MLXEngine(execution_mode="main_thread")`). The FastAPI parent holds an `EngineProcessProxy` and talks to the child over cmd/resp/ctrl Pipes. | Single-model serving. Restores throughput lost to a worker-thread temp>0 penalty. |
-| **`inprocess`** | Inside the FastAPI process (the original F3 worker-thread engine). | Multi-model (`--models`), or when you need GPU-keepalive (see below). |
+| **`inprocess`** | Inside the FastAPI process (the original F3 worker-thread engine). | Multi-model (`--models`). |
 
 **Why process mode is the default:** running generation on a *non-main* thread
 with `temp > 0` incurs a ~25% throughput penalty (a Metal / `mx.random`
@@ -914,18 +927,16 @@ interaction). Running generation on the **child's main thread** restores
 - **Single `--model` only.** Passing `--models` (multi-model) auto-falls back to
   in-process mode.
 - **`--draft-model` is single-model only** (so it pairs with process mode).
-- **GPU-keepalive is disabled** in process (main-thread) mode — the keepalive
-  ping thread (and the dirty-session disk flush it drives) is not started.
 
-> **Disk-persistence caveat for process mode.** The dirty-session disk flush is
-> driven by the keepalive loop and an `atexit`/signal shutdown handler, both of
-> which are registered only when keepalive starts — i.e. **not** in process
-> (main-thread) mode. The child worker also just exits on shutdown without a
-> final flush. So in the default process mode, dirty sessions are persisted to
-> disk less reliably than in `inprocess` mode (per-request saves still happen on
-> the explicit save path, but there is no periodic or shutdown flush). If you
-> need the strongest disk persistence of in-flight sessions, run
-> `--engine-mode inprocess --gpu-keepalive`.
+**Liveness & persistence in process mode.** The child worker is monitored by the
+parent (see [Reliability & Hardening](#reliability--hardening)): a crash is
+detected, in-flight requests fail fast, and the worker auto-respawns. GPU
+keepalive (`--gpu-keepalive`) now runs in process mode too — the ~1s Metal touch
+is issued from the worker's poll loop. That same loop drives a periodic idle
+dirty-session flush (~60s), and a `SIGTERM`/`SIGINT` shutdown handler flushes
+dirty sessions on exit, so in-flight sessions persist to disk in process mode as
+they do in `inprocess` mode (per-request saves still happen on the explicit save
+path as well).
 
 ### How KV Cache Reuse Works
 
@@ -964,6 +975,10 @@ To maintain cache validity, SoloHeaven compares stored messages with incoming re
 - **Tool result clearing** — Clients may replace old tool results with `[Old tool result content cleared]`; these are accepted
 - **Assistant content tolerance** — Last stored assistant message allows content differences (client disconnect/reformatting)
 - **Thinking tag stripping** — `<think>...</think>` blocks in assistant messages are stripped before comparison
+- **Prompt-contract fingerprint** — Every cache HIT is additionally gated by a fingerprint over the canonical tool schema, thinking on/off, and the model-family template revision. If the tools or thinking mode change mid-session, the HIT is refused and the session rebuilds honestly — a stale-schema cache is never reused. Legacy (unstamped) sessions take one cold rebuild that re-stamps the contract.
+- **Canonical tool-call matching** — Tool calls compare as canonical structured calls (name + normalized arguments, so a re-serialized resend still matches), with the `tool_call_id` chain pinned on `tool`-role messages — not a raw string compare.
+- **Strict anonymous matching** — A session-less (`user` omitted) request only matches engine-minted anonymous caches, by strict prefix. It can never select and mutate another conversation's cache, even on a coincidental message-prefix match.
+- **Fail-closed on ambiguity** — Residual tool-call markers, an unclosed GLM tool block, or a structured-output-vs-XML content conflict all refuse the HIT (honest MISS) rather than reuse a suspect cache.
 
 ### Cache Invalidation and Compaction
 
@@ -995,6 +1010,35 @@ For example, instead of rewriting the system prompt to include a conversation su
 ```
 
 This preserves the full cache prefix while adding context compression at the boundary.
+
+**Interruption is commit-or-invalidate.** When a turn on a cache HIT is cut
+short — the client cancels, disconnects mid-stream (`GeneratorExit`), or the
+model emits only a thinking block and no answer — the cache must not be left
+advanced past the messages recorded in the DB (an earlier bug did exactly that,
+so the next identical request re-injected the same user turn). SoloHeaven either
+**commits** the partial output and closes the turn, or **invalidates** the
+session cache fail-closed. It never commits from an unverifiable state.
+
+**MTP cache corruption terminates the stream.** On the speculative-decoding
+(MTP) path, an offset mismatch means the target cache can no longer be verified.
+Rather than decode untrustworthy tokens from it, the engine terminates the stream
+with an in-band error (`finish_reason: "error"`), invalidates the session cache,
+and the next turn takes an honest MISS.
+
+**Family-specific suffix reconciliation.** Because a cache HIT splices only the
+new turn's tokens onto the stored ids, the splice must be token-exact against
+what the chat template would render:
+
+- **Gemma 4** — a natural mlx-lm stop already records the end-of-turn token as the
+  stored tail; the HIT-splice drops the suffix's duplicate leading closer so the
+  end-of-turn token is never doubled back-to-back.
+- **GLM** — a natural-EOS reconciliation dedupes a duplicate leading role marker,
+  trims a foreign recorded EOS out of the cache, or demotes to an honest MISS; the
+  tool suffix renders `<|observation|>` + `<tool_response>` and the thinking
+  suffix opens/closes `<think>` per the official template.
+- **gemma4 `thinking=false`** HIT reuse is deliberately disabled (fail-closed
+  rebuild) for correctness, and pre-fix GLM sessions are migrated with a one-time
+  rebuild via the template-revision component of the prompt-contract fingerprint.
 
 ### Hybrid Attention Architecture Note
 
@@ -1054,6 +1098,52 @@ Branch at Turn 2:
 
 > The SQLite DB stores branch **metadata** (parent/child session links) only;
 > the KV cache itself is always reconstructed by reprocessing.
+
+## Reliability & Hardening
+
+SoloHeaven is built for a single-user, long-running, agentic workload where a
+Metal GPU abort can kill the generation process *uncatchably* and a long turn
+must never be able to freeze the endpoints that report health. The design goal is
+to **fail safe and stay honest** rather than hang or serve from an unverifiable
+state.
+
+**Process liveness & auto-recovery** (default process mode):
+
+- The FastAPI parent detects worker death directly (the response pipe closes — a
+  Metal abort can't be caught inside the child), so it never relies on the child
+  raising an exception.
+- In-flight RPCs *and* streams fail fast with a clear error instead of hanging.
+- The worker auto-respawns: single-flight (one respawn at a time) with bounded
+  attempts (3). After they're exhausted the engine is marked **permanently dead**
+  and every request returns `503` until the server is restarted.
+- While the engine is restarting, a request that hasn't started streaming yet gets
+  `503` + `Retry-After: 30` — never a `200` with a dead stream. Once a stream's
+  headers are already sent, an in-band SSE error frame is emitted instead.
+- Disk persistence in process mode: a periodic idle flush (~60s) plus a
+  `SIGTERM`/`SIGINT` shutdown flush persist dirty sessions (closing the earlier
+  process-mode gap).
+
+**Executor isolation & admission:**
+
+- Three dedicated thread pools replace the shared default executor — `run_long`
+  (mutations / completions), `run_read` (bounded reads: `/health`, admin
+  overviews, session lists), and `run_critical` (the mandatory post-stream commit)
+  — so an admin or metadata call during a long generation can no longer freeze an
+  in-flight SSE stream.
+- Bounded admission: under saturation the long/read pools return `503`
+  (`EngineBusyError`) rather than queueing unboundedly.
+- Graceful shutdown quiesces in-flight work: the critical commit lane is **poisoned,
+  never cancelled**, so a shutdown can't be mistaken for a client cancel; the engine
+  also closes a shutdown gate and self-flushes dirty sessions.
+- Mutating endpoints (branch / regenerate / delete-last / compaction) **reserve an
+  executor slot before the DB write**, so a busy engine returns a clean `503` with
+  the database left untouched (no orphan rows).
+
+**Cache safety:** every cache HIT is gated by a prompt-contract fingerprint,
+session-less requests match strictly by provenance, an interrupted turn is
+commit-or-invalidate, and unverifiable MTP cache corruption terminates the stream
+with an in-band error — see [Message Matching](#message-matching) and
+[Cache Invalidation and Compaction](#cache-invalidation-and-compaction).
 
 ## API Reference
 
@@ -1127,7 +1217,8 @@ SoloHeaven extends the OpenAI API with optional fields:
   "thinking_budget": 4096,
   "top_k": 40,
   "min_p": 0.05,
-  "repetition_penalty": 1.1
+  "repetition_penalty": 1.1,
+  "stop": ["\n\nUser:", "<END>"]
 }
 ```
 
@@ -1138,6 +1229,7 @@ SoloHeaven extends the OpenAI API with optional fields:
 - `min_p` — Min-p threshold override for this request
 - `repetition_penalty` — Repetition penalty override for this request
 - `frequency_penalty` / `presence_penalty` — OpenAI-standard penalties (mapped to `repetition_penalty`)
+- `stop` — OpenAI-standard stop sequence(s) (string or array). Now honored engine-side: generation stops at the first match, with a cross-token holdback so a sequence spanning multiple tokens is still caught, and the KV cache is truncated to stay consistent with the emitted text. A stop hit reports `finish_reason: "stop"`.
 
 **`user` field behavior:**
 
@@ -1155,17 +1247,21 @@ For OpenCode / OpenClaw, the client typically sends a consistent session ID auto
 src/mlx_soloheaven/
 ├── cli.py              # CLI entry point (argparse + env fallback)
 ├── config.py           # Configuration dataclass (ModelConfig + Config)
-├── server.py           # FastAPI app factory, multi-model setup
+├── server.py           # FastAPI app factory, multi-model setup, shutdown ordering
+├── executors.py        # Dedicated run_long/run_read/run_critical thread pools, bounded admission (503), poison-not-cancel shutdown quiesce
 ├── engine/
-│   ├── mlx_engine.py      # Core: model loading, generation, KV cache, drafter (~3700 lines)
-│   ├── thinking.py        # Thinking budget logits processor
+│   ├── mlx_engine.py      # Core: model loading, generation, KV cache, drafter, generation-finalization (~7.5k lines; the session-cache concern was extracted into the mixin below)
+│   ├── session_cache_mixin.py # SessionCacheMixin: matchers, prompt fingerprint, anon resolution, HIT transaction, base-cache LRU, disk persistence, active-LRU eviction, preflight (MLXEngine inherits it)
+│   ├── session_cache_types.py # Leaf types: SessionState, BaseCacheEntry, TurnCloseResult + shared helpers/regexes
+│   ├── thinking.py        # Thinking budget logits processor (UTF-8-boundary-safe forced </think>)
 │   ├── tool_parser.py     # XML tool calls <-> OpenAI JSON conversion
 │   ├── compaction.py      # Context compaction engine
 │   ├── pld.py             # Prompt Lookup Decoding (draft-model-free speculation)
+│   ├── qwen_mtp.py        # Native qwen3_5_mtp speculative decoding (mlx-lm path)
 │   ├── structured.py      # JSON-schema FSM logits masking (response_format)
-│   ├── types.py           # mlx-free GenerationResult/CompletionResult for IPC
-│   ├── process_client.py  # EngineProcessProxy (parent side of process mode)
-│   ├── process_worker.py  # Child-process worker (main-thread generation)
+│   ├── types.py           # mlx-free GenerationResult/CompletionResult + EngineBusyError for IPC
+│   ├── process_client.py  # EngineProcessProxy (parent side of process mode): death detection, auto-respawn
+│   ├── process_worker.py  # Child-process worker (main-thread generation, GPU keepalive, idle/shutdown flush)
 │   └── process_protocol.py # cmd/resp/ctrl Pipe message protocol
 ├── api/
 │   ├── openai_compat.py  # /v1/chat/completions, /v1/models

@@ -1485,7 +1485,11 @@ def test_corruption_suppresses_toolcalls_and_persistence(monkeypatch):
 def test_contract_and_marker_disk_roundtrip(tmp_path, monkeypatch):
     from mlx_lm.models.cache import KVCache
     from mlx_vlm.generate import PromptCacheState
-    from mlx_soloheaven.engine import mlx_engine as mlx_engine_module
+    # `_load_session_from_disk` now lives on SessionCacheMixin (behavior-
+    # preserving extraction) and resolves `make_prompt_cache` in the mixin's
+    # namespace, so the monkeypatch targets that module (same underlying
+    # mlx_lm.models.cache symbol — production behavior unchanged).
+    from mlx_soloheaven.engine import session_cache_mixin as session_cache_mixin_module
 
     def _kv(seq_len=4, num_heads=2, head_dim=8):
         c = KVCache()
@@ -1526,7 +1530,7 @@ def test_contract_and_marker_disk_roundtrip(tmp_path, monkeypatch):
     assert eng._save_session_to_disk("contract-1", session) is True
 
     monkeypatch.setattr(
-        mlx_engine_module, "make_prompt_cache",
+        session_cache_mixin_module, "make_prompt_cache",
         lambda lm: [KVCache() for _ in range(len(layers))],
     )
     loaded = eng._load_session_from_disk("contract-1")

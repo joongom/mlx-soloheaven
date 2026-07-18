@@ -20,7 +20,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from mlx_soloheaven.engine import mlx_engine as mlx_engine_module
+# `_save_session_to_disk` now lives on SessionCacheMixin (behavior-preserving
+# extraction from mlx_engine); it resolves the module-level `save_prompt_cache`
+# in the mixin's namespace, so the monkeypatch targets that module. Production
+# behavior is unchanged — both modules bind the same
+# `mlx_lm.models.cache.save_prompt_cache`.
+from mlx_soloheaven.engine import session_cache_mixin as session_cache_mixin_module
 from mlx_soloheaven.engine.mlx_engine import MLXEngine
 
 
@@ -93,7 +98,7 @@ def patched_save(tmp_path, monkeypatch):
     def fake_eval(cache):
         calls.eval += 1
 
-    monkeypatch.setattr(mlx_engine_module, "save_prompt_cache", fake_save)
+    monkeypatch.setattr(session_cache_mixin_module, "save_prompt_cache", fake_save)
     monkeypatch.setattr(MLXEngine, "_eval_cache", staticmethod(fake_eval))
     return calls
 
@@ -177,7 +182,7 @@ def test_empty_array_error_is_permanent_skip_through_executor(tmp_path, monkeypa
     def boom(path, cache, metadata=None):
         raise ValueError("cannot serialize empty array")
 
-    monkeypatch.setattr(mlx_engine_module, "save_prompt_cache", boom)
+    monkeypatch.setattr(session_cache_mixin_module, "save_prompt_cache", boom)
     monkeypatch.setattr(MLXEngine, "_eval_cache", staticmethod(lambda cache: None))
 
     ex = _RecordingExecutor()
@@ -195,7 +200,7 @@ def test_unexpected_error_through_executor_reraises(tmp_path, monkeypatch):
     def boom(path, cache, metadata=None):
         raise RuntimeError("There is no Stream(gpu, 1) in current thread.")
 
-    monkeypatch.setattr(mlx_engine_module, "save_prompt_cache", boom)
+    monkeypatch.setattr(session_cache_mixin_module, "save_prompt_cache", boom)
     monkeypatch.setattr(MLXEngine, "_eval_cache", staticmethod(lambda cache: None))
 
     ex = _RecordingExecutor()

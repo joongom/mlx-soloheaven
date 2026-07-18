@@ -22,7 +22,12 @@ import pytest
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 
 from mlx_soloheaven.config import Config
-from mlx_soloheaven.engine import mlx_engine as mlx_engine_module
+# `_load_session_from_disk`/`_save_session_to_disk` now live on
+# SessionCacheMixin (behavior-preserving extraction from mlx_engine); they
+# resolve the module-level `make_prompt_cache` symbol in the mixin's
+# namespace, so the monkeypatch targets that module. Production behavior is
+# unchanged — both modules bind the same mlx_lm.models.cache symbols.
+from mlx_soloheaven.engine import session_cache_mixin as session_cache_mixin_module
 from mlx_soloheaven.engine.mlx_engine import MLXEngine, SessionState
 from mlx_vlm.generate import PromptCacheState
 
@@ -109,7 +114,7 @@ def test_session_save_load_roundtrip(tmp_path, monkeypatch):
     # Patch make_prompt_cache so _load_session_from_disk's structural check
     # (layer count + type) passes without loading model weights.
     monkeypatch.setattr(
-        mlx_engine_module,
+        session_cache_mixin_module,
         "make_prompt_cache",
         lambda lm: [KVCache() for _ in range(len(layers))],
     )
@@ -160,7 +165,7 @@ def test_session_save_load_empty_token_ids(tmp_path, monkeypatch):
     assert eng._save_session_to_disk(sid, session) is True
 
     monkeypatch.setattr(
-        mlx_engine_module,
+        session_cache_mixin_module,
         "make_prompt_cache",
         lambda lm: [KVCache() for _ in range(len(layers))],
     )
@@ -221,7 +226,7 @@ def test_session_load_strips_trailing_mtp_head_entries(tmp_path, monkeypatch):
     _save_session(eng, "mtp-roundtrip", target + head, token_ids)
 
     monkeypatch.setattr(
-        mlx_engine_module,
+        session_cache_mixin_module,
         "make_prompt_cache",
         lambda lm: [KVCache() for _ in range(3)],
     )
@@ -247,7 +252,7 @@ def test_session_load_rejects_fewer_entries_than_model(tmp_path, monkeypatch):
     _save_session(eng, "short-load", layers, [1, 2, 3, 4])
 
     monkeypatch.setattr(
-        mlx_engine_module,
+        session_cache_mixin_module,
         "make_prompt_cache",
         lambda lm: [KVCache() for _ in range(3)],
     )
@@ -266,7 +271,7 @@ def test_session_load_rejects_wrong_leading_types(tmp_path, monkeypatch):
     _save_session(eng, "wrong-types", layers, [1, 2, 3, 4])
 
     monkeypatch.setattr(
-        mlx_engine_module,
+        session_cache_mixin_module,
         "make_prompt_cache",
         lambda lm: [KVCache(), KVCache(), NotKVCache()],
     )
@@ -288,7 +293,7 @@ def test_session_load_rejects_stripped_offset_mismatch(tmp_path, monkeypatch):
     _save_session(eng, "offset-desync", layers, [1, 2, 3, 4, 5, 6])
 
     monkeypatch.setattr(
-        mlx_engine_module,
+        session_cache_mixin_module,
         "make_prompt_cache",
         lambda lm: [KVCache() for _ in range(3)],
     )
@@ -312,7 +317,7 @@ def test_session_load_rejects_wrong_trailing_type(tmp_path, monkeypatch):
     _save_session(eng, "wrong-trailing-type", target + [rot], token_ids)
 
     monkeypatch.setattr(
-        mlx_engine_module,
+        session_cache_mixin_module,
         "make_prompt_cache",
         lambda lm: [KVCache() for _ in range(3)],
     )
@@ -333,7 +338,7 @@ def test_session_load_rejects_trailing_head_wrong_offset(tmp_path, monkeypatch):
     _save_session(eng, "head-wrong-offset", target + head, token_ids)
 
     monkeypatch.setattr(
-        mlx_engine_module,
+        session_cache_mixin_module,
         "make_prompt_cache",
         lambda lm: [KVCache() for _ in range(3)],
     )
@@ -354,7 +359,7 @@ def test_session_load_rejects_extra_count_mismatch(tmp_path, monkeypatch):
     _save_session(eng, "extra-count", target + extras, token_ids)
 
     monkeypatch.setattr(
-        mlx_engine_module,
+        session_cache_mixin_module,
         "make_prompt_cache",
         lambda lm: [KVCache() for _ in range(3)],
     )
@@ -375,7 +380,7 @@ def test_session_load_rejects_strip_when_not_mtp_capable(tmp_path, monkeypatch):
     _save_session(eng, "not-capable", target + head, token_ids)  # 41 entries
 
     monkeypatch.setattr(
-        mlx_engine_module,
+        session_cache_mixin_module,
         "make_prompt_cache",
         lambda lm: [KVCache() for _ in range(40)],
     )

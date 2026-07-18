@@ -321,7 +321,7 @@ def test_preflight_disk_is_metadata_only_never_loads_cache(tmp_path, monkeypatch
     ``_sessions``. Pre-fix it ran _load_session_from_disk (mx.load) on the
     engine-read executor thread and wrote _sessions — generation then
     consumed those arrays on the engine's owning thread."""
-    import mlx_soloheaven.engine.mlx_engine as engine_module
+    import mlx_soloheaven.engine.session_cache_mixin as cache_module
 
     eng = _preflight_engine(tmp_path)
     stored = [
@@ -338,7 +338,7 @@ def test_preflight_disk_is_metadata_only_never_loads_cache(tmp_path, monkeypatch
         "metadata-only preflight must never run the MLX disk load"
     )
     monkeypatch.setattr(
-        engine_module, "load_prompt_cache",
+        cache_module, "load_prompt_cache",
         lambda *a, **k: pytest.fail("preflight must never touch mx.load"),
     )
 

@@ -13,7 +13,7 @@ import logging
 from typing import AsyncGenerator, Optional, TYPE_CHECKING
 
 from fastapi import APIRouter, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import JSONResponse
 
 from pydantic import BaseModel
 
@@ -50,6 +50,12 @@ from mlx_soloheaven.api.errors import (
 from mlx_soloheaven.engine.process_client import EngineRestartingError
 from mlx_soloheaven.engine.types import EngineBusyError
 from mlx_soloheaven.executors import run_critical, run_long, run_read
+from mlx_soloheaven import inference_queue
+from mlx_soloheaven.api.gate_stream import (
+    SlotStreamingResponse,
+    closed_completion_response,
+    closed_stream_response,
+)
 from mlx_soloheaven.engine.tool_parser import (
     CHANNEL_REASONING,
     ThinkingRouter,
@@ -256,7 +262,9 @@ def _validate_sampling_params(request: ChatCompletionRequest) -> Optional[JSONRe
 # --- POST /v1/chat/completions ---
 
 @router.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest):
+async def chat_completions(
+    request: ChatCompletionRequest, raw_request: Request = None
+):
     engine = _get_engine(request.model)
 
     # Fail FAST while the process-mode child worker is dead/respawning:
@@ -373,7 +381,36 @@ async def chat_completions(request: ChatCompletionRequest):
         f"messages={len(request.messages)} | {preview_str}"
     )
     if request.stream:
-        return StreamingResponse(
+        # Batch C: FIFO + bounded inference-queue admission. Acquire the
+        # single generation slot BEFORE returning StreamingResponse, so a
+        # saturated queue answers a REAL 429 queue_full (once the SSE 200 has
+        # started, a status can no longer be sent) and a shutting-down server
+        # answers 503 — both raised immediately (no await) by the gate and
+        # mapped by the app-level EngineBusyError handler. FIFO waiting blocks
+        # here (the client waits for headers).
+        #
+        # Finding 2: a real queued HTTP disconnect does NOT cancel this
+        # coroutine (uvicorn only wakes receive with http.disconnect), so we
+        # RACE the acquire against a disconnect watcher on the ASGI receive
+        # channel. If the client left while queued, drop the ticket and return
+        # a closed stream — never enter generation.
+        # Findings 3+4: the slot is owned by SlotStreamingResponse, which
+        # closes the inner generation stream (full U13/C1 teardown) BEFORE
+        # releasing the lease, on EVERY exit — including a pre-body cancel
+        # (before the body generator starts) and a mid-send cancel.
+        gate = inference_queue.get_inference_gate()
+        receive = raw_request.receive if raw_request is not None else None
+        try:
+            lease = await inference_queue.acquire_or_disconnect(gate, receive)
+        except inference_queue.ClientDisconnected:
+            logger.info(
+                f"[Request] user={request.user!r} | client disconnected while "
+                f"queued on the inference gate — not generating"
+            )
+            return closed_stream_response()
+        return SlotStreamingResponse(
+            gate,
+            lease,
             _stream_completion(request, engine),
             media_type="text/event-stream",
             headers={
@@ -390,7 +427,34 @@ async def chat_completions(request: ChatCompletionRequest):
         # F2: on the bounded LONG-ops executor (not to_thread's shared
         # default pool) so a burst of these can never exhaust the workers
         # bounded reads (/health, admin) need to even start.
-        return await run_long(_sync_completion, request, engine)
+        # Batch C: the same FIFO gate fronts the non-streaming path (acquire /
+        # run / release all in this coroutine). Queue-full -> 429, shutdown ->
+        # 503; run_long underneath is now uncontended on the API path.
+        #
+        # Batch C round 3, finding 3: make the non-streaming path
+        # disconnect-aware too. uvicorn does NOT cancel the app task on socket
+        # loss, so a bare inference_slot() would PROMOTE a dead queued request
+        # and run the full _sync_completion / engine generation. Race the
+        # acquire against the ASGI disconnect watcher (as the streaming path
+        # does): a client that left while queued is dropped BEFORE
+        # _sync_completion / engine entry, and the lease is released.
+        gate = inference_queue.get_inference_gate()
+        receive = raw_request.receive if raw_request is not None else None
+        try:
+            lease = await inference_queue.acquire_or_disconnect(gate, receive)
+        except inference_queue.ClientDisconnected:
+            logger.info(
+                f"[Request] user={request.user!r} | client disconnected while "
+                f"queued (non-streaming) — not generating"
+            )
+            # The client is gone; the body is never read. Return a clean empty
+            # response (the lease was already released inside
+            # acquire_or_disconnect before ClientDisconnected was raised).
+            return closed_completion_response()
+        try:
+            return await run_long(_sync_completion, request, engine)
+        finally:
+            gate.release(lease)
 
 
 def _sync_completion(request: ChatCompletionRequest, engine: "MLXEngine"):
@@ -539,9 +603,15 @@ async def _stream_completion(
     started, a 503 can no longer be sent — if the process-mode child worker
     dies mid-stream (EngineRestartingError), emit a proper in-band error
     frame and a terminating [DONE] so the client sees a clean, explained
-    close instead of a silently-dead stream."""
+    close instead of a silently-dead stream.
+
+    Finding 1(a): the inner body generator is closed in a ``finally`` so an
+    ``aclose()`` of this wrapper (client disconnect) CASCADES GeneratorExit into
+    it — ``async for`` alone does NOT close a nested async generator, so without
+    this the engine stream's C1 teardown would run only later (on GC)."""
+    body = _stream_completion_body(request, engine)
     try:
-        async for chunk in _stream_completion_body(request, engine):
+        async for chunk in body:
             yield chunk
     except EngineRestartingError as exc:
         logger.error(
@@ -558,6 +628,9 @@ async def _stream_completion(
         )
         yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
+    finally:
+        # Cascade the close down to the engine stream so its C1 teardown runs.
+        await body.aclose()
 
 
 async def _stream_completion_body(
@@ -717,22 +790,26 @@ async def _stream_completion_body(
     # corruption) diverts to the in-band error envelope below instead of a
     # normal completion frame.
     final_finish_reason: Optional[str] = None
+    # Finding 1(a): hold the engine stream so its aclose can be cascaded in the
+    # finally below — closing THIS body generator (from _stream_completion's
+    # finally) must drive the engine generator's GeneratorExit rescue (C1).
+    engine_stream = engine.generate_stream_batches_async(
+        messages,
+        max_tokens=request.max_tokens or request.max_completion_tokens,
+        temperature=request.temperature,
+        top_p=request.top_p,
+        min_p=request.min_p,
+        top_k=request.top_k,
+        repetition_penalty=rep_penalty,
+        session_id=request.user,
+        tools=tools,
+        thinking=enable_thinking,
+        thinking_budget=thinking_budget,
+        response_format=response_format,
+        stop=request.stop,
+    )
     try:
-        async for batch in engine.generate_stream_batches_async(
-            messages,
-            max_tokens=request.max_tokens or request.max_completion_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            min_p=request.min_p,
-            top_k=request.top_k,
-            repetition_penalty=rep_penalty,
-            session_id=request.user,
-            tools=tools,
-            thinking=enable_thinking,
-            thinking_budget=thinking_budget,
-            response_format=response_format,
-            stop=request.stop,
-        ):
+        async for batch in engine_stream:
             # Concatenate the batch's content text; capture finish separately.
             chunk_text_parts: list[str] = []
             for result in batch:
@@ -912,6 +989,14 @@ async def _stream_completion_body(
             f"tail={tail!r}"
         )
         raise
+    finally:
+        # Finding 1(a): drive the engine generator's GeneratorExit rescue (C1
+        # commit-or-invalidate) synchronously here. On normal completion the
+        # engine stream is exhausted (no-op); on a disconnect (this except
+        # re-raises) this aclose does not return until C1 has run in BOTH engine
+        # modes, so the gate lease released above this chain is freed only after
+        # the turn is wound down.
+        await engine_stream.aclose()
 
     # U6/F1: corruption-terminated stream. "error" is NOT a valid OpenAI
     # finish_reason, and the already-streamed text is truncated at an

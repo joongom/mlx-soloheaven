@@ -9,8 +9,7 @@ import time
 import logging
 from typing import AsyncGenerator, TYPE_CHECKING
 
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from mlx_soloheaven.engine.process_client import EngineRestartingError
@@ -27,6 +26,11 @@ from mlx_soloheaven.engine.tool_parser import (
     ThinkingRouter,
     split_thinking_and_content,
     thinking_router_active,
+)
+from mlx_soloheaven import inference_queue
+from mlx_soloheaven.api.gate_stream import (
+    SlotStreamingResponse,
+    closed_stream_response,
 )
 from mlx_soloheaven.storage import database as db
 from mlx_soloheaven.api.compaction import build_post_compaction_messages
@@ -189,7 +193,7 @@ async def get_messages(session_id: str, limit: int | None = None):
 # --- Chat endpoint (SSE streaming) ---
 
 @router.post("/sessions/{session_id}/chat")
-async def chat(session_id: str, req: SendMessageRequest):
+async def chat(session_id: str, req: SendMessageRequest, request: Request = None):
     session = await db.get_session(session_id)
     if not session:
         raise HTTPException(404, "Session not found")
@@ -209,24 +213,62 @@ async def chat(session_id: str, req: SendMessageRequest):
     if ensure_available is not None:
         ensure_available()
 
-    # Codex round 11, finding 1: the NON-STREAMING path submits the whole
-    # generation through run_long AFTER the user message is persisted, and
-    # ensure_available() does NOT reserve executor capacity — a saturated
-    # long pool used to answer 503 with the message already in the DB (a
-    # retry duplicates it). Reserve the admission slot BEFORE the mutation;
-    # busy → clean 503 with the DB untouched. The streaming path bypasses
-    # run_long entirely (the engine's own async plumbing), so no
-    # reservation there.
-    slot: LongReservation | None = None
-    if not req.stream:
-        slot = reserve_long_slot()
+    # Batch C: FIFO + bounded inference-queue admission. Acquire the single
+    # generation slot BEFORE any DB mutation (user-message persist below), so
+    # a saturated queue answers a clean 429 queue_full — and a shutting-down
+    # server a 503 — with the DB untouched, exactly like the long-pool
+    # reservation. Raised immediately (no await) by the gate and mapped by the
+    # app-level EngineBusyError handler; FIFO waiting blocks here. The slot is
+    # held for the whole turn: for streaming it is released by the response
+    # (SlotStreamingResponse); for non-streaming it is released in this
+    # function's finally after the generation completes.
+    #
+    # Finding 2: a real queued HTTP disconnect does NOT cancel this coroutine,
+    # so acquire_or_disconnect RACES the acquire against a disconnect watcher on
+    # the ASGI receive channel. Acquiring BEFORE the user-message persist means
+    # a client that left while queued never lands a DB row nor enters the
+    # engine — the gate ticket is dropped and we return a closed stream.
+    gate = inference_queue.get_inference_gate()
+    receive = request.receive if request is not None else None
     try:
-        return await _chat_after_admission(session_id, req, session, use_engine, slot)
+        lease = await inference_queue.acquire_or_disconnect(gate, receive)
+    except inference_queue.ClientDisconnected:
+        logger.info(
+            f"[Chat] session={session_id} | client disconnected while queued "
+            f"on the inference gate — not generating, no user row persisted"
+        )
+        return closed_stream_response()
+    gate_handed_off = False
+    try:
+        # Codex round 11, finding 1: the NON-STREAMING path submits the whole
+        # generation through run_long AFTER the user message is persisted, and
+        # ensure_available() does NOT reserve executor capacity — a saturated
+        # long pool used to answer 503 with the message already in the DB (a
+        # retry duplicates it). Reserve the admission slot BEFORE the mutation;
+        # busy → clean 503 with the DB untouched. The streaming path bypasses
+        # run_long entirely (the engine's own async plumbing), so no
+        # reservation there.
+        slot: LongReservation | None = None
+        if not req.stream:
+            slot = reserve_long_slot()
+        try:
+            response = await _chat_after_admission(
+                session_id, req, session, use_engine, slot, gate, lease
+            )
+        finally:
+            # No-op once run_long consumed the reservation; releases the slot
+            # when anything between the reserve and the submit threw.
+            if slot is not None:
+                slot.release()
+        if req.stream:
+            # SlotStreamingResponse now owns the gate lease and releases it
+            # (after closing the inner stream's U13/C1 teardown) when the
+            # stream ends — this function must not release it.
+            gate_handed_off = True
+        return response
     finally:
-        # No-op once run_long consumed the reservation; releases the slot
-        # when anything between the reserve and the submit threw.
-        if slot is not None:
-            slot.release()
+        if not gate_handed_off:
+            gate.release(lease)
 
 
 async def _chat_after_admission(
@@ -235,11 +277,25 @@ async def _chat_after_admission(
     session: dict,
     use_engine: "MLXEngine",
     slot: "LongReservation | None",
+    gate: "inference_queue.InferenceGate",
+    lease: "inference_queue.Lease",
 ):
-    """Body of the chat endpoint AFTER the availability preflight and the
-    (non-streaming) admission reservation — split out so the reservation's
-    try/finally in ``chat`` covers every DB mutation below (codex round 11,
-    finding 1)."""
+    """Body of the chat endpoint AFTER the availability preflight, the FIFO
+    inference-queue admission (Batch C) and the (non-streaming) long-pool
+    reservation — split out so the reservation's try/finally in ``chat``
+    covers every DB mutation below (codex round 11, finding 1).
+
+    ``gate``/``lease`` are the already-ACQUIRED inference slot: the streaming
+    branch hands the lease to ``SlotStreamingResponse``; the non-streaming
+    branch leaves the release to ``chat``'s finally.
+
+    Finding 5 (auto-compaction lease-reuse): the auto-compaction below runs
+    INSIDE this held lease and reaches the engine DIRECTLY (never the gated
+    standalone compaction endpoint), so it MUST NOT re-acquire the gate — doing
+    so would self-deadlock at concurrency-1. Running under the existing lease is
+    correct: it is still one admission, still one running slot, still counted in
+    /ready. The standalone compaction endpoint (api/compaction.py) is the path
+    that acquires its OWN lease."""
     # Add user message. Its row id is threaded through the request (codex
     # round 3, finding 2): the assistant row is persisted only AFTER
     # generation, so a delete-last landing in between removes this row —
@@ -259,6 +315,20 @@ async def _chat_after_admission(
     utilization = (current_tokens / window_limit * 100) if window_limit > 0 else 0
     
     # Trigger compaction at 90% utilization
+    #
+    # TODO(pre-existing bug, out of Batch C scope): auto-compaction is
+    # currently DEAD. ``CompactionEngine`` (engine/compaction.py) exposes
+    # ``summarize`` / ``generate_summary_stream`` but NO ``compact()`` method,
+    # so the ``compaction_engine.compact(...)`` call below raises AttributeError
+    # every time — swallowed by the broad ``except Exception`` at the end of
+    # this block ("[Compaction] Auto-compaction failed: ..."). The turn then
+    # proceeds uncompacted. The Batch C invariant this block is SUPPOSED to
+    # prove — auto-compaction runs under the chat's ALREADY-HELD gate lease and
+    # never re-acquires the gate (which would self-deadlock at concurrency-1) —
+    # is still correct BY CONSTRUCTION (no gate call here), but it cannot be
+    # observed until compact() exists. See test_inference_queue.py
+    # test_finding5_auto_compaction_reuses_lease_no_reacquire, which stubs
+    # compact() so the lease-reuse is exercised honestly.
     if utilization >= 90:
         logger.info(f"[Compaction] Session {session_id} at {utilization:.1f}% - triggering auto-compaction")
         try:
@@ -322,7 +392,14 @@ async def _chat_after_admission(
     max_tokens = _session_value("max_tokens", use_engine.cfg.default_max_tokens)
 
     if req.stream:
-        return StreamingResponse(
+        # Batch C: the already-acquired gate lease is owned by
+        # SlotStreamingResponse, which closes the inner generation stream (full
+        # U13/C1 teardown) BEFORE releasing the slot on EVERY exit — normal
+        # completion, error, a pre-body disconnect (finding 3), or a mid-send
+        # disconnect (finding 4).
+        return SlotStreamingResponse(
+            gate,
+            lease,
             _stream_chat(
                 session_id, messages, use_engine,
                 temperature=temperature,
@@ -440,19 +517,25 @@ async def _stream_chat(
     Thin wrapper over ``_stream_chat_body``: once the SSE response started, a
     503 can no longer be sent — if the process-mode child worker dies
     mid-stream (EngineRestartingError), emit an in-band error event so the
-    web client terminates with a clear message instead of a dead stream."""
+    web client terminates with a clear message instead of a dead stream.
+
+    Finding 1(a): the inner body generator is closed in a ``finally`` so an
+    ``aclose()`` of this wrapper (client disconnect) CASCADES GeneratorExit into
+    it — ``async for`` alone does NOT close a nested async generator, so without
+    this the engine stream's C1 teardown would run only later (on GC)."""
+    body = _stream_chat_body(
+        session_id, messages, eng,
+        temperature=temperature,
+        top_p=top_p,
+        min_p=min_p,
+        top_k=top_k,
+        repetition_penalty=repetition_penalty,
+        thinking_budget=thinking_budget,
+        max_tokens=max_tokens,
+        user_message_id=user_message_id,
+    )
     try:
-        async for chunk in _stream_chat_body(
-            session_id, messages, eng,
-            temperature=temperature,
-            top_p=top_p,
-            min_p=min_p,
-            top_k=top_k,
-            repetition_penalty=repetition_penalty,
-            thinking_budget=thinking_budget,
-            max_tokens=max_tokens,
-            user_message_id=user_message_id,
-        ):
+        async for chunk in body:
             yield chunk
     except EngineRestartingError as exc:
         logger.error(
@@ -467,6 +550,9 @@ async def _stream_chat(
             ensure_ascii=False,
         )
         yield f"data: {event}\n\n"
+    finally:
+        # Cascade the close down to the engine stream so its C1 teardown runs.
+        await body.aclose()
 
 
 async def _stream_chat_body(
@@ -624,18 +710,22 @@ async def _stream_chat_body(
         )
         return f"data: {event}\n\n"
 
+    # Finding 1(a): hold the engine stream so its aclose can be cascaded in the
+    # finally below — closing THIS body generator (from _stream_chat's finally)
+    # must drive the engine generator's GeneratorExit rescue (C1 teardown).
+    engine_stream = eng.generate_stream_batches_async(
+        messages,
+        session_id=session_id,
+        temperature=temperature,
+        top_p=top_p,
+        min_p=min_p,
+        top_k=top_k,
+        repetition_penalty=repetition_penalty,
+        thinking_budget=thinking_budget,
+        max_tokens=max_tokens,
+    )
     try:
-        async for batch in eng.generate_stream_batches_async(
-            messages,
-            session_id=session_id,
-            temperature=temperature,
-            top_p=top_p,
-            min_p=min_p,
-            top_k=top_k,
-            repetition_penalty=repetition_penalty,
-            thinking_budget=thinking_budget,
-            max_tokens=max_tokens,
-        ):
+        async for batch in engine_stream:
             # Accumulate this batch's text, route once at batch end into ordered
             # reasoning/content segments, and emit a frame per contiguous-channel
             # run (reasoning frames + content frames).
@@ -724,6 +814,16 @@ async def _stream_chat_body(
             f"({type(exc).__name__}) after {token_count} tokens | "
             f"tail={tail!r}"
         )
+    finally:
+        # Finding 1(a): drive the engine generator's GeneratorExit rescue (C1
+        # commit-or-invalidate) synchronously here. On normal completion the
+        # engine stream is already exhausted (no-op); on a disconnect it is
+        # still suspended, and this aclose does not return until C1 has run (in
+        # BOTH engine modes — see MLXEngine._drain_worker_until_done /
+        # EngineProcessProxy._await_child_cancel_ack). The web-chat path SWALLOWS
+        # the disconnect above (persisting partial output), so this finally is
+        # what actually winds the engine down before the gate lease is released.
+        await engine_stream.aclose()
 
     # Flush the router's held tail (a partial marker that never completed is
     # real reasoning/content). Skip if the client already disconnected.

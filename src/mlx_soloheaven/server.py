@@ -204,6 +204,12 @@ def create_app(cfg: Config) -> FastAPI:
     # its construction branch below.
     from mlx_soloheaven.storage import database as db
     from mlx_soloheaven.api import openai_compat, chat, admin, settings, compaction, tokenize
+    from mlx_soloheaven import inference_queue
+
+    # Batch C: wire the configured bound into the parent-side FIFO inference
+    # gate that fronts all GPU generation (streaming + non-streaming completions,
+    # web-chat generation). mlx-free — the parent stays mlx-free in process mode.
+    inference_queue.configure(cfg.max_queue_length)
 
     # Set engine logger level based on verbose flag
     engine_logger = logging.getLogger("mlx_soloheaven.engine.mlx_engine")
@@ -383,7 +389,19 @@ def create_app(cfg: Config) -> FastAPI:
         Fail-closed: a failed flush logs and continues — it must never block
         or corrupt server shutdown.
         """
-        from mlx_soloheaven import executors
+        from mlx_soloheaven import executors, inference_queue
+
+        # Batch C: close the parent-side FIFO inference gate FIRST — reject
+        # every NEW generation acquire (503 engine_not_ready) and fail every
+        # QUEUED waiter the same way, so no queued generation hangs or slips
+        # into run_long/the engine behind the shutdown flush. The RUNNING
+        # generation is left to finish (its slot release wakes nothing new).
+        # Pure asyncio (no threads/pools), so it cannot deadlock with the
+        # executors quiesce ordering below.
+        try:
+            inference_queue.shutdown()
+        except Exception:  # noqa: BLE001 — never block server shutdown
+            logger.exception("[Shutdown] inference-queue close failed (continuing)")
 
         try:
             drained = executors.quiesce()

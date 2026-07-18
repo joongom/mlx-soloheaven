@@ -23,6 +23,7 @@ from mlx_soloheaven.api.errors import (
     invalid_request_response,
 )
 from mlx_soloheaven.executors import run_read
+from mlx_soloheaven import inference_queue
 
 if TYPE_CHECKING:
     # Type-only import: keeps mlx.core / mlx_vlm out of the FastAPI parent
@@ -106,15 +107,19 @@ async def ready_endpoint():
     STILL ready (200) — queue saturation is not a readiness failure. The probe
     never consults admission/pool state or acquires the GPU lock; it only reads
     already-published engine attributes (in process mode: the proxy's local
-    liveness state). ``queue_length`` is a best-effort in-flight indicator
-    (Batch C introduces the real request queue).
+    liveness state) plus the parent-side gate counter.
+
+    Batch C: ``queue_length`` is now the REAL inference-queue depth
+    (waiting + running) from the parent-side FIFO admission gate — the same
+    counter that bounds admission and answers 429 when saturated — rather than
+    the Batch A in-flight probe. A saturated-but-ready queue still returns 200.
     """
     engine = _default_engine
     if engine is None or not engine.is_ready():
         return _not_ready_response()
 
     try:
-        queue_length = int(engine.active_request_count())
+        queue_length = int(inference_queue.current_queue_length())
     except Exception:  # noqa: BLE001 — a probe must never fail readiness
         queue_length = 0
 

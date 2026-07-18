@@ -106,6 +106,53 @@ from mlx_soloheaven.engine.session_cache_mixin import SessionCacheMixin
 
 logger = logging.getLogger(__name__)
 
+# Batch C round 3, finding 1(b): ceiling (seconds) on how long an aclose()/
+# cancel of an async generation wrapper waits for the worker thread's C1
+# commit-or-invalidate teardown before it returns. The teardown is a fast
+# in-memory reconcile; this only bounds a pathologically wedged worker so the
+# gate release (cascaded ABOVE this aclose) cannot hang forever — on expiry the
+# drain gives up fail-closed and logs that C1 may be incomplete.
+_CANCEL_C1_DRAIN_TIMEOUT_S = 30.0
+
+
+async def _drain_worker_until_done(q, session_id) -> None:
+    """After ``cancel_event.set()``, wait until the worker thread posts its
+    terminal ``None`` sentinel (finding 1(b)).
+
+    The worker posts ``None`` as its LAST action, AFTER synchronously closing
+    ``generate_stream`` (which runs the C1 GeneratorExit rescue), so returning
+    here means this turn's C1 is genuinely wound down — the caller (the async
+    generator's cancel/GeneratorExit handler) then finishes its aclose, and only
+    THEN does the response-lifecycle wrapper release the gate lease.
+
+    Module-level (not a method) so it works when a consumer BREAKS out of the
+    batch loop on ``finished`` — the engine generator is still suspended, so its
+    aclose runs the GeneratorExit handler on a NORMAL completion too, and a
+    ``generate_stream_batches_async`` bound onto a lightweight fake engine (that
+    has no engine methods) still resolves this drain. Bounded + fail-closed: a
+    wedged worker cannot hang the release forever, and on a normal completion the
+    ``None`` sentinel is already (or imminently) in the queue, so it returns at
+    once."""
+    deadline = time.monotonic() + _CANCEL_C1_DRAIN_TIMEOUT_S
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            logger.warning(
+                f"[Stream] session={session_id} | worker C1 teardown did not "
+                f"complete within {_CANCEL_C1_DRAIN_TIMEOUT_S}s of cancel — "
+                f"proceeding (C1 may be incomplete)"
+            )
+            return
+        try:
+            item = await asyncio.wait_for(q.get(), timeout=min(1.0, remaining))
+        except asyncio.TimeoutError:
+            continue  # re-check the deadline; the worker is still winding down
+        if item is None:
+            return
+        # Any leftover batch/exception in flight is ignored — we are only
+        # waiting for the C1-complete sentinel while tearing down.
+
+
 # Heuristic threshold for the per-request drafter low-acceptance WARNING.
 # At block_size=3 the max possible mean_accepted is 2.0 (every block fully
 # accepted). A mean below 0.5 means more than 75% of drafted tokens are
@@ -6870,23 +6917,24 @@ class MLXEngine(SessionCacheMixin):
         cancel_event = threading.Event()
 
         def _run():
+            gen = self.generate_stream(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                min_p=min_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                session_id=session_id,
+                tools=tools,
+                cancel_event=cancel_event,
+                thinking=thinking,
+                thinking_budget=thinking_budget,
+                response_format=response_format,
+                stop=stop,
+            )
             try:
-                for result in self.generate_stream(
-                    messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    min_p=min_p,
-                    top_k=top_k,
-                    repetition_penalty=repetition_penalty,
-                    session_id=session_id,
-                    tools=tools,
-                    cancel_event=cancel_event,
-                    thinking=thinking,
-                    thinking_budget=thinking_budget,
-                    response_format=response_format,
-                    stop=stop,
-                ):
+                for result in gen:
                     if cancel_event.is_set():
                         break
                     loop.call_soon_threadsafe(q.put_nowait, result)
@@ -6894,6 +6942,19 @@ class MLXEngine(SessionCacheMixin):
                 if not cancel_event.is_set():
                     loop.call_soon_threadsafe(q.put_nowait, e)
             finally:
+                # Finding 1(b): drive the sync generator's C1 commit-or-invalidate
+                # teardown (its GeneratorExit rescue) SYNCHRONOUSLY here, BEFORE
+                # posting the terminal sentinel — so the parent's ``None`` means
+                # this turn's C1 is fully wound down. On normal completion / an
+                # exception ``gen`` is already exhausted, so close() is a no-op;
+                # on a cancel break it is still suspended and close() runs C1.
+                try:
+                    gen.close()
+                except Exception:  # noqa: BLE001 — teardown must never wedge the worker
+                    logger.exception(
+                        f"[Stream] session={session_id} | generate_stream close "
+                        f"(C1 teardown) raised"
+                    )
                 loop.call_soon_threadsafe(q.put_nowait, None)
 
         # F3: pin to the dedicated mlx-vlm worker thread so mlx-vlm's
@@ -6907,6 +6968,13 @@ class MLXEngine(SessionCacheMixin):
         else:
             threading.Thread(target=_run, daemon=True).start()
 
+        # Batch C round 4, finding 3: track whether the worker's terminal ``None``
+        # sentinel has already been consumed. The worker posts ``None`` as its
+        # LAST action, AFTER synchronously closing generate_stream (running C1).
+        # Once we have seen it, C1 is DONE — a later aclose must NOT re-drain:
+        # there is no second ``None`` coming, so a drain would block the full
+        # _CANCEL_C1_DRAIN_TIMEOUT_S on a sentinel that never arrives.
+        sentinel_consumed = False
         try:
             while True:
                 try:
@@ -6916,6 +6984,7 @@ class MLXEngine(SessionCacheMixin):
                     yield GenerationResult(text="")
                     continue
                 if item is None:
+                    sentinel_consumed = True
                     break
                 if isinstance(item, Exception):
                     raise item
@@ -6927,6 +6996,12 @@ class MLXEngine(SessionCacheMixin):
                 f"[Stream] session={session_id} | client disconnected "
                 f"({type(exc).__name__}) — cancelling generation"
             )
+            # Finding 1(b)/3: block this aclose until the worker's C1 teardown has
+            # completed (the terminal ``None``) — but ONLY when the sentinel has
+            # NOT already been seen. If it was consumed (normal completion), C1 is
+            # already done; skip the drain and release immediately.
+            if not sentinel_consumed:
+                await _drain_worker_until_done(q, session_id)
             raise
 
     async def generate_stream_batches_async(
@@ -6986,23 +7061,24 @@ class MLXEngine(SessionCacheMixin):
                 if batch:
                     loop.call_soon_threadsafe(q.put_nowait, tuple(batch))
 
+            gen = self.generate_stream(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                min_p=min_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                session_id=session_id,
+                tools=tools,
+                cancel_event=cancel_event,
+                thinking=thinking,
+                thinking_budget=thinking_budget,
+                response_format=response_format,
+                stop=stop,
+            )
             try:
-                for result in self.generate_stream(
-                    messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    min_p=min_p,
-                    top_k=top_k,
-                    repetition_penalty=repetition_penalty,
-                    session_id=session_id,
-                    tools=tools,
-                    cancel_event=cancel_event,
-                    thinking=thinking,
-                    thinking_budget=thinking_budget,
-                    response_format=response_format,
-                    stop=stop,
-                ):
+                for result in gen:
                     if cancel_event.is_set():
                         # Flush whatever's batched, then stop.
                         _flush_batch()
@@ -7049,6 +7125,17 @@ class MLXEngine(SessionCacheMixin):
                     loop.call_soon_threadsafe(q.put_nowait, e)
             finally:
                 _flush_batch()
+                # Finding 1(b): close generate_stream SYNCHRONOUSLY (running its
+                # C1 GeneratorExit rescue) BEFORE the terminal sentinel, so the
+                # parent's ``None`` means this turn's C1 is fully wound down (see
+                # the scalar generate_stream_async for the full rationale).
+                try:
+                    gen.close()
+                except Exception:  # noqa: BLE001 — teardown must never wedge the worker
+                    logger.exception(
+                        f"[Stream] session={session_id} | generate_stream close "
+                        f"(C1 teardown) raised"
+                    )
                 loop.call_soon_threadsafe(q.put_nowait, None)
 
         # F3: same worker-submit logic as generate_stream_async — VLM is pinned
@@ -7059,6 +7146,14 @@ class MLXEngine(SessionCacheMixin):
         else:
             threading.Thread(target=_run, daemon=True).start()
 
+        # Batch C round 4, finding 3: see generate_stream_async — track the
+        # terminal ``None`` so a post-completion aclose does not re-drain a
+        # sentinel that was already consumed. The codex-reproduced 30s stall was a
+        # NORMAL completion: the terminal batch AND the ``None`` were both dequeued
+        # (the ``None`` in the backlog-drain below) BEFORE the consumer observed
+        # the terminal batch and BROKE, suspending this generator at the yield with
+        # the only ``None`` already gone.
+        sentinel_consumed = False
         try:
             while True:
                 try:
@@ -7068,6 +7163,7 @@ class MLXEngine(SessionCacheMixin):
                     yield [GenerationResult(text="")]
                     continue
                 if item is None:
+                    sentinel_consumed = True
                     break
                 if isinstance(item, Exception):
                     raise item
@@ -7081,8 +7177,13 @@ class MLXEngine(SessionCacheMixin):
                     except asyncio.QueueEmpty:
                         break
                     if nxt is None:
-                        # End sentinel arrived in the backlog — yield what we
-                        # have, then stop after this drain.
+                        # End sentinel arrived in the backlog — the ONLY ``None``
+                        # is consumed HERE. Finding 3: mark it so that if the
+                        # consumer BREAKS on a terminal batch in the yield loop
+                        # below (suspending this generator with the sentinel
+                        # already gone), the aclose handler does NOT drain 30s —
+                        # C1 already ran in the worker before it posted ``None``.
+                        sentinel_consumed = True
                         for b in pending:
                             yield list(b)
                         return
@@ -7101,6 +7202,13 @@ class MLXEngine(SessionCacheMixin):
                 f"[Stream] session={session_id} | client disconnected "
                 f"({type(exc).__name__}) — cancelling generation (batched)"
             )
+            # Finding 1(b)/3: block this aclose until the worker's C1 teardown
+            # (terminal ``None``) — but ONLY when the sentinel has NOT already been
+            # consumed. If it was (normal completion), C1 is done; draining would
+            # block the full timeout on a ``None`` that never arrives, so skip it
+            # and release immediately.
+            if not sentinel_consumed:
+                await _drain_worker_until_done(q, session_id)
             raise
 
     # --- Truncation & Regeneration ---

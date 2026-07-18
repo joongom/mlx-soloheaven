@@ -12,8 +12,7 @@ import json
 import logging
 from typing import AsyncGenerator, Optional
 
-from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from mlx_soloheaven.storage import database as db
@@ -21,6 +20,11 @@ from mlx_soloheaven.engine.compaction import CompactionEngine, COMPACTION_SUMMAR
 from mlx_soloheaven.engine.process_client import EngineRestartingError
 from mlx_soloheaven.engine.types import EngineBusyError
 from mlx_soloheaven.executors import reserve_long_slot, run_long
+from mlx_soloheaven import inference_queue
+from mlx_soloheaven.api.gate_stream import (
+    SlotStreamingResponse,
+    closed_stream_response,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
@@ -44,8 +48,21 @@ class CompactionRequest(BaseModel):
 
 
 @router.post("/sessions/{session_id}/compact")
-async def compact_session(session_id: str, req: CompactionRequest):
-    """Compact conversation history via SSE streaming."""
+async def compact_session(
+    session_id: str, req: CompactionRequest, request: Request = None
+):
+    """Compact conversation history via SSE streaming.
+
+    Finding 5: the standalone compaction endpoint generates a summary via the
+    engine, so it MUST go through the same FIFO inference gate as the completion
+    handlers — otherwise a compaction runs CONCURRENTLY with a gated generation
+    (the "FIFO fronting all generation" invariant breaks, /ready under-reports,
+    and a standalone compaction can overtake queued requests). It acquires its
+    OWN lease here (the engine lock still serializes the GPU underneath); the
+    lease is owned by SlotStreamingResponse (findings 3+4). AUTO-compaction from
+    within a gated chat request does NOT come here — it runs under the chat's
+    existing lease and reaches the engine directly (see chat._chat_after_admission).
+    """
     session = await db.get_session(session_id)
     if not session:
         raise HTTPException(404, "Session not found")
@@ -61,7 +78,24 @@ async def compact_session(session_id: str, req: CompactionRequest):
     if ensure_available is not None:
         ensure_available()
 
-    return StreamingResponse(
+    # Batch C gate: acquire the single generation slot BEFORE returning the SSE
+    # response (queue-full -> real 429, shutdown -> 503, both raised by the gate
+    # and mapped by the app-level handler). Finding 2: race the acquire against
+    # a queued-disconnect watcher.
+    gate = inference_queue.get_inference_gate()
+    receive = request.receive if request is not None else None
+    try:
+        lease = await inference_queue.acquire_or_disconnect(gate, receive)
+    except inference_queue.ClientDisconnected:
+        logger.info(
+            f"[Compaction] session={session_id} | client disconnected while "
+            f"queued on the inference gate — not compacting"
+        )
+        return closed_stream_response()
+
+    return SlotStreamingResponse(
+        gate,
+        lease,
         _stream_compact(session_id, session, req),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
@@ -77,9 +111,15 @@ async def _stream_compact(
     started, a 503 can no longer be sent — if the process-mode child worker
     dies mid-stream (EngineRestartingError from the summary generation or
     the compact_session RPC), emit an in-band error event then terminate,
-    mirroring the openai_compat/chat stream wrappers."""
+    mirroring the openai_compat/chat stream wrappers.
+
+    Finding 1(a): the inner body generator is closed in a ``finally`` so an
+    ``aclose()`` of this wrapper (client disconnect) CASCADES GeneratorExit into
+    it — ``async for`` alone does NOT close a nested async generator, so without
+    this the summary-generation stream's C1 teardown would run only later."""
+    body = _stream_compact_body(session_id, session, req)
     try:
-        async for chunk in _stream_compact_body(session_id, session, req):
+        async for chunk in body:
             yield chunk
     except EngineRestartingError as exc:
         logger.error(
@@ -95,6 +135,9 @@ async def _stream_compact(
             ensure_ascii=False,
         )
         yield f"data: {event}\n\n"
+    finally:
+        # Cascade the close down to the summary-generation stream (C1 teardown).
+        await body.aclose()
 
 
 async def _stream_compact_body(
@@ -136,11 +179,22 @@ async def _stream_compact_body(
 
     # Stream: summary generation token-by-token
     summary = ""
-    async for event in compaction_engine.generate_summary_stream(summary_messages, session_id=session_id):
-        if event["type"] == "text":
-            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-        elif event["type"] == "result":
-            summary = event["summary"]
+    # Finding 1(a): hold the summary stream so its aclose is cascaded on a
+    # client disconnect (closing this body from _stream_compact's finally),
+    # driving the engine generator's GeneratorExit rescue (C1 teardown).
+    summary_stream = compaction_engine.generate_summary_stream(
+        summary_messages, session_id=session_id
+    )
+    try:
+        async for event in summary_stream:
+            if event["type"] == "text":
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            elif event["type"] == "result":
+                summary = event["summary"]
+    finally:
+        # Exhausted on normal completion (no-op); on a disconnect this aclose
+        # does not return until the engine C1 teardown has run.
+        await summary_stream.aclose()
 
     # Finalize: insert compaction message + rebuild cache.
     # ORDERING NOTE: the summary DB insert intentionally precedes the

@@ -113,6 +113,10 @@ class EngineProcessProxy:
         self.model_family = "chatml"
         self.enable_thinking = bool(getattr(cfg, "enable_thinking", True))
         self.think_end_token = int(getattr(cfg, "think_end_token", -1))
+        # Set from the child's `ready` frame: whether the model uses a
+        # translation-schema chat template (translategemma) whose user content
+        # must stay a structured list (see MLXEngine._is_translation_template).
+        self._is_translation_template = False
 
         # Parent-side cache_manager shim (chat.py reads .cache_manager.stats()).
         self.cache_manager = _CacheManagerShim(self)
@@ -754,6 +758,9 @@ class EngineProcessProxy:
             self.model_family = frame.get("model_family", "chatml")
             self.enable_thinking = bool(frame.get("enable_thinking", True))
             self.think_end_token = int(frame.get("think_end_token", -1))
+            self._is_translation_template = bool(
+                frame.get("is_translation_template", False)
+            )
             # Refresh cfg view from the child's authoritative post-load
             # snapshot so the API's default_*/thinking/token-id reads match
             # the child.

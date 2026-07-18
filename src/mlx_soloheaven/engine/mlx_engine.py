@@ -1805,6 +1805,48 @@ class MLXEngine(SessionCacheMixin):
         self.model_family = self._detect_model_family()
         logger.info(f"Model family: {self.model_family}")
 
+        # Detect translation-schema chat templates (e.g. translategemma): their
+        # template REQUIRES each user message's `content` to stay a list with a
+        # single structured item {type, source_lang_code, target_lang_code,
+        # text|image} — it reads the lang codes to synthesize the translator
+        # prompt. The normal content-flattening in _format_messages would turn
+        # that list into a bare string and the template would raise. Detect by
+        # template signature (model-name-independent) and skip flattening for
+        # user messages when set.
+        _ct = getattr(self.tokenizer, "chat_template", None)
+        self._is_translation_template = bool(
+            _ct and "source_lang_code" in _ct and "target_lang_code" in _ct
+        )
+        if self._is_translation_template:
+            logger.info(
+                f"[{self.model_id}] translation-schema chat template detected — "
+                f"user message content will be passed through unflattened"
+            )
+
+        # Gemma-family turn terminator: models whose chat template ends each
+        # turn with <end_of_turn> must stop generation on that token. Some
+        # checkpoints (e.g. translategemma) ship a generation_config.json
+        # WITHOUT eos_token_id, so the tokenizer's only EOS is <eos> (id 1) and
+        # generation never stops at the <end_of_turn> (id 106) the model emits —
+        # it runs to max_tokens and degenerates into repetition. Add it to the
+        # EOS set when the template uses it. Idempotent: models that already list
+        # 106 (gemma4) just re-add to the set. mlx-lm's stream_generate and the
+        # PLD path both read tokenizer.eos_token_ids, so this fixes every path.
+        if _ct and "<end_of_turn>" in _ct and hasattr(self.tokenizer, "add_eos_token"):
+            try:
+                before = set(getattr(self.tokenizer, "eos_token_ids", set()) or set())
+                self.tokenizer.add_eos_token("<end_of_turn>")
+                after = set(getattr(self.tokenizer, "eos_token_ids", set()) or set())
+                if after != before:
+                    logger.info(
+                        f"[{self.model_id}] added <end_of_turn> to EOS token set "
+                        f"(gemma turn terminator) — eos_token_ids={sorted(after)}"
+                    )
+            except Exception:  # noqa: BLE001 — never let EOS tweak break load
+                logger.exception(
+                    f"[{self.model_id}] failed to add <end_of_turn> to EOS set"
+                )
+
         # Auto-detect thinking end token (needed for SSE thinking_done signal)
         self._detect_special_tokens()
 
@@ -2768,6 +2810,18 @@ class MLXEngine(SessionCacheMixin):
             m = {"role": role}
             if msg.get("content") is not None:
                 content = msg["content"]
+                # Translation-schema templates (translategemma) need the user
+                # message's structured list content kept verbatim so the
+                # template can read source_lang_code/target_lang_code. Assistant
+                # replies are still plain strings, so only user is exempted.
+                if (
+                    getattr(self, "_is_translation_template", False)
+                    and role == "user"
+                    and isinstance(content, list)
+                ):
+                    m["content"] = content
+                    formatted.append(m)
+                    continue
                 if isinstance(content, list):
                     parts = []
                     for part in content:

@@ -346,6 +346,7 @@ def _sync_completion(request: ChatCompletionRequest, engine: "MLXEngine"):
         [m.model_dump(exclude_none=True) for m in request.messages],
         model_family=engine.model_family,
         thinking_active=enable_thinking,
+        translation_schema=getattr(engine, "_is_translation_template", False),
     )
 
     # Map OpenAI frequency/presence_penalty to repetition_penalty if not explicitly set
@@ -527,6 +528,7 @@ async def _stream_completion_body(
         [m.model_dump(exclude_none=True) for m in request.messages],
         model_family=engine.model_family,
         thinking_active=enable_thinking,
+        translation_schema=getattr(engine, "_is_translation_template", False),
     )
 
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"

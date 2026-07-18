@@ -1144,6 +1144,7 @@ def strip_thinking_tags(
     messages: list[dict],
     model_family: str = "chatml",
     thinking_active: bool = True,
+    translation_schema: bool = False,
 ) -> list[dict]:
     """Strip thinking tags from assistant messages and normalize content.
 
@@ -1156,10 +1157,23 @@ def strip_thinking_tags(
     contract is active — with thinking disabled an assistant turn genuinely
     starting with the words ``thought\\n...`` is content and must replay
     into the prompt untouched. Default True preserves round-6 behavior.
+
+    When ``translation_schema`` is set (translategemma-style models), user
+    messages carry structured list content
+    {type, source_lang_code, target_lang_code, text} that the model's chat
+    template consumes verbatim to synthesize the translator prompt — those are
+    passed through untouched instead of being flattened by normalize_content.
     """
     result = []
     for msg in messages:
         m = msg
+        if (
+            translation_schema
+            and msg.get("role") == "user"
+            and isinstance(msg.get("content"), list)
+        ):
+            result.append(msg)
+            continue
         if msg.get("content") and not isinstance(msg["content"], str):
             m = {**msg, "content": normalize_content(msg["content"])}
 

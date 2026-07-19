@@ -19,6 +19,7 @@ import os
 import threading
 import time
 import uuid
+from datetime import datetime
 from typing import Optional
 
 import mlx.core as mx
@@ -36,10 +37,12 @@ from mlx_soloheaven.engine.session_cache_types import (
     _NORMALIZE_RE_SYSTEM_REMINDER,
     _NORMALIZE_RE_TODAYS_DATE,
     _NORMALIZE_RE_TOOL_CALL_CHANNEL,
+    _NORMALIZE_RE_TOOL_CALL_HARMONY,
     _NORMALIZE_RE_TOOL_CALL_XML,
     _content_channel_union,
 )
 from mlx_soloheaven.engine.tool_parser import (
+    _HARMONY_MARKERS,
     _parse_glm_tool_calls,
     get_tool_markers,
     parse_tool_calls,
@@ -125,11 +128,41 @@ class SessionCacheMixin:
     # _prompt_fingerprint's template_rev doc).
     _GLM_SUFFIX_REV = "glm-suffix-v2"
 
+    # Harmony (gpt-oss) suffix-builder revision. The family is NEW (no
+    # legacy harmony sessions exist that would need a migration path), but
+    # the revision is stamped from day one so any FUTURE change to what
+    # _suffix_tokens_harmony / _reconcile_harmony_recorded_eos splices
+    # becomes an automatic one-time honest-MISS migration through the
+    # established U21/F5 fingerprint gate — no retrofit needed.
+    _HARMONY_SUFFIX_REV = "harmony-suffix-v1"
+
+    @staticmethod
+    def _harmony_template_date() -> str:
+        """The date string the harmony chat template embeds — computed the
+        SAME way the template does (``strftime_now("%Y-%m-%d")`` in
+        chat_template.jinja ~202, i.e. LOCAL ``datetime.now()``)."""
+        return datetime.now().strftime("%Y-%m-%d")
+
     def _suffix_template_rev(self) -> str:
         """Suffix-builder revision that participates in the prompt-contract
-        fingerprint for the current model family ('' = no revision)."""
-        if getattr(self, "model_family", None) == "glm":
+        fingerprint for the current model family ('' = no revision).
+
+        P2-5: for harmony the current DATE is folded into the revision. The
+        harmony system prefix embeds ``Current date: {today}`` (dynamic
+        ``strftime_now`` in the template), which is NOT part of the messages
+        the fingerprint otherwise hashes. Without this, a session that lives
+        across midnight would keep stored ids carrying YESTERDAY's date while
+        a fresh full retokenization renders TODAY's — a silent prefix
+        divergence. Folding the date in makes a date change flip the
+        fingerprint, so the established U21/F5 gate demotes the session to one
+        honest cold rebuild that restamps today's prefix (the correct
+        behavior — the system prefix genuinely changed). Only harmony embeds a
+        date; other families keep their historical revisions unchanged."""
+        family = getattr(self, "model_family", None)
+        if family == "glm":
             return self._GLM_SUFFIX_REV
+        if family == "harmony":
+            return f"{self._HARMONY_SUFFIX_REV}|date={self._harmony_template_date()}"
         return ""
 
     def _model_identity(self) -> str:
@@ -494,9 +527,39 @@ class SessionCacheMixin:
             # Strip thinking blocks (channel reduction per family/contract —
             # see the docstring).
             if model_family == "gemma4":
+                # The stored raw is the wire text with model-emitted channel
+                # markers, reduced to the router-authoritative content union
+                # (analysis excluded; tool blocks stripped by the regex below).
                 content = _content_channel_union(
                     content, model_family, thinking_active,
                 )
+            elif model_family == "harmony":
+                # Codex batch-5 P1-2 (batch-4 R13/14 twin): a raw harmony
+                # assistant turn whose VISIBLE content channel is EMPTY — an
+                # unclosed (or closed) analysis-only turn, a structural-only
+                # fragment, or an empty final body — must NOT reduce to "" and
+                # then plain-equality collide with a DIFFERENT plain resend (an
+                # empty/text resend wrong-HIT such a stored turn on the strict
+                # anon path, pre-fix). Keep it RAW so it matches nothing but
+                # its byte-identical self (honest MISS otherwise); the
+                # legitimate interrupted-resend equivalence is handled by
+                # _interrupted_resend_equiv under strict rules, never by plain
+                # equality. A turn WITH a real content/final body still
+                # reduces to it and matches its clean resend; a marker-less
+                # plain resend (client echo) reduces to itself.
+                reduced = _content_channel_union(
+                    content, model_family, thinking_active,
+                )
+                reduced_visible = _NORMALIZE_RE_TOOL_CALL_HARMONY.sub(
+                    "", reduced,
+                )
+                if (
+                    content.strip()
+                    and not reduced_visible.strip()
+                    and any(mk in content for mk in _HARMONY_MARKERS)
+                ):
+                    return content.strip()
+                content = reduced
             elif thinking_active:
                 # Codex round 11, finding 1: FIRST-close channel reduction.
                 # The router contract (content_segments /
@@ -545,6 +608,11 @@ class SessionCacheMixin:
             # Strip tool call blocks (both ChatML and Gemma 4 formats)
             content = _NORMALIZE_RE_TOOL_CALL_CHANNEL.sub("", content)
             content = _NORMALIZE_RE_TOOL_CALL_XML.sub("", content)
+            # Harmony tool blocks — GATED to the harmony family so
+            # chatml/gemma4/glm normalization stays byte-identical (a
+            # literal harmony marker in another family's content is prose).
+            if model_family == "harmony":
+                content = _NORMALIZE_RE_TOOL_CALL_HARMONY.sub("", content)
         return content.strip()
 
     @staticmethod
@@ -816,7 +884,7 @@ class SessionCacheMixin:
         s_content = s_content or ""
         family = getattr(self, "model_family", "chatml")
         started = s_content.lstrip().startswith("<think>")
-        if family == "gemma4" or (thinking_active and started):
+        if family in ("gemma4", "harmony") or (thinking_active and started):
             # gemma4 keeps its positional-router split; a chatml/glm stored
             # raw always carries the leading opener
             # (_make_full_assistant_content), and the split's Case 1 is

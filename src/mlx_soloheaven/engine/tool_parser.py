@@ -1,6 +1,7 @@
 """Parse model XML tool calls to/from OpenAI JSON format.
 
-Supports Qwen/ChatML, GLM, and Gemma 4 tool call formats.
+Supports Qwen/ChatML, GLM, Gemma 4, and Harmony (OpenAI gpt-oss) tool call
+formats.
 """
 
 import json
@@ -23,6 +24,14 @@ _TOOL_MARKERS = {
     "qwen":   ("<tool_call>", "</tool_call>"),
     "glm":    ("<tool_call>", "</tool_call>"),
     "gemma4": ("<|tool_call>", "<tool_call|>"),
+    # Harmony (gpt-oss): a tool call is a commentary-channel message with a
+    # functions recipient — ``<|channel|>commentary to=functions.NAME
+    # <|constrain|>json<|message|>{json}<|call|>``. The harmony
+    # ThinkingRouter branch re-emits complete tool blocks on the CONTENT
+    # channel in exactly this canonical shape (start marker at segment
+    # start, ``<|call|>`` terminator), so the streaming tool FSM's
+    # start/end scan works unchanged.
+    "harmony": ("<|channel|>commentary", "<|call|>"),
 }
 
 
@@ -46,6 +55,11 @@ def try_extract_tool_name(buf_after_start: str, model_family: str) -> Optional[s
     """
     if model_family == "gemma4":
         m = re.match(r"\s*call:(" + _NAME + r")\s*\{", buf_after_start)
+        return m.group(1) if m else None
+    if model_family == "harmony":
+        # After "<|channel|>commentary": " to=functions.NAME ..." (the
+        # generated header form; the router canonicalizes blocks to it).
+        m = re.match(r"\s*to=functions\.(" + _NAME + r")", buf_after_start)
         return m.group(1) if m else None
     if model_family == "glm":
         # GLM: name is bare text between <tool_call> and first <arg_key>
@@ -79,6 +93,7 @@ def parse_tool_calls(
     - ChatML/Qwen: <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
     - GLM: <tool_call>function_name<arg_key>key</arg_key><arg_value>value</arg_value>...</tool_call>
     - Gemma 4: <|tool_call>call:name{key:<|"|>val<|"|>}<tool_call|>
+    - Harmony: <|channel|>commentary to=functions.name <|constrain|>json<|message|>{json}<|call|>
 
     Returns:
         (content_text, tool_calls)
@@ -104,6 +119,8 @@ def parse_tool_calls(
     """
     if model_family == "gemma4":
         return _parse_gemma4_tool_calls(text, rstrip_content=rstrip_content)
+    if model_family == "harmony":
+        return _parse_harmony_tool_calls(text, rstrip_content=rstrip_content)
     if model_family == "glm":
         # GLM format has <arg_key>/<arg_value> pairs; if not found, fall through
         # to Qwen-style parsing (some GLM variants follow Qwen format).
@@ -508,6 +525,193 @@ def _parse_gemma4_tool_calls(
     return (content.rstrip() if rstrip_content else content), tool_calls
 
 
+# ---------------------------------------------------------------------------
+# Harmony (OpenAI gpt-oss, model_type "gpt_oss") channel markers.
+#
+# Wire format (derived from the model's chat_template.jinja and verified
+# against the real o200k_harmony tokenizer — see tests/test_harmony_family.py):
+# every message is ``<|start|>{role}[ to={recipient}]<|channel|>{channel}
+# [ to={recipient}][ <|constrain|>{type}]<|message|>{body}{terminator}``.
+# The generation prompt ends with ``<|start|>assistant``, so generated
+# output BEGINS at a ``<|channel|>`` header. Channels:
+#   * analysis   — chain-of-thought; body routes to CHANNEL_REASONING.
+#   * final      — the user-visible answer; body routes to CHANNEL_CONTENT.
+#   * commentary — with a ``to=functions.*`` recipient: a TOOL CALL (JSON
+#     args body, ``<|call|>`` terminator); without one: a user-visible
+#     preamble (routes to content).
+# Historical terminator is ``<|end|>``; a natural generated stop is
+# ``<|return|>`` (final) or ``<|call|>`` (tool call) — both chat EOS ids.
+# ``<|start|>assistant`` between generated blocks is STRUCTURAL (dropped).
+# ---------------------------------------------------------------------------
+_HARMONY_START = "<|start|>"
+_HARMONY_CHANNEL = "<|channel|>"
+_HARMONY_MESSAGE = "<|message|>"
+_HARMONY_END = "<|end|>"
+_HARMONY_RETURN = "<|return|>"
+_HARMONY_CALL = "<|call|>"
+# All markers a harmony stream can split across chunk boundaries.
+_HARMONY_MARKERS = (
+    _HARMONY_START, _HARMONY_CHANNEL, _HARMONY_MESSAGE,
+    _HARMONY_END, _HARMONY_RETURN, _HARMONY_CALL,
+)
+# Body terminators that are CONSUMED (the block ended); a new block header
+# marker (start/channel) also terminates the current body but is REPROCESSED
+# as the next block's opener (harmony messages are header-delimited).
+_HARMONY_BODY_TERMINATORS = (_HARMONY_END, _HARMONY_RETURN, _HARMONY_CALL)
+_HARMONY_HEADER_OPENERS = (_HARMONY_START, _HARMONY_CHANNEL)
+# Markers that END an already-open message body. The set DIFFERS by the
+# body's channel (codex batch-5 P1-3 STRUCTURAL PRECEDENCE, refined by
+# batch-6 FINDING B):
+#
+#   * A REASONING (analysis) body also ends at a ``<|start|>`` (reprocessed
+#     as the next block's opener): a degenerate analysis that dropped its
+#     ``<|end|>`` and ran straight into the next message is recovered — the
+#     model LEGITIMATELY continues after analysis (to final, or to a
+#     commentary tool call), so a ``<|start|>`` there is a genuine boundary.
+#
+#   * A CONTENT (final / preamble) body ends ONLY at a real terminator
+#     (``<|end|>``/``<|return|>``/``<|call|>``) — NOT at a ``<|start|>``.
+#     Within one generated response a final is TERMINAL: the model does not
+#     open a NEW message after a final has begun. So a ``<|start|>`` appearing
+#     INSIDE an open final body is the model QUOTING a frame (e.g. showing the
+#     ``<|start|>assistant<|channel|>commentary...<|call|>`` format as an
+#     example), and must stay VISIBLE CONTENT — never be sent back to
+#     structural processing where the quoted frame would execute as a phantom
+#     tool call (FINDING B). Ambiguity resolves toward content: we NEVER
+#     execute a call that is not cleanly ``<|call|>``-terminated at a genuine
+#     top-level boundary.
+#
+# A bare ``<|channel|>`` is DELIBERATELY EXCLUDED from BOTH — in valid harmony
+# a real channel switch is ALWAYS preceded by ``<|start|>{role}`` (or is the
+# gen-start opener), so a bare ``<|channel|>...`` inside an open body is
+# QUOTED content, not a switch (P1-3).
+_HARMONY_REASONING_BODY_ENDERS = _HARMONY_BODY_TERMINATORS + (_HARMONY_START,)
+_HARMONY_CONTENT_BODY_ENDERS = _HARMONY_BODY_TERMINATORS
+# The EXACT channel-header sequences the harmony chat template RAISES on when
+# present in assistant content / thinking (chat_template.jinja ~264). ONLY
+# these trigger strip_thinking_tags' destructive history reduction
+# (ground-truth correction): a bare marker SUBSTRING that is not one of these
+# real headers is legitimate quoted/incomplete text and must pass through
+# unchanged.
+_HARMONY_RAISE_SEQUENCES = (
+    _HARMONY_CHANNEL + "analysis" + _HARMONY_MESSAGE,
+    _HARMONY_CHANNEL + "final" + _HARMONY_MESSAGE,
+)
+
+_HARMONY_RECIPIENT_RE = re.compile(r"to=(" + _NAME + r")")
+
+
+def _harmony_channel_of(header: str) -> Optional[str]:
+    """The channel word of a harmony header body (text between
+    ``<|channel|>`` and ``<|message|>``): the first whitespace-delimited
+    token. None for an empty header."""
+    stripped = header.strip()
+    if not stripped:
+        return None
+    return stripped.split()[0]
+
+
+def _harmony_recipient(*texts: str) -> Optional[str]:
+    """First ``to={recipient}`` found across the given header fragments
+    (the generated form carries it after the channel word; the template's
+    history form carries it between ``<|start|>assistant`` and
+    ``<|channel|>``)."""
+    for t in texts:
+        m = _HARMONY_RECIPIENT_RE.search(t)
+        if m:
+            return m.group(1)
+    return None
+
+
+# Harmony tool-call block: a commentary-channel header carrying a
+# ``to=functions.*`` recipient, a ``<|message|>`` body, and a ``<|call|>``
+# terminator — the tool-call eos. FINDINGS A/B (codex batch-6): ONLY a
+# ``<|call|>``-terminated block is an EXECUTABLE tool call. A real generated
+# tool call ALWAYS ends with ``<|call|>`` (the P1-1 synthesis re-attaches it
+# on a natural CALL stop), so an ``<|end|>``/``<|return|>``/``<|start|>``/EOF
+# termination means the block is NOT a call — it is raw CONTENT and must never
+# be promoted (the old ``<|end|>`` alternate here canonicalized a non-call
+# frame into a phantom call, diverging batch from stream). The header may not
+# contain another marker (tempered dot).
+_HARMONY_BLOCK_RE = re.compile(
+    r"<\|channel\|>commentary"
+    r"((?:(?!<\|message\|>|<\|channel\|>|<\|start\|>).)*)"
+    r"<\|message\|>"
+    r"(.*?)"
+    r"<\|call\|>",
+    re.DOTALL,
+)
+
+
+def _parse_harmony_tool_calls(
+    text: str, *, rstrip_content: bool = True,
+) -> tuple[str, list[dict]]:
+    """Parse harmony (gpt-oss) tool-call blocks:
+    ``<|channel|>commentary to=functions.NAME [<|constrain|>json]
+    <|message|>{json args}<|call|>``.
+
+    U11 per-block preservation semantics (mirrors _parse_chatml_tool_calls):
+    a block is consumed only when it is ``<|call|>``-terminated AND has a
+    ``functions.*`` recipient AND its body parses as a JSON object; every
+    other block (missing/foreign recipient, non-object/garbage body,
+    non-``<|call|>`` termination, unterminated trailing block) and all
+    surrounding ordinary text are RETAINED in the content in original order.
+
+    FINDINGS A/B: ONLY a ``<|call|>`` terminator makes a block a tool call.
+    A real generated call always ends with ``<|call|>`` (the tool-call eos;
+    the P1-1 synthesis re-attaches it on a natural stop), and BOTH the batch
+    parse (positional spans over raw text) and the streaming router now emit
+    a non-``<|call|>``-terminated functions-commentary block as RAW CONTENT
+    with the terminator consumed — so the two sides extract the same calls by
+    construction. A block with NO ``<|call|>`` at all (``<|end|>``-closed,
+    ``<|start|>``-bounded, or stream truncated mid-call) stays unparsed — raw
+    passthrough, like the chatml truncated-block behavior.
+    """
+    if "<|channel|>commentary" not in text:
+        return text, []
+
+    tool_calls: list[dict] = []
+    content_parts: list[str] = []
+    pos = 0
+    for block in _HARMONY_BLOCK_RE.finditer(text):
+        header = block.group(1)
+        recipient = _harmony_recipient(header)
+        if not recipient or not recipient.startswith("functions."):
+            # Preamble / foreign-recipient commentary: not a functions tool
+            # call — retained in content (not consumed).
+            continue
+        func_name = recipient[len("functions."):]
+        if not func_name:
+            continue
+        body = block.group(2).strip()
+        try:
+            arguments = json.loads(body) if body else {}
+        except (json.JSONDecodeError, ValueError):
+            # Unparseable body: block retained in content (U11).
+            continue
+        if not isinstance(arguments, dict):
+            # OpenAI tool-call arguments must be a JSON object.
+            continue
+        tool_calls.append({
+            "id": generate_call_id(),
+            "type": "function",
+            "function": {
+                "name": func_name,
+                "arguments": json.dumps(arguments, ensure_ascii=False),
+            },
+        })
+        content_parts.append(text[pos:block.start()])
+        pos = block.end()
+    content_parts.append(text[pos:])
+
+    # U11 fail-closed: markers present but nothing parsed — byte-identical
+    # passthrough (no vanished block).
+    if not tool_calls:
+        return text, []
+    content = "".join(content_parts)
+    return (content.rstrip() if rstrip_content else content), tool_calls
+
+
 # Gemma 4 thinking-channel markers. The well-formed shape is
 # ``<|channel>thought\n...reasoning...<channel|>answer``; degenerate
 # multi-cycle / sliding-window outputs emit repeated or orphaned markers.
@@ -583,8 +787,15 @@ def thinking_router_active(model_family: str, enable_thinking: bool) -> bool:
     activation: their thought block exists only when the prompt suffix opens
     it, so an inactive router is correct there (a literal ``</think>`` in
     non-thinking output is a quote).
+
+    harmony (gpt-oss) is marker-active for the same reason: the model emits
+    its own ``<|channel|>`` headers unconditionally (the template has no
+    enable_thinking rendering at all), and an inactive passthrough would
+    leak the raw channel markers — including the whole analysis block —
+    into ``content``. With thinking OFF the analysis body still routes to
+    the reasoning channel (never content), mirroring the gemma4 policy.
     """
-    return bool(enable_thinking) or model_family == "gemma4"
+    return bool(enable_thinking) or model_family in ("gemma4", "harmony")
 
 
 class ThinkingRouter:
@@ -639,6 +850,19 @@ class ThinkingRouter:
         self.active = active
         self.model_family = model_family
         self._is_gemma4 = model_family == "gemma4"
+        self._is_harmony = model_family == "harmony"
+        # --- harmony channel-FSM state (see _feed_harmony) ---
+        # mode: "text"   — plain passthrough scanning for a header opener;
+        #       "struct" — consuming ``<|start|>{role}[ to=...]`` up to the
+        #                  ``<|channel|>``/``<|message|>`` marker (structural,
+        #                  emits nothing; a recipient found here is kept);
+        #       "header" — consuming ``<|channel|>...<|message|>``;
+        #       "reasoning" / "content" — streaming a message body;
+        #       "tool"   — buffering a functions-commentary body (emitted as
+        #                  one canonical content-channel block on close).
+        self._h_mode = "text"
+        self._h_recipient: Optional[str] = None
+        self._h_tool_header = ""
         # gemma4 starts in CONTENT mode (enter reasoning on an opener); chatml /
         # glm start in REASONING mode (the <think> opener is in the prompt
         # suffix, so generated output begins inside the thought block).
@@ -665,7 +889,212 @@ class ThinkingRouter:
             return [(CHANNEL_CONTENT, text)] if text else []
         if self._is_gemma4:
             return self._feed_gemma4(text)
+        if self._is_harmony:
+            return self._feed_harmony(text)
         return self._feed_chatml(text)
+
+    # --- harmony: <|channel|>{ch}<|message|>{body}{terminator} blocks -----
+
+    def _feed_harmony(self, text: str) -> list[tuple[str, str]]:
+        """Incremental harmony channel FSM.
+
+        Routing: analysis body -> reasoning; final body (and preamble /
+        unknown-channel bodies) -> content; a commentary body whose header
+        carries a ``to=functions.*`` recipient is BUFFERED and re-emitted on
+        close as ONE canonical content segment ``<|channel|>commentary
+        {header}<|message|>{body}<|call|>`` for the streaming tool FSM
+        (get_tool_markers("harmony")). Structural text — ``<|start|>{role}``
+        prefixes and the channel headers themselves — is never emitted, so
+        content deltas contain no markers. Markers split across chunk
+        boundaries are held in ``_pending`` (never emitted on any channel).
+
+        A REASONING body ends at ``<|end|>``/``<|return|>``/``<|call|>``
+        (consumed) or at a ``<|start|>`` (degenerate missing terminator —
+        reprocessed as the next block's opener). A CONTENT/final body ends
+        ONLY at a real terminator — a ``<|start|>`` inside it is a quoted
+        frame kept as content (FINDING B). A functions-commentary block is
+        canonicalized to a ``<|call|>``-terminated tool block ONLY when it is
+        itself terminated by ``<|call|>`` (FINDING A); a block terminated by
+        anything else (header opener, ``<|end|>``, or STREAM END) is emitted
+        RAW as content with no fabricated terminator, so an incomplete / quoted
+        / non-call frame stays a raw-content passthrough and is never promoted
+        (chatml parity, U11) — keeping the positional twin (_harmony_walk) and
+        the batch parse in lockstep with the wire.
+        """
+        buf = self._pending + text
+        self._pending = ""
+        out: list[tuple[str, str]] = []
+
+        def _find_earliest(s: str, markers: tuple[str, ...]):
+            best_idx, best_m = -1, None
+            for m in markers:
+                i = s.find(m)
+                if i != -1 and (best_idx == -1 or i < best_idx):
+                    best_idx, best_m = i, m
+            return best_idx, best_m
+
+        while buf:
+            if self._h_mode == "text":
+                idx, marker = _find_earliest(buf, _HARMONY_HEADER_OPENERS)
+                if idx == -1:
+                    keep = _partial_marker_tail(buf, _HARMONY_HEADER_OPENERS)
+                    body = buf[: len(buf) - keep] if keep else buf
+                    if body:
+                        out.append((CHANNEL_CONTENT, body))
+                    self._pending = buf[len(buf) - keep:] if keep else ""
+                    buf = ""
+                    break
+                if idx:
+                    out.append((CHANNEL_CONTENT, buf[:idx]))
+                if marker == _HARMONY_START:
+                    self._h_mode = "struct"
+                    self._h_recipient = None
+                else:
+                    self._h_mode = "header"
+                buf = buf[idx + len(marker):]
+                continue
+
+            if self._h_mode == "struct":
+                # ``<|start|>{role}[ to=...]`` — ends at <|channel|> (normal)
+                # or directly at <|message|> (degenerate header-less block).
+                idx, marker = _find_earliest(
+                    buf, (_HARMONY_CHANNEL, _HARMONY_MESSAGE),
+                )
+                if idx == -1:
+                    self._pending = buf
+                    buf = ""
+                    break
+                self._h_recipient = _harmony_recipient(buf[:idx])
+                if marker == _HARMONY_CHANNEL:
+                    self._h_mode = "header"
+                    buf = buf[idx + len(marker):]
+                else:
+                    # No channel at all -> default to visible content.
+                    self._h_mode = "content"
+                    buf = buf[idx + len(marker):]
+                continue
+
+            if self._h_mode == "header":
+                # ``{channel}[ to=...][ <|constrain|>type]`` up to <|message|>.
+                idx = buf.find(_HARMONY_MESSAGE)
+                if idx == -1:
+                    self._pending = buf
+                    buf = ""
+                    break
+                header = buf[:idx]
+                buf = buf[idx + len(_HARMONY_MESSAGE):]
+                channel = _harmony_channel_of(header)
+                recipient = _harmony_recipient(header) or self._h_recipient
+                if channel == "analysis":
+                    # Analysis ALWAYS routes to reasoning — even a
+                    # ``to=browser.*`` builtin call or a rehearsed
+                    # functions call inside analysis stays reasoning (U12).
+                    self._h_mode = "reasoning"
+                elif channel == "commentary" and recipient and recipient.startswith(
+                    "functions."
+                ):
+                    self._h_mode = "tool"
+                    # Canonical re-emission header: keep the raw header
+                    # body; inject the recipient after the channel word when
+                    # it only appeared in the structural prefix (template's
+                    # history form) so the block stays self-describing.
+                    if _HARMONY_RECIPIENT_RE.search(header) is None:
+                        header = header.replace(
+                            "commentary", f"commentary to={recipient}", 1,
+                        )
+                    self._h_tool_header = header
+                elif channel in ("final", "commentary"):
+                    # final answer, or a preamble commentary WITHOUT a
+                    # functions recipient — both are user-visible content.
+                    self._h_mode = "content"
+                else:
+                    # P2-6: an UNKNOWN / unrecognized channel (a misspelled
+                    # 'analysis', a novel channel word, or an empty header)
+                    # fails SAFE toward HIDING — route to reasoning so model
+                    # reasoning can never leak into visible content through a
+                    # channel this FSM does not recognize (the original
+                    # confidentiality bug was the fail-OPEN-to-content default).
+                    self._h_mode = "reasoning"
+                continue
+
+            if self._h_mode == "tool":
+                # The open block's body-so-far always rides in ``_pending``
+                # (folded into ``buf`` at feed start), so nothing is emitted
+                # until the block closes — no partial-tail bookkeeping needed.
+                #
+                # FINDINGS A/B: a functions-commentary block is an EXECUTABLE
+                # tool call ONLY when terminated by ``<|call|>`` (the tool-call
+                # eos; P1-1 synthesizes it on a natural stop). ANY other
+                # terminator — a ``<|start|>``/``<|channel|>`` header opener, a
+                # stray ``<|end|>``/``<|return|>``/``<|message|>``, or flush/EOF
+                # — means it is NOT a call: emit the buffered block RAW as
+                # content (never fabricate ``<|call|>``), so a quoted /
+                # truncated / degenerate frame is never promoted and the
+                # positional twin (_harmony_walk) agrees by construction.
+                idx, marker = _find_earliest(buf, _HARMONY_MARKERS)
+                if idx == -1:
+                    self._pending = buf
+                    buf = ""
+                    break
+                body = buf[:idx]
+                if marker == _HARMONY_CALL:
+                    # Genuine tool call: canonical content-channel block.
+                    out.append((
+                        CHANNEL_CONTENT,
+                        _HARMONY_CHANNEL + self._h_tool_header
+                        + _HARMONY_MESSAGE + body + _HARMONY_CALL,
+                    ))
+                else:
+                    # Not ``<|call|>``-terminated: RAW passthrough, NO ``<|call|>``.
+                    out.append((
+                        CHANNEL_CONTENT,
+                        _HARMONY_CHANNEL + self._h_tool_header
+                        + _HARMONY_MESSAGE + body,
+                    ))
+                self._h_tool_header = ""
+                self._h_mode = "text"
+                if marker in _HARMONY_HEADER_OPENERS:
+                    # Header opener: reprocess as the next block's opener.
+                    buf = buf[idx:]
+                else:
+                    # ``<|call|>`` / ``<|end|>`` / ``<|return|>`` / ``<|message|>``:
+                    # a consumed terminator.
+                    buf = buf[idx + len(marker):]
+                continue
+
+            # reasoning / content body streaming. P1-3 STRUCTURAL PRECEDENCE
+            # + FINDING B: a bare ``<|channel|>`` mid-body is ALWAYS quoted
+            # content (never an ender). A ``<|start|>`` ends a REASONING body
+            # (degenerate analysis missing ``<|end|>``) but NOT a CONTENT/final
+            # body (there it is a quoted frame — kept content, never promoted).
+            if self._h_mode == "reasoning":
+                channel = CHANNEL_REASONING
+                enders = _HARMONY_REASONING_BODY_ENDERS
+            else:
+                channel = CHANNEL_CONTENT
+                enders = _HARMONY_CONTENT_BODY_ENDERS
+            idx, marker = _find_earliest(buf, enders)
+            if idx == -1:
+                keep = _partial_marker_tail(buf, _HARMONY_MARKERS)
+                body = buf[: len(buf) - keep] if keep else buf
+                if body:
+                    out.append((channel, body))
+                self._pending = buf[len(buf) - keep:] if keep else ""
+                buf = ""
+                break
+            if idx:
+                out.append((channel, buf[:idx]))
+            self._h_mode = "text"
+            if marker in _HARMONY_BODY_TERMINATORS:
+                buf = buf[idx + len(marker):]
+            else:
+                # ``<|start|>`` ending a REASONING body (degenerate missing
+                # terminator): the marker itself opens the next block —
+                # reprocess it in text mode.
+                buf = buf[idx:]
+            continue
+
+        return out
 
     # --- gemma4: <|channel>thought\n ... <channel|> answer (multi-cycle) ---
 
@@ -790,6 +1219,31 @@ class ThinkingRouter:
         out: list[tuple[str, str]] = []
         pending = self._pending
         self._pending = ""
+        if self._is_harmony:
+            if self._h_mode == "tool":
+                # Stream ended inside a tool block: flush the RAW truncated
+                # block (no fabricated terminator) as content — the
+                # downstream FSM / batch parser treats an unterminated block
+                # as an unparseable raw passthrough (chatml parity, U11).
+                out.append((
+                    CHANNEL_CONTENT,
+                    _HARMONY_CHANNEL + self._h_tool_header
+                    + _HARMONY_MESSAGE + pending,
+                ))
+                self._h_tool_header = ""
+            elif self._h_mode in ("struct", "header"):
+                # Incomplete structural/header text: never emit (leaking a
+                # half-header would put raw markers on the content channel).
+                pass
+            elif self._h_mode == "reasoning":
+                # A held tail here is a partial-marker fragment (the body
+                # before it was already emitted) — drop it (gemma4 parity).
+                pass
+            elif pending:
+                # text / content: a marker that never completed is real text.
+                out.append((CHANNEL_CONTENT, pending))
+            self._h_mode = "text"
+            return out
         if not pending:
             return out
         if self._is_gemma4:
@@ -1009,6 +1463,8 @@ def content_segments(
     """
     if not text:
         return []
+    if model_family == "harmony":
+        return _harmony_content_segments(text)
     if model_family != "gemma4":
         if not thinking_active:
             return [(0, len(text))]
@@ -1048,6 +1504,169 @@ def content_segments(
     return [(s, e) for s, e in segments if s < e]
 
 
+def _harmony_find_earliest(
+    text: str, pos: int, markers: tuple[str, ...],
+) -> tuple[int, Optional[str]]:
+    """Earliest occurrence of any of ``markers`` in ``text[pos:]`` as an
+    absolute index (-1 when none)."""
+    best_idx, best_m = -1, None
+    for m in markers:
+        i = text.find(m, pos)
+        if i != -1 and (best_idx == -1 or i < best_idx):
+            best_idx, best_m = i, m
+    return best_idx, best_m
+
+
+def _harmony_walk(text: str) -> list[tuple[str, int, int]]:
+    """Positional twin of the harmony ``ThinkingRouter`` branch: walk the
+    raw text with the same channel FSM and return ``(kind, start, end)``
+    spans, where kind is ``"reasoning"`` (analysis body), ``"content"``
+    (final / preamble / unknown-channel body, marker-less plain text, OR a
+    functions-commentary block that is NOT ``<|call|>``-terminated — raw,
+    never a call, FINDINGS A/B) or ``"tool"`` (a ``<|call|>``-terminated
+    functions-commentary BLOCK — span starts at its ``<|channel|>`` marker and
+    includes the ``<|call|>`` terminator; the router emits the same block).
+    Structural ``<|start|>...`` prefixes and channel headers yield no span.
+    """
+    spans: list[tuple[str, int, int]] = []
+    n = len(text)
+    pos = 0
+    mode = "text"
+    recipient: Optional[str] = None
+    tool_block_start = 0
+    while pos < n:
+        if mode == "text":
+            idx, marker = _harmony_find_earliest(
+                text, pos, _HARMONY_HEADER_OPENERS,
+            )
+            if idx == -1:
+                spans.append(("content", pos, n))
+                break
+            if idx > pos:
+                spans.append(("content", pos, idx))
+            if marker == _HARMONY_START:
+                mode = "struct"
+                recipient = None
+            else:
+                mode = "header"
+                tool_block_start = idx  # a tool block's span starts here
+            pos = idx + len(marker)
+            continue
+        if mode == "struct":
+            idx, marker = _harmony_find_earliest(
+                text, pos, (_HARMONY_CHANNEL, _HARMONY_MESSAGE),
+            )
+            if idx == -1:
+                break  # incomplete structural tail: no span (router drops it)
+            recipient = _harmony_recipient(text[pos:idx])
+            if marker == _HARMONY_CHANNEL:
+                mode = "header"
+                tool_block_start = idx
+            else:
+                mode = "content"
+            pos = idx + len(marker)
+            continue
+        if mode == "header":
+            idx = text.find(_HARMONY_MESSAGE, pos)
+            if idx == -1:
+                break  # incomplete header tail: no span
+            header = text[pos:idx]
+            channel = _harmony_channel_of(header)
+            rcp = _harmony_recipient(header) or recipient
+            pos = idx + len(_HARMONY_MESSAGE)
+            if channel == "analysis":
+                mode = "reasoning"
+            elif channel == "commentary" and rcp and rcp.startswith("functions."):
+                mode = "tool"
+            elif channel in ("final", "commentary"):
+                # final / preamble commentary — visible content.
+                mode = "content"
+            else:
+                # P2-6 (batch twin): unknown channel fails SAFE to reasoning.
+                mode = "reasoning"
+            continue
+        if mode == "tool":
+            # FINDINGS A/B (batch twin of _feed_harmony's tool mode): a
+            # functions-commentary block is a ``"tool"`` span (executable) ONLY
+            # when terminated by ``<|call|>``. ANY other termination (header
+            # opener, ``<|end|>``/``<|return|>``/``<|message|>``, or EOF) makes
+            # it a ``"content"`` span (raw, never promoted) with the terminator
+            # dropped exactly as the streaming FSM drops it — so the positional
+            # union equals the wire.
+            idx, marker = _harmony_find_earliest(text, pos, _HARMONY_MARKERS)
+            if idx == -1:
+                # Truncated tool block runs to the end — NOT ``<|call|>``-
+                # terminated, so it is content (raw), never a tool call.
+                spans.append(("content", tool_block_start, n))
+                break
+            if marker == _HARMONY_CALL:
+                end = idx + len(marker)
+                spans.append(("tool", tool_block_start, end))
+                mode = "text"
+                pos = end
+            elif marker in _HARMONY_HEADER_OPENERS:
+                # Non-``<|call|>`` header opener: raw content, reprocess opener.
+                spans.append(("content", tool_block_start, idx))
+                mode = "text"
+                pos = idx
+            else:
+                # ``<|end|>``/``<|return|>``/``<|message|>``: raw content,
+                # consume the terminator.
+                spans.append(("content", tool_block_start, idx))
+                mode = "text"
+                pos = idx + len(marker)
+            continue
+        # reasoning / content body. P1-3 STRUCTURAL PRECEDENCE + FINDING B
+        # (batch twin): a bare ``<|channel|>`` mid-body is always quoted
+        # content; a ``<|start|>`` ends a REASONING body but is quoted content
+        # inside a CONTENT/final body (keep batch == stream).
+        if mode == "reasoning":
+            kind = "reasoning"
+            enders = _HARMONY_REASONING_BODY_ENDERS
+        else:
+            kind = "content"
+            enders = _HARMONY_CONTENT_BODY_ENDERS
+        idx, marker = _harmony_find_earliest(text, pos, enders)
+        if idx == -1:
+            spans.append((kind, pos, n))
+            break
+        if idx > pos:
+            spans.append((kind, pos, idx))
+        mode = "text"
+        pos = idx if marker in _HARMONY_HEADER_OPENERS else idx + len(marker)
+    return [s for s in spans if s[1] < s[2]]
+
+
+def _harmony_content_segments(text: str) -> list[tuple[int, int]]:
+    """Content-channel spans of raw harmony assistant text — the positional
+    union the router would have emitted as content: final/preamble bodies,
+    marker-less plain text, and functions-commentary TOOL BLOCKS (raw span
+    including markers; the router emits the same block with its terminator
+    canonicalized to ``<|call|>`` — the harmony tool parser accepts both, so
+    parse/strip consumers converge). Analysis bodies and all structural
+    markers are excluded — a tool call REHEARSED inside analysis is never
+    extractable (U12)."""
+    return [
+        (s, e) for kind, s, e in _harmony_walk(text) if kind != "reasoning"
+    ]
+
+
+def _harmony_router_split(text: str) -> tuple[Optional[str], str]:
+    """Whole-text harmony thinking/content split with ROUTER-AUTHORITATIVE
+    semantics: literally drive the streaming ``ThinkingRouter`` over the
+    full text (feed + flush), so the batch split is byte-equal to the
+    concatenation of what the router streams on the wire — the same
+    single-authority principle as the gemma4 round-6 positional split, made
+    exact by construction. content includes tool-call blocks re-emitted in
+    canonical form (the tool FSM / parse_tool_calls consumes them)."""
+    router = ThinkingRouter(active=True, model_family="harmony")
+    segs = router.feed(text)
+    segs.extend(router.flush())
+    thinking = "".join(t for c, t in segs if c == CHANNEL_REASONING)
+    content = "".join(t for c, t in segs if c == CHANNEL_CONTENT)
+    return (thinking.strip() or None), content
+
+
 def split_thinking_and_content(
     text: str,
     model_family: str = "chatml",
@@ -1084,6 +1703,17 @@ def split_thinking_and_content(
         # ``<channel|>`` are CONTENT under the router. Marker-free text is
         # (None, text) either way.
         return _gemma4_router_split(text, thinking_active=thinking_active)
+
+    if model_family == "harmony":
+        # Router-authoritative split (driven by the streaming router itself,
+        # so batch == stream by construction). ``started_in_thinking`` and
+        # ``thinking_active`` are intentionally unused: harmony generation
+        # always starts at its own ``<|channel|>`` header (never inside a
+        # prompt-opened thought block), and the model-emitted channel
+        # markers are authoritative regardless of the thinking contract —
+        # analysis routes to reasoning, never content (gemma4 full-marker
+        # policy; harmony has no ambiguous bare opener to gate).
+        return _harmony_router_split(text)
 
     # ChatML: <think>...</think>
     # Case 1: Has <think>...</think> wrapper (full tags in output)
@@ -1165,6 +1795,35 @@ def strip_thinking_tags(
 
         if m.get("role") == "assistant" and m.get("content"):
             content = m["content"]
+            # Harmony (gpt-oss): a client replaying raw channel-marked wire
+            # text (e.g. the pre-fix chatml-fallback leak, or a stateless
+            # client echoing reasoning) must NEVER reach the chat template —
+            # it raises on real <|channel|>analysis/final headers in content
+            # and would render analysis into history the template's own
+            # semantics DROP. Reduce to the router-authoritative content
+            # channel, with PARSED functions-commentary tool blocks removed
+            # (the structured tool_calls field, when present, is authoritative
+            # for the template's tool-call rendering; an unparseable block
+            # stays raw per U11).
+            #
+            # GROUND-TRUTH CORRECTION: trigger the reduction ONLY when the
+            # content actually contains the EXACT header sequences the
+            # template RAISES on (chat_template.jinja ~264:
+            # ``<|channel|>analysis<|message|>`` or
+            # ``<|channel|>final<|message|>``) — NOT on any marker substring.
+            # The old "any marker present" gate destructively rewrote
+            # legitimate content that merely QUOTED or partially typed a
+            # marker (e.g. a user pasting ``<|channel|>`` into a question, or
+            # an incomplete ``<|call|>`` fragment) even though the template
+            # would never raise on it.
+            if model_family == "harmony" and any(
+                seq in content for seq in _HARMONY_RAISE_SEQUENCES
+            ):
+                _, cleaned = _harmony_router_split(content)
+                if "<|channel|>commentary" in cleaned:
+                    cleaned, _ = _parse_harmony_tool_calls(cleaned)
+                result.append({**m, "content": cleaned.strip()})
+                continue
             # Strip Gemma 4 thinking channels — strengthened (FIX 3) to remove
             # ALL <|channel>thought...<channel|> spans + orphan markers +
             # degenerate trailing reasoning (the old single-span re.sub +

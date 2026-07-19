@@ -1353,7 +1353,10 @@ async def _stream_completion_body(
         # Codex round 3, finding 4: with thinking DISABLED the router was a
         # pass-through — the whole text is content and a literal </think> in
         # it is a quote, never a boundary (mirrors the engine's batch parse).
-        if model_family != "gemma4" and not enable_thinking:
+        # gemma4/harmony always split (model-emitted channel markers are
+        # authoritative regardless of the thinking flag — raw marker text
+        # must never persist as content).
+        if model_family not in ("gemma4", "harmony") and not enable_thinking:
             thinking, content = None, "".join(acc_parts)
         else:
             # Codex round 7, finding 3: thinking_active threads the contract
@@ -1362,7 +1365,10 @@ async def _stream_completion_body(
             thinking, content = split_thinking_and_content(
                 "".join(acc_parts),
                 model_family=model_family,
-                started_in_thinking=enable_thinking and model_family != "gemma4",
+                started_in_thinking=(
+                    enable_thinking
+                    and model_family not in ("gemma4", "harmony")
+                ),
                 thinking_active=enable_thinking,
             )
         assistant_msg: dict = {"role": "assistant", "content": content or ""}

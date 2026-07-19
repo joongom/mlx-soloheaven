@@ -1016,7 +1016,9 @@ async def _stream_chat_body(
     # (started_in_thinking mirrors the active router, including the
     # degenerate no-</think> turn routing entirely to reasoning). gemma4
     # keeps its marker-driven split (the model emits its own channels).
-    if model_family != "gemma4" and not enable_thinking:
+    # harmony joins gemma4: its channel markers are model-emitted and
+    # authoritative regardless of the thinking flag.
+    if model_family not in ("gemma4", "harmony") and not enable_thinking:
         thinking, content = None, accumulated_text
     else:
         # Codex round 7, finding 3: thinking_active threads the contract into
@@ -1025,7 +1027,8 @@ async def _stream_chat_body(
         thinking, content = split_thinking_and_content(
             accumulated_text, model_family=eng.model_family,
             started_in_thinking=(
-                enable_thinking and model_family != "gemma4"
+                enable_thinking
+                and model_family not in ("gemma4", "harmony")
             ),
             thinking_active=enable_thinking,
         )

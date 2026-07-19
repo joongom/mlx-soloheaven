@@ -61,7 +61,8 @@ support through mlx-vlm. (`--backend mlx-lm` forces the mlx-lm path;
 | **GLM-5.1 / DeepSeek-V3.2** (`glm_moe_dsa`, `deepseek_v32`) | mlx-lm | `CacheList(KVCache, KVCache)` per layer (MLA + DSA indexer) | **Multi-head Latent Attention (MLA)**: KV is pre-compressed to `kv_lora_rank=512` — cache is ~1/3 of typical. **PLD-capable** (CacheList is trimmable), but `--pld` is off by default here — acceptance was ~12% on casual/reasoning; add it back only for copy-heavy workloads. Use `--no-thinking` (keep `prefill-step-size` at the default `2048` — `8192` OOMs on >100K prompts). |
 | **GLM-4.5 / 4.7** (`glm4_moe`, `glm4_moe_lite`) | mlx-lm | `KVCache` or `RotatingKVCache` mix | ChatML-ish format with `<\|user\|>`/`<\|assistant\|>`. PLD compatible on pure-KVCache variants. |
 | **GLM4V / GLM-OCR** | mlx-vlm | Per-model | Vision variants. |
-| **MiniMax, GPT-OSS** | mlx-lm | Standard `KVCache` | ChatML. |
+| **GPT-OSS** (`gpt_oss`, e.g. 20B/120B) | mlx-lm | Standard `KVCache` mix | **Harmony format** (family `harmony`): `<\|start\|>`/`<\|channel\|>`/`<\|message\|>` channel framing. The server parses the channels — `analysis` → `reasoning_content`, `final` → `content`, `commentary to=functions.*` → OpenAI `tool_calls` — so raw markers never leak into `content`. Thinking-budget forcing is disabled (the analysis→final transition is multi-token; no single close token exists). Natural stops record `<\|return\|>`/`<\|call\|>`; the HIT-splice reconciles them against the template's `<\|end\|>` history rendering (see suffix reconciliation below). |
+| **MiniMax** | mlx-lm | Standard `KVCache` | ChatML. |
 
 **Note on mxfp4/mxfp8 quantization**: MLX currently has kernel inefficiencies for
 MoE matmul under mxfp4/mxfp8 modes (see [mlx issue #3402](https://github.com/ml-explore/mlx/issues/3402)).
@@ -1036,6 +1037,14 @@ what the chat template would render:
   trims a foreign recorded EOS out of the cache, or demotes to an honest MISS; the
   tool suffix renders `<|observation|>` + `<tool_response>` and the thinking
   suffix opens/closes `<think>` per the official template.
+- **Harmony (gpt-oss)** — the next-turn suffix leads with the `<|end|>` turn
+  closer; a recorded `<|end|>`/`<|call|>` tail dedupes it (a tool result stays
+  adjacent to its `<|call|>`, per the template), while a recorded `<|return|>` /
+  `<|endoftext|>` — which history rendering never contains — is REPLACED via a
+  verified 1-token cache trim (untrimmable → honest MISS). Analysis blocks stay
+  in the cached stream (the retained-reasoning deviation, as on ChatML): splice
+  equals full retokenization exactly for analysis-free turns, and boundary-exact
+  otherwise. Stamped with `harmony-suffix-v1` in the prompt-contract fingerprint.
 - **gemma4 `thinking=false`** HIT reuse is deliberately disabled (fail-closed
   rebuild) for correctness, and pre-fix GLM sessions are migrated with a one-time
   rebuild via the template-revision component of the prompt-contract fingerprint.

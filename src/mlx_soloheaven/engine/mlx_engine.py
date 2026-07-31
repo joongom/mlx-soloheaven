@@ -103,8 +103,17 @@ from mlx_soloheaven.engine.session_cache_types import (  # noqa: F401
     _strip_content_channel_tool_xml,
 )
 from mlx_soloheaven.engine.session_cache_mixin import SessionCacheMixin
+from mlx_soloheaven.models import register_extra_architectures
 
 logger = logging.getLogger(__name__)
+
+# Teach mlx-lm about architectures it does not ship (currently exaone4_5).
+# Must run before any load: mlx-lm resolves the model class by importing
+# mlx_lm.models.<model_type>, and this pre-seeds sys.modules for the misses.
+# Idempotent, and a no-op for any type upstream mlx-lm already provides.
+# Module scope on purpose — both the in-process engine and the child
+# process worker import this module before touching a checkpoint.
+register_extra_architectures()
 
 # Heuristic threshold for the per-request drafter low-acceptance WARNING.
 # At block_size=3 the max possible mean_accepted is 2.0 (every block fully

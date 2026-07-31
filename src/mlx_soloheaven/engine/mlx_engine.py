@@ -115,6 +115,95 @@ logger = logging.getLogger(__name__)
 # process worker import this module before touching a checkpoint.
 register_extra_architectures()
 
+
+@dataclass(frozen=True)
+class ChatMLDialect:
+    """Turn markers for a ChatML-family template.
+
+    The "chatml" model family covers every model whose *thinking* and *tool*
+    syntax is Qwen-style (``<think>``/``</think>``, ``<tool_call>{...}``) — that
+    part is genuinely shared and is parsed family-wide. But the *turn framing*
+    is NOT shared: EXAONE uses ``<|user|>``/``<|endofturn|>`` where Qwen uses
+    ``<|im_start|>``/``<|im_end|>``.
+
+    That distinction only matters on the cache-HIT path, which appends a
+    hand-built suffix to the stored token_ids instead of re-tokenizing. Framing
+    the suffix in the wrong dialect does not raise — it splices tokens the model
+    has never seen in that arrangement (``<|im_start|>`` is not even a single
+    token in EXAONE's vocab) and the model answers turn 2 with a stray marker.
+    So the markers are data, not literals baked into the builder.
+
+    Adding a dialect REQUIRES a real-token differential test proving
+    ``cached_prefix_ids + suffix_ids == apply_chat_template(full messages)`` on
+    the actual installed template — see tests/test_chatml_dialect.py. An
+    approximate splice silently corrupts every later turn built on the cache.
+    """
+
+    name: str
+    #: Opens a user turn (leads with \n: the previous turn's terminator is the
+    #: last cached token, and the template puts a newline after it).
+    user_open: str
+    #: Per-turn terminator. Also the token forwarded to template-close an
+    #: interrupted assistant turn (_try_close_interrupted_turn).
+    turn_end: str
+    assistant_open: str
+    tool_open: str
+    tool_result_open: str
+    tool_result_close: str
+    #: Generation prompt tail when thinking is ON / OFF respectively.
+    think_open: str
+    think_closed: str
+    #: True when consecutive tool messages share ONE opener and one terminator
+    #: (marker emitted only when the previous message is not also a tool).
+    tool_runs: bool
+
+
+#: Qwen and friends — the historical hardcoded behaviour, unchanged.
+CHATML_DIALECT_QWEN = ChatMLDialect(
+    name="qwen",
+    user_open="\n<|im_start|>user\n",
+    turn_end="<|im_end|>",
+    assistant_open="\n<|im_start|>assistant\n",
+    tool_open="\n<|im_start|>user\n",
+    tool_result_open="<tool_response>\n",
+    tool_result_close="\n</tool_response>",
+    think_open="<think>\n",
+    think_closed="",
+    tool_runs=False,
+)
+
+#: EXAONE 4.x. Note think_closed: the template primes a CLOSED think block when
+#: enable_thinking is false, where Qwen emits the bare role marker.
+CHATML_DIALECT_EXAONE = ChatMLDialect(
+    name="exaone",
+    user_open="\n<|user|>\n",
+    turn_end="<|endofturn|>",
+    assistant_open="\n<|assistant|>\n",
+    tool_open="\n<|tool|>\n",
+    tool_result_open="<tool_result>",
+    tool_result_close="</tool_result>",
+    think_open="<think>\n",
+    think_closed="<think>\n\n</think>\n\n",
+    tool_runs=True,
+)
+
+
+def detect_chatml_dialect(chat_template: str | None) -> ChatMLDialect | None:
+    """Identify a ChatML dialect by template signature (name-independent).
+
+    Returns None when the template is ChatML-family by thinking/tool syntax but
+    uses turn markers we have not verified — the caller warns rather than
+    guessing, because guessing here is the bug this type exists to prevent.
+    """
+    if not chat_template:
+        return None
+    if "<|endofturn|>" in chat_template:
+        return CHATML_DIALECT_EXAONE
+    if "<|im_start|>" in chat_template:
+        return CHATML_DIALECT_QWEN
+    return None
+
+
 # Heuristic threshold for the per-request drafter low-acceptance WARNING.
 # At block_size=3 the max possible mean_accepted is 2.0 (every block fully
 # accepted). A mean below 0.5 means more than 75% of drafted tokens are
@@ -1849,6 +1938,31 @@ class MLXEngine(SessionCacheMixin):
         self.model_family = self._detect_model_family()
         logger.info(f"Model family: {self.model_family}")
 
+        # ChatML turn markers vary by model even though thinking/tool syntax
+        # does not (see ChatMLDialect). Only the cache-HIT suffix splice reads
+        # these, so a wrong dialect corrupts turn 2+ silently rather than
+        # raising — hence detect from the template and say so at load.
+        _dialect = detect_chatml_dialect(
+            getattr(self.tokenizer, "chat_template", None)
+        )
+        if _dialect is None:
+            self._chatml_dialect = CHATML_DIALECT_QWEN
+            if self.model_family == "chatml":
+                logger.warning(
+                    f"[{self.model_id}] chatml-family template with unrecognized "
+                    f"turn markers (no <|im_start|> and no <|endofturn|>) — "
+                    f"assuming Qwen ChatML for the cache-hit suffix splice. If "
+                    f"multi-turn replies contain stray role markers, this is "
+                    f"why: add a ChatMLDialect for it."
+                )
+        else:
+            self._chatml_dialect = _dialect
+            if self.model_family == "chatml":
+                logger.info(
+                    f"[{self.model_id}] chatml dialect={_dialect.name} "
+                    f"(turn_end={_dialect.turn_end!r})"
+                )
+
         # Detect translation-schema chat templates (e.g. translategemma): their
         # template REQUIRES each user message's `content` to stay a list with a
         # single structured item {type, source_lang_code, target_lang_code,
@@ -3105,7 +3219,16 @@ class MLXEngine(SessionCacheMixin):
     def _suffix_tokens_chatml(
         self, new_messages: list[dict], thinking: bool,
     ) -> list[int]:
-        """ChatML suffix: \\n<|im_start|>user\\n{content}<|im_end|>\\n<|im_start|>assistant\\n<think>\\n
+        """ChatML suffix in THIS model's dialect (see ChatMLDialect).
+
+        Qwen:   \\n<|im_start|>user\\n{c}<|im_end|>\\n<|im_start|>assistant\\n<think>\\n
+        EXAONE: \\n<|user|>\\n{c}<|endofturn|>\\n<|assistant|>\\n<think>\\n
+
+        The markers are dialect data rather than literals because framing the
+        suffix in the wrong dialect does not fail loudly — it splices tokens
+        into the KV that the model never sees in that arrangement, and turn 2
+        comes back as a bare role marker. Both dialects' output is pinned
+        token-exact against apply_chat_template in tests/test_chatml_dialect.py.
 
         U4/F4: only reachable for cache-resident turns — a NON-resident
         assistant (crash-recovery resend) was routed to an honest MISS by
@@ -3114,7 +3237,9 @@ class MLXEngine(SessionCacheMixin):
         '<think>\\n\\n</think>\\n\\n' prefix into past assistant turns when
         thinking is disabled, and trims content) — see the gate's docstring
         for the differential-test requirement before ever splicing here."""
+        d = self._chatml_dialect
         parts = []
+        prev_role = None
         for msg in new_messages:
             role = msg.get("role", "user")
             content = msg.get("content", "") or ""
@@ -3125,15 +3250,28 @@ class MLXEngine(SessionCacheMixin):
                 )
             if role == "assistant":
                 continue
-            elif role == "tool":
-                parts.append(
-                    f"\n<|im_start|>user\n<tool_response>\n"
-                    f"{content}\n</tool_response><|im_end|>"
-                )
+            # tool_runs dialects (EXAONE) open the block once for a RUN of
+            # consecutive tool messages and terminate it once when the run
+            # ends, separating members with a newline — matching the
+            # template's `previous message is not also a tool` guard.
+            if d.tool_runs and prev_role == "tool" and role != "tool":
+                parts.append(d.turn_end)
+            if role != "tool":
+                parts.append(f"{d.user_open}{content}{d.turn_end}")
+            elif d.tool_runs:
+                parts.append(d.tool_open if prev_role != "tool" else "\n")
+                parts.append(f"{d.tool_result_open}{content}{d.tool_result_close}")
             else:
-                parts.append(f"\n<|im_start|>user\n{content}<|im_end|>")
-        gen_prompt = "\n<|im_start|>assistant\n<think>\n" if thinking else "\n<|im_start|>assistant\n"
-        parts.append(gen_prompt)
+                parts.append(
+                    f"{d.tool_open}{d.tool_result_open}{content}"
+                    f"{d.tool_result_close}{d.turn_end}"
+                )
+            prev_role = role
+        if d.tool_runs and prev_role == "tool":
+            parts.append(d.turn_end)
+        parts.append(
+            d.assistant_open + (d.think_open if thinking else d.think_closed)
+        )
         return self.tokenizer.encode("".join(parts), add_special_tokens=False)
 
     def _suffix_tokens_glm(
@@ -6133,7 +6271,13 @@ class MLXEngine(SessionCacheMixin):
     # its chat-EOS ids (<|endoftext|>/<|user|>/<|observation|>) at a natural
     # stop; the HIT path reconciles it — dedupe/trim/honest MISS — in
     # _reconcile_glm_recorded_eos.)
-    _CHATML_TURN_END = "<|im_end|>"
+    # The ChatML terminator is per-DIALECT — <|im_end|> for Qwen,
+    # <|endofturn|> for EXAONE — so it is read off _chatml_dialect rather
+    # than hardcoded; forwarding the wrong one would commit a turn the
+    # template cannot continue. CLASS attribute so instances built without
+    # __init__ (test stand-ins) and every pre-load path still resolve it;
+    # load_model() shadows it per instance from the chat template.
+    _chatml_dialect: ChatMLDialect = CHATML_DIALECT_QWEN
     # gemma4 end-of-turn token — the template's per-turn closer AND the chat
     # EOS recorded by the mlx-lm terminal frame at a natural stop (U18).
     _GEMMA4_TURN_END = "<turn|>"
@@ -6150,7 +6294,7 @@ class MLXEngine(SessionCacheMixin):
         the cache (mlx-lm lookahead / QwenMTP finalize).
 
         Tri-state per-path policy (see TurnCloseResult):
-        - gemma4 / glm: NOT_REQUIRED — see _CHATML_TURN_END comment; the
+        - gemma4 / glm: NOT_REQUIRED — see the ChatML terminator comment; the
           commit proceeds without a close and stays template-valid.
         - recorded tail already IS an end-of-turn token (tokenizer EOS ids /
           <|im_end|>): NOT_REQUIRED — the turn terminated naturally and the
@@ -6202,7 +6346,7 @@ class MLXEngine(SessionCacheMixin):
         except Exception:  # noqa: BLE001 — vocab probing must never raise
             pass
         try:
-            eot = _detect_token_id(self.tokenizer, self._CHATML_TURN_END)
+            eot = _detect_token_id(self.tokenizer, self._chatml_dialect.turn_end)
         except Exception:  # noqa: BLE001 — vocab probing must never raise
             eot = -1
         if eot >= 0:
@@ -6238,7 +6382,7 @@ class MLXEngine(SessionCacheMixin):
             return _close_unavailable("the target model is not callable")
         if eot < 0:
             return _close_unavailable(
-                f"no {self._CHATML_TURN_END!r} token in the vocab"
+                f"no {self._chatml_dialect.turn_end!r} token in the vocab"
             )
         try:
             model(mx.array([[eot]]), cache=cache)

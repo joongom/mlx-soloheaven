@@ -499,8 +499,18 @@ def create_app(cfg: Config) -> FastAPI:
 
 
 def _check_port(host: str, port: int):
-    """Exit early if port is already in use."""
+    """Exit early if port is already in use.
+
+    Mirror uvicorn's bind exactly by setting SO_REUSEADDR: without it this
+    preflight FALSE-POSITIVES against the TIME_WAIT sockets a just-killed
+    server leaves behind (server-side TIME_WAIT lingers ~60s), reporting
+    "already in use" and exiting even though uvicorn — which sets
+    SO_REUSEADDR — would bind the very same port fine. With the option set,
+    the check succeeds iff the real bind would, so it only trips on a truly
+    LISTENing occupant.
+    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         sock.bind((host if host != "0.0.0.0" else "127.0.0.1", port))
     except OSError:

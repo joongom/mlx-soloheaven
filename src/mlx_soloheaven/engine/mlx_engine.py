@@ -1988,7 +1988,21 @@ class MLXEngine(SessionCacheMixin):
             from mlx_soloheaven.engine import qwen_mtp as qwen_mtp_mod
 
             _draft_type = qwen_mtp_mod.read_model_type(self.cfg.draft_model)
-            if _draft_type == qwen_mtp_mod.QWEN_MTP_MODEL_TYPE:
+            if _draft_type is None:
+                # Draft config.json is MISSING or unreadable — the drafter path
+                # doesn't exist yet (e.g. an in-progress download) or is
+                # corrupt. Losing MTP speculative decoding is graceful
+                # degradation, NOT fatal: the target model already loaded, so
+                # serve plain decode instead of crashing the worker (which
+                # previously took down the whole server on a missing draft
+                # file). Fix --draft-model and restart to re-enable MTP.
+                logger.warning(
+                    f"[Drafter] no readable config.json at draft model "
+                    f"{self.cfg.draft_model!r} (missing / incomplete "
+                    f"download?) — DISABLING MTP speculative decoding, "
+                    f"continuing with plain decode."
+                )
+            elif _draft_type == qwen_mtp_mod.QWEN_MTP_MODEL_TYPE:
                 # Qwen3.5/3.6 MTP head — runs NATIVELY on the mlx-lm path
                 # (no mlx-vlm; the installed mlx-vlm has no qwen3_5_mtp
                 # drafter). Loaded inline like the target weights: lm-path
@@ -2000,30 +2014,46 @@ class MLXEngine(SessionCacheMixin):
                         "on the mlx-lm path; remove --backend mlx-vlm (the "
                         "installed mlx-vlm has no qwen3_5_mtp drafter)."
                     )
-                t0_drafter = time.perf_counter()
-                _head, _info = qwen_mtp_mod.load_qwen_mtp_head(
-                    self.cfg.draft_model
-                )
-                # Fail-closed at load: the head borrows the target's
-                # embeddings + lm_head, and the manual pre-final-norm layer
-                # loop must reproduce model() logits exactly.
-                qwen_mtp_mod.assert_head_target_compat(
-                    _info, self._language_model
-                )
-                qwen_mtp_mod.verify_layer_loop_parity(self._language_model)
-                self._drafter = _head
-                self._draft_kind = "qwen_mtp"
-                self._mtp_block_size = int(
-                    self.cfg.draft_block_size or _info["block_size"] or 3
-                )
-                logger.info(
-                    f"[Drafter] loaded {self.cfg.draft_model} kind=qwen_mtp "
-                    f"block_size={self._mtp_block_size} "
-                    f"num_head_layers={_info['num_layers']} "
-                    f"weights={_info['num_weights']} (strict) in "
-                    f"{time.perf_counter() - t0_drafter:.1f}s — "
-                    f"MTP speculative decoding active on the mlx-lm path"
-                )
+                try:
+                    t0_drafter = time.perf_counter()
+                    _head, _info = qwen_mtp_mod.load_qwen_mtp_head(
+                        self.cfg.draft_model
+                    )
+                    # Fail-closed at load: the head borrows the target's
+                    # embeddings + lm_head, and the manual pre-final-norm layer
+                    # loop must reproduce model() logits exactly.
+                    qwen_mtp_mod.assert_head_target_compat(
+                        _info, self._language_model
+                    )
+                    qwen_mtp_mod.verify_layer_loop_parity(self._language_model)
+                    self._drafter = _head
+                    self._draft_kind = "qwen_mtp"
+                    self._mtp_block_size = int(
+                        self.cfg.draft_block_size or _info["block_size"] or 3
+                    )
+                    logger.info(
+                        f"[Drafter] loaded {self.cfg.draft_model} kind=qwen_mtp "
+                        f"block_size={self._mtp_block_size} "
+                        f"num_head_layers={_info['num_layers']} "
+                        f"weights={_info['num_weights']} (strict) in "
+                        f"{time.perf_counter() - t0_drafter:.1f}s — "
+                        f"MTP speculative decoding active on the mlx-lm path"
+                    )
+                except Exception as e:  # noqa: BLE001
+                    # Config says qwen3_5_mtp but the checkpoint won't load
+                    # (incomplete / corrupt weights, or a head that fails the
+                    # target-parity checks). Degrade to plain decode with a
+                    # loud warning rather than crash the worker. The flag
+                    # conflict above stays a hard error — that's a genuine
+                    # misconfiguration, not a bad/missing file.
+                    logger.warning(
+                        f"[Drafter] failed to load qwen3_5_mtp head at "
+                        f"{self.cfg.draft_model!r}: {e} — DISABLING MTP "
+                        f"speculative decoding, continuing with plain decode."
+                    )
+                    self._drafter = None
+                    self._draft_kind = None
+                    self._mtp_block_size = None
             elif not self._use_vlm:
                 raise RuntimeError(
                     f"MTP drafter (--draft-model) with drafter model_type="

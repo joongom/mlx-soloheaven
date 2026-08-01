@@ -75,24 +75,45 @@ DeepSeek-reference style. That is single-conversation, non-trimmable, and
 unusable for our session machinery. The port must move all state into explicit
 cache objects passed per call, exactly as v32 does.
 
-Per-layer state, and it is **small**:
+DeepSeek's own `inference/model.py` shows the layout, and it is a **single
+preallocated buffer per layer** — the compressor writes into a *view* of it:
 
-| State | Shape | Size |
-|---|---|---|
-| sliding ring | `[b, 128, 512]` | ~128 KB/layer → **5.5 MB total** |
-| `compressor.cache` (compressed KV) | grows at `seq/ratio` | ratio 4 or 128 |
-| `compressor.kv_state`, `score_state` | fixed decode buffers | small |
-| indexer's own compressor cache | grows at `seq/4` | |
+```python
+kv_cache_size = window_size + (max_seq_len // compress_ratio if compress_ratio else 0)
+self.kv_cache = zeros(max_batch, kv_cache_size, head_dim)      # [b, 128 + seq/ratio, 512]
+self.compressor.kv_cache = self.kv_cache[:, win:]              # view, not a copy
+```
 
-Two consequences:
+* slots `[0, win)` — the sliding ring, written at `start_pos % win`
+* slots `[win, ...)` — compressed KV, appended every `ratio` tokens
 
-1. **Session snapshot/restore is cheap** — all of it is plain `mx.array`, and the
-   growing parts are append-only concatenations, so prefix reuse and rollback are
-   expressible.
-2. **The 128-token ring has the RotatingKVCache hazard** — trimming a rotating
-   buffer past its wrap point silently loses state. Speculative rollback must be
-   gated on ring headroom, or the ring must be snapshotted by value (cheap at
-   128 KB/layer).
+Attention is then `sparse_attn(q, kv_cache, attn_sink, topk_idxs, scale)` where
+`topk_idxs` concatenates window slots and compressed/Indexer-selected slots.
+
+Sizes (head_dim 512, bf16):
+
+| Context | ratio-4 layers (×21) | ratio-128 layers (×20) | total |
+|---|---|---|---|
+| 32K | 8320 slots → 8.5 MB | 384 slots → 0.4 MB | **~187 MB** |
+| 1M | 262272 slots → 268 MB | 8320 slots → 8.5 MB | ~5.8 GB |
+
+Three consequences, all favourable:
+
+1. **Prefix reuse works.** The compressed region is append-only and the ring is a
+   deterministic function of `offset`, so a session's whole state is
+   `(buffer, offset)` — exactly the shape `state` get/set needs for our disk
+   cache.
+2. **Rollback is exactly solvable, unlike EXAONE.** The ring is only
+   `128 × 512 × 2 B = 128 KB` per layer (**5.5 MB across all 43**), so it can be
+   snapshotted *by value* before a speculative round and restored bit-exactly —
+   no ring-headroom gate needed. EXAONE's ring is 4096 × 8 heads × 128 dim,
+   which is why value-snapshot is not affordable there and trimming past the
+   wrap is lossy.
+3. **KV is cheap at normal context.** ~187 MB at 32K, versus 80+ GB of weights.
+
+So `DeepSeekV4Cache` per layer: the buffer, `offset`, `state` get/set for
+persistence, `trim(n)` (truncate compressed region + restore ring snapshot), and
+a cheap snapshot/restore pair for speculation.
 
 ## Validation: ds4 is a numerical oracle
 

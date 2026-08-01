@@ -1,6 +1,9 @@
 # Porting DeepSeek-V4 to MLX (`mlx_lm/models/deepseek_v4.py`)
 
-**Status**: feasibility established, implementation not started
+**Status**: modules implemented through step 2 (config, index math/routing,
+attention + compressor + Indexer + MoE + Hyper-Connections, session caches);
+decode-consistency and checkpoint shape parity green. Next: fp8/fp4 weight
+loading + conversion, then the ds4 oracle.
 **Date**: 2026-08-01
 **Goal**: run DeepSeek-V4-Flash *inside* our engine, so SoloHeaven's KV/prompt
 machinery actually applies to it.

@@ -188,6 +188,27 @@ CHATML_DIALECT_EXAONE = ChatMLDialect(
 )
 
 
+#: DeepSeek (V4 family). Differs structurally from Qwen/EXAONE ChatML: user
+#: turns have NO terminator (turn_end — the eos — closes ASSISTANT turns only,
+#: and full retokenization DOES render it, unlike GLM's role-marker EOS set),
+#: so the generic _suffix_tokens_chatml builder must NOT run with this dialect
+#: — the "deepseek" model family dispatches to _suffix_tokens_deepseek instead.
+#: This dialect exists so the interrupted-turn close (dialect.turn_end) and the
+#: generation-prompt think tails stay data-driven.
+CHATML_DIALECT_DEEPSEEK = ChatMLDialect(
+    name="deepseek",
+    user_open="<｜User｜>",
+    turn_end="<｜end▁of▁sentence｜>",
+    assistant_open="<｜Assistant｜>",
+    tool_open="<｜User｜>",
+    tool_result_open="<tool_result>",
+    tool_result_close="</tool_result>",
+    think_open="<think>",
+    think_closed="</think>",
+    tool_runs=True,
+)
+
+
 def detect_chatml_dialect(chat_template: str | None) -> ChatMLDialect | None:
     """Identify a ChatML dialect by template signature (name-independent).
 
@@ -201,6 +222,8 @@ def detect_chatml_dialect(chat_template: str | None) -> ChatMLDialect | None:
         return CHATML_DIALECT_EXAONE
     if "<|im_start|>" in chat_template:
         return CHATML_DIALECT_QWEN
+    if "<｜User｜>" in chat_template:
+        return CHATML_DIALECT_DEEPSEEK
     return None
 # Batch C round 3, finding 1(b): ceiling (seconds) on how long an aclose()/
 # cancel of an async generation wrapper waits for the worker thread's C1
@@ -2503,6 +2526,10 @@ class MLXEngine(SessionCacheMixin):
             return "glm"
         if "gpt_oss" in mt or "gpt-oss" in mt:
             return "harmony"
+        if "deepseek_v4" in mt:
+            # <｜User｜>/<｜Assistant｜> markers, eos closes assistant turns
+            # only; users are unterminated. Own suffix builder.
+            return "deepseek"
         # Default: ChatML family (Qwen, MiniMax, etc.)
         return "chatml"
 
@@ -3225,6 +3252,8 @@ class MLXEngine(SessionCacheMixin):
             return self._suffix_tokens_harmony(
                 new_messages, thinking, prior_messages=prior_messages,
             )
+        if self.model_family == "deepseek":
+            return self._suffix_tokens_deepseek(new_messages, thinking)
         return self._suffix_tokens_chatml(new_messages, thinking)
 
     def _suffix_tokens_gemma4(
@@ -3372,6 +3401,52 @@ class MLXEngine(SessionCacheMixin):
             prev_role = role
         if d.tool_runs and prev_role == "tool":
             parts.append(d.turn_end)
+        parts.append(
+            d.assistant_open + (d.think_open if thinking else d.think_closed)
+        )
+        return self.tokenizer.encode("".join(parts), add_special_tokens=False)
+
+    def _suffix_tokens_deepseek(
+        self, new_messages: list[dict], thinking: bool,
+    ) -> list[int]:
+        """DeepSeek-V4 suffix, mirroring the official ``encoding_dsv4.py``
+        (the release ships that script instead of a Jinja template; our
+        converter installs a Jinja rendering of the same rules, and this
+        builder is kept token-exact against it in
+        tests/test_deepseek_family.py):
+
+        - user turn: ``<｜User｜>{content}`` — NO terminator; the eos closes
+          assistant turns only, and a NATURAL stop records that eos as the
+          stored tail, which full retokenization also renders — so unlike GLM
+          there is nothing to reconcile at HIT-splice time.
+        - tool turns: the official encoder merges a run of tool results into
+          ONE user message of ``<tool_result>...</tool_result>`` blocks
+          joined by blank lines.
+        - generation prompt: ``<｜Assistant｜><think>`` when thinking, else
+          ``<｜Assistant｜></think>`` (chat mode primes a CLOSED think block;
+          the model answers directly after it).
+        """
+        d = CHATML_DIALECT_DEEPSEEK
+        parts = []
+        prev_role = None
+        for msg in new_messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "") or ""
+            if isinstance(content, list):
+                content = "\n".join(
+                    p["text"] if isinstance(p, dict) and "text" in p else str(p)
+                    for p in content
+                )
+            if role == "assistant":
+                # U4: non-resident assistants were routed to an honest MISS
+                # by the _suffix_blocking_assistants gate.
+                continue
+            if role == "tool":
+                parts.append(d.tool_open if prev_role != "tool" else "\n\n")
+                parts.append(f"{d.tool_result_open}{content}{d.tool_result_close}")
+            else:
+                parts.append(f"{d.user_open}{content}")
+            prev_role = role
         parts.append(
             d.assistant_open + (d.think_open if thinking else d.think_closed)
         )
@@ -6706,9 +6781,13 @@ class MLXEngine(SessionCacheMixin):
         """
         if self.model_family in ("gemma4", "harmony"):
             return accumulated_text
-        # ChatML and GLM both use <think> prefix
+        # ChatML, GLM and DeepSeek all use a <think> prefix; GLM and DeepSeek
+        # templates open it without a trailing newline.
         if thinking_enabled:
-            prefix = "<think>" if self.model_family == "glm" else "<think>\n"
+            prefix = (
+                "<think>" if self.model_family in ("glm", "deepseek")
+                else "<think>\n"
+            )
             return prefix + accumulated_text
         return accumulated_text
 

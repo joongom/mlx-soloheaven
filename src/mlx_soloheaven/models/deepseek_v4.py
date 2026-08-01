@@ -203,20 +203,40 @@ def compress_topk_indices(
 ) -> mx.array:
     """Compressed-KV slot indices, per query position.
 
-    Port of ``get_compress_topk_idxs``. ``offset`` is where the compressed
-    region starts inside the shared per-layer buffer (``window_size``), since
-    DeepSeek stores ring and compressed KV in ONE buffer.
+    Port of ``get_compress_topk_idxs``, generalized to CONTINUATION chunks
+    (``start_pos > 0`` with ``seqlen > 1``, which the reference never sees —
+    it only prefills from zero or decodes one token). ``offset`` is where the
+    compressed region starts inside a shared buffer (0 when the compressed KV
+    is its own buffer).
 
-    A compressed slot only becomes visible once its whole ``ratio``-token group
-    has been consumed, which is what the ``>=`` mask encodes.
+    A compressed slot only becomes visible once its whole ``ratio``-token
+    group has been consumed, which is what the ``>=`` mask encodes; at the
+    reference's two regimes this reduces exactly to the reference output
+    (checked in tests against the transcription).
     """
-    if start_pos > 0:
-        row = mx.arange((start_pos + 1) // ratio) + offset
-        return row.astype(mx.int32)[None, :]
-    width = seqlen // ratio
+    width = (start_pos + seqlen) // ratio
     matrix = mx.broadcast_to(mx.arange(width)[None, :], (seqlen, width))
-    visible = (mx.arange(1, seqlen + 1) // ratio)[:, None]
+    visible = (mx.arange(start_pos + 1, start_pos + seqlen + 1) // ratio)[:, None]
     return mx.where(matrix >= visible, MASKED_INDEX, matrix + offset).astype(mx.int32)
+
+
+def continuation_window_indices(
+    window_size: int, seqlen: int, start_pos: int
+) -> mx.array:
+    """Window indices for a continuation chunk, into the VIRTUAL buffer
+    ``concat([ring (window_size slots), chunk (seqlen)], axis=1)``.
+
+    Query row ``i`` (absolute position ``p = start_pos + i``) attends to
+    positions ``p-window+1 .. p``: in-chunk positions map past the ring
+    (``window_size + (q - start_pos)``), older positions live in the ring at
+    slot ``q % window_size`` (guaranteed present — the ring holds the last
+    ``window_size`` positions), and negative positions are masked.
+    """
+    p = mx.arange(start_pos, start_pos + seqlen)[:, None]
+    q = p - window_size + 1 + mx.arange(window_size)[None, :]
+    ring_slot = mx.maximum(q, 0) % window_size
+    idx = mx.where(q >= start_pos, q - start_pos + window_size, ring_slot)
+    return mx.where(q < 0, MASKED_INDEX, idx).astype(mx.int32)
 
 
 def sqrtsoftplus(x: mx.array) -> mx.array:
@@ -511,14 +531,64 @@ class Compressor(nn.Module):
             state.append(self._finish(groups, freqs, 0, x.dtype))
             return
 
-        assert s == 1, "continuation prefill is not implemented yet"
-        p = start_pos
-        kv1, score1 = kv[:, 0], score[:, 0] + self.ape[p % ratio]
-        slot = (ratio if self.overlap else 0) + p % ratio
-        state.kv_state[:, slot] = kv1
-        state.score_state[:, slot] = score1
-        if (p + 1) % ratio:
-            return
+        # Continuation (start_pos > 0, any seqlen): finish the partially
+        # filled group from state, bulk-pool the full groups in the chunk, and
+        # stash the remainder back into state. The single-token decode step is
+        # the seqlen == 1 special case of this path.
+        off = ratio if self.overlap else 0
+        groups: list[mx.array] = []
+        pos = 0
+        filled = start_pos % ratio
+        if filled:
+            n = min(s, ratio - filled)
+            state.kv_state[:, off + filled : off + filled + n] = kv[:, :n]
+            state.score_state[:, off + filled : off + filled + n] = (
+                score[:, :n] + self.ape[filled : filled + n]
+            )
+            pos = n
+            if filled + n == ratio:
+                groups.append(self._pool_state(state))
+        nfull = (s - pos) // ratio
+        if nfull:
+            kv_g = kv[:, pos : pos + nfull * ratio].reshape(b, nfull, ratio, coff * d)
+            sc_g = (
+                score[:, pos : pos + nfull * ratio].reshape(b, nfull, ratio, coff * d)
+                + self.ape
+            )
+            if self.overlap:
+                # Chain the overlap halves: group j's first rows come from
+                # group j-1's raw kv; group 0's come from the last COMPLETED
+                # group, which state[:ratio] holds by invariant (prefill and
+                # _pool_state both maintain it).
+                prev_kv = mx.concatenate(
+                    [state.kv_state[:, None, :ratio], kv_g[:, :-1]], axis=1
+                )[..., :d]
+                prev_sc = mx.concatenate(
+                    [state.score_state[:, None, :ratio], sc_g[:, :-1]], axis=1
+                )[..., :d]
+                kv_o = mx.concatenate([prev_kv, kv_g[..., d:]], axis=2)
+                sc_o = mx.concatenate([prev_sc, sc_g[..., d:]], axis=2)
+                groups.append((kv_o * mx.softmax(sc_o, axis=2)).sum(axis=2))
+                state.kv_state[:, :ratio] = kv_g[:, -1]
+                state.score_state[:, :ratio] = sc_g[:, -1]
+            else:
+                groups.append((kv_g * mx.softmax(sc_g, axis=2)).sum(axis=2))
+            pos += nfull * ratio
+        r = s - pos
+        if r:  # start of a new partial group (start_pos + pos is a boundary)
+            state.kv_state[:, off : off + r] = kv[:, pos:]
+            state.score_state[:, off : off + r] = score[:, pos:] + self.ape[:r]
+        if groups:
+            state.append(
+                self._finish(
+                    mx.concatenate(groups, axis=1), freqs, start_pos // ratio, x.dtype
+                )
+            )
+
+    def _pool_state(self, state: CompressorState) -> mx.array:
+        """Pool the completed group held in ``state`` into one slot and (for
+        overlap) shift the current group into the previous-group region."""
+        ratio, d = self.ratio, self.head_dim
         if self.overlap:
             ks = mx.concatenate(
                 [state.kv_state[:, :ratio, :d], state.kv_state[:, ratio:, d:]], axis=1
@@ -534,8 +604,7 @@ class Compressor(nn.Module):
             group = (state.kv_state * mx.softmax(state.score_state, axis=1)).sum(
                 axis=1, keepdims=True
             )
-        first_group = (p + 1) // ratio - 1
-        state.append(self._finish(group, freqs, first_group, x.dtype))
+        return group
 
     def _overlap_transform(self, t: mx.array, fill: float) -> mx.array:
         """[b,g,r,2d] -> [b,g,2r,d]: rows [:r] carry the PREVIOUS group's
@@ -593,14 +662,15 @@ class Indexer(nn.Module):
         )
         scores = (mx.maximum(scores, 0) * w[..., None]).sum(axis=2)  # [B,S,G]
         g = kvc.shape[1]
-        if start_pos == 0:
-            visible = (mx.arange(1, s + 1) // self.ratio)[:, None]
-            scores = mx.where(mx.arange(g)[None, :] >= visible, -mx.inf, scores)
+        # Per-row causal visibility: row i (absolute position start_pos + i)
+        # sees only groups completed by then. At single-token decode this
+        # masks nothing (g == (start_pos + 1) // ratio), matching the
+        # reference's unmasked decode branch.
+        visible = ((mx.arange(s) + start_pos + 1) // self.ratio)[:, None]
+        scores = mx.where(mx.arange(g)[None, :] >= visible, -mx.inf, scores)
         k = min(self.topk, g)
         idxs = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k].astype(mx.int32)
-        if start_pos == 0:
-            idxs = mx.where(idxs >= visible, MASKED_INDEX, idxs)
-        return idxs
+        return mx.where(idxs >= visible, MASKED_INDEX, idxs)
 
 
 def sparse_attend(
@@ -692,7 +762,6 @@ class Attention(nn.Module):
         b, s, _ = x.shape
         rd, win = self.rope_dim, self.window
         start = cache.offset
-        assert start == 0 or s == 1, "continuation prefill is not implemented yet"
         cos, sin = rope_cos_sin(self._freqs, mx.arange(start, start + s))
 
         qr = self.q_norm(self.wq_a(x))
@@ -710,43 +779,38 @@ class Attention(nn.Module):
             cache.ring = mx.zeros((b, win, self.head_dim), dtype=x.dtype)
 
         if start == 0:
-            if s <= win:
-                cache.ring[:, :s] = kv
-            else:
-                slots = mx.arange(s - win, s) % win
-                cache.ring[:, slots] = kv[:, -win:]
+            # Cold prefill: window indices point into the chunk itself.
             win_idx = window_topk_indices(win, s, 0)
             parts = [(kv, mx.broadcast_to(win_idx[None], (b, s, win_idx.shape[1])))]
-            if self.ratio:
-                if "indexer" in self:
-                    cidx = self.indexer(x, qr, cache.idx, self._freqs, 0)
-                elif s >= self.ratio:
-                    cidx = compress_topk_indices(self.ratio, s, 0, 0)
-                else:
-                    cidx = None
-                self.compressor(x, cache.comp, self._freqs, 0)
-                comp = cache.comp.valid()
-                if comp is not None and cidx is not None and cidx.shape[-1] > 0:
-                    if cidx.ndim == 2:
-                        cidx = mx.broadcast_to(cidx[None], (b, *cidx.shape))
-                    parts.append((comp, cidx))
         else:
-            cache.ring[:, start % win] = kv[:, 0]
-            win_idx = window_topk_indices(win, 1, start)
-            parts = [(cache.ring, mx.broadcast_to(win_idx[None], (b, 1, win)))]
-            if self.ratio:
-                if "indexer" in self:
-                    cidx = self.indexer(x, qr, cache.idx, self._freqs, start)
-                else:
-                    cidx = None
-                self.compressor(x, cache.comp, self._freqs, start)
-                comp = cache.comp.valid()
-                if comp is not None:
-                    if cidx is None:
-                        cidx = compress_topk_indices(self.ratio, 1, start, 0)
-                        cidx = mx.broadcast_to(cidx[None], (b, *cidx.shape))
-                    if cidx.shape[-1] > 0:
-                        parts.append((comp, cidx))
+            # Continuation (chunked prefill or decode): attend over the
+            # virtual buffer [ring | chunk]. The ring still holds the state
+            # from BEFORE this chunk — it is written below, after the
+            # indices are established (rows never reference their own
+            # in-chunk positions through the ring half).
+            buffer = mx.concatenate([cache.ring, kv], axis=1)
+            win_idx = continuation_window_indices(win, s, start)
+            parts = [(buffer, mx.broadcast_to(win_idx[None], (b, *win_idx.shape)))]
+        if self.ratio:
+            if "indexer" in self:
+                cidx = self.indexer(x, qr, cache.idx, self._freqs, start)
+            else:
+                cidx = None
+            self.compressor(x, cache.comp, self._freqs, start)
+            comp = cache.comp.valid()
+            if comp is not None:
+                if cidx is None:
+                    m = compress_topk_indices(self.ratio, s, start, 0)
+                    cidx = mx.broadcast_to(m[None], (b, *m.shape))
+                if cidx.shape[-1] > 0:
+                    parts.append((comp, cidx))
+
+        if s >= win:
+            slots = mx.arange(start + s - win, start + s) % win
+            cache.ring[:, slots] = kv[:, -win:]
+        else:
+            slots = mx.arange(start, start + s) % win
+            cache.ring[:, slots] = kv
         cache.offset = start + s
 
         o = sparse_attend(q, parts, self.attn_sink, self.scale)

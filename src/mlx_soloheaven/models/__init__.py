@@ -27,7 +27,36 @@ logger = logging.getLogger(__name__)
 _EXTRA_ARCHITECTURES: dict[str, str] = {
     # EXAONE-4.5 (LGAI-EXAONE). Text tower only — see exaone4_5.py.
     "exaone4_5": "mlx_soloheaven.models.exaone4_5",
+    # DeepSeek-V4-Flash. See deepseek_v4.py and
+    # docs/specs/deepseek-v4-mlx-port.md.
+    "deepseek_v4": "mlx_soloheaven.models.deepseek_v4",
 }
+
+
+def _register_transformers_config(model_type: str) -> None:
+    """Teach transformers a minimal config class for ``model_type``.
+
+    Without this, AutoTokenizer falls back to the GENERIC PreTrainedConfig for
+    the unknown model_type, and transformers 5.x's rope standardization then
+    crashes on ``rope_scaling`` before ``max_position_embeddings`` is set —
+    the tokenizer never loads even though its own files are fine. The class
+    carries no modeling behaviour; it only has to survive config parsing.
+    """
+    try:
+        from transformers import AutoConfig, PretrainedConfig
+
+        class _MinimalConfig(PretrainedConfig):
+            def __init__(self, max_position_embeddings=131072, **kwargs):
+                # Set BEFORE super().__init__: rope standardization runs
+                # inside it and reads this attribute.
+                self.max_position_embeddings = max_position_embeddings
+                super().__init__(**kwargs)
+
+        _MinimalConfig.model_type = model_type
+        AutoConfig.register(model_type, _MinimalConfig)
+    except Exception as exc:  # noqa: BLE001 — transformers is optional here
+        logger.debug("[models] transformers config shim for %r skipped: %s",
+                     model_type, exc)
 
 _registered: dict[str, str] = {}
 
@@ -57,6 +86,7 @@ def register_extra_architectures() -> dict[str, str]:
 
         module = importlib.import_module(module_path)
         sys.modules[target] = module
+        _register_transformers_config(model_type)
         # Also bind as an attribute so `from mlx_lm.models import <t>` works.
         try:
             setattr(importlib.import_module("mlx_lm.models"), model_type, module)

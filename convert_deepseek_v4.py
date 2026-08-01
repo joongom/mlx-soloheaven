@@ -266,6 +266,50 @@ def convert_layer(r: Reader, cfg: dict, layer: int, path: str) -> None:
     r.close_unused(keep)
 
 
+# The release ships no Jinja template — only encoding/encoding_dsv4.py. This
+# is a Jinja rendering of that script's CHAT-mode rules (thinking mode differs
+# only in the generation opener, selected via enable_thinking):
+#   <BOS>{system}<｜User｜>{u}<｜Assistant｜></think>{a}<EOS>...<｜Assistant｜></think>
+# Earlier-turn reasoning is always dropped (the official default), and runs of
+# tool results merge into one <｜User｜> turn of <tool_result> blocks joined by
+# blank lines. Kept token-exact against the engine's suffix builder in
+# tests/test_deepseek_family.py.
+CHAT_TEMPLATE = (
+    "{{- '<｜begin▁of▁sentence｜>' -}}"
+    "{%- for m in messages -%}"
+    "{%- if m['role'] == 'system' -%}"
+    "{{- m['content'] -}}"
+    "{%- elif m['role'] == 'user' -%}"
+    "{{- '<｜User｜>' + m['content'] -}}"
+    "{%- elif m['role'] == 'tool' -%}"
+    "{%- if loop.index0 == 0 or messages[loop.index0 - 1]['role'] != 'tool' -%}"
+    "{{- '<｜User｜>' -}}"
+    "{%- else -%}"
+    "{{- '\\n\\n' -}}"
+    "{%- endif -%}"
+    "{{- '<tool_result>' + m['content'] + '</tool_result>' -}}"
+    "{%- elif m['role'] == 'assistant' -%}"
+    "{{- '<｜Assistant｜></think>' + (m['content'] or '') + '<｜end▁of▁sentence｜>' -}}"
+    "{%- endif -%}"
+    "{%- endfor -%}"
+    "{%- if add_generation_prompt -%}"
+    "{%- if enable_thinking is defined and enable_thinking -%}"
+    "{{- '<｜Assistant｜><think>' -}}"
+    "{%- else -%}"
+    "{{- '<｜Assistant｜></think>' -}}"
+    "{%- endif -%}"
+    "{%- endif -%}"
+)
+
+
+def install_chat_template(dst: str) -> None:
+    path = os.path.join(dst, "tokenizer_config.json")
+    tc = json.load(open(path))
+    tc["chat_template"] = CHAT_TEMPLATE
+    with open(path, "w") as f:
+        json.dump(tc, f, indent=2, ensure_ascii=False)
+
+
 def convert_top(r: Reader, path: str) -> None:
     out: dict[str, mx.array] = {}
     emit_q(out, "embed", r.linear("embed"), Q8)
@@ -357,6 +401,7 @@ def main() -> None:
     for fn in ("tokenizer.json", "tokenizer_config.json", "generation_config.json", "LICENSE"):
         if os.path.exists(os.path.join(SRC, fn)):
             shutil.copy(os.path.join(SRC, fn), os.path.join(DST, fn))
+    install_chat_template(DST)
 
     verify(cfg)
     total = sum(

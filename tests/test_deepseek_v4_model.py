@@ -240,6 +240,40 @@ def test_compressor_prefill_equals_step_decode(ratio, split):
         ), f"compressed caches diverge (ratio={ratio}, split={split})"
 
 
+@pytest.mark.parametrize("ratio", [4, 8])
+@pytest.mark.parametrize(
+    "plan",
+    [
+        [2, 7, 5, 9],   # chunks landing mid-group everywhere
+        [13, 8, 2],     # chunk completing a partial group then bulk
+        [3, 1, 4, 15],  # single-token steps interleaved with chunks
+        [8, 8, 7],      # aligned chunks (ratio 4 and 8 boundaries)
+    ],
+)
+def test_compressor_chunked_equals_full_prefill(ratio, plan):
+    """Continuation chunks (start > 0, seqlen > 1) — the regime the engine's
+    prefill-step chunking produces and the reference never exercises — must
+    reproduce the one-shot prefill exactly."""
+    total = sum(plan)
+    comp = Compressor(dim=12, head_dim=8, ratio=ratio, rope_dim=4, eps=1e-6)
+    randomize(comp, seed=100 + ratio)
+    x = mx.random.normal((1, total, 12), key=mx.random.key(10))
+    freqs = yarn_freqs(4, 100.0, 0, 1.0, 32.0, 1.0)
+
+    full = CompressorState()
+    comp(x, full, freqs, 0)
+
+    part = CompressorState()
+    pos = 0
+    for n in plan:
+        comp(x[:, pos : pos + n], part, freqs, pos)
+        pos += n
+
+    assert part.n == full.n == total // ratio
+    if full.n:
+        assert np.allclose(np.array(part.valid()), np.array(full.valid()), atol=1e-5)
+
+
 # --- full model ------------------------------------------------------------
 
 
@@ -271,6 +305,36 @@ def test_decode_consistency_full_model(split):
     out = [model(ids[:, :split], cache)]
     for p in range(split, len(TOKENS)):
         out.append(model(ids[:, p : p + 1], cache))
+    got = mx.concatenate(out, axis=1)
+
+    assert np.allclose(np.array(got), np.array(ref), atol=2e-4), (
+        f"max abs diff {np.abs(np.array(got) - np.array(ref)).max()}"
+    )
+
+
+@pytest.mark.parametrize(
+    "plan",
+    [
+        [2, 5, 9, 7],    # chunks crossing the window-8 wrap mid-chunk
+        [11, 3, 9],      # first chunk longer than the window
+        [6, 1, 1, 15],   # decode steps then a long continuation chunk
+    ],
+)
+def test_chunked_prefill_consistency_full_model(plan):
+    """prefill in engine-style chunks == one-shot prefill, through every layer
+    kind. This is the exact call pattern mlx-lm's generate_step produces with
+    --prefill-step-size, so it is the invariant serving depends on."""
+    model = build_tiny()
+    ids = mx.array([TOKENS])
+    assert sum(plan) == len(TOKENS)
+
+    ref = model(ids)
+
+    cache = model.make_cache()
+    out, pos = [], 0
+    for n in plan:
+        out.append(model(ids[:, pos : pos + n], cache))
+        pos += n
     got = mx.concatenate(out, axis=1)
 
     assert np.allclose(np.array(got), np.array(ref), atol=2e-4), (

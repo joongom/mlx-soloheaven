@@ -7,10 +7,10 @@ turns), thinking-mode routing, per-request sampling. ds4 oracle on identical
 raw-tokenized input: top-1 match, KL 0.18; teacher-forced over 32
 continuation positions: top-1 27/32, ours-in-ds4-top5 31/32.
 
-**Open issue: generation quality.** English is usable, Korean is corrupted
-at the token level. NOT a loading or port bug — see "The quantization
-ceiling" below, which is the measured reason and the limit of what this
-machine can do with MLX's quantizers.
+Generation quality was broken (Korean corrupted at the token level) until the
+converter stopped using MLX's min/max scales — see "The quantization ceiling"
+below. With the error-searched scales, teacher-forced perplexity is 3.69
+overall / 6.60 Korean, down from 7.11 / 17.91, at identical size.
 **Date**: 2026-08-01
 **Goal**: run DeepSeek-V4-Flash *inside* our engine, so SoloHeaven's KV/prompt
 machinery actually applies to it.
@@ -229,20 +229,52 @@ to 3-bit while dropping `w1`/`w3` to gs128 moves 0.671 → 0.651 for +2.8 GB.
 The error is dominated by `w1`/`w3`, and raising those is what costs the
 memory we do not have.
 
-**Conclusion**: 284 B parameters in 128 GiB is ~2.5 bits/param after
-headroom, and at that bitrate uniform affine quantization is not viable —
-usable quality there requires a codebook quantizer with importance
-calibration, which MLX does not provide. The shipped build is the best
-point on the frontier that actually fits. Paths that could change this,
-in order of expected value:
+### What actually fixed it: choosing the scale instead of taking min/max
 
-* run the 3-bit build (112 GiB) NON-resident — MoE activates only ~6/256
-  experts per token, so mmap-backed streaming is plausible (it is what ds4's
-  `--ssd-streaming` does); needs MLX to keep weights file-backed and unwired,
-  which is unverified.
-* an IQ2-style codebook quantizer for MLX (no kernel exists; dequant-to-bf16
-  at matmul time would give back the memory saving).
-* accept the ceiling and serve the model for English-dominant use.
+The bits were never the real constraint. `mx.quantize` sets a group's scale to
+`(max-min)/(2^bits-1)`, so at 2 bits — four levels — one outlier in a
+64-weight group stretches the scale and coarsens the other 63. llama.cpp's
+Q2_K searches for the scale that minimizes reconstruction error instead, and
+that is a large part of why ds4's build stays coherent.
+
+`quantize_search()` in the converter does the same: a grid over range-shrink
+factors, and for each candidate a least-squares re-fit of (scale, bias) given
+the resulting level assignment. The output is ORDINARY MLX affine layout —
+same packing, dtypes and shapes — so `mx.dequantize` and every quantized
+kernel consume it unchanged. **No memory cost, no runtime cost.** Conversion
+goes from 14 to 34 minutes.
+
+Measured, same weights, same size:
+
+| probe | min/max scales | searched scales |
+|---|---|---|
+| Korean | ppl 17.91 | **6.60** |
+| English | ppl 9.01 | **4.12** |
+| code | ppl 1.55 | **1.46** |
+| **overall** | **ppl 7.11** | **ppl 3.69** |
+
+Korean generation goes from `대한민국의 수도는 **서ulum** (서울-ulo…)` to
+`대한민국의 수도는 **서울**입니다. 서울은 대한민국의 정치, 경제, 문화, 교육
+중심지이며…`.
+
+Two process notes, both earned the hard way:
+
+* The first rebuild produced a BYTE-IDENTICAL model. The search had been wired
+  into `emit_q`, but the routed experts — the only sub-8-bit tensors — were
+  quantized by a separate loop calling `mx.quantize` directly. All quantization
+  now goes through one `quantize_weight()` entry point, and `verify()` checks a
+  VALUE (stored expert scales must differ from plain min/max), not just tensor
+  names, because name checks passed happily on the identical build.
+* Ranking builds by top-1 agreement with ds4 over a 32-token continuation is
+  too noisy and too indirect to use: it preferred the WORSE build (27/32 vs
+  23/32) while perplexity and generation both said the opposite. Use
+  `validate_deepseek_v4.py ppl`.
+
+**Remaining headroom**: 3-bit experts would reach 0.400 block error but need
+112 GiB. The only way to get there on this machine is non-resident weights —
+MoE activates ~6/256 experts per token, so mmap-backed streaming is plausible
+(it is what ds4's `--ssd-streaming` does), but it needs MLX to keep weights
+file-backed and unwired, which is unverified.
 
 ## Sequence
 

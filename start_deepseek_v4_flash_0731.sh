@@ -2,12 +2,18 @@
 # Start SoloHeaven with DeepSeek-V4-Flash-0731 (MLX 2-bit mixed, 94.5 GB).
 #
 # Build this model first (the MLX weights do not exist on the Hub):
-#   .venv/bin/python convert_deepseek_v4.py     # official fp8 167G -> 94.5G
-# The port lives in src/mlx_soloheaven/models/deepseek_v4.py; full plan and
-# evidence in docs/specs/deepseek-v4-mlx-port.md. Validated against the ds4
-# numerical oracle: top-1 agreement 27/32, ours-in-ds4-top5 31/32 on
-# teacher-forced continuations (both builds are 2-bit; disagreements were
-# near-synonyms).
+#   .venv/bin/python convert_deepseek_v4.py \
+#     ~/.lmstudio/models/deepseek-ai/DeepSeek-V4-Flash-0731 "$MODEL_PATH"
+# ~34 min, official fp8 167G -> 94.5G. The port lives in
+# src/mlx_soloheaven/models/deepseek_v4.py; plan and evidence in
+# docs/specs/deepseek-v4-mlx-port.md.
+#
+# QUANTIZATION: routed experts 2-bit, everything else 8-bit — the same recipe
+# ds4 uses. The experts' per-group scales are chosen by ERROR SEARCH rather
+# than min/max (see quantize_search in the converter), which is what makes the
+# build usable at all: teacher-forced perplexity 7.11 -> 3.69 overall, and
+# 17.91 -> 6.60 in Korean, at identical size. Check a rebuild with
+#   .venv/bin/python validate_deepseek_v4.py ppl
 #
 # Architecture: 284B total / MoE 256-way top-6 + 1 shared, 43 layers
 # (2 dense + 21 compressed(4)+DSA-Indexer + 20 compressed(128)), MLA with a
@@ -30,10 +36,9 @@
 # Drop --no-thinking to serve in reasoning mode.
 #
 # Sampling: the official generation_config.json says temperature 1.0 /
-# top_p 1.0. Our build quantizes routed experts to affine 2-bit WITHOUT
-# imatrix calibration (MLX has no equivalent), which fattens the logit tails,
-# so serve slightly cooler by default; clients can override per request.
-MODEL_PATH="${MODEL_PATH:-$HOME/.lmstudio/models/mlx-soloheaven/DeepSeek-V4-Flash-0731-MLX-2bit-mixed}"
+# top_p 1.0. 2-bit experts still fatten the logit tails, so serve slightly
+# cooler by default; clients can override per request.
+MODEL_PATH="${MODEL_PATH:-$HOME/.lmstudio/models/mlx-soloheaven/DeepSeek-V4-Flash-0731-MLX-2bit-search}"
 
 cd "$(dirname "$0")"
 source .venv/bin/activate

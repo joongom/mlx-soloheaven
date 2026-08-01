@@ -147,3 +147,116 @@ def _normalize_compress_ratios(ratios: List[int], num_layers: int) -> List[int]:
     if len(out) < num_layers:
         out += [COMPRESS_DENSE] * (num_layers - len(out))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Step 2a — pure functions, ported verbatim from DeepSeek's inference/model.py
+#
+# These are separated out and unit-tested first on purpose: they are index math
+# and routing rules, so an off-by-one here does not raise, it silently attends
+# to the wrong positions or routes to the wrong experts. Everything built on top
+# would then be debugged against a foundation that was already wrong.
+# ---------------------------------------------------------------------------
+
+import mlx.core as mx  # noqa: E402  (kept next to the code that uses it)
+
+#: Sentinel used by DeepSeek's sparse_attn kernel for "no position" — gathered
+#: slots equal to this are excluded from the softmax.
+MASKED_INDEX = -1
+
+
+def window_topk_indices(
+    window_size: int, seqlen: int, start_pos: int
+) -> mx.array:
+    """Sliding-window slot indices, per query position.
+
+    Port of ``get_window_topk_idxs``. Returns ``[seqlen, k]`` (prefill) or
+    ``[1, window_size]`` (decode) WITHOUT the batch axis — callers broadcast.
+
+    The three branches are the ring's three regimes: fully wrapped (rotate the
+    slot order so the oldest slot comes first), partially filled (pad the unused
+    tail with MASKED_INDEX), and the prefill triangle.
+    """
+    if start_pos >= window_size - 1:
+        sp = start_pos % window_size
+        row = mx.concatenate(
+            [mx.arange(sp + 1, window_size), mx.arange(0, sp + 1)], axis=0
+        )
+        return row.astype(mx.int32)[None, :]
+    if start_pos > 0:
+        row = mx.concatenate(
+            [
+                mx.arange(start_pos + 1),
+                mx.full((window_size - start_pos - 1,), MASKED_INDEX),
+            ],
+            axis=0,
+        )
+        return row.astype(mx.int32)[None, :]
+    base = mx.arange(seqlen)[:, None]
+    width = min(seqlen, window_size)
+    matrix = mx.maximum(base - window_size + 1, 0) + mx.arange(width)
+    return mx.where(matrix > base, MASKED_INDEX, matrix).astype(mx.int32)
+
+
+def compress_topk_indices(
+    ratio: int, seqlen: int, start_pos: int, offset: int
+) -> mx.array:
+    """Compressed-KV slot indices, per query position.
+
+    Port of ``get_compress_topk_idxs``. ``offset`` is where the compressed
+    region starts inside the shared per-layer buffer (``window_size``), since
+    DeepSeek stores ring and compressed KV in ONE buffer.
+
+    A compressed slot only becomes visible once its whole ``ratio``-token group
+    has been consumed, which is what the ``>=`` mask encodes.
+    """
+    if start_pos > 0:
+        row = mx.arange((start_pos + 1) // ratio) + offset
+        return row.astype(mx.int32)[None, :]
+    width = seqlen // ratio
+    matrix = mx.broadcast_to(mx.arange(width)[None, :], (seqlen, width))
+    visible = (mx.arange(1, seqlen + 1) // ratio)[:, None]
+    return mx.where(matrix >= visible, MASKED_INDEX, matrix + offset).astype(mx.int32)
+
+
+def sqrtsoftplus(x: mx.array) -> mx.array:
+    """V4's routing score: ``sqrt(softplus(x))`` (v32 uses sigmoid).
+
+    softplus is computed in the numerically stable form
+    ``log1p(exp(-|x|)) + max(x, 0)`` so large logits do not overflow before the
+    sqrt — the naive ``log(1+exp(x))`` saturates to inf and the sqrt then
+    propagates it into every routing decision.
+    """
+    return mx.sqrt(mx.log1p(mx.exp(-mx.abs(x))) + mx.maximum(x, 0))
+
+
+def route(
+    scores: mx.array,
+    topk: int,
+    route_scale: float,
+    bias: mx.array | None = None,
+) -> tuple[mx.array, mx.array]:
+    """noaux_tc top-k selection. Returns ``(weights, indices)``.
+
+    The correction ``bias`` shifts scores for SELECTION only — the returned
+    weights are gathered from the UNBIASED scores. Folding the bias into the
+    weights instead is a silent quality regression, not an error.
+    """
+    biased = scores if bias is None else scores + bias
+    indices = mx.argpartition(-biased, kth=topk - 1, axis=-1)[..., :topk]
+    weights = mx.take_along_axis(scores, indices, axis=-1)
+    weights = weights / weights.sum(axis=-1, keepdims=True)
+    return weights * route_scale, indices
+
+
+def clipped_swiglu(gate: mx.array, up: mx.array, limit: float) -> mx.array:
+    """SwiGLU with V4's asymmetric clipping.
+
+    Note the asymmetry, straight from the reference: ``up`` is clamped on BOTH
+    sides, ``gate`` only from above. Clamping gate symmetrically would cut off
+    the negative tail that silu needs.
+    """
+    if limit > 0:
+        up = mx.clip(up, -limit, limit)
+        gate = mx.minimum(gate, limit)
+    return mx.sigmoid(gate) * gate * up

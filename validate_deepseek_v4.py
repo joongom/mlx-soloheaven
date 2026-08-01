@@ -38,6 +38,7 @@ def free_gib() -> float:
 
 def load():
     import os
+    from pathlib import Path
 
     if free_gib() < 100 and "--force" not in sys.argv:
         raise SystemExit(
@@ -49,9 +50,19 @@ def load():
     import mlx_soloheaven.models.deepseek_v4 as v4
 
     _sys.modules["mlx_lm.models.deepseek_v4"] = v4
-    from mlx_lm.utils import load as mlx_load
+    from mlx_lm.utils import load_model
 
-    return mlx_load(os.path.expanduser(MODEL))
+    path = os.path.expanduser(MODEL)
+    model, _ = load_model(Path(path))
+    # AutoTokenizer consults AutoConfig for the unknown model_type and
+    # transformers 5.x's generic config trips over rope_scaling; loading the
+    # concrete class reads only the tokenizer files.
+    from transformers import PreTrainedTokenizerFast
+
+    from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+    tokenizer = TokenizerWrapper(PreTrainedTokenizerFast.from_pretrained(path))
+    return model, tokenizer
 
 
 def cmd_smoke() -> None:

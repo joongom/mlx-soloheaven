@@ -1,9 +1,15 @@
 # Porting DeepSeek-V4 to MLX (`mlx_lm/models/deepseek_v4.py`)
 
-**Status**: modules implemented through step 2 (config, index math/routing,
-attention + compressor + Indexer + MoE + Hyper-Connections, session caches);
-decode-consistency and checkpoint shape parity green. Next: fp8/fp4 weight
-loading + conversion, then the ds4 oracle.
+**Status**: steps 1-8 DONE. Converted build (94.5 GB, experts 2-bit gs64,
+rest 8-bit) loads and runs; ds4 oracle agreement on identical raw-tokenized
+input: top-1 " Paris" match, KL 0.18 single-position; teacher-forced over 32
+continuation positions: top-1 27/32, ours-in-ds4-top5 31/32, disagreements
+all near-synonyms — structural errors would sit at chance. ds4's one-shot
+mode applies a chat template (`--raw` disables it); a template-mismatched
+compare reads as chance (KL 13.6) — align tokenization FIRST.
+Remaining: step 9 (engine integration: dialect/template, continuation
+prefill for prefix reuse, trim/rollback, launcher) and quality work — our
+affine 2-bit trails ds4's imatrix-calibrated build in free generation.
 **Date**: 2026-08-01
 **Goal**: run DeepSeek-V4-Flash *inside* our engine, so SoloHeaven's KV/prompt
 machinery actually applies to it.

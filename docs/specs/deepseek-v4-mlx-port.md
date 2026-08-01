@@ -1,15 +1,16 @@
 # Porting DeepSeek-V4 to MLX (`mlx_lm/models/deepseek_v4.py`)
 
-**Status**: steps 1-8 DONE. Converted build (94.5 GB, experts 2-bit gs64,
-rest 8-bit) loads and runs; ds4 oracle agreement on identical raw-tokenized
-input: top-1 " Paris" match, KL 0.18 single-position; teacher-forced over 32
-continuation positions: top-1 27/32, ours-in-ds4-top5 31/32, disagreements
-all near-synonyms — structural errors would sit at chance. ds4's one-shot
-mode applies a chat template (`--raw` disables it); a template-mismatched
-compare reads as chance (KL 13.6) — align tokenization FIRST.
-Remaining: step 9 (engine integration: dialect/template, continuation
-prefill for prefix reuse, trim/rollback, launcher) and quality work — our
-affine 2-bit trails ds4's imatrix-calibrated build in free generation.
+**Status**: ALL 9 STEPS DONE — DeepSeek-V4 runs inside our engine and serves
+over both APIs. Verified live: multi-turn prefix reuse (`cache=hit
+cached=33 new=8`), SSE streaming, native session API (carries a name across
+turns), thinking-mode routing, per-request sampling. ds4 oracle on identical
+raw-tokenized input: top-1 match, KL 0.18; teacher-forced over 32
+continuation positions: top-1 27/32, ours-in-ds4-top5 31/32.
+
+**Open issue: generation quality.** English is usable, Korean is corrupted
+at the token level. NOT a loading or port bug — see "The quantization
+ceiling" below, which is the measured reason and the limit of what this
+machine can do with MLX's quantizers.
 **Date**: 2026-08-01
 **Goal**: run DeepSeek-V4-Flash *inside* our engine, so SoloHeaven's KV/prompt
 machinery actually applies to it.
@@ -181,6 +182,67 @@ equivalent, so step 3 above is what decides whether this is usable.
 **staged conversion** — download shard → dequant + quantize its tensors → write →
 delete shard — keeping peak at ~90 GB. Quantization is per-tensor independent, so
 this is sound. (Do not delete the user's models to make room.)
+
+## The quantization ceiling (why output quality is poor)
+
+The conversion was audited tensor-by-tensor against the source checkpoint
+before blaming quantization. Everything checkable is **correct**:
+
+| check | result |
+|---|---|
+| 8-bit path (attention `wq_a`/`wkv`/`wo_b`) | cos 0.99997, rel err 0.7% |
+| `wo_a` grouped reshape `[8,1024,4096]` | cos 0.99997 |
+| unquantized (`attn_sink`, `ape`, `hc_*`, `gate.weight`) | bit-exact |
+| `tid2eid` hash-routing table | bit-exact, range [0,255] |
+| expert STACKING ORDER (ours[e] vs source[e]) | cos 0.913 on the diagonal, **0.0002 off-diagonal** |
+
+So the damage is the 2-bit step itself. Measured on a real expert block
+(`layers.20.experts.3`, output relative error of the full
+clipped-SwiGLU FFN under a realistic post-RMSNorm input):
+
+| experts | out rel err | total build | fits 128 GiB? |
+|---|---|---|---|
+| 2-bit gs128 | 0.733 | 79.9 GiB | yes |
+| **2-bit gs64 (shipped)** | **0.671** | **88.0 GiB** | yes — measured 2.3 GiB free |
+| 2-bit gs32 | 0.611 | 104.1 GiB | no |
+| 3-bit gs128 | **0.400** | 112.2 GiB | no |
+
+Three findings that close off the obvious escapes:
+
+1. **The recipe is already ds4's.** Its GGUF is named
+   `IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-imatrix` — routed experts ~2-bit,
+   attention/shared-experts/output 8-bit. Identical to ours. The ONLY
+   difference is the quantizer: IQ2_XXS (codebook/lattice) with imatrix
+   calibration versus MLX affine.
+2. **MLX has no sub-3-bit alternative.** Modes are `affine`, `mxfp4`,
+   `mxfp8`, `nvfp4` — the fp4 ones are 4-bit (≈156 GB of experts) — and
+   affine group sizes are limited to 32/64/128.
+3. **AWQ-style scale folding does not help here** (measured: 0.6712 →
+   0.672–0.796 across α and both foldable scale points). The usual win comes
+   from equalizing outlier input channels, but DeepSeek ships the experts
+   ALREADY fp4-quantized with per-32-element scales, so that structure is
+   pre-flattened and there is nothing left to exploit. Recorded so nobody
+   spends a day re-deriving it.
+
+Mixed precision was measured too and is not a way out: upgrading only `w2`
+to 3-bit while dropping `w1`/`w3` to gs128 moves 0.671 → 0.651 for +2.8 GB.
+The error is dominated by `w1`/`w3`, and raising those is what costs the
+memory we do not have.
+
+**Conclusion**: 284 B parameters in 128 GiB is ~2.5 bits/param after
+headroom, and at that bitrate uniform affine quantization is not viable —
+usable quality there requires a codebook quantizer with importance
+calibration, which MLX does not provide. The shipped build is the best
+point on the frontier that actually fits. Paths that could change this,
+in order of expected value:
+
+* run the 3-bit build (112 GiB) NON-resident — MoE activates only ~6/256
+  experts per token, so mmap-backed streaming is plausible (it is what ds4's
+  `--ssd-streaming` does); needs MLX to keep weights file-backed and unwired,
+  which is unverified.
+* an IQ2-style codebook quantizer for MLX (no kernel exists; dequant-to-bf16
+  at matmul time would give back the memory saving).
+* accept the ceiling and serve the model for English-dominant use.
 
 ## Sequence
 

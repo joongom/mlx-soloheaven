@@ -798,6 +798,14 @@ class EngineProcessProxy:
     # 503) — mirrors the in-process engine's _read_locked bound.
     RPC_READ_TIMEOUT_S = 10.0
 
+    # Batch C round 3, finding 1(b): ceiling (seconds) on how long a cancelled
+    # streaming request waits for the child's terminal ``done`` ack before its
+    # aclose returns (and the gate lease is released). The child now closes its
+    # generate_stream — running the C1 teardown — BEFORE emitting ``done``, so
+    # awaiting ``done`` means the child turn is wound down. Bounded + fail-closed
+    # against a wedged/dead child so the release never hangs forever.
+    CANCEL_ACK_TIMEOUT_S = 30.0
+
     def _rpc_read(self, method: str, *args, **kwargs):
         """Read-only RPC: bounded wait + EngineBusyError on expiry."""
         return self._rpc(
@@ -920,18 +928,42 @@ class EngineProcessProxy:
     # --- generation (streaming) ------------------------------------------
 
     async def generate_stream_batches_async(self, messages, **params):
-        """Send a generate command; yield list[GenerationResult] batches."""
-        async for batch in self._stream(messages, params, scalar=False):
-            yield batch
+        """Send a generate command; yield list[GenerationResult] batches.
+
+        Batch C round 4, finding 1: HOIST ``_stream`` into a local and close it
+        in a ``finally``. A plain ``async for batch in self._stream(...): yield``
+        never closes the inner generator, so an ``aclose()`` of THIS public proxy
+        generator — a client disconnect mid-send OR the response wrapper closing
+        it after the child emits its terminal batch on normal completion — would
+        leave ``_stream`` suspended and skip its cancel handler entirely. With the
+        hoist, GeneratorExit CASCADES into ``_stream``'s
+        ``except (CancelledError, GeneratorExit)`` (~1028), which sends the child
+        cancel and awaits ``_await_child_cancel_ack`` (the child's C1 teardown)
+        BEFORE this aclose returns and the gate lease is released."""
+        stream = self._stream(messages, params, scalar=False)
+        try:
+            async for batch in stream:
+                yield batch
+        finally:
+            await stream.aclose()
 
     async def generate_stream_async(self, messages, **params):
         """Send a scalar generate command; yield individual GenerationResult.
 
         Mirrors MLXEngine.generate_stream_async — used by the compaction summary
-        streamer (CompactionEngine.generate_summary_stream)."""
-        async for batch in self._stream(messages, params, scalar=True):
-            for item in batch:
-                yield item
+        streamer (CompactionEngine.generate_summary_stream).
+
+        Batch C round 4, finding 1: same HOIST + ``finally: await stream.aclose()``
+        as generate_stream_batches_async so closing this public generator cascades
+        GeneratorExit into ``_stream``'s cancel handler (child cancel + C1 ack)
+        before the aclose returns and the lease releases."""
+        stream = self._stream(messages, params, scalar=True)
+        try:
+            async for batch in stream:
+                for item in batch:
+                    yield item
+        finally:
+            await stream.aclose()
 
     async def _stream(self, messages, params, scalar: bool):
         """Shared streaming driver for batched + scalar paths. Yields
@@ -1036,6 +1068,12 @@ class EngineProcessProxy:
             logger.info(
                 f"[ProcessProxy] rid={rid} cancelled — sent cancel to child"
             )
+            # Finding 1(b): do NOT return from this aclose until the child has
+            # acked with its terminal ``done``/``error`` frame — the child
+            # closes generate_stream (C1 teardown) BEFORE emitting it, so the
+            # gate lease (released above this aclose by the response wrapper) is
+            # not freed until the child turn is wound down. Bounded + fail-closed.
+            await self._await_child_cancel_ack(rid, q)
             raise
         finally:
             with self._routing_lock:
@@ -1043,6 +1081,40 @@ class EngineProcessProxy:
                 self._loops.pop(rid, None)
             with self._inflight_lock:
                 self._inflight -= 1
+
+    async def _await_child_cancel_ack(self, rid, q) -> None:
+        """After sending a cancel, wait for the child's terminal
+        ``done``/``error`` frame on this request's queue (finding 1(b)).
+
+        The child closes its ``generate_stream`` — running the C1 teardown —
+        BEFORE emitting the terminal frame, so returning here means the child
+        turn is genuinely wound down. Any in-flight ``batch``/``final`` frames
+        are drained and ignored. Bounded + fail-closed: a dead child (liveness
+        flags) or the timeout returns immediately so the caller's aclose (and
+        the gate release above it) never hangs."""
+        deadline = time.monotonic() + self.CANCEL_ACK_TIMEOUT_S
+        while True:
+            if self._dead or self._permanently_dead or self._closed:
+                # Child is gone — no ack will ever come; the death sweep already
+                # tore this request's routing down. Release fail-closed.
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    f"[ProcessProxy] rid={rid} cancel ack not received within "
+                    f"{self.CANCEL_ACK_TIMEOUT_S}s — proceeding (child C1 may be "
+                    f"incomplete)"
+                )
+                return
+            try:
+                frame = await asyncio.wait_for(q.get(), timeout=min(1.0, remaining))
+            except asyncio.TimeoutError:
+                continue  # re-check liveness + deadline; the child is winding down
+            ftype = frame.get("type") if isinstance(frame, dict) else None
+            if ftype in ("done", "error"):
+                return
+            # batch/final frames arriving after the cancel are ignored — we are
+            # only waiting for the terminal ack.
 
     def is_busy(self) -> bool:
         with self._inflight_lock:

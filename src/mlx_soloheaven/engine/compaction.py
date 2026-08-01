@@ -106,20 +106,37 @@ class CompactionEngine:
         summary_messages: list[dict],
         session_id: str | None = None,
     ):
-        """Async generator that yields text chunks during summary generation."""
+        """Async generator that yields text chunks during summary generation.
+
+        Batch C round 4, finding 2: HOIST the engine stream into a local and
+        close it in a ``finally``. A plain ``async for chunk in
+        self.engine.generate_stream_async(...): yield`` never closes the inner
+        engine generator, so an ``aclose()`` of this generator — cascaded down
+        from api/compaction._stream_compact_body on a compaction client
+        disconnect — would release the gate lease WITHOUT driving the engine
+        generator's teardown (in-proc C1 commit-or-invalidate, or the process-mode
+        child cancel-ack). With the hoist, GeneratorExit cascades into the engine
+        generator's teardown before this aclose returns and the lease releases."""
         from mlx_soloheaven.engine.tool_parser import split_thinking_and_content
 
         full_text = ""
-        async for chunk in self.engine.generate_stream_async(
+        engine_stream = self.engine.generate_stream_async(
             summary_messages,
             max_tokens=4096,
             temperature=0.3,
             thinking_budget=2048,
             session_id=session_id,
-        ):
-            if chunk.text:
-                full_text += chunk.text
-                yield {"type": "text", "content": chunk.text}
+        )
+        try:
+            async for chunk in engine_stream:
+                if chunk.text:
+                    full_text += chunk.text
+                    yield {"type": "text", "content": chunk.text}
+        finally:
+            # Exhausted on normal completion (aclose is a no-op); on a disconnect
+            # this aclose cascades GeneratorExit into the engine generator's C1
+            # teardown before we unwind and the lease releases.
+            await engine_stream.aclose()
 
         # Final: strip thinking, return clean summary
         model_family = self.engine.model_family

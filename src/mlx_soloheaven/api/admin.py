@@ -3,20 +3,69 @@ Admin API — real-time logs, cache/DB overview, and cache reset.
 """
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
 from collections import deque
 from typing import AsyncGenerator
 
-from fastapi import APIRouter
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
+from mlx_soloheaven.api.errors import error_dict
 from mlx_soloheaven.engine.types import EngineBusyError
 from mlx_soloheaven.executors import run_long, run_read
 from mlx_soloheaven.storage import database as db
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/admin")
+
+# Hostnames (not IP literals) treated as loopback for the admin log gate.
+_LOOPBACK_HOSTNAMES = frozenset({"localhost"})
+
+
+def _client_is_loopback(host: str | None) -> bool:
+    """True iff ``host`` is a loopback address (127.0.0.0/8, ::1) or a known
+    local hostname. Batch D log-leak control: the admin LOG endpoints are bound
+    to loopback ONLY (there is no auth system — user decision), so tracebacks
+    and operational logs are visible to a LOCAL operator alone, never to an
+    unauthenticated remote viewer."""
+    if not host:
+        return False
+    if host in _LOOPBACK_HOSTNAMES:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _require_loopback(request: "Request | None") -> "JSONResponse | None":
+    """Return a 403 envelope when the caller is NOT loopback, else None.
+
+    ``request is None`` (direct unit-test invocation, no ASGI scope) is treated
+    as local — the gate protects the network boundary, and a direct call has no
+    remote peer."""
+    if request is None:
+        return None
+    client = request.client
+    host = client.host if client is not None else None
+    if _client_is_loopback(host):
+        return None
+    logger.warning(
+        f"[Admin] rejected non-loopback access to {request.url.path} "
+        f"from {host!r} — admin log endpoints are localhost-only"
+    )
+    return JSONResponse(
+        status_code=403,
+        content=error_dict(
+            "admin log endpoints are restricted to localhost",
+            "forbidden",
+            "forbidden",
+        ),
+    )
 
 # Engine registry — set by server.py
 _engines: dict[str, "MLXEngine"] = {}
@@ -87,8 +136,14 @@ def install_log_handler():
 
 
 @router.get("/logs/stream")
-async def stream_logs():
-    """SSE endpoint for real-time log streaming."""
+async def stream_logs(request: Request = None):
+    """SSE endpoint for real-time log streaming.
+
+    Batch D: localhost-gated — logs (incl. tracebacks) are visible only to a
+    local operator, never an unauthenticated remote viewer."""
+    denied = _require_loopback(request)
+    if denied is not None:
+        return denied
     # Ensure loop is set
     log_buffer.set_loop(asyncio.get_event_loop())
 
@@ -118,8 +173,13 @@ async def stream_logs():
 
 
 @router.get("/logs/recent")
-async def recent_logs(limit: int = 200):
-    """Get recent log entries."""
+async def recent_logs(limit: int = 200, request: Request = None):
+    """Get recent log entries.
+
+    Batch D: localhost-gated (see ``stream_logs``)."""
+    denied = _require_loopback(request)
+    if denied is not None:
+        return denied
     entries = list(log_buffer.buffer)[-limit:]
     return entries
 

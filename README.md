@@ -35,6 +35,12 @@ SoloHeaven turns your Mac into a personal AI server with sub-second response tim
 - **Transactional mutations** — Branch / regenerate / delete-last / compaction reserve engine capacity before the DB write, so a busy or restarting engine returns a clean `503` with the database untouched; a cancelled or disconnected turn commits-or-invalidates the cache instead of leaving it advanced past the stored messages
 - **Request validation** — Out-of-range / non-finite sampling params are rejected `4xx` at the API boundary; `top_k` beyond the vocabulary is clamped rather than crashing mid-generation
 - **Stop sequences & finish_reason** — The `stop` parameter is honored engine-side (cross-token holdback, cache-consistent truncation); `finish_reason` correctly reports `length` on `max_tokens` truncation (with the detokenizer tail flushed) and `stop` on a stop-sequence hit
+- **Bounded FIFO inference queue** — All generation is admitted through a single-slot gate (real concurrency is exactly 1, matching the engine); requests are ordered FIFO, and a saturated queue returns `429` + `Retry-After` instead of an unbounded backlog (configurable via `--max-queue-length`)
+- **Canonical error contract** — One `{"error":{"message","type","code"}}` envelope on every error path, with a `429 queue_full` (retry soon) vs `503 engine_not_ready` (retry after `Retry-After`) backpressure split; raw exception text is never leaked to the client
+- **Server-info endpoints** — `POST /tokenize` (offline token counting with the loaded tokenizer, read-only, no GPU lock) and `GET /ready` (model+tokenizer readiness probe; `200` when serveable, `503` while loading/restarting — readiness is independent of queue saturation)
+- **Prometheus metrics & request IDs** — `GET /metrics` exposes hand-rolled Prometheus text (request / token / cache-reuse counters + queue-wait/TTFT/generation histograms, bounded label cardinality), and every response carries an `X-Request-ID` correlation header. Prompt and generated text are scrubbed from logs; admin `/logs` endpoints are localhost-only (there is no auth system — the server assumes a trusted/local network)
+- **GPT-OSS / Harmony support** — gpt-oss models are served as the `harmony` family: the Harmony channel format is parsed so reasoning, answer, and tool calls route to `reasoning_content` / `content` / `tool_calls` with no raw markers leaking into `content`
+- **Cross-model KV safety** — The prompt-contract fingerprint includes a best-effort model-build identity, so a different model (even the same architecture with different weights) can never reuse another model's KV cache — fail-closed
 
 ## Supported Model Families
 
@@ -61,7 +67,8 @@ support through mlx-vlm. (`--backend mlx-lm` forces the mlx-lm path;
 | **GLM-5.1 / DeepSeek-V3.2** (`glm_moe_dsa`, `deepseek_v32`) | mlx-lm | `CacheList(KVCache, KVCache)` per layer (MLA + DSA indexer) | **Multi-head Latent Attention (MLA)**: KV is pre-compressed to `kv_lora_rank=512` — cache is ~1/3 of typical. **PLD-capable** (CacheList is trimmable), but `--pld` is off by default here — acceptance was ~12% on casual/reasoning; add it back only for copy-heavy workloads. Use `--no-thinking` (keep `prefill-step-size` at the default `2048` — `8192` OOMs on >100K prompts). |
 | **GLM-4.5 / 4.7** (`glm4_moe`, `glm4_moe_lite`) | mlx-lm | `KVCache` or `RotatingKVCache` mix | ChatML-ish format with `<\|user\|>`/`<\|assistant\|>`. PLD compatible on pure-KVCache variants. |
 | **GLM4V / GLM-OCR** | mlx-vlm | Per-model | Vision variants. |
-| **MiniMax, GPT-OSS** | mlx-lm | Standard `KVCache` | ChatML. |
+| **GPT-OSS** (`gpt_oss`, e.g. 20B/120B) | mlx-lm | Standard `KVCache` mix | **Harmony format** (family `harmony`): `<\|start\|>`/`<\|channel\|>`/`<\|message\|>` channel framing. The server parses the channels — `analysis` → `reasoning_content`, `final` → `content`, `commentary to=functions.*` → OpenAI `tool_calls` — so raw markers never leak into `content`. Thinking-budget forcing is disabled (the analysis→final transition is multi-token; no single close token exists). Natural stops record `<\|return\|>`/`<\|call\|>`; the HIT-splice reconciles them against the template's `<\|end\|>` history rendering (see suffix reconciliation below). |
+| **MiniMax** | mlx-lm | Standard `KVCache` | ChatML. |
 
 **Note on mxfp4/mxfp8 quantization**: MLX currently has kernel inefficiencies for
 MoE matmul under mxfp4/mxfp8 modes (see [mlx issue #3402](https://github.com/ml-explore/mlx/issues/3402)).
@@ -497,6 +504,9 @@ Options:
   --thinking-budget     Max thinking tokens before forcing </think> (default: 8192, 0=unlimited)
   --memory-budget-gb    In-memory KV cache budget in GB (default: 200)
   --disk-budget-gb      On-disk KV cache budget in GB, auto-evicts oldest (default: 100)
+  --max-queue-length    Max inference queue length (waiting + running) for the FIFO
+                        admission gate fronting all generation (default: 32; over it a
+                        new request gets 429 queue_full; env: SOLOHEAVEN_MAX_QUEUE_LENGTH)
   --max-checkpoints     Max DeltaNet checkpoints per session for branching (default: 50, 0=unlimited)
   --data-dir            Directory for SQLite DB and cache files (default: ./data)
   --no-thinking         Disable thinking mode globally
@@ -728,13 +738,22 @@ data = Person.model_validate_json(response.choices[0].message.content)
 | All models loaded via mlx-lm (Qwen3.5/3.6, GLM-5.1, GLM-4.7, DeepSeek, Llama, Mistral, MiniMax, …) | ✅ Works |
 | mlx-vlm models (Gemma 4, Qwen3-VL, GLM4V, …) | ✅ Works (same `logits_processors` contract) |
 | Streaming (`stream=True`) | ✅ Works — tokens stream normally, client buffers and parses |
-| `tools` present | ⚠️ `response_format` ignored with server-side warning (OpenAI behavior — tools imply `tool_calls` output, which is not JSON-schema content) |
+| `tools` + `response_format.type` in (`json_object`,`json_schema`) | ⛔ Rejected with `400` — tools and a JSON-constraining `response_format` are mutually exclusive (tools imply `tool_calls` output, not JSON-schema content). Send one or the other; `type:"text"` alongside tools is unconstrained. No longer silently dropped. |
 | `--pld` enabled | ⚠️ `response_format` disabled with warning (PLD's speculative multi-token steps are incompatible with FSM state). Either: drop `--pld` for that server, or keep `--pld` and skip `response_format` requests. |
 
-**Validation**: SoloHeaven validates the schema at request time via
-`outlines_core.json_schema.build_regex_from_schema()`. Malformed schemas
-return HTTP 400 (matches OpenAI behavior) rather than silently falling
-through to unconstrained generation.
+**Validation & error codes**: SoloHeaven validates `response_format` up front,
+rather than silently falling through to unconstrained generation:
+
+- An unsupported `type` (anything other than `text` / `json_object` /
+  `json_schema`) → `400 invalid_request`.
+- `tools` combined with a JSON-constraining `response_format` → `400`
+  (mutually exclusive, see above).
+- A `json_schema` with a missing or malformed schema → `400` (validated via
+  `outlines_core.json_schema.build_regex_from_schema()`, matching OpenAI).
+- A `json_schema` request when the optional `outlines_core` dependency is not
+  installed server-side → `501 not_supported` (`code:
+  "structured_output_unavailable"`, no `Retry-After` — the request is valid,
+  but the server lacks the feature).
 
 **Performance cost**: ~1 ms per decode step for the mask build on a ~250K
 vocab (benchmarked on M3 Ultra). Typical overhead on a 27 TPS generation is
@@ -849,6 +868,7 @@ SoloHeaven handles common quirks of OpenAI-compatible clients:
 - Accepts dashes and dots in tool / function names (e.g. `my-tool`, `my.tool`) instead of silently dropping the call
 - Parses tool calls from the content channel only — a call "rehearsed" inside `<think>` reasoning is ignored
 - With `response_format`, suppresses thinking so the JSON lands in `content`, not `reasoning_content`
+- For gpt-oss (Harmony family), parses the channel format into the LM Studio-style fields — the `analysis` channel becomes `reasoning_content`, the `final` channel `content`, and `functions`-commentary blocks become `tool_calls` — so raw Harmony markers (`<|channel|>`, `<|message|>`, …) never surface in `content`
 
 ## Architecture
 
@@ -975,7 +995,7 @@ To maintain cache validity, SoloHeaven compares stored messages with incoming re
 - **Tool result clearing** — Clients may replace old tool results with `[Old tool result content cleared]`; these are accepted
 - **Assistant content tolerance** — Last stored assistant message allows content differences (client disconnect/reformatting)
 - **Thinking tag stripping** — `<think>...</think>` blocks in assistant messages are stripped before comparison
-- **Prompt-contract fingerprint** — Every cache HIT is additionally gated by a fingerprint over the canonical tool schema, thinking on/off, and the model-family template revision. If the tools or thinking mode change mid-session, the HIT is refused and the session rebuilds honestly — a stale-schema cache is never reused. Legacy (unstamped) sessions take one cold rebuild that re-stamps the contract.
+- **Prompt-contract fingerprint** — Every cache HIT is additionally gated by a fingerprint over the canonical tool schema, thinking on/off, the model-family template revision, and a best-effort model-build identity (see [Cache Invalidation](#cache-invalidation-and-compaction) — a different model can never reuse another's KV cache). If the tools or thinking mode change mid-session, the HIT is refused and the session rebuilds honestly — a stale-schema cache is never reused. Legacy (unstamped) sessions take one cold rebuild that re-stamps the contract.
 - **Canonical tool-call matching** — Tool calls compare as canonical structured calls (name + normalized arguments, so a re-serialized resend still matches), with the `tool_call_id` chain pinned on `tool`-role messages — not a raw string compare.
 - **Strict anonymous matching** — A session-less (`user` omitted) request only matches engine-minted anonymous caches, by strict prefix. It can never select and mutate another conversation's cache, even on a coincidental message-prefix match.
 - **Fail-closed on ambiguity** — Residual tool-call markers, an unclosed GLM tool block, or a structured-output-vs-XML content conflict all refuse the HIT (honest MISS) rather than reuse a suspect cache.
@@ -1011,6 +1031,20 @@ For example, instead of rewriting the system prompt to include a conversation su
 
 This preserves the full cache prefix while adding context compression at the boundary.
 
+**Cross-model KV safety.** The prompt-contract fingerprint that gates every
+cache HIT also folds in a best-effort **model-build identity** — the model id,
+the absolute model path, a hash of `config.json`, and a weight-build marker
+(each shard's `st_mtime_ns` + size + a safetensors-header hash, plus a sampled
+data digest of the first shard). So a *different* model — even the same
+architecture with different weights, or weights swapped in place at the same
+path — can never reuse another build's KV cache: the identity differs, the HIT
+is refused, and the session rebuilds honestly. It is **fail-closed**: a model
+directory whose build cannot be verified (unreadable / no safetensors / corrupt
+header) gets a unique-per-load identity and cold-rebuilds rather than risk a
+silent cross-model reuse. A shell/test engine with no real model directory
+keeps the historical (identity-free) fingerprint, so legacy caches are
+unaffected apart from one re-stamping rebuild.
+
 **Interruption is commit-or-invalidate.** When a turn on a cache HIT is cut
 short — the client cancels, disconnects mid-stream (`GeneratorExit`), or the
 model emits only a thinking block and no answer — the cache must not be left
@@ -1036,6 +1070,14 @@ what the chat template would render:
   trims a foreign recorded EOS out of the cache, or demotes to an honest MISS; the
   tool suffix renders `<|observation|>` + `<tool_response>` and the thinking
   suffix opens/closes `<think>` per the official template.
+- **Harmony (gpt-oss)** — the next-turn suffix leads with the `<|end|>` turn
+  closer; a recorded `<|end|>`/`<|call|>` tail dedupes it (a tool result stays
+  adjacent to its `<|call|>`, per the template), while a recorded `<|return|>` /
+  `<|endoftext|>` — which history rendering never contains — is REPLACED via a
+  verified 1-token cache trim (untrimmable → honest MISS). Analysis blocks stay
+  in the cached stream (the retained-reasoning deviation, as on ChatML): splice
+  equals full retokenization exactly for analysis-free turns, and boundary-exact
+  otherwise. Stamped with `harmony-suffix-v1` in the prompt-contract fingerprint.
 - **gemma4 `thinking=false`** HIT reuse is deliberately disabled (fail-closed
   rebuild) for correctness, and pre-fix GLM sessions are migrated with a one-time
   rebuild via the template-revision component of the prompt-contract fingerprint.
@@ -1139,10 +1181,31 @@ state.
   executor slot before the DB write**, so a busy engine returns a clean `503` with
   the database left untouched (no orphan rows).
 
-**Cache safety:** every cache HIT is gated by a prompt-contract fingerprint,
-session-less requests match strictly by provenance, an interrupted turn is
-commit-or-invalidate, and unverifiable MTP cache corruption terminates the stream
-with an in-band error — see [Message Matching](#message-matching) and
+**Single inference queue (bounded FIFO admission):**
+
+- All generation is fronted by a **single-slot FIFO gate** in the FastAPI
+  parent, so real inference concurrency is **exactly 1** — matching the engine's
+  concurrency-1 GPU path (this is the admission + bounding layer on top of the
+  engine's own single-flight generation).
+- Requests are admitted **strictly FIFO**: when the slot is busy, a request
+  enqueues and is woken in order. The queue is **bounded** by
+  `--max-queue-length` / `SOLOHEAVEN_MAX_QUEUE_LENGTH` / `Config.max_queue_length`
+  (default **32**); over the ceiling a new request gets `429 queue_full` +
+  `Retry-After` instead of an unbounded backlog.
+- A client that **disconnects while queued** is dropped before generation ever
+  starts — its ticket is removed, the counter decremented, and the slot is
+  handed to the next FIFO waiter.
+- The slot **lease is held until the turn's cache commit completes** (the
+  post-stream commit-or-invalidate runs, *then* the slot is released), so the
+  next admitted request never starts against a half-committed cache. Releases
+  are ownership-safe (a stale / double / foreign release is a no-op).
+
+**Cache safety:** every cache HIT is gated by a prompt-contract fingerprint (now
+including a best-effort model-build identity, so a different model can never
+reuse another's KV cache — fail-closed), session-less requests match strictly by
+provenance, an interrupted turn is commit-or-invalidate, and unverifiable MTP
+cache corruption terminates the stream with an in-band error — see
+[Message Matching](#message-matching) and
 [Cache Invalidation and Compaction](#cache-invalidation-and-compaction).
 
 ## API Reference
@@ -1206,6 +1269,69 @@ with an in-band error — see [Message Matching](#message-matching) and
 | POST | `/api/admin/db/reset` | Reset the database only |
 | POST | `/api/admin/reset-all` | Reset caches and database |
 
+> **Admin `/logs` endpoints are localhost-only.** There is no auth system — the
+> server assumes a trusted / local network — so the log endpoints
+> (`/api/admin/logs/stream`, `/api/admin/logs/recent`), which can surface
+> tracebacks, are **loopback-gated**: a non-loopback caller gets `403`. Prompt
+> text and generated output are scrubbed from all log records (the request
+> preview logs only role + length metadata; the generated tail is redacted).
+
+### Server Info & Observability
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/tokenize` | Tokenize text with the loaded tokenizer. Read-only — no GPU lock. |
+| GET | `/ready` | Readiness probe: `200` when the model + tokenizer can serve, `503` otherwise. |
+| GET | `/metrics` | Prometheus text exposition (ungated read — never queues behind generation). |
+
+**`POST /tokenize`** — request `{"content": <str>, "add_special": false, "with_pieces": false}`.
+Response `{"tokens": [int, ...], "count": int}`, plus `"pieces": [{"id": int, "piece": str}, ...]`
+(aligned 1:1 with `tokens`) when `with_pieces` is set. A missing/empty `content` → `400`;
+a not-ready engine → `503`. It is purely additive and never touches the generation or cache paths.
+
+**`GET /ready`** — `200` `{"status":"ready","model":<id>,"context_length":<int|null>,"queue_length":<int>}`
+**only** when the model and tokenizer are loaded and able to serve; otherwise `503`
+`{"error":{...,"type":"engine_not_ready"}}` + `Retry-After` (loading / reloading / a
+process-mode child restarting). **Readiness ≠ availability**: `/ready` stays `200` even
+when the inference queue is saturated (a full queue is a `429` on the generation path, not a
+readiness failure) — use it for liveness/rollout probes, not admission control.
+
+**`GET /metrics`** — a hand-rolled Prometheus text exposition (version 0.0.4; no
+`prometheus_client` dependency). Series:
+`soloheaven_requests_total{model,finish_reason,error_code,cache_result}`,
+`soloheaven_tokens_total{model,kind}`, `soloheaven_cache_reused_tokens_total{model}`, and
+`soloheaven_queue_wait_seconds` / `soloheaven_ttft_seconds` / `soloheaven_generation_seconds`
+histograms. Label cardinality is deliberately **bounded** (`model` is the model id; request /
+session IDs are **never** labels — they live in logs/headers only). It is an ungated read: it
+never acquires the inference slot, so scraping answers even while a generation holds the GPU.
+
+Every HTTP response carries an **`X-Request-ID`** correlation header: an incoming
+`X-Request-ID` is echoed when present and safe (bounded length, `[A-Za-z0-9._-]` only — a guard
+against header injection), otherwise a fresh id is generated. The header is present even on
+`500` responses.
+
+### Error Contract & Backpressure
+
+Every error path returns one canonical envelope (raw exception text is never
+included in the body — it is logged server-side only):
+
+```json
+{"error": {"message": "...", "type": "...", "code": "..."}}
+```
+
+The status code carries the backpressure contract:
+
+| Condition | Status | `type` / `code` | `Retry-After` | Client action |
+|-----------|--------|-----------------|---------------|---------------|
+| Inference queue / pool saturated | `429` | `queue_full` | short (`1`) | Retry quickly — capacity frees as the running turn finishes |
+| Engine loading / reloading / shutting down / not yet ready / process-child respawning / admission stopped | `503` | `engine_not_ready` | long (`30`) | Retry after `Retry-After` |
+| Request validation / bad sampling params / unsupported `response_format` | `400` (or `422`) | type `invalid_request_error`, code `invalid_request` | — | Fix the request |
+| `json_schema` requested but `outlines_core` not installed | `501` | type `not_supported`, code `structured_output_unavailable` | — | Not retryable — install the dependency |
+| Uncaught internal error / fail-closed cache-corruption termination | `500` | `server_error` | — | — |
+
+On the streaming path the same envelope is delivered as an in-band SSE error
+frame once headers are already sent.
+
 ### Extra Request Fields
 
 SoloHeaven extends the OpenAI API with optional fields:
@@ -1214,6 +1340,7 @@ SoloHeaven extends the OpenAI API with optional fields:
 {
   "user": "session-id",
   "thinking": true,
+  "chat_template_kwargs": {"enable_thinking": true},
   "thinking_budget": 4096,
   "top_k": 40,
   "min_p": 0.05,
@@ -1224,6 +1351,7 @@ SoloHeaven extends the OpenAI API with optional fields:
 
 - `user` — Session ID for KV cache reuse (see below)
 - `thinking` — Override server config for this request (`true`/`false`)
+- `chat_template_kwargs.enable_thinking` — Nested thinking toggle honored for spec clients (e.g. bultagi) that send `{"chat_template_kwargs":{"enable_thinking":false}}`. Precedence: an explicit top-level `thinking` wins, otherwise this nested flag, otherwise the server default — both drive thinking identically
 - `thinking_budget` — Override thinking token budget for this request
 - `top_k` — Top-k sampling override for this request
 - `min_p` — Min-p threshold override for this request
@@ -1249,6 +1377,7 @@ src/mlx_soloheaven/
 ├── config.py           # Configuration dataclass (ModelConfig + Config)
 ├── server.py           # FastAPI app factory, multi-model setup, shutdown ordering
 ├── executors.py        # Dedicated run_long/run_read/run_critical thread pools, bounded admission (503), poison-not-cancel shutdown quiesce
+├── inference_queue.py  # Parent-side single-slot FIFO admission gate fronting all generation (concurrency 1, bounded queue → 429 queue_full, disconnect-while-queued drop)
 ├── engine/
 │   ├── mlx_engine.py      # Core: model loading, generation, KV cache, drafter, generation-finalization (~7.5k lines; the session-cache concern was extracted into the mixin below)
 │   ├── session_cache_mixin.py # SessionCacheMixin: matchers, prompt fingerprint, anon resolution, HIT transaction, base-cache LRU, disk persistence, active-LRU eviction, preflight (MLXEngine inherits it)
@@ -1266,9 +1395,14 @@ src/mlx_soloheaven/
 ├── api/
 │   ├── openai_compat.py  # /v1/chat/completions, /v1/models
 │   ├── chat.py           # /api/sessions/*/chat (web UI)
-│   ├── admin.py          # /api/admin/* (admin dashboard)
+│   ├── admin.py          # /api/admin/* (admin dashboard; /logs loopback-gated)
 │   ├── settings.py       # /api/sessions/*/settings
 │   ├── compaction.py     # /api/sessions/*/compact
+│   ├── tokenize.py       # POST /tokenize + GET /ready (read-only server-info)
+│   ├── metrics.py        # GET /metrics (hand-rolled Prometheus text exposition)
+│   ├── request_id.py     # X-Request-ID ASGI middleware + correlation ContextVar
+│   ├── errors.py         # Canonical {message,type,code} error envelope + 429/503 helpers
+│   ├── gate_stream.py    # SlotStreamingResponse: holds the inference lease until post-stream commit, then releases
 │   └── schemas.py        # Pydantic request/response models
 ├── cache/
 │   └── manager.py      # Budget-based LRU cache manager

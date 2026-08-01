@@ -202,6 +202,51 @@ def detect_chatml_dialect(chat_template: str | None) -> ChatMLDialect | None:
     if "<|im_start|>" in chat_template:
         return CHATML_DIALECT_QWEN
     return None
+# Batch C round 3, finding 1(b): ceiling (seconds) on how long an aclose()/
+# cancel of an async generation wrapper waits for the worker thread's C1
+# commit-or-invalidate teardown before it returns. The teardown is a fast
+# in-memory reconcile; this only bounds a pathologically wedged worker so the
+# gate release (cascaded ABOVE this aclose) cannot hang forever — on expiry the
+# drain gives up fail-closed and logs that C1 may be incomplete.
+_CANCEL_C1_DRAIN_TIMEOUT_S = 30.0
+
+
+async def _drain_worker_until_done(q, session_id) -> None:
+    """After ``cancel_event.set()``, wait until the worker thread posts its
+    terminal ``None`` sentinel (finding 1(b)).
+
+    The worker posts ``None`` as its LAST action, AFTER synchronously closing
+    ``generate_stream`` (which runs the C1 GeneratorExit rescue), so returning
+    here means this turn's C1 is genuinely wound down — the caller (the async
+    generator's cancel/GeneratorExit handler) then finishes its aclose, and only
+    THEN does the response-lifecycle wrapper release the gate lease.
+
+    Module-level (not a method) so it works when a consumer BREAKS out of the
+    batch loop on ``finished`` — the engine generator is still suspended, so its
+    aclose runs the GeneratorExit handler on a NORMAL completion too, and a
+    ``generate_stream_batches_async`` bound onto a lightweight fake engine (that
+    has no engine methods) still resolves this drain. Bounded + fail-closed: a
+    wedged worker cannot hang the release forever, and on a normal completion the
+    ``None`` sentinel is already (or imminently) in the queue, so it returns at
+    once."""
+    deadline = time.monotonic() + _CANCEL_C1_DRAIN_TIMEOUT_S
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            logger.warning(
+                f"[Stream] session={session_id} | worker C1 teardown did not "
+                f"complete within {_CANCEL_C1_DRAIN_TIMEOUT_S}s of cancel — "
+                f"proceeding (C1 may be incomplete)"
+            )
+            return
+        try:
+            item = await asyncio.wait_for(q.get(), timeout=min(1.0, remaining))
+        except asyncio.TimeoutError:
+            continue  # re-check the deadline; the worker is still winding down
+        if item is None:
+            return
+        # Any leftover batch/exception in flight is ignored — we are only
+        # waiting for the C1-complete sentinel while tearing down.
 
 
 # Heuristic threshold for the per-request drafter low-acceptance WARNING.
@@ -2004,6 +2049,19 @@ class MLXEngine(SessionCacheMixin):
                 logger.exception(
                     f"[{self.model_id}] failed to add <end_of_turn> to EOS set"
                 )
+        # Batch D (spec item 9): compute a stable per-model-build identity ONCE,
+        # here, from model_id + abspath(model_path) + config.json hash. It is
+        # folded into the prompt-contract fingerprint (so an in-memory session
+        # and the disk cache both carry it) and stamped in disk metadata, so a
+        # KV built by THIS model can never be silently reused by a DIFFERENT
+        # model sharing a data_dir + session_id. Cheap: computed at load, read
+        # per request. '' when it cannot be derived (falls back to the existing
+        # layer/type checks — no regression).
+        self._model_identity_str = self._compute_model_identity(model_config)
+        logger.info(
+            f"[{self.model_id}] model identity: "
+            f"{self._model_identity_str or '(unavailable)'}"
+        )
 
         # Auto-detect thinking end token (needed for SSE thinking_done signal)
         self._detect_special_tokens()
@@ -2036,7 +2094,15 @@ class MLXEngine(SessionCacheMixin):
                 f"sliding_window={self._sliding_window_size}"
             )
 
-        if self.cfg.think_end_token < 0 and self.cfg.enable_thinking:
+        if (
+            self.cfg.think_end_token < 0
+            and self.cfg.enable_thinking
+            and self.model_family != "harmony"
+        ):
+            # harmony is exempt: it deliberately has think_end_token = -1
+            # (no single-token close exists — see _detect_special_tokens)
+            # yet reasons unconditionally; disabling thinking here would
+            # flip the prompt contract/fingerprint for no rendering change.
             self.cfg.enable_thinking = False
             logger.info(
                 f"[{self.model_id}] think_end token not found — auto-disabled thinking"
@@ -2423,12 +2489,20 @@ class MLXEngine(SessionCacheMixin):
             return False
 
     def _detect_model_family(self) -> str:
-        """Detect model family from model_type in config.json."""
+        """Detect model family from model_type in config.json.
+
+        Families: gemma4 (channel-thought markers), glm (role markers +
+        <think>), harmony (OpenAI gpt-oss — <|start|>/<|channel|>/<|message|>
+        channel framing: analysis/commentary/final), chatml (default: Qwen,
+        MiniMax, etc.).
+        """
         mt = self._model_type.lower()
         if "gemma4" in mt:
             return "gemma4"
         if "glm" in mt:
             return "glm"
+        if "gpt_oss" in mt or "gpt-oss" in mt:
+            return "harmony"
         # Default: ChatML family (Qwen, MiniMax, etc.)
         return "chatml"
 
@@ -2436,6 +2510,22 @@ class MLXEngine(SessionCacheMixin):
         """Detect thinking end token for SSE thinking_done signal."""
         if self.model_family == "gemma4":
             self.cfg.think_end_token = _detect_token_id(self.tokenizer, "<channel|>")
+        elif self.model_family == "harmony":
+            # Harmony has NO single thinking-close token: the analysis ->
+            # final transition is the multi-token header sequence
+            # ``<|end|><|start|>assistant<|channel|>final<|message|>``.
+            # think_end_token stays -1, which (a) disables the
+            # ThinkingBudgetProcessor for this family — a single forced
+            # token cannot produce that transition, and a naive forced
+            # ``<|end|>`` would ALSO truncate a direct-to-final answer the
+            # counter misreads as analysis (the processor cannot see channel
+            # headers) — and (b) is exempted from the load-time
+            # "no think_end -> auto-disable thinking" fallback below:
+            # harmony reasons unconditionally (the template has no
+            # enable_thinking rendering), and the ThinkingRouter — not a
+            # token id — drives the reasoning/content split and the web UI's
+            # thinking_done signal.
+            self.cfg.think_end_token = -1
         else:
             # ChatML and GLM both use </think>
             if self.cfg.think_end_token < 0:
@@ -3105,7 +3195,10 @@ class MLXEngine(SessionCacheMixin):
         return sum(1 for m in new_messages if m.get("role") == "assistant")
 
     def _suffix_tokens(
-        self, new_messages: list[dict], thinking: bool = True,
+        self,
+        new_messages: list[dict],
+        thinking: bool = True,
+        prior_messages: list[dict] | None = None,
     ) -> list[int]:
         """Compute suffix tokens for new messages to append to stored token_ids.
 
@@ -3117,11 +3210,21 @@ class MLXEngine(SessionCacheMixin):
         honest MISS by the U4 gate in _generate_locked
         (_suffix_blocking_assistants) on ALL templates — a manual splice is
         not token-exact against apply_chat_template (F4).
+
+        ``prior_messages`` (harmony only): the session's cache-resident
+        messages, needed to resolve the harmony template's
+        ``last_tool_call.name`` context when rendering a tool-result turn
+        (``<|start|>functions.{name} to=assistant...``). Other families
+        ignore it.
         """
         if self.model_family == "gemma4":
             return self._suffix_tokens_gemma4(new_messages, thinking)
         if self.model_family == "glm":
             return self._suffix_tokens_glm(new_messages, thinking)
+        if self.model_family == "harmony":
+            return self._suffix_tokens_harmony(
+                new_messages, thinking, prior_messages=prior_messages,
+            )
         return self._suffix_tokens_chatml(new_messages, thinking)
 
     def _suffix_tokens_gemma4(
@@ -3466,6 +3569,277 @@ class MLXEngine(SessionCacheMixin):
         )
         return suffix
 
+    # --- Harmony (gpt-oss) suffix + recorded-EOS reconciliation ------------
+
+    # Harmony structural markers involved in the HIT-splice reconcile.
+    # <|endoftext|> is probed explicitly (GLM precedent): it is in the
+    # gpt-oss generation_config eos set, but a bare HF tokenizer surface
+    # does not expose it as an eos id.
+    _HARMONY_MARKER_END = "<|end|>"
+    _HARMONY_MARKER_CALL = "<|call|>"
+    _HARMONY_MARKER_RETURN = "<|return|>"
+    _HARMONY_MARKER_ENDOFTEXT = "<|endoftext|>"
+
+    def _suffix_tokens_harmony(
+        self,
+        new_messages: list[dict],
+        thinking: bool,
+        prior_messages: list[dict] | None = None,
+    ) -> list[int]:
+        """Harmony suffix, token-exact against the model's chat_template
+        (verified end-to-end against the real gpt-oss template + o200k
+        tokenizer in tests/test_harmony_family.py):
+
+        - user turn:  ``<|start|>user<|message|>{content}<|end|>``
+        - tool turn:  ``<|start|>functions.{name} to=assistant<|channel|>
+          commentary<|message|>{content|tojson}<|end|>`` — content is
+          JSON-encoded (ensure_ascii=False, matching transformers' tojson
+          filter), and {name} follows the template's ``last_tool_call.name``
+          semantics: the most recent prior assistant turn WITH tool_calls
+          (reset by a final assistant turn), falling back to the message's
+          own ``name`` field.
+        - generation prompt: ``<|start|>assistant`` (the template emits
+          exactly this — the model then generates its own
+          ``<|channel|>...`` header).
+
+        The suffix LEADS with the ``<|end|>`` turn closer — the
+        interrupted-turn contract (C1 NOT_REQUIRED, gemma4 U18 shape: an
+        unterminated harmony commit is closed by this token). A NATURAL stop
+        records a chat-EOS instead (``<|return|>`` for a final answer /
+        ``<|call|>`` for a tool call — mlx-lm records the fired eos into
+        token_ids), which the template's HISTORY rendering never uses
+        (``<|end|>`` / bare ``<|call|>`` adjacency): the HIT path therefore
+        runs the built suffix through _reconcile_harmony_recorded_eos
+        (dedupe / drop / trim-and-replace / honest MISS).
+
+        ``thinking`` is intentionally unused: the harmony template has no
+        enable_thinking rendering — the prompt is byte-identical either way
+        (analysis is a generated-output phenomenon, routed by the
+        ThinkingRouter). RETAINED-REASONING NOTE (the chatml-campaign
+        deviation, applied here by design): the cached stream keeps the
+        analysis blocks (and generated tool-call header forms) THE MODEL
+        ACTUALLY PROCESSED, while full retokenization drops analysis from
+        history per the template — so full-sequence equality is the
+        contract only for analysis-free turns; the SPLICE BOUNDARY is
+        token-exact in every case (see the reconcile + tests).
+        """
+        parts = [self._HARMONY_MARKER_END]
+        # Template ``last_tool_call.name`` context: seeded from the
+        # cache-resident prior messages (an assistant turn with tool_calls
+        # sets it; a final assistant turn resets it — template line
+        # ``last_tool_call.name = none``).
+        last_tool_name = ""
+        for msg in prior_messages or []:
+            if msg.get("role") != "assistant":
+                continue
+            tcs = msg.get("tool_calls") or []
+            if tcs and isinstance(tcs[0], dict):
+                fn = tcs[0].get("function") or {}
+                last_tool_name = fn.get("name") or ""
+            else:
+                last_tool_name = ""
+        for msg in new_messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "") or ""
+            if isinstance(content, list):
+                content = "\n".join(
+                    p["text"] if isinstance(p, dict) and "text" in p else str(p)
+                    for p in content
+                )
+            if role == "assistant":
+                # U4: unreachable for non-resident assistants (honest MISS
+                # via _suffix_blocking_assistants) — see the chatml builder.
+                continue
+            elif role == "tool":
+                name = msg.get("name") or last_tool_name
+                parts.append(
+                    f"<|start|>functions.{name} to=assistant<|channel|>"
+                    f"commentary<|message|>"
+                    f"{json.dumps(content, ensure_ascii=False)}<|end|>"
+                )
+            else:
+                parts.append(f"<|start|>user<|message|>{content}<|end|>")
+        parts.append("<|start|>assistant")
+        return self.tokenizer.encode("".join(parts), add_special_tokens=False)
+
+    def _harmony_marker_ids(self) -> dict[str, int]:
+        """Lazily detected ids of the harmony markers involved in
+        recorded-EOS reconciliation (memoized — _detect_token_id builds the
+        full vocab dict, too costly per HIT). Missing tokens map to -1 (the
+        reconcile then fails open to the historical splice, mirroring the
+        U18/GLM detection policy: never drop/trim a token it cannot
+        verify)."""
+        cached = getattr(self, "_harmony_marker_id_cache", None)
+        if cached is None:
+            cached = {}
+            for name in (
+                self._HARMONY_MARKER_END,
+                self._HARMONY_MARKER_CALL,
+                self._HARMONY_MARKER_RETURN,
+                self._HARMONY_MARKER_ENDOFTEXT,
+            ):
+                try:
+                    cached[name] = _detect_token_id(self.tokenizer, name)
+                except Exception:  # noqa: BLE001 — vocab probing must never break a HIT
+                    cached[name] = -1
+            self._harmony_marker_id_cache = cached
+        return cached
+
+    def _reconcile_harmony_recorded_eos(
+        self, suffix: list[int], cache_state, session_id: str | None,
+    ) -> list[int] | None:
+        """Harmony natural-EOS reconciliation at HIT-splice time — the
+        gpt-oss analog of gemma4's U18 dedupe + GLM's finding-A foreign-eos
+        trim, driven by what the mlx-lm recording contract actually leaves
+        as the stored tail (the terminal frame carries token=eos and the
+        lookahead already forwarded it through the KV; gpt-oss eos set is
+        {<|return|> 200002, <|endoftext|> 199999, <|call|> 200012}) versus
+        what the template's HISTORY rendering uses at the same boundary
+        (measured against the real tokenizer — tests/test_harmony_family.py):
+
+        - tail == ``<|end|>``: the closer is already recorded (stop
+          sequence / manual close) — DROP the suffix's duplicate leading
+          ``<|end|>`` (U18 dedupe shape; special token, so dropping
+          suffix[0] equals encoding without it).
+        - tail == ``<|call|>``: a natural TOOL-CALL stop. The template
+          renders history tool calls terminated by ``<|call|>`` with the
+          next message (tool result / user turn) adjacent — NO ``<|end|>``
+          between them — so the recorded tail is template-native: drop the
+          suffix's leading ``<|end|>`` and splice.
+        - tail == ``<|return|>`` (or any other chat EOS, e.g.
+          <|endoftext|>): FOREIGN — history rendering terminates a final
+          turn with ``<|end|>``, and ``<|return|>`` must never be model
+          input (template comment: emitted at generation end only). REPLACE
+          the one trailing token: trim it out of the cache (C1 machinery —
+          every flattened leaf positively trimmable, offsets verified at
+          len(token_ids)-1), pop it from token_ids, and keep the suffix's
+          leading ``<|end|>``. Untrimmable cache → honest MISS (None, cache
+          left intact); trim/verify failure → fail-closed invalidation.
+        - any other tail: interrupted turn (C1 NOT_REQUIRED) — the leading
+          ``<|end|>`` is what closes it; splice as built.
+
+        INVARIANT: the splice boundary is token-exact vs full
+        retokenization; for analysis-free turns the WHOLE spliced sequence
+        equals apply_chat_template(full) (proven on the real tokenizer).
+        Detection failure (markers missing from the vocab) fails open to
+        the historical splice, mirroring U18.
+        """
+        if self.model_family != "harmony" or not suffix:
+            return suffix
+        ids = cache_state.token_ids
+        if not ids:
+            return suffix
+        markers = self._harmony_marker_ids()
+        end_id = markers[self._HARMONY_MARKER_END]
+        tail = int(ids[-1])
+        if end_id < 0:
+            # P2-4 CORRECTED POLARITY: marker-detection FAILURE (the <|end|>
+            # id is missing from the vocab probe). We cannot verify the
+            # suffix's leading closer NOR run the dedupe/replace reconcile —
+            # and returning the suffix AS-IS is UNSAFE: if the recorded tail
+            # is a FOREIGN eos (<|return|>/<|endoftext|>), the spliced stream
+            # keeps ``... <foreign> <|end|> <nextturn>`` with <|return|> as
+            # model INPUT (forbidden by the template). "No unverified
+            # MUTATION" is insufficient — the unverified PASS-THROUGH is the
+            # corruption. Only splice when we can PROVE the tail is a normal
+            # content token (an interrupted turn the leading closer closes);
+            # otherwise honest MISS (rebuild replaces the cache).
+            eos_ids: set[int] = set()
+            try:
+                eos_ids |= _collect_eos_ids(self.tokenizer)
+            except Exception:  # noqa: BLE001 — eos probing must never break a HIT
+                eos_ids = set()
+            for _name in (
+                self._HARMONY_MARKER_RETURN,
+                self._HARMONY_MARKER_ENDOFTEXT,
+                self._HARMONY_MARKER_CALL,
+            ):
+                _mid = markers[_name]
+                if _mid >= 0:
+                    eos_ids.add(_mid)
+            if not eos_ids or tail in eos_ids:
+                # No reliable eos set (can't tell RETURN from content), or the
+                # tail IS a foreign/natural eos we cannot reconcile without the
+                # <|end|> id — safe default is MISS, never a corrupt splice.
+                logger.info(
+                    f"[KV Cache] session={session_id} | harmony marker "
+                    f"detection failed and the recorded tail (token {tail}) "
+                    f"cannot be proven a content token — honest MISS "
+                    f"(rebuild replaces the cache)"
+                )
+                return None
+            # Provably a content token (not any known eos): an interrupted
+            # turn — the suffix's leading closer closes it. Splice as built.
+            return suffix
+        if suffix[0] != end_id:
+            # Unexpected suffix shape (the builder always leads with <|end|>):
+            # fail open to the historical splice, never trim unverified tokens.
+            return suffix
+        call_id = markers[self._HARMONY_MARKER_CALL]
+        if tail == end_id or (call_id >= 0 and tail == call_id):
+            return suffix[1:]
+        # Foreign recorded chat-EOS? (<|return|> / <|endoftext|> / any other
+        # id the tokenizer surfaces as eos — never <|end|>/<|call|>, which
+        # are template-native and handled above.)
+        eos_ids: set[int] = set()
+        if markers[self._HARMONY_MARKER_RETURN] >= 0:
+            eos_ids.add(markers[self._HARMONY_MARKER_RETURN])
+        if markers[self._HARMONY_MARKER_ENDOFTEXT] >= 0:
+            eos_ids.add(markers[self._HARMONY_MARKER_ENDOFTEXT])
+        try:
+            eos_ids |= _collect_eos_ids(self.tokenizer)
+        except Exception:  # noqa: BLE001 — eos probing must never break a HIT
+            pass
+        eos_ids.discard(end_id)
+        if call_id >= 0:
+            eos_ids.discard(call_id)
+        if tail not in eos_ids:
+            # Interrupted turn (content tail): the leading <|end|> closes it.
+            return suffix
+        # REPLACE: trim the foreign terminal out of the cache, keep the
+        # suffix's leading <|end|> (mirrors _reconcile_glm_recorded_eos).
+        flat = self._flatten_cache_layers(cache_state.cache)
+        if not flat or not all(self._leaf_trimmable(c) for c in flat):
+            logger.info(
+                f"[KV Cache] session={session_id} | harmony recorded eos "
+                f"(token {tail}) is foreign to the history rendering "
+                f"(template uses <|end|>) and the cache has untrimmable "
+                f"layers — honest MISS (rebuild replaces the cache)"
+            )
+            return None
+        from mlx_soloheaven.engine.pld import _layer_offsets
+        target_len = len(ids) - 1
+        trim_exc = False
+        for c in cache_state.cache:
+            try:
+                c.trim(1)
+            except Exception:  # noqa: BLE001
+                trim_exc = True
+                logger.exception(
+                    "[KV Cache] harmony foreign-eos cache trim failed"
+                )
+        bad_layers = [
+            (i, off)
+            for i, off in enumerate(_layer_offsets(flat))
+            if off is not None and off != target_len
+        ]
+        if trim_exc or bad_layers:
+            logger.warning(
+                f"[KV Cache] session={session_id} | harmony foreign-eos trim "
+                f"to {target_len} failed (exception={trim_exc}, layers off "
+                f"target: {bad_layers[:8]}) — INVALIDATING session cache "
+                f"(next turn cold-fills)"
+            )
+            self._invalidate_cache_state(cache_state)
+            return None
+        cache_state.token_ids = list(ids[:-1])
+        logger.info(
+            f"[KV Cache] session={session_id} | harmony recorded eos "
+            f"(token {tail}) replaced with the template's <|end|> closer "
+            f"at splice time — boundary token-exact vs full retokenization"
+        )
+        return suffix
+
     def generate_stream(
         self,
         messages: list[dict],
@@ -3534,6 +3908,7 @@ class MLXEngine(SessionCacheMixin):
                     self._canonical_tools(tools),
                     _fp_thinking,
                     template_rev=self._suffix_template_rev(),
+                    model_identity=self._model_identity(),
                 ),
             )
             logger.debug(f"[Queue] session={sid} | lock acquired | waited={wait_ms:.0f}ms")
@@ -3953,6 +4328,7 @@ class MLXEngine(SessionCacheMixin):
         _incoming_fp = self._prompt_fingerprint(
             _tools_canonical, use_thinking,
             template_rev=self._suffix_template_rev(),
+            model_identity=self._model_identity(),
         )
         _reusable = (
             session is not None
@@ -4049,7 +4425,17 @@ class MLXEngine(SessionCacheMixin):
                 # for new messages. This avoids full re-tokenization which
                 # breaks special token round-trip (e.g. Gemma 4
                 # <|channel>/<channel|>).
-                suffix = self._suffix_tokens(new_messages, thinking=use_thinking)
+                if self.model_family == "harmony":
+                    # harmony: prior messages resolve the template's
+                    # last_tool_call.name context for tool-result turns.
+                    # (kwarg passed ONLY here — other families keep the
+                    # historical call shape byte-for-byte.)
+                    suffix = self._suffix_tokens(
+                        new_messages, thinking=use_thinking,
+                        prior_messages=session.messages,
+                    )
+                else:
+                    suffix = self._suffix_tokens(new_messages, thinking=use_thinking)
                 # U18: gemma4's suffix leads with the <turn|> closer for the
                 # C1 interrupted-turn contract, but a natural mlx-lm EOS
                 # already recorded <turn|> as the stored tail — splicing the
@@ -4068,6 +4454,15 @@ class MLXEngine(SessionCacheMixin):
                     # honest MISS (None) when the splice cannot be made
                     # byte-exact vs full retokenization.
                     suffix = self._reconcile_glm_recorded_eos(
+                        suffix, session.cache_state, session_id,
+                    )
+                if self.model_family == "harmony":
+                    # Harmony records <|return|>/<|call|>/<|endoftext|> at a
+                    # natural stop while history rendering uses <|end|> (or
+                    # bare <|call|> adjacency) — dedupe/drop the suffix's
+                    # leading closer, replace a foreign recorded eos via a
+                    # verified 1-token trim, or demote to an honest MISS.
+                    suffix = self._reconcile_harmony_recorded_eos(
                         suffix, session.cache_state, session_id,
                     )
                 if suffix is None:
@@ -4358,6 +4753,23 @@ class MLXEngine(SessionCacheMixin):
             _eos_ids = _collect_eos_ids(self.tokenizer)
         except Exception:  # noqa: BLE001 — vocab probing must never break generation
             pass
+        # P1-1: the harmony CALL eos id (or -1 when not harmony / probe fails).
+        # mlx-lm STOPS before adding the terminal eos token to the
+        # detokenizer, so a natural tool-call stop records the CALL token id
+        # but leaves its ``<|call|>`` terminator marker OUT of resp.text. The
+        # router/batch-parse then never see the block terminator, so a real
+        # tool call leaks as raw marker CONTENT with finish_reason=stop. We
+        # re-attach the marker text on the CALL frame in the loop below so the
+        # terminator reaches every consumer (streaming router, batch parse,
+        # sync split) and finish_reason resolves to tool_calls. Memoized probe.
+        _harmony_call_id = -1
+        if self.model_family == "harmony":
+            try:
+                _harmony_call_id = self._harmony_marker_ids()[
+                    self._HARMONY_MARKER_CALL
+                ]
+            except Exception:  # noqa: BLE001 — probing must never break generation
+                _harmony_call_id = -1
         # U24: stop-sequence scan state. ``_stop_pending`` holds back the
         # longest suffix of emitted-so-far text that could still begin a stop
         # sequence (a stop can split across token boundaries); text is only
@@ -4820,10 +5232,13 @@ class MLXEngine(SessionCacheMixin):
                 if cancel_event is not None and cancel_event.is_set():
                     # Report last token state when cancelled so we can see
                     # where generation was when the client disconnected.
-                    tail = ("".join(text_parts))[-200:].replace('\n', '\\n')
+                    # LOG-LEAK SCRUB (Batch D): NEVER interpolate generated text
+                    # — every log record is broadcast to the admin log SSE via
+                    # the root LogBuffer. Emit safe metadata (char count) only.
+                    _gen_chars = sum(len(p) for p in text_parts)
                     _logger.info(
                         f"[Generate] session={session_id} | CANCELLED at token {gen_token_count} | "
-                        f"last_tps={last_gen_tps:.1f} | tail={tail!r}"
+                        f"last_tps={last_gen_tps:.1f} | generated_chars={_gen_chars} (content redacted)"
                     )
                     cancelled = True
                     break
@@ -4831,6 +5246,23 @@ class MLXEngine(SessionCacheMixin):
                 text = resp.text if hasattr(resp, "text") else ""
                 tok_attr = getattr(resp, "token", None)
                 token = tok_attr if tok_attr is not None else 0
+                # P1-1: a natural harmony tool-call stop fires the CALL eos —
+                # its numeric id rides on THIS frame but mlx-lm never
+                # detokenized the ``<|call|>`` terminator into resp.text.
+                # Re-attach the marker text so the tool block completes on the
+                # router (open "tool" mode -> canonical block -> parsed call)
+                # AND the batch parse (accumulated_text carries the
+                # terminator). The eos id is already recorded below — this only
+                # completes the TEXT side, never double-counts a token. A
+                # ``<|call|>`` seen in content/final mode is just a harmless
+                # body terminator, so this stays safe in any router state.
+                if (
+                    _harmony_call_id >= 0
+                    and tok_attr is not None
+                    and int(tok_attr) == _harmony_call_id
+                    and self._HARMONY_MARKER_CALL not in text
+                ):
+                    text = text + self._HARMONY_MARKER_CALL
                 prompt_tps = getattr(resp, "prompt_tps", 0.0) or 0.0
                 gen_tps = getattr(resp, "generation_tps", 0.0) or 0.0
                 # U7: capture the runner's terminal signal (mlx-lm final
@@ -4943,18 +5375,29 @@ class MLXEngine(SessionCacheMixin):
                 # unless DEBUG logging is actually enabled. The default --verbose
                 # off case skips the f-string entirely.
                 if _debug_enabled:
+                    # LOG-LEAK SCRUB (Batch D, finding 1): NEITHER the
+                    # detokenized token text NOR the numeric token ID may be
+                    # logged. The text is generated OUTPUT, and the token ID is a
+                    # REVERSIBLE encoding of that same output for anyone holding
+                    # the tokenizer — and every record here is captured by the
+                    # admin LogBuffer / SSE. Emit only the position (token index)
+                    # + char count as diagnostics; no token id, no text.
                     _logger.debug(
-                        f"[Token] session={session_id} | n={gen_token_count} id={token} text={text!r}"
+                        f"[Token] session={session_id} | n={gen_token_count} "
+                        f"chars={len(text)} (id+text redacted)"
                     )
 
                 # Periodic INFO snapshot (every 50 tokens) so we can see progress
-                # when verbose is off
+                # when verbose is off. LOG-LEAK SCRUB (Batch D): this is an INFO
+                # line — it leaks even when --verbose is OFF — and the old
+                # ``tail`` echoed generated text into the root LogBuffer / admin
+                # SSE. Report only the char count (safe progress metadata).
                 if gen_token_count % progress_interval == 0:
-                    tail = ("".join(text_parts[-40:]))[-120:].replace('\n', '\\n')
+                    _gen_chars = sum(len(p) for p in text_parts)
                     _logger.info(
                         f"[Generate] session={session_id} | "
                         f"tokens={gen_token_count} | tps={gen_tps:.1f} | "
-                        f"tail={tail!r}"
+                        f"generated_chars={_gen_chars} (content redacted)"
                     )
 
                 last_gen_tps = gen_tps
@@ -4966,6 +5409,9 @@ class MLXEngine(SessionCacheMixin):
                     completion_tokens=gen_token_count,
                     prompt_tps=prompt_tps,
                     generation_tps=gen_tps,
+                    # Finding 4: a genuine generated token this frame (even when
+                    # ``text`` is empty-detok) — anchors TTFT, never a keepalive.
+                    token_produced=True,
                 )
 
                 if _stop_hit:
@@ -5103,13 +5549,14 @@ class MLXEngine(SessionCacheMixin):
             )
         )
 
-        # Log generated text for debugging
+        # Log generation summary for debugging. LOG-LEAK SCRUB (Batch D): the
+        # old ``preview`` echoed generated OUTPUT into the log (captured by the
+        # root LogBuffer -> admin SSE). Emit safe metadata (char count) only.
         if accumulated_text:
-            preview = accumulated_text[:200].replace('\n', '\\n')
             logger.debug(
                 f"[Generate] session={session_id} | "
                 f"tokens={gen_token_count} | cancelled={cancelled} | "
-                f"text={preview!r}"
+                f"generated_chars={len(accumulated_text)} (content redacted)"
             )
 
         if cancelled:
@@ -5156,11 +5603,17 @@ class MLXEngine(SessionCacheMixin):
             _, content = split_thinking_and_content(
                 accumulated_text, model_family=self.model_family,
                 started_in_thinking=(
-                    use_thinking and self.model_family != "gemma4"
+                    use_thinking
+                    and self.model_family not in ("gemma4", "harmony")
                 ),
                 thinking_active=use_thinking,
             )
-            if not use_thinking and self.model_family != "gemma4":
+            if not use_thinking and self.model_family not in (
+                "gemma4", "harmony",
+            ):
+                # gemma4/harmony emit their own channel markers — the split
+                # stays marker-authoritative regardless of the flag (raw
+                # marker text must never be judged as content).
                 content = accumulated_text
             if not content or not content.strip():
                 if cache_mode == "hit" and session is not None:
@@ -5212,6 +5665,10 @@ class MLXEngine(SessionCacheMixin):
                         text=_stop_flush_text,
                         prompt_tokens=total_prompt_tokens,
                         completion_tokens=gen_token_count,
+                        # Finding 4: this frame carries REAL generated output
+                        # (the held stop-pending tail), not a keepalive — mark it
+                        # so the chat keepalive gate never drops its content.
+                        token_produced=True,
                     )
                 yield GenerationResult(
                     text="",
@@ -5254,12 +5711,15 @@ class MLXEngine(SessionCacheMixin):
             #   EVERYTHING through — the whole text is the content channel
             #   and a literal </think> in it is a quote, never a boundary
             #   that hides a call before it.
-            if self.model_family == "gemma4":
+            if self.model_family in ("gemma4", "harmony"):
                 # Codex round 7, finding 3: thread the turn's thinking
                 # contract — bare-opener recognition inside the segmentation
                 # follows the router (full markers stay authoritative).
+                # harmony: the union carries the functions-commentary blocks
+                # (raw spans) and excludes analysis, so a rehearsal inside
+                # analysis is never parsed (U12) while real calls are.
                 _content_channel = _content_channel_union(
-                    accumulated_text, "gemma4", use_thinking,
+                    accumulated_text, self.model_family, use_thinking,
                 )
             elif use_thinking:
                 _, _content_channel = split_thinking_and_content(
@@ -5381,6 +5841,9 @@ class MLXEngine(SessionCacheMixin):
                 text=_stop_flush_text,
                 prompt_tokens=total_prompt_tokens,
                 completion_tokens=gen_token_count,
+                # Finding 4: real generated output (held stop-pending tail),
+                # not a keepalive.
+                token_produced=True,
             )
 
         # Determine finish reason (parsed_tool_calls computed above).
@@ -6237,10 +6700,11 @@ class MLXEngine(SessionCacheMixin):
         ChatML/GLM: prompt suffix includes '<think>\\n' (or '<think>'), so
         accumulated_text starts after it. Prepend to get the complete content.
 
-        Gemma 4: model generates thinking markers itself (e.g. '<|channel>thought\\n'),
-        so accumulated_text already includes them.
+        Gemma 4 / Harmony: the model generates its channel markers itself
+        ('<|channel>thought\\n' / '<|channel|>analysis<|message|>'), so
+        accumulated_text already includes them — stored raw.
         """
-        if self.model_family == "gemma4":
+        if self.model_family in ("gemma4", "harmony"):
             return accumulated_text
         # ChatML and GLM both use <think> prefix
         if thinking_enabled:
@@ -6324,8 +6788,14 @@ class MLXEngine(SessionCacheMixin):
         EVERY FAILED path invalidates the session cache before returning
         (fail-closed): a close was needed but cannot be performed/verified,
         so the only safe outcome is an honest MISS → cold-fill next turn.
+
+        harmony joins the NOT_REQUIRED set: like gemma4, its next-turn
+        suffix LEADS with the ``<|end|>`` closer (_suffix_tokens_harmony),
+        and the HIT reconcile (_reconcile_harmony_recorded_eos) dedupes /
+        replaces it against whatever terminal token was actually recorded —
+        an unterminated harmony commit stays template-valid.
         """
-        if self.model_family in ("gemma4", "glm"):
+        if self.model_family in ("gemma4", "glm", "harmony"):
             return TurnCloseResult.NOT_REQUIRED
         cache = cache_state.cache
         if cache is None or not cache_state.token_ids:
@@ -6611,6 +7081,7 @@ class MLXEngine(SessionCacheMixin):
                 else self._prompt_fingerprint(
                     tools_canonical, use_thinking,
                     template_rev=self._suffix_template_rev(),
+                    model_identity=self._model_identity(),
                 )
             ),
             # U26: the interrupted commit is a reinstall too — keep the
@@ -6835,7 +7306,10 @@ class MLXEngine(SessionCacheMixin):
         thinking, content = split_thinking_and_content(
             full_text,
             model_family=self.model_family,
-            started_in_thinking=_use_thinking and self.model_family != "gemma4",
+            started_in_thinking=(
+                _use_thinking
+                and self.model_family not in ("gemma4", "harmony")
+            ),
             thinking_active=_use_thinking,
         )
         result.thinking = thinking
@@ -6843,10 +7317,10 @@ class MLXEngine(SessionCacheMixin):
         # returned as content) follows the streaming router — with thinking
         # DISABLED on chatml/glm the whole output is content (a literal
         # </think> quote is not a boundary hiding a call before it). gemma4
-        # keeps the split (its extract also feeds result.thinking); the
-        # session-persistence parse above already converged its tool
-        # extraction on the router-policy union.
-        if not _use_thinking and self.model_family != "gemma4":
+        # and harmony keep the split regardless of the flag (their channel
+        # markers are model-emitted and authoritative; raw analysis text must
+        # never surface as content).
+        if not _use_thinking and self.model_family not in ("gemma4", "harmony"):
             content = full_text
 
         if result.finish_reason == "error":
@@ -6865,8 +7339,10 @@ class MLXEngine(SessionCacheMixin):
             # Codex round 7, finding 3: the union threads the thinking
             # contract (bare-opener gate) like the split above.
             _parse_channel = (
-                _content_channel_union(full_text, "gemma4", _use_thinking)
-                if self.model_family == "gemma4" else content
+                _content_channel_union(
+                    full_text, self.model_family, _use_thinking,
+                )
+                if self.model_family in ("gemma4", "harmony") else content
             )
             text_part, tool_calls = parse_tool_calls(
                 _parse_channel, model_family=self.model_family,
@@ -6972,6 +7448,7 @@ class MLXEngine(SessionCacheMixin):
                 prompt_fingerprint=self._prompt_fingerprint(
                     sess_tools, sess_thinking,
                     template_rev=self._suffix_template_rev(),
+                    model_identity=self._model_identity(),
                 ),
                 # U26: compaction rebuilds the cache, not the session identity
                 # — keep the cumulative drafter stats.
@@ -7107,23 +7584,24 @@ class MLXEngine(SessionCacheMixin):
         cancel_event = threading.Event()
 
         def _run():
+            gen = self.generate_stream(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                min_p=min_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                session_id=session_id,
+                tools=tools,
+                cancel_event=cancel_event,
+                thinking=thinking,
+                thinking_budget=thinking_budget,
+                response_format=response_format,
+                stop=stop,
+            )
             try:
-                for result in self.generate_stream(
-                    messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    min_p=min_p,
-                    top_k=top_k,
-                    repetition_penalty=repetition_penalty,
-                    session_id=session_id,
-                    tools=tools,
-                    cancel_event=cancel_event,
-                    thinking=thinking,
-                    thinking_budget=thinking_budget,
-                    response_format=response_format,
-                    stop=stop,
-                ):
+                for result in gen:
                     if cancel_event.is_set():
                         break
                     loop.call_soon_threadsafe(q.put_nowait, result)
@@ -7131,6 +7609,19 @@ class MLXEngine(SessionCacheMixin):
                 if not cancel_event.is_set():
                     loop.call_soon_threadsafe(q.put_nowait, e)
             finally:
+                # Finding 1(b): drive the sync generator's C1 commit-or-invalidate
+                # teardown (its GeneratorExit rescue) SYNCHRONOUSLY here, BEFORE
+                # posting the terminal sentinel — so the parent's ``None`` means
+                # this turn's C1 is fully wound down. On normal completion / an
+                # exception ``gen`` is already exhausted, so close() is a no-op;
+                # on a cancel break it is still suspended and close() runs C1.
+                try:
+                    gen.close()
+                except Exception:  # noqa: BLE001 — teardown must never wedge the worker
+                    logger.exception(
+                        f"[Stream] session={session_id} | generate_stream close "
+                        f"(C1 teardown) raised"
+                    )
                 loop.call_soon_threadsafe(q.put_nowait, None)
 
         # F3: pin to the dedicated mlx-vlm worker thread so mlx-vlm's
@@ -7144,6 +7635,13 @@ class MLXEngine(SessionCacheMixin):
         else:
             threading.Thread(target=_run, daemon=True).start()
 
+        # Batch C round 4, finding 3: track whether the worker's terminal ``None``
+        # sentinel has already been consumed. The worker posts ``None`` as its
+        # LAST action, AFTER synchronously closing generate_stream (running C1).
+        # Once we have seen it, C1 is DONE — a later aclose must NOT re-drain:
+        # there is no second ``None`` coming, so a drain would block the full
+        # _CANCEL_C1_DRAIN_TIMEOUT_S on a sentinel that never arrives.
+        sentinel_consumed = False
         try:
             while True:
                 try:
@@ -7153,6 +7651,7 @@ class MLXEngine(SessionCacheMixin):
                     yield GenerationResult(text="")
                     continue
                 if item is None:
+                    sentinel_consumed = True
                     break
                 if isinstance(item, Exception):
                     raise item
@@ -7164,6 +7663,12 @@ class MLXEngine(SessionCacheMixin):
                 f"[Stream] session={session_id} | client disconnected "
                 f"({type(exc).__name__}) — cancelling generation"
             )
+            # Finding 1(b)/3: block this aclose until the worker's C1 teardown has
+            # completed (the terminal ``None``) — but ONLY when the sentinel has
+            # NOT already been seen. If it was consumed (normal completion), C1 is
+            # already done; skip the drain and release immediately.
+            if not sentinel_consumed:
+                await _drain_worker_until_done(q, session_id)
             raise
 
     async def generate_stream_batches_async(
@@ -7223,23 +7728,24 @@ class MLXEngine(SessionCacheMixin):
                 if batch:
                     loop.call_soon_threadsafe(q.put_nowait, tuple(batch))
 
+            gen = self.generate_stream(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                min_p=min_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                session_id=session_id,
+                tools=tools,
+                cancel_event=cancel_event,
+                thinking=thinking,
+                thinking_budget=thinking_budget,
+                response_format=response_format,
+                stop=stop,
+            )
             try:
-                for result in self.generate_stream(
-                    messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    min_p=min_p,
-                    top_k=top_k,
-                    repetition_penalty=repetition_penalty,
-                    session_id=session_id,
-                    tools=tools,
-                    cancel_event=cancel_event,
-                    thinking=thinking,
-                    thinking_budget=thinking_budget,
-                    response_format=response_format,
-                    stop=stop,
-                ):
+                for result in gen:
                     if cancel_event.is_set():
                         # Flush whatever's batched, then stop.
                         _flush_batch()
@@ -7286,6 +7792,17 @@ class MLXEngine(SessionCacheMixin):
                     loop.call_soon_threadsafe(q.put_nowait, e)
             finally:
                 _flush_batch()
+                # Finding 1(b): close generate_stream SYNCHRONOUSLY (running its
+                # C1 GeneratorExit rescue) BEFORE the terminal sentinel, so the
+                # parent's ``None`` means this turn's C1 is fully wound down (see
+                # the scalar generate_stream_async for the full rationale).
+                try:
+                    gen.close()
+                except Exception:  # noqa: BLE001 — teardown must never wedge the worker
+                    logger.exception(
+                        f"[Stream] session={session_id} | generate_stream close "
+                        f"(C1 teardown) raised"
+                    )
                 loop.call_soon_threadsafe(q.put_nowait, None)
 
         # F3: same worker-submit logic as generate_stream_async — VLM is pinned
@@ -7296,6 +7813,14 @@ class MLXEngine(SessionCacheMixin):
         else:
             threading.Thread(target=_run, daemon=True).start()
 
+        # Batch C round 4, finding 3: see generate_stream_async — track the
+        # terminal ``None`` so a post-completion aclose does not re-drain a
+        # sentinel that was already consumed. The codex-reproduced 30s stall was a
+        # NORMAL completion: the terminal batch AND the ``None`` were both dequeued
+        # (the ``None`` in the backlog-drain below) BEFORE the consumer observed
+        # the terminal batch and BROKE, suspending this generator at the yield with
+        # the only ``None`` already gone.
+        sentinel_consumed = False
         try:
             while True:
                 try:
@@ -7305,6 +7830,7 @@ class MLXEngine(SessionCacheMixin):
                     yield [GenerationResult(text="")]
                     continue
                 if item is None:
+                    sentinel_consumed = True
                     break
                 if isinstance(item, Exception):
                     raise item
@@ -7318,8 +7844,13 @@ class MLXEngine(SessionCacheMixin):
                     except asyncio.QueueEmpty:
                         break
                     if nxt is None:
-                        # End sentinel arrived in the backlog — yield what we
-                        # have, then stop after this drain.
+                        # End sentinel arrived in the backlog — the ONLY ``None``
+                        # is consumed HERE. Finding 3: mark it so that if the
+                        # consumer BREAKS on a terminal batch in the yield loop
+                        # below (suspending this generator with the sentinel
+                        # already gone), the aclose handler does NOT drain 30s —
+                        # C1 already ran in the worker before it posted ``None``.
+                        sentinel_consumed = True
                         for b in pending:
                             yield list(b)
                         return
@@ -7338,6 +7869,13 @@ class MLXEngine(SessionCacheMixin):
                 f"[Stream] session={session_id} | client disconnected "
                 f"({type(exc).__name__}) — cancelling generation (batched)"
             )
+            # Finding 1(b)/3: block this aclose until the worker's C1 teardown
+            # (terminal ``None``) — but ONLY when the sentinel has NOT already been
+            # consumed. If it was (normal completion), C1 is done; draining would
+            # block the full timeout on a ``None`` that never arrives, so skip it
+            # and release immediately.
+            if not sentinel_consumed:
+                await _drain_worker_until_done(q, session_id)
             raise
 
     # --- Truncation & Regeneration ---
@@ -7527,6 +8065,7 @@ class MLXEngine(SessionCacheMixin):
             thinking=thinking,
             prompt_fingerprint=self._prompt_fingerprint(
                 tools, thinking, template_rev=self._suffix_template_rev(),
+                model_identity=self._model_identity(),
             ),
             # U26: rebuild reinstalls the state — keep the cumulative
             # drafter stats.

@@ -123,6 +123,18 @@ def engine_not_ready_response(
     )
 
 
+def server_error_response(
+    message: str = "internal server error",
+) -> JSONResponse:
+    """500 server_error envelope (Batch B canonical shape).
+
+    Used for uncaught exceptions (finding 6: the outer 500 handler) — NEVER
+    carries the underlying exception text (that is logged server-side only)."""
+    return error_response(
+        500, message, TYPE_SERVER_ERROR, CODE_SERVER_ERROR
+    )
+
+
 def structured_output_unavailable_response(
     message: str = (
         "json_schema structured output is not supported by this server"

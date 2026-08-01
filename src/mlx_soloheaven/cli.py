@@ -133,6 +133,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "(env: SOLOHEAVEN_STREAM_COALESCE_MS)",
     )
     p.add_argument(
+        "--max-queue-length",
+        type=int,
+        default=int(_env("MAX_QUEUE_LENGTH", "32")),
+        help="Max inference queue length (waiting + running) for the FIFO "
+             "admission gate that fronts all GPU generation (default: 32). "
+             "Over it, a new request gets 429 queue_full + Retry-After. "
+             "(env: SOLOHEAVEN_MAX_QUEUE_LENGTH)",
+    )
+    p.add_argument(
         "--memory-budget-gb",
         type=float,
         default=float(_env("MEMORY_BUDGET_GB", "200")),

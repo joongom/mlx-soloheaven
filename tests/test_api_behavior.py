@@ -104,6 +104,19 @@ class _StubResult:
     prompt_tps: float = 0.0
     generation_tps: float = 0.0
     cache_info: Optional[dict] = None
+    # Finding 4: a real GenerationResult carries an explicit token_produced flag.
+    token_produced: bool = False
+
+    def __post_init__(self):
+        # These stubs never emit keepalives — any CONTENT frame (no status / no
+        # finish_reason) represents a REAL generated token, so mark it
+        # token_produced (the anchor/keepalive logic keys off this flag now).
+        if (
+            self.status is None
+            and self.finish_reason is None
+            and not self.token_produced
+        ):
+            self.token_produced = True
 
 
 class _StreamStubEngine:

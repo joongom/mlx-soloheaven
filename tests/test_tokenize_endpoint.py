@@ -213,9 +213,18 @@ def test_ready_not_ready_503():
 
 
 def test_ready_ignores_queue_saturation():
-    """CRITICAL POLICY: model+tokenizer ready but busy (in-flight work) -> still
-    200. Readiness must NOT fail on queue saturation."""
-    client = _client(_StubEngine(ready=True, in_flight=5))
+    """CRITICAL POLICY: model+tokenizer ready but the inference queue is busy
+    (running + waiting) -> still 200. Readiness must NOT fail on queue
+    saturation. Batch C: queue_length is now the REAL parent-side gate depth
+    (running + waiting), not the Batch A engine in-flight probe."""
+    from mlx_soloheaven import inference_queue
+
+    # Seed the gate: 1 running generation + 4 queued waiters -> depth 5.
+    gate = inference_queue.get_inference_gate()
+    gate._running = 1
+    gate._waiting = 4
+
+    client = _client(_StubEngine(ready=True, in_flight=0))
     r = client.get("/ready")
     assert r.status_code == 200
     body = r.json()

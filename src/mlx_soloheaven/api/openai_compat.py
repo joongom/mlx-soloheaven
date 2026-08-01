@@ -13,7 +13,7 @@ import logging
 from typing import AsyncGenerator, Optional, TYPE_CHECKING
 
 from fastapi import APIRouter, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import JSONResponse
 
 from pydantic import BaseModel
 
@@ -50,6 +50,13 @@ from mlx_soloheaven.api.errors import (
 from mlx_soloheaven.engine.process_client import EngineRestartingError
 from mlx_soloheaven.engine.types import EngineBusyError
 from mlx_soloheaven.executors import run_critical, run_long, run_read
+from mlx_soloheaven import inference_queue
+from mlx_soloheaven.api import metrics
+from mlx_soloheaven.api.gate_stream import (
+    SlotStreamingResponse,
+    closed_completion_response,
+    closed_stream_response,
+)
 from mlx_soloheaven.engine.tool_parser import (
     CHANNEL_REASONING,
     ThinkingRouter,
@@ -256,7 +263,9 @@ def _validate_sampling_params(request: ChatCompletionRequest) -> Optional[JSONRe
 # --- POST /v1/chat/completions ---
 
 @router.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest):
+async def chat_completions(
+    request: ChatCompletionRequest, raw_request: Request = None
+):
     engine = _get_engine(request.model)
 
     # Fail FAST while the process-mode child worker is dead/respawning:
@@ -353,28 +362,78 @@ async def chat_completions(request: ChatCompletionRequest):
                     "Invalid JSON schema in response_format"
                 )
 
-    # Build message preview for logging
-    msg_preview = []
-    for m in request.messages[:3]:
-        role = m.role
+    # Batch D log-leak scrub: log SAFE request metadata ONLY — never the
+    # message/prompt CONTENT. Prompts can carry user PII/secrets and every log
+    # record is broadcast to the admin log SSE, so we emit the role sequence +
+    # per-message content LENGTHS (chars) + counts, with the text redacted.
+    role_summary = []
+    for m in request.messages[:8]:
         raw = m.content
-        if isinstance(raw, list):
-            content = str(raw)[:80]
-        else:
-            content = (raw or "")[:80].replace('\n', '\\n')
-        msg_preview.append(f"{role}:{content!r}")
-    preview_str = " | ".join(msg_preview)
-    if len(request.messages) > 3:
-        preview_str += f" | ...+{len(request.messages)-3} more"
+        clen = len(str(raw)) if isinstance(raw, list) else len(raw or "")
+        role_summary.append(f"{m.role}({clen})")
+    roles_str = " ".join(role_summary)
+    if len(request.messages) > 8:
+        roles_str += f" ...+{len(request.messages) - 8} more"
     logger.info(
         f"[Request] user={request.user!r}, model={request.model} -> {engine.model_id}, "
         f"stream={request.stream}, thinking={request.thinking}, "
         f"max_tokens={request.max_tokens or request.max_completion_tokens}, "
-        f"messages={len(request.messages)} | {preview_str}"
+        f"messages={len(request.messages)} | roles=[{roles_str}] (content redacted)"
     )
     if request.stream:
-        return StreamingResponse(
-            _stream_completion(request, engine),
+        # Batch C: FIFO + bounded inference-queue admission. Acquire the
+        # single generation slot BEFORE returning StreamingResponse, so a
+        # saturated queue answers a REAL 429 queue_full (once the SSE 200 has
+        # started, a status can no longer be sent) and a shutting-down server
+        # answers 503 — both raised immediately (no await) by the gate and
+        # mapped by the app-level EngineBusyError handler. FIFO waiting blocks
+        # here (the client waits for headers).
+        #
+        # Finding 2: a real queued HTTP disconnect does NOT cancel this
+        # coroutine (uvicorn only wakes receive with http.disconnect), so we
+        # RACE the acquire against a disconnect watcher on the ASGI receive
+        # channel. If the client left while queued, drop the ticket and return
+        # a closed stream — never enter generation.
+        # Findings 3+4: the slot is owned by SlotStreamingResponse, which
+        # closes the inner generation stream (full U13/C1 teardown) BEFORE
+        # releasing the lease, on EVERY exit — including a pre-body cancel
+        # (before the body generator starts) and a mid-send cancel.
+        gate = inference_queue.get_inference_gate()
+        receive = raw_request.receive if raw_request is not None else None
+        # Batch D metrics: queue_wait == the gate acquire duration (time between
+        # the acquire() request and the slot grant). Measured here, threaded into
+        # the stream body which records the per-request metric at completion.
+        _t_acquire = time.perf_counter()
+        try:
+            lease = await inference_queue.acquire_or_disconnect(gate, receive)
+        except inference_queue.ClientDisconnected:
+            logger.info(
+                f"[Request] user={request.user!r} | client disconnected while "
+                f"queued on the inference gate — not generating"
+            )
+            return closed_stream_response()
+        queue_wait = time.perf_counter() - _t_acquire
+        # Finding 3: ARM the deferred metric at generation START (right after the
+        # slot is acquired), defaulting to a CANCEL terminal, so EVERY admitted
+        # request records exactly one metric even if it dies before the body's
+        # explicit terminal record (a client disconnect / mid-frame cancel /
+        # EngineRestartingError). The body UPDATEs ttft/tokens/finish/cache/error
+        # as data arrives; SlotStreamingResponse FIRES it via on_release, strictly
+        # AFTER the lease is released (batch-C: never inside the lease window).
+        metric_sink = metrics.DeferredRequestMetric()
+        metric_sink.arm(
+            model=getattr(engine, "model_id", None),
+            queue_wait=queue_wait,
+            finish_reason="cancel",
+            error_code="cancel",
+        )
+        return SlotStreamingResponse(
+            gate,
+            lease,
+            _stream_completion(
+                request, engine, queue_wait=queue_wait, metric_sink=metric_sink,
+            ),
+            on_release=metric_sink.fire,
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -390,7 +449,176 @@ async def chat_completions(request: ChatCompletionRequest):
         # F2: on the bounded LONG-ops executor (not to_thread's shared
         # default pool) so a burst of these can never exhaust the workers
         # bounded reads (/health, admin) need to even start.
-        return await run_long(_sync_completion, request, engine)
+        # Batch C: the same FIFO gate fronts the non-streaming path (acquire /
+        # run / release all in this coroutine). Queue-full -> 429, shutdown ->
+        # 503; run_long underneath is now uncontended on the API path.
+        #
+        # Batch C round 3, finding 3: make the non-streaming path
+        # disconnect-aware too. uvicorn does NOT cancel the app task on socket
+        # loss, so a bare inference_slot() would PROMOTE a dead queued request
+        # and run the full _sync_completion / engine generation. Race the
+        # acquire against the ASGI disconnect watcher (as the streaming path
+        # does): a client that left while queued is dropped BEFORE
+        # _sync_completion / engine entry, and the lease is released.
+        gate = inference_queue.get_inference_gate()
+        receive = raw_request.receive if raw_request is not None else None
+        # Batch D metrics: time the gate acquire (queue_wait) and the generation.
+        _t_acquire = time.perf_counter()
+        try:
+            lease = await inference_queue.acquire_or_disconnect(gate, receive)
+        except inference_queue.ClientDisconnected:
+            logger.info(
+                f"[Request] user={request.user!r} | client disconnected while "
+                f"queued (non-streaming) — not generating"
+            )
+            # The client is gone; the body is never read. Return a clean empty
+            # response (the lease was already released inside
+            # acquire_or_disconnect before ClientDisconnected was raised).
+            return closed_completion_response()
+        queue_wait = time.perf_counter() - _t_acquire
+        # Finding 3: ARM the metric at generation START (post-admission),
+        # defaulting to an ERROR terminal, so an exception AFTER admission
+        # (EngineRestarting/Busy/any) still records exactly one metric. The
+        # normal path UPDATEs it with the real result; the fire happens in the
+        # finally, strictly AFTER the lease release (batch-C invariant).
+        metric_sink = metrics.DeferredRequestMetric()
+        metric_sink.arm(
+            model=getattr(engine, "model_id", None),
+            queue_wait=queue_wait,
+            finish_reason="error",
+            error_code="server_error",
+        )
+        response = None
+        _gen_elapsed: Optional[float] = None
+        _t_gen = time.perf_counter()
+        try:
+            response = await run_long(_sync_completion, request, engine)
+            _gen_elapsed = time.perf_counter() - _t_gen
+            _record_completion_metrics(
+                engine, response,
+                queue_wait=queue_wait,
+                generation_time=_gen_elapsed,
+                sink=metric_sink,
+            )
+            return response
+        except Exception as exc:
+            # Finding 3: an exception after admission still emits one metric —
+            # error_code by class — fired after the lease release below.
+            metric_sink.update(
+                finish_reason="error",
+                error_code=_error_code_for_exception(exc),
+                generation_time=time.perf_counter() - _t_gen,
+            )
+            raise
+        finally:
+            # Finding 3(b): release the lease FIRST, then fire the per-request
+            # metric — strictly OUTSIDE the lease window, so a metrics-lock stall
+            # (e.g. a slow /metrics scrape) can never extend the inference lease.
+            gate.release(lease)
+            metric_sink.fire()
+
+
+def _error_code_for_exception(exc: Exception) -> str:
+    """Bounded ``error_code`` metric label for a post-admission exception
+    (finding 3). EngineRestartingError -> engine_not_ready; EngineBusyError ->
+    its reason (queue_full / engine_not_ready); anything else -> server_error.
+    Kept to the SAME small vocabulary the HTTP error contract uses so the metric
+    cardinality stays bounded."""
+    if isinstance(exc, EngineRestartingError):
+        return "engine_not_ready"
+    if isinstance(exc, EngineBusyError):
+        reason = getattr(exc, "reason", EngineBusyError.REASON_ENGINE_NOT_READY)
+        return "queue_full" if reason == EngineBusyError.REASON_QUEUE_FULL else "engine_not_ready"
+    return "server_error"
+
+
+def _record_completion_metrics(
+    engine, response, *, queue_wait=None, generation_time=None, sink=None
+) -> None:
+    """Record the Batch D per-request metric for a NON-STREAMING completion.
+
+    ``response`` is a ChatCompletionResponse (normal) or a JSONResponse error
+    object (fail-closed 500 corruption). TTFT is not observed here — a
+    non-streaming request has no first-token event; queue_wait + generation_time
+    are. Defensive: never raises (metrics must not break a response).
+
+    Finding 3: when ``sink`` is a ``DeferredRequestMetric`` the record is MERGED
+    into it (enriching the arm-at-start baseline) and FIRED later by the handler
+    finally, AFTER the lease is released; without a sink it records immediately."""
+    try:
+        model = getattr(engine, "model_id", None)
+        if isinstance(response, ChatCompletionResponse):
+            usage = response.usage
+            finish = response.choices[0].finish_reason if response.choices else None
+            cache_result, reused = metrics.cache_result_from_info(
+                getattr(usage, "cache_info", None)
+            )
+            kwargs = dict(
+                model=model,
+                finish_reason=finish,
+                error_code="none",
+                cache_result=cache_result,
+                reused_tokens=reused,
+                queue_wait=queue_wait,
+                generation_time=generation_time,
+                prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+                completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
+            )
+        else:
+            # A JSONResponse error object (e.g. 500 fail-closed cache corruption).
+            kwargs = dict(
+                model=model,
+                finish_reason="error",
+                error_code="server_error",
+                queue_wait=queue_wait,
+                generation_time=generation_time,
+            )
+        if sink is not None:
+            sink.update(**kwargs)
+        else:
+            metrics.observe_request(**kwargs)
+    except Exception:  # noqa: BLE001 — metrics must never break the response
+        logger.debug("metrics: completion record failed (ignored)", exc_info=True)
+
+
+def _record_stream_metrics(
+    engine, *, finish_reason, error_code, cache_info, queue_wait,
+    t_body_start, t_first_token, prompt_tokens, completion_tokens, sink=None,
+) -> None:
+    """Record the Batch D per-request metric for a STREAMING completion at its
+    terminal frame. Finding 7: TTFT = FIRST engine token frame - body start
+    (anchored the same way as the web-chat path); generation_time = completion -
+    body start. Defensive: never raises.
+
+    Finding 3(b): when ``sink`` is a ``DeferredRequestMetric`` the (lock-taking)
+    record is ARMED here — computed cheaply and lock-free — and FIRED later by
+    ``SlotStreamingResponse`` AFTER the inference lease is released, so metrics
+    recording never sits inside the lease window. Without a sink (direct callers)
+    it records immediately."""
+    try:
+        ttft = (t_first_token - t_body_start) if t_first_token else None
+        generation_time = time.perf_counter() - t_body_start
+        cache_result, reused = metrics.cache_result_from_info(cache_info)
+        kwargs = dict(
+            model=getattr(engine, "model_id", None),
+            finish_reason=finish_reason,
+            error_code=error_code,
+            cache_result=cache_result,
+            reused_tokens=reused,
+            queue_wait=queue_wait,
+            ttft=ttft,
+            generation_time=generation_time,
+            prompt_tokens=prompt_tokens or 0,
+            completion_tokens=completion_tokens or 0,
+        )
+        if sink is not None:
+            # Finding 3: MERGE onto the early-armed baseline (arm-at-start) so a
+            # terminal record enriches it; the fire happens after lease release.
+            sink.update(**kwargs)
+        else:
+            metrics.observe_request(**kwargs)
+    except Exception:  # noqa: BLE001 — metrics must never break the stream
+        logger.debug("metrics: stream record failed (ignored)", exc_info=True)
 
 
 def _sync_completion(request: ChatCompletionRequest, engine: "MLXEngine"):
@@ -533,6 +761,9 @@ def _sync_completion(request: ChatCompletionRequest, engine: "MLXEngine"):
 async def _stream_completion(
     request: ChatCompletionRequest,
     engine: "MLXEngine",
+    *,
+    queue_wait: Optional[float] = None,
+    metric_sink=None,
 ) -> AsyncGenerator[str, None]:
     """Streaming SSE completion with tool call detection.
 
@@ -540,14 +771,33 @@ async def _stream_completion(
     started, a 503 can no longer be sent — if the process-mode child worker
     dies mid-stream (EngineRestartingError), emit a proper in-band error
     frame and a terminating [DONE] so the client sees a clean, explained
-    close instead of a silently-dead stream."""
+    close instead of a silently-dead stream.
+
+    Finding 1(a): the inner body generator is closed in a ``finally`` so an
+    ``aclose()`` of this wrapper (client disconnect) CASCADES GeneratorExit into
+    it — ``async for`` alone does NOT close a nested async generator, so without
+    this the engine stream's C1 teardown would run only later (on GC).
+
+    ``metric_sink`` (finding 3b): the deferred per-request metric the body arms
+    at its terminal frame; SlotStreamingResponse fires it after the lease is
+    released."""
+    body = _stream_completion_body(
+        request, engine, queue_wait=queue_wait, metric_sink=metric_sink,
+    )
     try:
-        async for chunk in _stream_completion_body(request, engine):
+        async for chunk in body:
             yield chunk
     except EngineRestartingError as exc:
         logger.error(
             f"[Stream] user={request.user!r} | engine unavailable mid-stream: {exc}"
         )
+        # Finding 3: the engine died mid-stream — the body's terminal record was
+        # never reached, so UPDATE the early-armed metric to an error terminal
+        # (fired once via on_release after the lease release).
+        if metric_sink is not None:
+            metric_sink.update(
+                finish_reason="error", error_code="engine_not_ready",
+            )
         # Batch B: canonical {message,type,code} envelope; type renamed to
         # engine_not_ready; NO detail:str(exc) leak (exc is logged above). The
         # in-band frame fires under the SAME condition as before — only the
@@ -559,13 +809,25 @@ async def _stream_completion(
         )
         yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
+    finally:
+        # Cascade the close down to the engine stream so its C1 teardown runs.
+        await body.aclose()
 
 
 async def _stream_completion_body(
     request: ChatCompletionRequest,
     engine: "MLXEngine",
+    *,
+    queue_wait: Optional[float] = None,
+    metric_sink=None,
 ) -> AsyncGenerator[str, None]:
     """Streaming SSE completion with tool call detection."""
+    # Batch D metrics: mark the body start (generation start, post gate-acquire)
+    # and the first-token time for TTFT; record the per-request metric at the
+    # terminal points below. ``queue_wait`` is the gate acquire duration measured
+    # by the handler.
+    _t_body_start = time.perf_counter()
+    _t_first_token: Optional[float] = None
     # Determine thinking mode (moved above the input-history strip — codex
     # round 7, finding 3: the strip needs the request's thinking contract).
     # Batch B item 3: top-level `thinking` and nested
@@ -719,22 +981,26 @@ async def _stream_completion_body(
     # corruption) diverts to the in-band error envelope below instead of a
     # normal completion frame.
     final_finish_reason: Optional[str] = None
+    # Finding 1(a): hold the engine stream so its aclose can be cascaded in the
+    # finally below — closing THIS body generator (from _stream_completion's
+    # finally) must drive the engine generator's GeneratorExit rescue (C1).
+    engine_stream = engine.generate_stream_batches_async(
+        messages,
+        max_tokens=request.max_tokens or request.max_completion_tokens,
+        temperature=request.temperature,
+        top_p=request.top_p,
+        min_p=request.min_p,
+        top_k=request.top_k,
+        repetition_penalty=rep_penalty,
+        session_id=request.user,
+        tools=tools,
+        thinking=enable_thinking,
+        thinking_budget=thinking_budget,
+        response_format=response_format,
+        stop=request.stop,
+    )
     try:
-        async for batch in engine.generate_stream_batches_async(
-            messages,
-            max_tokens=request.max_tokens or request.max_completion_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            min_p=request.min_p,
-            top_k=request.top_k,
-            repetition_penalty=rep_penalty,
-            session_id=request.user,
-            tools=tools,
-            thinking=enable_thinking,
-            thinking_budget=thinking_budget,
-            response_format=response_format,
-            stop=request.stop,
-        ):
+        async for batch in engine_stream:
             # Concatenate the batch's content text; capture finish separately.
             chunk_text_parts: list[str] = []
             for result in batch:
@@ -750,6 +1016,15 @@ async def _stream_completion_body(
                     break
                 if result.status == "generating":
                     continue
+                # Finding 4/7: anchor TTFT on the FIRST frame that ACTUALLY
+                # produced a token (``token_produced``) — even when its detok
+                # text is empty (one frame per token, MTP contract) — and NEVER
+                # on a keepalive frame (``token_produced=False``, empty text
+                # emitted during long prefill). ``token == 0`` / empty ``text``
+                # can each be a real token OR a keepalive, so the explicit flag
+                # is the only reliable discriminator. Matches the web-chat path.
+                if result.token_produced and _t_first_token is None:
+                    _t_first_token = time.perf_counter()
                 if not result.text:
                     continue
                 chunk_text_parts.append(result.text)
@@ -770,6 +1045,8 @@ async def _stream_completion_body(
             # ORDER so reasoning/content interleaving (multi-cycle) is preserved.
             acc_parts.append(chunk_text)
             token_count += 1
+            # Finding 7: TTFT is anchored on the first TOKEN frame above (incl.
+            # empty-detok) — NOT here on the first non-empty visible-text batch.
             segments = thinking_router.feed(chunk_text)
             if not segments:
                 # Reasoning-only held partial marker / nothing emittable yet.
@@ -907,13 +1184,37 @@ async def _stream_completion_body(
             if finished:
                 break
     except (asyncio.CancelledError, GeneratorExit) as exc:
-        tail = ("".join(acc_parts))[-200:].replace('\n', '\\n')
+        # Batch D log-leak scrub: do NOT log the generated-output tail (it is
+        # conversation content, broadcast to the admin log SSE). Log only the
+        # safe token count + generated char length.
+        gen_len = len("".join(acc_parts))
         logger.info(
             f"[Stream] user={request.user!r} | client disconnected "
             f"({type(exc).__name__}) after {token_count} tokens | "
-            f"tail={tail!r}"
+            f"generated_chars={gen_len} (content redacted)"
         )
+        # Finding 3: enrich the early-armed (cancel) metric with what streamed
+        # before the disconnect. It stays finish_reason/error_code=cancel and
+        # fires exactly once via on_release AFTER the lease release.
+        if metric_sink is not None:
+            metric_sink.update(
+                finish_reason="cancel",
+                error_code="cancel",
+                queue_wait=queue_wait,
+                ttft=(_t_first_token - _t_body_start) if _t_first_token else None,
+                generation_time=time.perf_counter() - _t_body_start,
+                completion_tokens=final_completion_tokens,
+                prompt_tokens=final_prompt_tokens,
+            )
         raise
+    finally:
+        # Finding 1(a): drive the engine generator's GeneratorExit rescue (C1
+        # commit-or-invalidate) synchronously here. On normal completion the
+        # engine stream is exhausted (no-op); on a disconnect (this except
+        # re-raises) this aclose does not return until C1 has run in BOTH engine
+        # modes, so the gate lease released above this chain is freed only after
+        # the turn is wound down.
+        await engine_stream.aclose()
 
     # U6/F1: corruption-terminated stream. "error" is NOT a valid OpenAI
     # finish_reason, and the already-streamed text is truncated at an
@@ -929,6 +1230,18 @@ async def _stream_completion_body(
             f"[Stream] user={request.user!r} | generation terminated by "
             f"cache corruption after {token_count} tokens — emitting error "
             f"envelope (no tool_calls, nothing persisted)"
+        )
+        # Finding 3: record (UPDATE the armed sink) BEFORE the terminal frames,
+        # so a disconnect between the error frame and [DONE] still fires the
+        # ERROR metric, not the cancel baseline. The fire itself is still after
+        # the lease release (on_release).
+        _record_stream_metrics(
+            engine, finish_reason="error", error_code="server_error",
+            cache_info=final_cache_info, queue_wait=queue_wait,
+            t_body_start=_t_body_start, t_first_token=_t_first_token,
+            prompt_tokens=final_prompt_tokens,
+            completion_tokens=final_completion_tokens,
+            sink=metric_sink,
         )
         # Batch B: canonical {message,type,code} envelope (code now a string).
         # U6/F1 fail-closed semantics unchanged — same terminal condition,
@@ -1042,7 +1355,10 @@ async def _stream_completion_body(
         # Codex round 3, finding 4: with thinking DISABLED the router was a
         # pass-through — the whole text is content and a literal </think> in
         # it is a quote, never a boundary (mirrors the engine's batch parse).
-        if model_family != "gemma4" and not enable_thinking:
+        # gemma4/harmony always split (model-emitted channel markers are
+        # authoritative regardless of the thinking flag — raw marker text
+        # must never persist as content).
+        if model_family not in ("gemma4", "harmony") and not enable_thinking:
             thinking, content = None, "".join(acc_parts)
         else:
             # Codex round 7, finding 3: thinking_active threads the contract
@@ -1051,7 +1367,10 @@ async def _stream_completion_body(
             thinking, content = split_thinking_and_content(
                 "".join(acc_parts),
                 model_family=model_family,
-                started_in_thinking=enable_thinking and model_family != "gemma4",
+                started_in_thinking=(
+                    enable_thinking
+                    and model_family not in ("gemma4", "harmony")
+                ),
                 thinking_active=enable_thinking,
             )
         assistant_msg: dict = {"role": "assistant", "content": content or ""}
@@ -1081,6 +1400,17 @@ async def _stream_completion_body(
                 f"[OpenAI Stream] user={request.user} | post-stream session "
                 f"commit failed (persistence already guaranteed engine-side)"
             )
+
+    # Batch D metrics: record the completed streaming request (bounded labels).
+    # Finding 3(b): armed here, fired after the lease is released.
+    _record_stream_metrics(
+        engine, finish_reason=finish_reason, error_code="none",
+        cache_info=final_cache_info, queue_wait=queue_wait,
+        t_body_start=_t_body_start, t_first_token=_t_first_token,
+        prompt_tokens=final_prompt_tokens,
+        completion_tokens=final_completion_tokens,
+        sink=metric_sink,
+    )
 
     # Final chunk
     final_chunk = ChatCompletionChunk(

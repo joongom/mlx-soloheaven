@@ -115,7 +115,11 @@ class FakeChildConn:
             if q is None or loop is None:
                 return
             frames = [
-                proto.make_batch(rid, [GenerationResult(text="ok").to_dict()]),
+                # Finding 4: a real token frame carries token_produced=True (the
+                # stream readers key their keepalive/anchor off it now).
+                proto.make_batch(
+                    rid, [GenerationResult(text="ok", token_produced=True).to_dict()]
+                ),
                 proto.make_final(
                     rid, GenerationResult(finish_reason="stop").to_dict()
                 ),
@@ -907,6 +911,16 @@ class StubResult:
     prompt_tps: float = 0.0
     generation_tps: float = 0.0
     cache_info: Optional[dict] = None
+    # Finding 4: a CONTENT frame (no status / no finish) is a real token here.
+    token_produced: bool = False
+
+    def __post_init__(self):
+        if (
+            self.status is None
+            and self.finish_reason is None
+            and not self.token_produced
+        ):
+            self.token_produced = True
 
 
 class DyingStubEngine:

@@ -768,42 +768,78 @@ def _run_generate(engine, rid, messages, params, cancel_event, resp_conn,
             last_flush = time.perf_counter()
 
     final_sent = False
-    for result in gen:
-        if cancel_event.is_set():
-            _flush_batch()
-            break
+    try:
+        for result in gen:
+            if cancel_event.is_set():
+                _flush_batch()
+                break
 
-        is_content = (result.status is None and result.finish_reason is None)
-        flush_now = (
-            result.status == "generating"
-            or result.finish_reason is not None
-            or (is_content and not first_content_seen)
-            or not coalescing
-        )
-        if is_content:
-            first_content_seen = True
+            is_content = (result.status is None and result.finish_reason is None)
+            flush_now = (
+                result.status == "generating"
+                or result.finish_reason is not None
+                or (is_content and not first_content_seen)
+                or not coalescing
+            )
+            if is_content:
+                first_content_seen = True
 
-        if result.finish_reason is not None:
-            # Terminal frame: flush pending, then emit as a final frame.
-            _flush_batch()
-            resp_conn.send(proto.make_final(rid, result.to_dict()))
-            final_sent = True
-            continue
+            if result.finish_reason is not None:
+                # Terminal frame: flush pending, then emit as a final frame.
+                _flush_batch()
+                resp_conn.send(proto.make_final(rid, result.to_dict()))
+                final_sent = True
+                continue
 
-        if flush_now:
-            _flush_batch()
-            resp_conn.send(proto.make_batch(rid, [result.to_dict()]))
-            last_flush = time.perf_counter()
-            continue
+            if flush_now:
+                _flush_batch()
+                resp_conn.send(proto.make_batch(rid, [result.to_dict()]))
+                last_flush = time.perf_counter()
+                continue
 
-        batch.append(result.to_dict())
-        now = time.perf_counter()
-        if len(batch) >= coalesce_n or (now - last_flush) * 1000 >= coalesce_ms:
-            _flush_batch()
+            batch.append(result.to_dict())
+            now = time.perf_counter()
+            if len(batch) >= coalesce_n or (now - last_flush) * 1000 >= coalesce_ms:
+                _flush_batch()
 
-    _flush_batch()
-    if not final_sent:
-        resp_conn.send(proto.make_final(rid, None))
+        _flush_batch()
+        if not final_sent:
+            resp_conn.send(proto.make_final(rid, None))
+    finally:
+        # Batch C round 3, finding 1(b) + round-5 NIT 1: drive
+        # generate_stream's C1 commit-or-invalidate teardown (its
+        # GeneratorExit rescue) SYNCHRONOUSLY and DETERMINISTICALLY on EVERY
+        # exit of the generation-driving block — normal completion, a cancel
+        # ``break``, AND any DRIVER-SIDE exception (e.g. an invalid yielded
+        # object failing at the ``result.status`` read above) — BEFORE the
+        # terminal frame is sent.
+        #
+        # The proxy releases the gate lease on EITHER the ``done`` OR the
+        # ``error`` ack (process_client._await_child_cancel_ack treats both as
+        # C1-complete), so C1 must have run before BOTH. Pre-NIT-1 gen.close()
+        # sat only on the straight-line success path below the loop: a
+        # driver-side exception jumped straight to worker_main's outer error
+        # sender, emitting the ``error`` frame while ``gen`` was still
+        # suspended (C1 unrun until GC) — the proxy then freed the lease on
+        # that ``error`` ack mid-teardown, violating the "release only after
+        # C1" contract on the error path.
+        #
+        # Safety: (a) close() on an already-exhausted generator (normal
+        # completion) is a no-op, and generate_stream's C1 is idempotent
+        # (_turn_committed / _stream_reconciled guards) so a redundant close
+        # is harmless; (b) the original driver exception is NOT swallowed —
+        # close() runs in this finally, then the exception propagates to the
+        # outer error sender, which emits the ``error`` frame carrying it
+        # AFTER C1 has run; (c) this runs on the child's engine (main) thread
+        # — the same thread that iterated the generator — which is where C1
+        # MUST run, and it does not block the serial main loop beyond the
+        # synchronous teardown the success path already paid.
+        try:
+            gen.close()
+        except Exception:  # noqa: BLE001 — teardown must never wedge the worker
+            logger.exception(
+                f"[child] rid={rid} generate_stream close (C1 teardown) raised"
+            )
     resp_conn.send(proto.make_done(rid))
 
 

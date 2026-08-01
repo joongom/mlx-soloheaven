@@ -171,6 +171,13 @@ class Config:
     stream_coalesce_n: int = 4
     stream_coalesce_ms: int = 30
 
+    # Batch C: bounded FIFO inference-queue length (waiting + running) for the
+    # parent-side admission gate that fronts all GPU generation. Default 32 —
+    # a sensible single-user ceiling (concurrency-1 generation makes a deeper
+    # backlog stale by construction). Over it, a new request gets 429
+    # queue_full. Overridable via --max-queue-length / SOLOHEAVEN_MAX_QUEUE_LENGTH.
+    max_queue_length: int = 32
+
     # Cache budgets (no time-based TTL — evict LRU when over budget)
     memory_budget_gb: float = 200.0
     disk_budget_gb: float = 100.0
@@ -301,6 +308,7 @@ class Config:
             enable_thinking=not args.no_thinking,
             stream_coalesce_n=args.stream_coalesce_n,
             stream_coalesce_ms=args.stream_coalesce_ms,
+            max_queue_length=args.max_queue_length,
             memory_budget_gb=args.memory_budget_gb,
             disk_budget_gb=args.disk_budget_gb,
             mlx_cache_limit_gb=getattr(args, "mlx_cache_limit_gb", 4.0),

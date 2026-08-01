@@ -198,6 +198,15 @@ _NORMALIZE_RE_TOOL_CALL_CHANNEL = re.compile(
     r"<\|tool_call>.*?<tool_call\|>", re.DOTALL
 )
 _NORMALIZE_RE_TOOL_CALL_XML = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
+# Harmony (gpt-oss) tool-call block inside a content-channel union: a
+# ``<|channel|>commentary``-headed block up to its ``<|call|>`` (canonical)
+# or ``<|end|>`` (degenerate) terminator. Only functions-recipient blocks
+# ever carry these markers into the union — the router/segments emit
+# preamble commentary as a BARE body — so the pattern needs no recipient
+# discrimination. Mirrors the chatml/gemma4 strips above.
+_NORMALIZE_RE_TOOL_CALL_HARMONY = re.compile(
+    r"<\|channel\|>commentary.*?(?:<\|call\|>|<\|end\|>)", re.DOTALL
+)
 # (codex round 13, finding 2: the first-<tool_call> prefix-split regex is
 # retired with the _messages_match shortcut it served.)
 

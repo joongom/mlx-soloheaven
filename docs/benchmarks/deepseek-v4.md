@@ -702,6 +702,21 @@ hc_pre 2.81/86 · rms 2.66/173 · hc_mix 1.56/86 · attn_core 1.40/43.
 Remaining to 40 ms: **-1.7**. The pooling column-scatter half of comp_step
 (-2.3 candidate, online-softmax rewrite) stays queued if needed.
 
+### Stage 3p — shared-expert w1/w3+SwiGLU fused: 40.7 ms / 24.6 tok/s (2026-08-02)
+
+`dsv4_sh13_k`: one simdgroup per inter row does both 8-bit gs64 dots and
+applies the clipped SwiGLU in-register — the shared expert drops from
+2 library qmv + swiglu to ONE dispatch per MoE layer (qmv count 280 -> 194).
+Bench16: 40.7 ms / 24.6 tok/s (1.88x vs 76.5 compiled); sh13 isolated
+1.99 vs the ~2.9 the three dispatches cost.
+
+### Stage 3q — comp_step pooling as online softmax: 40.2 ms / 24.9 tok/s (2026-08-02)
+
+Single pass with running rescale over the row-strided state instead of
+max-then-sum twice (the second half of the Stage 3o bisection). The
+mn > -inf guard skips empty rows so the -inf - -inf NaN intermediate never
+forms. Bench17: 40.2 ms / 24.9 tok/s; comp_step isolated 4.00 -> 3.41.
+
 ## 3. Reproduce
 
 ```bash

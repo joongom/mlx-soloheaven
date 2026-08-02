@@ -49,16 +49,25 @@ step unless profiling later demands it) owning:
 
 ## Verification ladder (development order — each step gates the next)
 
-1. dummy-plan encode-cost measurement (decides re-encode vs ICB)
-2. ONE layer (dense, layer 0) replayed → logits diff vs the MLX compiled
-   step for the same inputs (tolerance bf16 ~1e-2)
-3. layer kinds: +ratio-128 (comp step), +ratio-4 (indexer) — per-kind diff
-4. full 43-layer step + embed/head → token-level agreement with the MLX
-   path over a 32-token greedy run (must be exact or near-exact)
-5. ppl probes through the native path ≈ MLX path (3.65)
-6. serving integration: third path in `Model.__call__` behind
-   `SOLOHEAVEN_DSV4_NATIVE=1`, fallback preserved; multi-turn HIT check
-7. bench: target ≤40 ms/token
+1. ✅ encode-cost measurement — C loop 0.43 µs/dispatch, re-encode wins.
+2. ✅ plumbing proven end-to-end (tests/test_dsv4_native.py): library qmv
+   via C loop == mx.quantized_matmul (diff 0.0); per-token uniform rewrite
+   takes effect with no re-encode; BufferTable dedup + diff 0.0; and OUR
+   custom kernel (kernels.metal, explicit signature, C-loop dispatch) ==
+   the mx.fast version. Every runtime primitive the loop needs now has a
+   passing test.
+3. NEXT: port the remaining kernel bodies into kernels.metal with explicit
+   signatures (attention core, MoE K1, compressor step, HC sinkhorn tail,
+   gate/indexer top-k) — each diffed against its mx.fast twin the same way
+   dsv4_moe_w2 is. This is mechanical: the bodies are frozen and tested.
+4. Build the per-layer plan + session BufferTable from a real Model, replay
+   ONE dense layer → logits diff vs the MLX compiled step (bf16 ~1e-2).
+5. All layer kinds, then the full 43-layer step + embed/head → token-level
+   agreement over a 32-token greedy run.
+6. ppl probes through the native path ≈ MLX path (3.65).
+7. serving integration: third path in `Model.__call__` behind
+   `SOLOHEAVEN_DSV4_NATIVE=1`, fallback preserved; multi-turn HIT check.
+8. bench: target ≤40 ms/token (≥25 tok/s).
 
 ## Known constraints
 

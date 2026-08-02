@@ -202,6 +202,54 @@ class Runtime:
         return self._dylib.dsv4_buffer_contents(buf_ptr)
 
 
+class BufferTable:
+    """Maps mx.arrays to stable (MTLBuffer, offset) entries for a session.
+
+    Every array registered here is kept alive (via its DLPack capsule) for the
+    table's lifetime, so the pointers stay valid. Registration is idempotent by
+    array identity, so shared tensors (e.g. the tied embed/head, or a cache
+    array referenced by several plan items) get ONE slot.
+    """
+
+    def __init__(self):
+        self._ptrs: list[int] = []
+        self._keep: list[object] = []
+        self._index: dict[int, int] = {}  # id(array) -> slot
+
+    def add(self, a: mx.array) -> int:
+        key = id(a)
+        if key in self._index:
+            return self._index[key]
+        ptr, off, cap = mtl_buffer(a)
+        if off != 0:
+            # MLX arrays from quantize/zeros are whole buffers; a nonzero
+            # offset would mean a view we must fold into plan items. None of
+            # the decode tensors are views, so refuse rather than silently
+            # mis-address.
+            raise RuntimeError("registered array has a nonzero byte offset")
+        slot = len(self._ptrs)
+        self._ptrs.append(ptr)
+        self._keep.append((cap, a))  # keep BOTH the capsule and the array
+        self._index[key] = slot
+        return slot
+
+    @property
+    def ptrs(self) -> list[int]:
+        return self._ptrs
+
+
+def register_quantized_linear(table: BufferTable, qlin) -> tuple[int, int, int]:
+    """Slots for a QuantizedLinear/QuantizedSwitchLinear's (weight, scales,
+    biases)."""
+    return table.add(qlin.weight), table.add(qlin.scales), table.add(qlin.biases)
+
+
+def load_custom_kernels(rt: Runtime) -> None:
+    """Compile native/kernels.metal into the runtime's custom library."""
+    with open(os.path.join(_HERE, "kernels.metal")) as f:
+        rt.load_custom_source(f.read())
+
+
 def plan_qmv(rt: Runtime, buf_ids: tuple, K: int, N: int,
              const_off_K: int, const_off_N: int) -> _PlanItem:
     """A single affine_qmv_fast dispatch item. buf_ids = (w, scales, biases,

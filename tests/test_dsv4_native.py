@@ -286,13 +286,14 @@ def test_native_attn_core_matches_mx_fast():
     )
     out = mx.zeros((H * D,), dtype=mx.bfloat16)
     kvo = mx.zeros((D,), dtype=mx.bfloat16)
-    mx.eval(q, kv, ring, comp, cidx, sink, freqs, out_ref, kv_ref, out, kvo)
+    kv32 = kv.reshape(-1).astype(mx.float32)   # attn_core reads fp32 kv now
+    mx.eval(q, kv, kv32, ring, comp, cidx, sink, freqs, out_ref, kv_ref, out, kvo)
     mx.synchronize()
 
     rt_mod.load_custom_kernels(_RT)
     table = rt_mod.BufferTable()
     named = dict(
-        q=q.reshape(-1), kv=kv.reshape(-1), ring=ring.reshape(-1),
+        q=q.reshape(-1), kv=kv32, ring=ring.reshape(-1),
         comp=comp.reshape(-1), cidx=cidx.reshape(-1), sink=sink, freqs=freqs,
         out=out, kv_out=kvo,
     )
@@ -790,7 +791,8 @@ def test_native_full_model_logits_match_reference():
         hx=z(hidden, mx.float32), xn32=z(hidden, mx.float32),
         post=z(hc, mx.float32), comb=z(hc * hc, mx.float32), xn=z(hidden),
         hc_mixes=z((2 + hc) * hc, mx.float32),
-        xall=z(8192), xp0=z(512), qr=z(512), q_raw=z(hidden * 2 // 2 * 2), xp1=z(D), kvn=z(D),
+        xall=z(8192, mx.float32), qr32=z(512, mx.float32), kvn32=z(D, mx.float32),
+        xp0=z(512), qr=z(512), q_raw=z(hidden * 2 // 2 * 2), xp1=z(D), kvn=z(D),
         acore=z(2 * D), kv_roped=z(D), o_lora=z(2 * 512), attn_out=z(hidden), h1=z(hc * hidden, mx.float32),
         scores=z(8, mx.float32), idx=mx.zeros((topk,), mx.int32), w=z(topk, mx.float32),
         hexp=z(topk * 512, mx.float32), y_routed=z(hidden, mx.float32), sg=z(512), su=z(512),
@@ -905,8 +907,10 @@ def test_native_ratio4_attention_plan_matches_reference():
 
     cd, icd = coff * D, icoff * ihd
     scratch = dict(
-        x=x.reshape(-1), ring=ring0.astype(mx.float32).astype(mx.bfloat16).reshape(-1),
-        xall=z(8192), xp0=z(q_lora), qr=z(q_lora), q_raw=z(NHD), xp1=z(D), kvn=z(D), acore=z(NHD),
+        x=x.reshape(-1), x32=x.reshape(-1).astype(mx.float32),
+        ring=ring0.astype(mx.float32).astype(mx.bfloat16).reshape(-1),
+        xall=z(8192, mx.float32), qr32=z(q_lora, mx.float32), kvn32=z(D, mx.float32),
+        xp0=z(q_lora), qr=z(q_lora), q_raw=z(NHD), xp1=z(D), kvn=z(D), acore=z(NHD),
         kv_roped=z(D), o_lora=z(g * o_lora), attn_out=z(hidden), cwkv=z(cd), cwgate=z(cd),
         kv_st=z(coff * ratio * cd, mx.float32), sc_st=ninf(coff * ratio * cd),
         kv_st2=z(coff * ratio * cd, mx.float32), sc_st2=z(coff * ratio * cd, mx.float32),
@@ -985,7 +989,7 @@ def test_native_indexer_kernels_match_reference():
 
     rt_mod.load_custom_kernels(_RT)
     q_raw = idx.wq_b(qr).reshape(-1)
-    wraw = idx.weights_proj(x).reshape(-1)
+    wraw = idx.weights_proj(x).reshape(-1).astype(mx.float32)   # fp32 chain
     scores = mx.zeros((cap,), dtype=mx.float32)
     oi = mx.zeros((topk,), dtype=mx.int32)
     mx.eval(q_raw, wraw, fr, scores, oi)
@@ -1098,8 +1102,10 @@ def test_native_compressed_attention_plan_matches_reference():
 
     cd = attn.compressor.coff * D
     scratch = dict(
-        x=x.reshape(-1), ring=ring0.astype(mx.float32).astype(mx.bfloat16).reshape(-1),
-        xall=z(8192), xp0=z(q_lora), qr=z(q_lora), q_raw=z(NHD), xp1=z(D), kvn=z(D), acore=z(NHD),
+        x=x.reshape(-1), x32=x.reshape(-1).astype(mx.float32),
+        ring=ring0.astype(mx.float32).astype(mx.bfloat16).reshape(-1),
+        xall=z(8192, mx.float32), qr32=z(q_lora, mx.float32), kvn32=z(D, mx.float32),
+        xp0=z(q_lora), qr=z(q_lora), q_raw=z(NHD), xp1=z(D), kvn=z(D), acore=z(NHD),
         kv_roped=z(D), o_lora=z(g * o_lora), attn_out=z(hidden), cwkv=z(cd), cwgate=z(cd),
         kv_st=z(ratio * cd, mx.float32), sc_st=mx.full((ratio * cd,), -mx.inf, mx.float32),
         kv_st2=z(ratio * cd, mx.float32), sc_st2=z(ratio * cd, mx.float32),
@@ -1180,7 +1186,8 @@ def test_native_full_block_plan_matches_reference():
         hx=z(hidden, mx.float32), xn32=z(hidden, mx.float32),
         post=z(hc, mx.float32), comb=z(hc * hc, mx.float32), xn=z(hidden),
         hc_mixes=z((2 + hc) * hc, mx.float32),
-        xall=z(8192), xp0=z(q_lora), qr=z(q_lora), q_raw=z(NHD), xp1=z(D), kvn=z(D), acore=z(NHD),
+        xall=z(8192, mx.float32), qr32=z(q_lora, mx.float32), kvn32=z(D, mx.float32),
+        xp0=z(q_lora), qr=z(q_lora), q_raw=z(NHD), xp1=z(D), kvn=z(D), acore=z(NHD),
         kv_roped=z(D), o_lora=z(g * o_lora), attn_out=z(hidden), h1=z(hc * hidden, mx.float32),
         scores=z(n_exp, mx.float32), idx=mx.zeros((topk,), mx.int32), w=z(topk, mx.float32),
         hexp=z(topk * inter, mx.float32), y_routed=z(hidden, mx.float32), sg=z(inter),
@@ -1260,7 +1267,8 @@ def test_native_qmv_into_attn_core_chain():
     ac = BUFFER_SLOTS["dsv4_attn_core"]
     s = {nm: table.add(a) for nm, a in [
         ("qr", qr), ("wqb_q", wqb_q), ("wqb_s", wqb_s), ("wqb_b", wqb_b),
-        ("q_raw", q_raw), ("kv", kv.reshape(-1)), ("ring", ring.reshape(-1)),
+        ("q_raw", q_raw), ("kv", kv.reshape(-1).astype(mx.float32)),
+        ("ring", ring.reshape(-1)),
         ("dummy", dummy.reshape(-1)), ("didx", didx.reshape(-1)),
         ("sink", sink), ("freqs", freqs), ("out", out), ("kvo", kvo)]}
     const = struct.pack("<ii5i2f2i", QLORA, NHD, D, RD, WIN, 0, 1,
@@ -1343,8 +1351,12 @@ def test_native_dense_attention_plan_matches_reference():
 
     ring = (ring0.astype(mx.float32).astype(mx.bfloat16)).reshape(-1)
     scratch = dict(
-        x=x.reshape(-1), ring=ring, xall=z(8192), xp0=z(q_lora), qr=z(q_lora), q_raw=z(NHD),
-        xp1=z(D), kvn=z(D), out=z(NHD), kv_roped=z(D), o_lora=z(g * o_lora),
+        x=x.reshape(-1), x32=x.reshape(-1).astype(mx.float32), ring=ring,
+        xall=z(8192, mx.float32),
+        qr32=z(q_lora, mx.float32), kvn32=z(D, mx.float32),
+        xp0=z(q_lora), qr=z(q_lora), q_raw=z(NHD),
+        xp1=z(D), xp1_32=z(D, mx.float32), kvn=z(D), out=z(NHD),
+        kv_roped=z(D), o_lora=z(g * o_lora),
         attn_out=z(hidden), dummy=z(D), dummy_idx=mx.full((1,), -1, dtype=mx.int32),
         sink=attn.attn_sink, freqs=attn._freqs, ioff=mx.array([offset, 0], dtype=mx.int32),
     )
@@ -1356,6 +1368,16 @@ def test_native_dense_attention_plan_matches_reference():
     ioff_off, _ = cb.add("2i", offset, 0)
     items = []
 
+    def pl_qmv8(qlin, xs, ys, K, N):
+        o, _ = cb.add("2i", K, N)
+        k = BUFFER_SLOTS["dsv4_qmv8_k"]
+        return rt_mod.plan_item(
+            _RT, "dsv4_qmv8_k", True,
+            [(xs, k["x"]), (T.add(qlin.weight), k["weight"]),
+             (T.add(qlin.scales), k["scales"]), (T.add(qlin.biases), k["biases"]),
+             (ys, k["out"])],
+            [(o, 8, k["params"])], ((N + 7) // 8, 1, 1), (256, 1, 1))
+
     def qmv(w, s, b, xs, ys, K, N, w_off=0, s_off=0, b_off=0, xoff=0, yoff=0):
         ko, _ = cb.add("ii", K, N)
         return rt_mod.plan_item(
@@ -1364,11 +1386,19 @@ def test_native_dense_attention_plan_matches_reference():
              (xs, 3, xoff), (ys, 4, yoff)],
             [(ko, 4, 5), (ko + 4, 4, 6)], (1, (N + 7) // 8, 1), (32, 2, 1))
 
-    def rms(w, xs, ys, d):
+    def rms(w, xs, ys, d, ys32=None):
         o, _ = cb.add("if", d, attn.eps)
-        r = BUFFER_SLOTS["dsv4_rms_k"]
+        if ys32 is None:
+            r = BUFFER_SLOTS["dsv4_rms_k"]
+            return rt_mod.plan_item(
+                _RT, "dsv4_rms_k", True, [(xs, r["x"]), (T.add(w), r["w"]), (ys, r["y"])],
+                [(o, 4, r["params"]), (o + 4, 4, r["feps"])], (1, 1, 1), (256, 1, 1))
+        # attn_core reads the fp32 copy (Stage 4d): dsv4_rms32_k emits both,
+        # but its x must be fp32 — xp1_32 holds the same values.
+        r = BUFFER_SLOTS["dsv4_rms32_k"]
         return rt_mod.plan_item(
-            _RT, "dsv4_rms_k", True, [(xs, r["x"]), (T.add(w), r["w"]), (ys, r["y"])],
+            _RT, "dsv4_rms32_k", True,
+            [(xs, r["x"]), (T.add(w), r["w"]), (ys, r["y"]), (ys32, r["y32"])],
             [(o, 4, r["params"]), (o + 4, 4, r["feps"])], (1, 1, 1), (256, 1, 1))
 
     items.append(qmv(attn.wq_a.weight, attn.wq_a.scales, attn.wq_a.biases,
@@ -1376,16 +1406,15 @@ def test_native_dense_attention_plan_matches_reference():
     items.append(rms(attn.q_norm.weight, S["xp0"], S["qr"], q_lora))
     items.append(qmv(attn.wq_b.weight, attn.wq_b.scales, attn.wq_b.biases,
                      S["qr"], S["q_raw"], q_lora, NHD))
-    items.append(qmv(attn.wkv.weight, attn.wkv.scales, attn.wkv.biases,
-                     S["x"], S["xp1"], hidden, D))
-    items.append(rms(attn.kv_norm.weight, S["xp1"], S["kvn"], D))
+    items.append(pl_qmv8(attn.wkv, S["x32"], S["xp1_32"], hidden, D))
+    items.append(rms(attn.kv_norm.weight, S["xp1_32"], S["kvn"], D, S["kvn32"]))
 
     ac = BUFFER_SLOTS["dsv4_attn_core"]
     po, _ = cb.add("5i", D, attn.rope_dim, win, 0, 1)
     fo, _ = cb.add("2f", attn.scale, attn.eps)
     items.append(rt_mod.plan_item(
         _RT, "dsv4_attn_core", True,
-        [(S["q_raw"], ac["q"]), (S["kvn"], ac["kv"]), (S["ring"], ac["ring"]),
+        [(S["q_raw"], ac["q"]), (S["kvn32"], ac["kv"]), (S["ring"], ac["ring"]),
          (S["dummy"], ac["comp"]), (S["dummy_idx"], ac["cidx"]), (S["sink"], ac["sink"]),
          (S["freqs"], ac["freqs"]), (S["out"], ac["out"]), (S["kv_roped"], ac["kv_out"])],
         [(po, 20, ac["params"]), (fo, 8, ac["fscal"]), (ioff_off, 8, ac["ioff"])],

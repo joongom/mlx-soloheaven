@@ -135,7 +135,10 @@ class NativeDecoder:
             hc_mixes=self._z((2 + hc) * hc, mx.float32),
             # xall: the stacked x-projection output, sized for the widest layer
             # kind (ratio-4: q_lora + D + 2*(2D) + idx heads + 2*(2*idx_hd)).
-            xall=self._z(q_lora + D + 4 * D + i_nh + 4 * ihd),
+            # fp32: every projection consumer in a layer reads a slice of
+            # this, so its rounding dominated the layer's divergence (4d)
+            xall=self._z(q_lora + D + 4 * D + i_nh + 4 * ihd, mx.float32),
+            qr32=self._z(q_lora, mx.float32), kvn32=self._z(D, mx.float32),
             xp0=self._z(q_lora), qr=self._z(q_lora), q_raw=self._z(NHD), xp1=self._z(D),
             kvn=self._z(D), acore=self._z(NHD), kv_roped=self._z(D), o_lora=self._z(NHD),
             attn_out=self._z(hidden), h1=self._z(hc * hidden, mx.float32), scores=self._z(self._cap, mx.float32),

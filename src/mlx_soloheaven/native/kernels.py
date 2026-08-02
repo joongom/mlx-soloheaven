@@ -38,13 +38,18 @@ _SPECS = {
     ),
     "dsv4_attn_core": (
         "_ATTN_CORE_SRC",
-        [("q", _B), ("kv", _B), ("ring", _B), ("comp", _B), ("cidx", _I),
+        [("q", _B), ("kv", _F), ("ring", _B), ("comp", _B), ("cidx", _I),
          ("sink", _F), ("freqs", _F), ("params", _I), ("fscal", _F),
          ("ioff", _I), ("out", "device bfloat*"), ("kv_out", "device bfloat*")],
     ),
     "dsv4_ring_store_k": (
         "_RING_STORE_SRC",
         [("src", _B), ("params", _I), ("ioff", _I), ("ring", "device bfloat*")],
+    ),
+    "dsv4_qmv8_k": (
+        "_QMV8_SRC",
+        [("x", _F), ("weight", _U), ("scales", _B), ("biases", _B),
+         ("params", _I), ("out", "device float*")],
     ),
     "dsv4_wo_a_k": (
         "_WO_A_SRC",
@@ -68,7 +73,7 @@ _SPECS = {
     ),
     "dsv4_idx_score_k": (
         "_IDX_SCORE_SRC",
-        [("q", _B), ("buf", _B), ("w", _B), ("freqs", _F), ("params", _I),
+        [("q", _B), ("buf", _B), ("w", _F), ("freqs", _F), ("params", _I),
          ("fscal", _F), ("ioff", _I), ("scores", "device float*")],
     ),
     "dsv4_idx_topk_k": (
@@ -137,7 +142,7 @@ _SPECS = {
     ),
     "dsv4_comp_step": (
         "_COMP_STEP_SRC",
-        [("kv_row", _B), ("sc_row", _B), ("kv_st", "device float*"),
+        [("kv_row", _F), ("sc_row", _F), ("kv_st", "device float*"),
          ("sc_st", "device float*"),
          ("ape", _F), ("nw", _B), ("freqs", _F), ("params", _I), ("feps", _F),
          ("ioff", _I), ("row_out", "device bfloat*"), ("old_row", _B)],

@@ -56,7 +56,20 @@ class Planner:
              (self.t.add(mod.biases), 2, b_off), (self.S[x], 3, xoff), (self.S[y], 4, yoff)],
             [(ko, 4, 5), (ko + 4, 4, 6)], (1, (N + 7) // 8, 1), (32, 2, 1))
 
-    def rms32(self, w, x, y, y32, d, eps):
+    def qmv8(self, qlin, x, y, K, N):
+        """8-bit affine qmv, FP32 activation in and out (dsv4_qmv8_k). Used
+        for the stacked x-projection so the layer's dominant input carries no
+        bf16 rounding — see _QMV8_SRC."""
+        o, _ = self.cb.add("2i", K, N)
+        k = BUFFER_SLOTS["dsv4_qmv8_k"]
+        return self._pi(
+            "dsv4_qmv8_k", True,
+            [(self.S[x], k["x"]), (self.t.add(qlin.weight), k["weight"]),
+             (self.t.add(qlin.scales), k["scales"]), (self.t.add(qlin.biases), k["biases"]),
+             (self.S[y], k["out"])],
+            [(o, 8, k["params"])], ((N + 7) // 8, 1, 1), (256, 1, 1))
+
+    def rms32(self, w, x, y, y32, d, eps, xoff=0):
         """RMS over an FP32 stream, emitting the bf16 vector the qmv consumes
         AND an fp32 copy for the MoE gate (whose expert pick is the decode
         path's only discrete decision — see _RMS32_SRC)."""
@@ -64,7 +77,7 @@ class Planner:
         r = BUFFER_SLOTS["dsv4_rms32_k"]
         return self._pi(
             "dsv4_rms32_k", True,
-            [(self.S[x], r["x"]), (self.t.add(w), r["w"]), (self.S[y], r["y"]),
+            [(self.S[x], r["x"], xoff), (self.t.add(w), r["w"]), (self.S[y], r["y"]),
              (self.S[y32], r["y32"])],
             [(o, 4, r["params"]), (o + 4, 4, r["feps"])], (1, 1, 1), (256, 1, 1))
 
@@ -189,7 +202,8 @@ def plan_indexer(pl: Planner, idxr, freqs, xin: str, qr: str, idx_cache: dict,
 
 def plan_attention(pl: Planner, attn, xin: str, ring: str, out: str,
                    ioff_off: int, comp_cache: dict | None = None, ncomp: int = 0,
-                   n: int = 0, idx_cache: dict | None = None) -> list:
+                   n: int = 0, idx_cache: dict | None = None,
+                   xin32: str | None = None) -> list:
     """Attention on scratch[xin] (the attn_norm output) -> scratch[out].
     Dense (comp_cache is None) or plain-compressed (ratio-128: comp_cache
     names the compressor state slots, ncomp = visible compressed groups).
@@ -212,13 +226,17 @@ def plan_attention(pl: Planner, attn, xin: str, ring: str, out: str,
     shim = types.SimpleNamespace(weight=sqw, scales=ssc, biases=sbs)
     offs, acc = [], 0
     for sz in sizes:
-        offs.append(acc * 2)  # bf16 bytes
+        offs.append(acc * 4)  # fp32 bytes (the stacked output is fp32)
         acc += sz
+    # xall is FP32: it feeds every projection consumer in the layer, so its
+    # rounding used to dominate the layer's divergence (Stage 4d). q_norm
+    # still emits bf16 qr for the library wq_b; kv_norm's fp32 copy goes to
+    # attn_core, which is ours.
     items = [
-        pl.qmv(shim, xin, "xall", hidden, acc),
-        pl.rms(a.q_norm.weight, "xall", "qr", q_lora, a.eps, xoff=offs[0]),
+        pl.qmv8(shim, xin32 or f"{xin}32", "xall", hidden, acc),
+        pl.rms32(a.q_norm.weight, "xall", "qr", "qr32", q_lora, a.eps, xoff=offs[0]),
         pl.qmv(a.wq_b, "qr", "q_raw", q_lora, NHD),
-        pl.rms(a.kv_norm.weight, "xall", "kvn", D, a.eps, xoff=offs[1]),
+        pl.rms32(a.kv_norm.weight, "xall", "kvn", "kvn32", D, a.eps, xoff=offs[1]),
     ]
     kc, plain = 0, 1
     comp_slot, cidx_slot = "dummy", "dummy_idx"
@@ -240,7 +258,7 @@ def plan_attention(pl: Planner, attn, xin: str, ring: str, out: str,
     fo, _ = pl.cb.add("2f", a.scale, a.eps)
     items.append(pl._pi(
         "dsv4_attn_core", True,
-        [(pl.S["q_raw"], ac["q"]), (pl.S["kvn"], ac["kv"]), (pl.S[ring], ac["ring"]),
+        [(pl.S["q_raw"], ac["q"]), (pl.S["kvn32"], ac["kv"]), (pl.S[ring], ac["ring"]),
          (pl.S[comp_slot], ac["comp"]), (pl.S[cidx_slot], ac["cidx"]),
          (pl.t.add(a.attn_sink), ac["sink"]), (pl.t.add(a._freqs), ac["freqs"]),
          (pl.S["acore"], ac["out"]), (pl.S["kv_roped"], ac["kv_out"])],

@@ -2205,6 +2205,42 @@ _ADD_SRC = """
     out[tid] = T(float(a[tid]) + float(b[tid]));
 """
 
+_QMV8_SRC = """
+    // 8-bit affine qmv with an FP32 activation in AND out.
+    //   out[j] = sum_i deq(weight[j, i]) * x[i],  deq = q * scale + bias
+    // The library qmv is bf16-in/bf16-out; every such buffer is a rounding
+    // point, and a native kernel's last bit differs from MLX's, which the
+    // 43-layer HC ladder amplifies ~240x (Stage 4d). Keeping the activation
+    // chain in fp32 makes this path track the unquantized model MORE closely
+    // than the bf16 reference does, instead of chasing its rounding.
+    // One simdgroup per output row; weight is uint32-packed 8-bit gs64.
+    uint sg_id = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint row = threadgroup_position_in_grid.x * 8 + sg_id;
+    const int K = params[0];
+    const int N = params[1];
+    if (row >= (uint)N) return;
+    const int words = K / 4;
+    const uint wbase = row * (uint)words;
+    const uint sbase = row * (uint)(K / 64);
+    float a = 0.0f;
+    for (int w = lane; w < words; w += 32) {
+        uint p = weight[wbase + w];
+        float sc = float(scales[sbase + w / 16]);
+        float bi = float(biases[sbase + w / 16]);
+        float aw = 0.0f, sw = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            float xk = x[w * 4 + k];
+            aw += float((p >> (8 * k)) & 0xFFu) * xk;
+            sw += xk;
+        }
+        a += aw * sc + sw * bi;
+    }
+    a = simd_sum(a);
+    if (lane == 0) out[row] = a;
+"""
+
 _WO_A_SRC = """
     // Grouped 8-bit affine qmv for the o_groups low-rank O projection:
     //   out[gi*o_lora + j] = sum_i deq(w[gi, j, i]) * x[gi*gin + i]

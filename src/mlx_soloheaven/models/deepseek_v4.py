@@ -1039,8 +1039,8 @@ _ATTN_CORE_SRC = """
             a0 = e * c + o * s;
             a1 = o * c - e * s;
         }
-        out[h_ * D + i0] = T(a0);
-        out[h_ * D + i0 + 1] = T(a1);
+        out[h_ * D + i0] = HCSTORE(a0);
+        out[h_ * D + i0 + 1] = HCSTORE(a1);
     }
 """
 
@@ -1158,6 +1158,7 @@ def _get_attn_core_kernel():
                          "params", "fscal", "ioff"],
             output_names=["out", "kv_out"],
             source=_ATTN_CORE_SRC,
+            header="#define HCSTORE(v) T(v)\n",
         )
     return _attn_core_kernel
 
@@ -2274,7 +2275,7 @@ _WO_A_SRC = """
         a += aw * sc + sw * bi;
     }
     a = simd_sum(a);
-    if (lane == 0) out[row] = T(a);
+    if (lane == 0) out[row] = HCSTORE(a);
 """
 
 _SH13_SRC = """
@@ -2316,7 +2317,7 @@ _SH13_SRC = """
     if (lane == 0) {
         float g = a1, u = a3;
         if (limit > 0.0f) { u = clamp(u, -limit, limit); g = min(g, limit); }
-        out[row] = T((g / (1.0f + exp(-g))) * u);
+        out[row] = HCSTORE((g / (1.0f + exp(-g))) * u);
     }
 """
 
@@ -2631,11 +2632,10 @@ _MOE_K1_SRC = """
         float bgv = float(gb[sbase + g_]);
         float suv = float(us[sbase + g_]);
         float buv = float(ub[sbase + g_]);
-        const device bfloat* xv = x + w * 16;
         float ag = 0.0f, au = 0.0f, sx = 0.0f;
         #pragma unroll
         for (int j = 0; j < 16; ++j) {
-            float xj = float(xv[j]);
+            float xj = float(x[w * 16 + j]);
             ag += float((pg >> (2 * j)) & 3u) * xj;
             au += float((pu >> (2 * j)) & 3u) * xj;
             sx += xj;

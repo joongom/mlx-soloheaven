@@ -140,11 +140,17 @@ class NativeDecoder:
             xall=self._z(q_lora + D + 4 * D + i_nh + 4 * ihd, mx.float32),
             qr32=self._z(q_lora, mx.float32), kvn32=self._z(D, mx.float32),
             xp0=self._z(q_lora), qr=self._z(q_lora), q_raw=self._z(NHD), xp1=self._z(D),
-            kvn=self._z(D), acore=self._z(NHD), kv_roped=self._z(D), o_lora=self._z(NHD),
-            attn_out=self._z(hidden), h1=self._z(hc * hidden, mx.float32), scores=self._z(self._cap, mx.float32),
+            kvn=self._z(D), kv_roped=self._z(D),
+            # the attention/FFN OUTPUT path stays fp32: these land straight in
+            # the residual (|attn_out| ~4-18 vs |h| ~1.1), so a bf16 round here
+            # injects 1.5-6% per layer — the dominant divergence (Stage 4d).
+            acore=self._z(NHD, mx.float32), o_lora=self._z(NHD, mx.float32),
+            attn_out=self._z(hidden, mx.float32),
+            h1=self._z(hc * hidden, mx.float32), scores=self._z(self._cap, mx.float32),
             idx=mx.zeros((self.topk,), mx.int32), w=self._z(self.topk, mx.float32),
             hexp=self._z(self.topk * inter, mx.float32), y_routed=self._z(hidden, mx.float32),
-            sg=self._z(inter), su=self._z(inter), sh=self._z(inter), shared=self._z(hidden),
+            sg=self._z(inter), su=self._z(inter),
+            sh=self._z(inter, mx.float32), shared=self._z(hidden, mx.float32),
             moe_out=self._z(hidden), cwkv=self._z(2 * D), cwgate=self._z(2 * D),
             i_ckv=self._z(2 * ihd), i_cwg=self._z(2 * ihd), iw=self._z(i_nh),
             iq=self._z(i_nh * ihd), cidx=mx.zeros((512,), mx.int32),

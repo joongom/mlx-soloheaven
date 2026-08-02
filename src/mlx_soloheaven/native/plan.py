@@ -280,7 +280,7 @@ def plan_attention(pl: Planner, attn, xin: str, ring: str, out: str,
          (pl.t.add(a.wo_a.scales), wa["scales"]), (pl.t.add(a.wo_a.biases), wa["biases"]),
          (pl.S["o_lora"], wa["out"])],
         [(wo, 12, wa["params"])], ((g * o_lora + 7) // 8, 1, 1), (256, 1, 1)))
-    items.append(pl.qmv(a.wo_b, "o_lora", out, g * o_lora, hidden))
+    items.append(pl.qmv8(a.wo_b, "o_lora", out, g * o_lora, hidden))
     return items
 
 
@@ -325,7 +325,7 @@ def plan_moe(pl: Planner, ffn, xin: str, out: str, topk: int, rscale: float,
     w1 = BUFFER_SLOTS["dsv4_moe_w13"]
     items.append(pl._pi(
         "dsv4_moe_w13", True,
-        [(pl.S[xin], w1["x"]), (pl.t.add(exp.gate_proj.weight), w1["gw"]),
+        [(pl.S["xn32"], w1["x"]), (pl.t.add(exp.gate_proj.weight), w1["gw"]),
          (pl.t.add(exp.gate_proj.scales), w1["gs_"]), (pl.t.add(exp.gate_proj.biases), w1["gb"]),
          (pl.t.add(exp.up_proj.weight), w1["uw"]), (pl.t.add(exp.up_proj.scales), w1["us"]),
          (pl.t.add(exp.up_proj.biases), w1["ub"]), (pl.S["idx"], w1["idxs"]), (pl.S["hexp"], w1["h"])],
@@ -345,7 +345,7 @@ def plan_moe(pl: Planner, ffn, xin: str, out: str, topk: int, rscale: float,
     sf, _ = pl.cb.add("f", limit)
     items.append(pl._pi(
         "dsv4_sh13_k", True,
-        [(pl.S[xin], k13["x"]),
+        [(pl.S["xn32"], k13["x"]),
          (pl.t.add(sh.w1.weight), k13["w1"]), (pl.t.add(sh.w1.scales), k13["s1"]),
          (pl.t.add(sh.w1.biases), k13["b1"]),
          (pl.t.add(sh.w3.weight), k13["w3"]), (pl.t.add(sh.w3.scales), k13["s3"]),
@@ -353,7 +353,7 @@ def plan_moe(pl: Planner, ffn, xin: str, out: str, topk: int, rscale: float,
          (pl.S["sh"], k13["out"])],
         [(so, 8, k13["params"]), (sf, 4, k13["feps"])],
         ((inter + 7) // 8, 1, 1), (256, 1, 1)))
-    items.append(pl.qmv(sh.w2, "sh", "shared", inter, hidden))
+    items.append(pl.qmv8(sh.w2, "sh", "shared", inter, hidden))
     # No add here: the block's hc_post2 fuses y_routed + shared into its x.
     return items
 

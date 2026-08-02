@@ -27,7 +27,7 @@ _F = "const device float*"
 _SPECS = {
     "dsv4_moe_w13": (
         "_MOE_K1_SRC",
-        [("x", _B), ("gw", _U), ("gs_", _B), ("gb", _B), ("uw", _U), ("us", _B),
+        [("x", _F), ("gw", _U), ("gs_", _B), ("gb", _B), ("uw", _U), ("us", _B),
          ("ub", _B), ("idxs", _I), ("params", _I), ("feps", _F),
          ("h", "device float*")],
     ),
@@ -40,7 +40,7 @@ _SPECS = {
         "_ATTN_CORE_SRC",
         [("q", _B), ("kv", _F), ("ring", _B), ("comp", _B), ("cidx", _I),
          ("sink", _F), ("freqs", _F), ("params", _I), ("fscal", _F),
-         ("ioff", _I), ("out", "device bfloat*"), ("kv_out", "device bfloat*")],
+         ("ioff", _I), ("out", "device float*"), ("kv_out", "device bfloat*")],
     ),
     "dsv4_ring_store_k": (
         "_RING_STORE_SRC",
@@ -53,14 +53,14 @@ _SPECS = {
     ),
     "dsv4_wo_a_k": (
         "_WO_A_SRC",
-        [("x", _B), ("weight", _U), ("scales", _B), ("biases", _B),
-         ("params", _I), ("out", "device bfloat*")],
+        [("x", _F), ("weight", _U), ("scales", _B), ("biases", _B),
+         ("params", _I), ("out", "device float*")],
     ),
     "dsv4_sh13_k": (
         "_SH13_SRC",
-        [("x", _B), ("w1", _U), ("s1", _B), ("b1", _B),
+        [("x", _F), ("w1", _U), ("s1", _B), ("b1", _B),
          ("w3", _U), ("s3", _B), ("b3", _B),
-         ("params", _I), ("feps", _F), ("out", "device bfloat*")],
+         ("params", _I), ("feps", _F), ("out", "device float*")],
     ),
     "dsv4_swiglu_k": (
         "_SWIGLU_SRC",
@@ -132,12 +132,12 @@ _SPECS = {
     ),
     "dsv4_hc_post_k": (
         "_HC_POST_SRC",
-        [("x", _B), ("residual", _F), ("post", _F), ("comb", _F), ("params", _I),
+        [("x", _F), ("residual", _F), ("post", _F), ("comb", _F), ("params", _I),
          ("y", "device float*")],
     ),
     "dsv4_hc_post2_k": (
         "_HC_POST2_SRC",
-        [("a", _F), ("b", _B), ("residual", _F), ("post", _F), ("comb", _F),
+        [("a", _F), ("b", _F), ("residual", _F), ("post", _F), ("comb", _F),
          ("params", _I), ("y", "device float*")],
     ),
     "dsv4_comp_step": (

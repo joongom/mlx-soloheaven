@@ -28,9 +28,13 @@ import os
 import subprocess
 import sys
 
+# Default = the SHIPPED build. An unset DSV4_MODEL once silently measured
+# the old min/max build and produced a false "weights regressed" alarm
+# (ledger Stage 4a correction) — quality numbers are meaningless without
+# the build they were measured on, so load() also prints the resolved path.
 MODEL = os.environ.get(
     "DSV4_MODEL",
-    "~/.lmstudio/models/mlx-soloheaven/DeepSeek-V4-Flash-0731-MLX-2bit-mixed",
+    "~/.lmstudio/models/mlx-soloheaven/DeepSeek-V4-Flash-0731-MLX-2bit-search",
 )
 
 
@@ -62,6 +66,7 @@ def load():
     from mlx_lm.utils import load_model
 
     path = os.path.expanduser(MODEL)
+    print(f"[validate] model: {path}", flush=True)
     model, _ = load_model(Path(path))
     # AutoTokenizer consults AutoConfig for the unknown model_type and
     # transformers 5.x's generic config trips over rope_scaling; loading the

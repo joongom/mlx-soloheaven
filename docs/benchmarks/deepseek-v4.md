@@ -770,14 +770,22 @@ model. The investigation chain and its traps, in order:
    batch 7.11 / compiled-decode 6.98 / **native-decode 6.96** (ALL) —
    the native path is quality-EQUIVALENT. Gate PASSED.
 
-**Separate finding, blocking serving**: the model directory
-`...-2bit-search` was rewritten 2026-08-02 01:43 (after the ledger's §1.1
-measurement) and now scores ko 17.80 / en 9.17 / code 1.54 / ALL 7.11 —
-numerically the MIN/MAX (pre-fix) build's row (17.91/9.01/1.55/7.11), not
-the shipped search build (6.60/4.12/1.46/3.69). The error-searched weights
-appear to have been overwritten by a converter run. Every speed number in
-this ledger is unaffected (quantization scales do not change kernel
-timing); quality-sensitive serving needs the search build reconverted.
+**CORRECTION (same day)**: the paragraph that stood here claimed the
+`-2bit-search` weights had been overwritten and regressed. **False — it
+was a measurement error on this side.** `validate_deepseek_v4.py`'s MODEL
+default (DSV4_MODEL unset) pointed at `-2bit-mixed`, so every Stage 4a
+quality run measured the OLD min/max build — hence the exact match with
+§1.1's mixed row. Proof the code did not regress either: batch ppl at
+pre-campaign commit d8b55fe, same (default) build, gives the identical
+17.91/9.01/1.55/7.11. The -search shards (one conversion run 01:10-01:43,
+untouched since) show no evidence of damage. Consequences: the speed
+numbers stand (the builds differ only in scale VALUES — identical sizes
+and kernel timing); the three-way path-equivalence verdict stands (all
+paths measured on the same weights); only the "weights regressed" claim is
+retracted. The default now points at the shipped `-search` build so an
+unset DSV4_MODEL can't silently measure the wrong build again. Lesson:
+**a quality number is meaningless without the build it was measured on —
+print the resolved model path in every validate run** (validate now does).
 
 New validate subcommands: `nativecheck` (seeded-session agreement,
 determinism, mini second turn), `pplnative` / `ppldec` (teacher-forced ppl

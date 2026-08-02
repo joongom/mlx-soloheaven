@@ -2231,6 +2231,11 @@ _WO_A_SRC = """
     // replacing the o_groups (8) separate library qmv dispatches with ONE.
     // One simdgroup per output row (gi, j); weight is uint32-packed 8-bit gs64
     // (4 values/word, one scale+bias per 64 = 16 words), affine w = q*sc + bi.
+    // Pairing two rows per simdgroup (as done in moe_w2, where it is worth
+    // -1.6 ms) measured 3.45 -> 3.73 ms HERE — see Stage 4k: this kernel's
+    // activation is only 8 KB per group and already L1-resident, so the
+    // halved loads bought nothing and the doubled live weight stream cost
+    // occupancy. Do not re-pair it without a new measurement.
     uint sg_id = simdgroup_index_in_threadgroup;
     uint lane = thread_index_in_simdgroup;
     uint row = threadgroup_position_in_grid.x * 8 + sg_id;
@@ -2595,6 +2600,11 @@ _MOE_K1_SRC = """
     const int d_inner = params[2];
     const float limit = feps[0];
 
+    // One inner row per simdgroup. Pairing two rows here (the trick that is
+    // worth -1.6 ms in moe_w2) measured 4.80 -> 4.90 ms: this kernel already
+    // carries TWO weight streams (gate and up), so a pair needs four live
+    // streams and four accumulators, and the register cost ate the halved x
+    // loads. See Stage 4k — do not re-pair without a new measurement.
     uint e_slot = sg_global / (uint)d_inner;
     uint row = sg_global % (uint)d_inner;
     if (e_slot >= (uint)n_act) return;
@@ -2639,52 +2649,85 @@ _MOE_K1_SRC = """
     }
 """
 
+#: Output dims one moe_w2 simdgroup computes. Widening this tile divides the
+#: dominant h stream (see the kernel body); 1 -> 2 measured 4.65 -> 3.07 ms.
+#: The shared body is compiled twice — native replay and the mx.fast twin — so
+#: the value ships as a #define from this one constant.
+_W2_ROWS = 4
+_W2_ROWS_HEADER = f"#define W2_ROWS {_W2_ROWS}\n"
+
 _MOE_K2_SRC = """
     // threadgroup covers 8 output dims; h read straight from device — the
     // active experts' h is ~48 KB and L2-hot across all threadgroups.
     // Staging each expert into threadgroup memory serialized the TG behind
     // 2 barriers per expert; removing it measured -1.6 ms/token (Stage 3l).
+    // W2_ROWS output dims per simdgroup. Every output dim reduces against the
+    // SAME h (all active experts, ~57 KB), so h is by far the larger of the
+    // two streams a row reads — its packed weights are only ~3.5 KB. Widening
+    // the tile divides that dominant stream: 1 -> 2 rows measured
+    // 4.65 -> 3.07 ms. The same trick LOSES in moe_w13 and wo_a, where the
+    // activation is 8 KB against 2-4 KB of weights (Stage 4k) — the rule is
+    // the activation:weight ratio, not the kernel.
+    // W2_ROWS must divide d_model, which _moe_kernel_usable enforces.
     uint sg_id = simdgroup_index_in_threadgroup;
     uint lane = thread_index_in_simdgroup;
-    uint dim = threadgroup_position_in_grid.x * 8 + sg_id;
+    uint dim0 = (threadgroup_position_in_grid.x * 8 + sg_id) * W2_ROWS;
     const int n_act = params[0];
     const int d_model = params[1];
     const int d_inner = params[2];
     const int words = d_inner / 16;
     const int wpg = 4;
+    const uint meta = (uint)(d_inner / 64);
+    // dim0 is uniform across the simdgroup, so this return takes all 32 lanes
+    // with it and no simd_sum is left half-populated.
+    if (dim0 >= (uint)d_model) return;
 
-    float acc = 0.0f;
+    float acc[W2_ROWS];
+    #pragma unroll
+    for (int r = 0; r < W2_ROWS; ++r) acc[r] = 0.0f;
+
     for (int s = 0; s < n_act; ++s) {
         int e = idxs[s];
-        if (e < 0 || dim >= (uint)d_model) continue;
+        if (e < 0) continue;
         const device float* hs = h + s * d_inner;
         float we = wts[s];
-        const uint base = ((uint)e * (uint)d_model + dim) * (uint)words;
-        const uint sbase = ((uint)e * (uint)d_model + dim) * (uint)(d_inner / 64);
-        float a = 0.0f, sh = 0.0f, gacc = 0.0f;
-        int cur_g = -1;
-        float sc = 0.0f, bi = 0.0f;
+        const uint base = ((uint)e * (uint)d_model + dim0) * (uint)words;
+        const uint sbase = ((uint)e * (uint)d_model + dim0) * meta;
+        float a[W2_ROWS];
+        #pragma unroll
+        for (int r = 0; r < W2_ROWS; ++r) a[r] = 0.0f;
         for (int w = lane; w < words; w += 32) {
-            uint p = dw[base + w];
+            uint p[W2_ROWS];
+            #pragma unroll
+            for (int r = 0; r < W2_ROWS; ++r) p[r] = dw[base + r * words + w];
             uint g_ = w / wpg;
-            sc = float(ds_[sbase + g_]);
-            bi = float(db[sbase + g_]);
             const device float* hv = hs + w * 16;
-            float aw = 0.0f, sw = 0.0f;
+            float aw[W2_ROWS];
+            #pragma unroll
+            for (int r = 0; r < W2_ROWS; ++r) aw[r] = 0.0f;
+            float sw = 0.0f;
             #pragma unroll
             for (int j = 0; j < 16; ++j) {
                 float hj = hv[j];
-                aw += float((p >> (2 * j)) & 3u) * hj;
+                #pragma unroll
+                for (int r = 0; r < W2_ROWS; ++r)
+                    aw[r] += float((p[r] >> (2 * j)) & 3u) * hj;
                 sw += hj;
             }
-            a += aw * sc + sw * bi;
+            #pragma unroll
+            for (int r = 0; r < W2_ROWS; ++r)
+                a[r] += aw[r] * float(ds_[sbase + r * meta + g_])
+                      + sw * float(db[sbase + r * meta + g_]);
         }
-        (void)cur_g; (void)gacc; (void)sh;
-        acc += we * a;
+        #pragma unroll
+        for (int r = 0; r < W2_ROWS; ++r) acc[r] += we * a[r];
     }
-    if (dim >= (uint)d_model) return;
-    acc = simd_sum(acc);
-    if (lane == 0) y[dim] = acc;
+    #pragma unroll
+    for (int r = 0; r < W2_ROWS; ++r) acc[r] = simd_sum(acc[r]);
+    if (lane == 0) {
+        #pragma unroll
+        for (int r = 0; r < W2_ROWS; ++r) y[dim0 + r] = acc[r];
+    }
 """
 
 _moe_kernels = None
@@ -2704,6 +2747,7 @@ def _get_moe_kernels():
             input_names=["h", "dw", "ds_", "db", "idxs", "wts", "params"],
             output_names=["y"],
             source=_MOE_K2_SRC,
+            header=_W2_ROWS_HEADER,
         )
         _moe_kernels = (k1, k2)
     return _moe_kernels
@@ -2728,6 +2772,9 @@ def _moe_kernel_usable(glu) -> bool:
         and glu.gate_proj.group_size == 64
         and glu.gate_proj.input_dims % 64 == 0
         and glu.down_proj.input_dims % 64 == 0
+        # moe_w2 emits _W2_ROWS output dims per simdgroup, so the tile must
+        # divide the output vector exactly
+        and glu.down_proj.output_dims % _W2_ROWS == 0
     )
 
 
@@ -2756,7 +2803,7 @@ def _moe_routed_kernel(glu, x, indices, weights, limit: float) -> mx.array:
         inputs=[h, glu.down_proj.weight, glu.down_proj.scales,
                 glu.down_proj.biases, idxs, weights.reshape(-1).astype(mx.float32),
                 params],
-        grid=(((d_model + 7) // 8) * tg, 1, 1),
+        grid=(((d_model + 8 * _W2_ROWS - 1) // (8 * _W2_ROWS)) * tg, 1, 1),
         threadgroup=(tg, 1, 1),
         output_shapes=[(d_model,)],
         output_dtypes=[mx.float32],

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import struct
 
+from mlx_soloheaven.models.deepseek_v4 import _W2_ROWS
 from mlx_soloheaven.native.kernels import BUFFER_SLOTS
 
 _QMV = "affine_qmv_fast_bfloat16_t_gs_64_b_8_batch_0"
@@ -313,7 +314,8 @@ def plan_moe(pl: Planner, ffn, xin: str, out: str, topk: int, rscale: float,
         [(pl.S["hexp"], w2["h"]), (pl.t.add(exp.down_proj.weight), w2["dw"]),
          (pl.t.add(exp.down_proj.scales), w2["ds_"]), (pl.t.add(exp.down_proj.biases), w2["db"]),
          (pl.S["idx"], w2["idxs"]), (pl.S["w"], w2["wts"]), (pl.S["y_routed"], w2["y"])],
-        [(mo, 12, w2["params"])], ((hidden + 7) // 8, 1, 1), (256, 1, 1)))
+        [(mo, 12, w2["params"])],
+        ((hidden + 8 * _W2_ROWS - 1) // (8 * _W2_ROWS), 1, 1), (256, 1, 1)))
     # shared expert w1 + w3 + clipped SwiGLU as ONE dispatch (was 2 library
     # qmv + the elementwise swiglu): one simdgroup per inter row does both
     # 8-bit dots and applies the activation in-register.

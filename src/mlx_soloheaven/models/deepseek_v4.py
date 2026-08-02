@@ -1796,6 +1796,58 @@ _GATE_SRC = """
     }
 """
 
+# Split gate for the native path: the single-threadgroup _GATE_SRC scores all
+# n_exp experts with ONE threadgroup, which cannot hide the weight-fetch latency
+# and cost ~1.75 ms/layer on the real model (256 experts x 4096). dsv4_gate_score_k
+# scores ONE expert per threadgroup (grid = n_exp) so the whole chip hides latency;
+# dsv4_gate_topk_k then does the tiny noaux_tc top-k over the scores. Same math as
+# _GATE_SRC, just parallelized.
+_GATE_SCORE_SRC = """
+    uint e = threadgroup_position_in_grid.x;
+    uint tid = thread_position_in_threadgroup.x;
+    const int TG = 256;
+    const int n_exp = params[0];
+    const int dim = params[1];
+    if ((int)e >= n_exp) return;
+    threadgroup float red[8];
+    float a = 0.0f;
+    for (int i = tid; i < dim; i += TG) a += float(weight[e * dim + i]) * float(x[i]);
+    a = simd_sum(a);
+    if ((tid & 31u) == 0) red[tid / 32] = a;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float t = 0.0f;
+        for (int i = 0; i < TG / 32; ++i) t += red[i];
+        float sp = log(1.0f + exp(-fabs(t))) + max(t, 0.0f);
+        scores[e] = sqrt(sp);
+    }
+"""
+
+_GATE_TOPK_SRC = """
+    uint tid = thread_position_in_threadgroup.x;
+    const int n_exp = params[0];
+    const int topk = params[2];
+    const float route_scale = feps[0];
+    if (tid != 0) return;
+    float wsum = 0.0f;
+    bool taken[512];
+    for (int e = 0; e < n_exp; ++e) taken[e] = false;
+    for (int k = 0; k < topk; ++k) {
+        int best = -1;
+        float bestv = -INFINITY;
+        for (int e = 0; e < n_exp; ++e) {
+            if (taken[e]) continue;
+            float v = scores[e] + bias[e];
+            if (v > bestv) { bestv = v; best = e; }
+        }
+        taken[best] = true;
+        out_idx[k] = best;
+        out_w[k] = scores[best];
+        wsum += scores[best];
+    }
+    for (int k = 0; k < topk; ++k) out_w[k] = out_w[k] / wsum * route_scale;
+"""
+
 # Hash-routing gate (the first `num_hash_layers` layers): the topk experts come
 # straight from tid2eid[token] (no top-k search, no bias), and the weights are
 # the UNBIASED sqrtsoftplus scores at exactly those experts, normalized and

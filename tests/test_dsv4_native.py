@@ -394,6 +394,53 @@ def test_native_gate_and_rms_match_reference():
     assert np.abs(np.array(y.astype(mx.float32)) - np.array(yr)).max() < 3e-2
 
 
+def test_native_gate_split_matches_reference():
+    """dsv4_gate_score_k (one threadgroup per expert) + dsv4_gate_topk_k chained
+    == the model's noaux_tc route, same as the fused dsv4_gate_k but parallelized
+    over the chip (the fused version was ~1.75 ms/layer on the real model)."""
+    from mlx_soloheaven.models.deepseek_v4 import route, sqrtsoftplus
+    from mlx_soloheaven.native.kernels import BUFFER_SLOTS
+
+    n_exp, dim, topk, rscale = 32, 256, 6, 1.5
+    rng = np.random.default_rng(7)
+    x = mx.array(rng.standard_normal((dim,)).astype(np.float32)).astype(mx.bfloat16)
+    weight = mx.array(rng.standard_normal((n_exp, dim)).astype(np.float32) * 0.1).astype(mx.bfloat16)
+    bias = mx.array(rng.standard_normal(n_exp).astype(np.float32)).astype(mx.float32)
+    scores_ref = sqrtsoftplus(x.astype(mx.float32)[None] @ weight.T.astype(mx.float32))
+    wref, iref = route(scores_ref, topk, rscale, bias)
+    biased = np.array(scores_ref)[0] + np.array(bias)
+    order = np.argsort(-biased)
+    assert biased[order[topk - 1]] - biased[order[topk]] > 1e-2, "seed hit a near-tie"
+
+    rt_mod.load_custom_kernels(_RT)
+    sc = mx.zeros((n_exp,), dtype=mx.float32)
+    oi = mx.zeros((topk,), dtype=mx.int32)
+    ow = mx.zeros((topk,), dtype=mx.float32)
+    mx.eval(x, weight, bias, sc, oi, ow)
+    mx.synchronize()
+    table = rt_mod.BufferTable()
+    gs, gt = BUFFER_SLOTS["dsv4_gate_score_k"], BUFFER_SLOTS["dsv4_gate_topk_k"]
+    s = {nm: table.add(a) for nm, a in
+         [("x", x), ("weight", weight), ("bias", bias), ("scores", sc),
+          ("out_idx", oi), ("out_w", ow)]}
+    const = struct.pack("<iiif", n_exp, dim, topk, rscale)
+    score_it = rt_mod.plan_item(
+        _RT, "dsv4_gate_score_k", True,
+        [(s["x"], gs["x"]), (s["weight"], gs["weight"]), (s["scores"], gs["scores"])],
+        [(0, 8, gs["params"])], (n_exp, 1, 1), (256, 1, 1))
+    topk_it = rt_mod.plan_item(
+        _RT, "dsv4_gate_topk_k", True,
+        [(s["scores"], gt["scores"]), (s["bias"], gt["bias"]),
+         (s["out_idx"], gt["out_idx"]), (s["out_w"], gt["out_w"])],
+        [(0, 12, gt["params"]), (12, 4, gt["feps"])], (1, 1, 1), (256, 1, 1))
+    _RT.commit([score_it, topk_it], table.ptrs, const, wait=True)
+
+    assert sorted(np.array(oi).tolist()) == sorted(np.array(iref)[0].tolist())
+    gw = dict(zip(np.array(oi).tolist(), np.array(ow).tolist()))
+    rw = dict(zip(np.array(iref)[0].tolist(), np.array(wref)[0].tolist()))
+    assert all(abs(gw[k] - rw[k]) < 1e-3 for k in rw)
+
+
 def test_native_gate_hash_matches_reference():
     """dsv4_gate_hash_k: the first num_hash_layers route experts by
     tid2eid[token] (no top-k, no bias); weights are the UNBIASED sqrtsoftplus

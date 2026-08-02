@@ -85,6 +85,15 @@ _SPECS = {
         [("x", _B), ("weight", _B), ("tid2eid", _I), ("params", _I), ("feps", _F),
          ("ioff", _I), ("out_idx", "device int*"), ("out_w", "device float*")],
     ),
+    "dsv4_gate_score_k": (
+        "_GATE_SCORE_SRC",
+        [("x", _B), ("weight", _B), ("params", _I), ("scores", "device float*")],
+    ),
+    "dsv4_gate_topk_k": (
+        "_GATE_TOPK_SRC",
+        [("scores", _F), ("bias", _F), ("params", _I), ("feps", _F),
+         ("out_idx", "device int*"), ("out_w", "device float*")],
+    ),
     "dsv4_rms_k": (
         "_RMS_SRC",
         [("x", _B), ("w", _B), ("params", _I), ("feps", _F),

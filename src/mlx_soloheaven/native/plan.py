@@ -233,13 +233,20 @@ def plan_moe(pl: Planner, ffn, xin: str, out: str, topk: int, rscale: float,
             [(go, 12, gh["params"]), (go + 12, 4, gh["feps"]), (tok_off, 4, gh["ioff"])],
             (1, 1, 1), (256, 1, 1)))
     else:
-        gk = BUFFER_SLOTS["dsv4_gate_k"]
+        # score every expert in parallel (grid = n_exp threadgroups so the chip
+        # hides the weight-fetch latency), then a tiny top-k over the scores.
+        gs = BUFFER_SLOTS["dsv4_gate_score_k"]
         items.append(pl._pi(
-            "dsv4_gate_k", True,
-            [(pl.S[xin], gk["x"]), (pl.t.add(ffn.gate.weight), gk["weight"]),
-             (pl.t.add(ffn.gate.bias), gk["bias"]), (pl.S["scores"], gk["scores"]),
-             (pl.S["idx"], gk["out_idx"]), (pl.S["w"], gk["out_w"])],
-            [(go, 12, gk["params"]), (go + 12, 4, gk["feps"])], (1, 1, 1), (256, 1, 1)))
+            "dsv4_gate_score_k", True,
+            [(pl.S[xin], gs["x"]), (pl.t.add(ffn.gate.weight), gs["weight"]),
+             (pl.S["scores"], gs["scores"])],
+            [(go, 8, gs["params"])], (n_exp, 1, 1), (256, 1, 1)))
+        gt = BUFFER_SLOTS["dsv4_gate_topk_k"]
+        items.append(pl._pi(
+            "dsv4_gate_topk_k", True,
+            [(pl.S["scores"], gt["scores"]), (pl.t.add(ffn.gate.bias), gt["bias"]),
+             (pl.S["idx"], gt["out_idx"]), (pl.S["w"], gt["out_w"])],
+            [(go, 12, gt["params"]), (go + 12, 4, gt["feps"])], (1, 1, 1), (256, 1, 1)))
     mo, _ = pl.cb.add("iii", topk, hidden, inter)
     ml, _ = pl.cb.add("f", limit)
     w1 = BUFFER_SLOTS["dsv4_moe_w13"]

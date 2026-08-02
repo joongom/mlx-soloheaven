@@ -173,7 +173,10 @@ def _wrap(name: str, body: str, bufs: list[tuple[str, str]]) -> str:
 
 def build_source() -> str:
     """The complete native/kernels source, generated from the model bodies."""
-    parts = ["#include <metal_stdlib>", "using namespace metal;", ""]
+    # The 2-bit unpack table is file-scope `constant`, so it is emitted ONCE
+    # here; the mx.fast twins get the same text as their per-kernel header.
+    parts = ["#include <metal_stdlib>", "using namespace metal;", "",
+             _m._Q2_LUT_HEADER, ""]
     for name, (attr, bufs) in _SPECS.items():
         parts.append(_wrap(name, getattr(_m, attr), bufs))
     return "\n".join(parts)

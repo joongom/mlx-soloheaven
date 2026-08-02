@@ -106,6 +106,11 @@ _SPECS = {
         [("scores", _F), ("bias", _F), ("params", _I), ("feps", _F),
          ("out_idx", "device int*"), ("out_w", "device float*")],
     ),
+    "sh_dsv4_rms2_k": (
+        "_RMS2_SRC",
+        [("xa", _B), ("wa", _B), ("xb", _B), ("wb", _B), ("params", _I),
+         ("feps", _F), ("ya", "device bfloat*"), ("yb", "device bfloat*")],
+    ),
     "sh_dsv4_rms_k": (
         "_RMS_SRC",
         [("x", _B), ("w", _B), ("params", _I), ("feps", _F),

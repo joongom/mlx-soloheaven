@@ -56,6 +56,17 @@ class Planner:
              (self.t.add(mod.biases), 2, b_off), (self.S[x], 3, xoff), (self.S[y], 4, yoff)],
             [(ko, 4, 5), (ko + 4, 4, 6)], (1, (N + 7) // 8, 1), (32, 2, 1))
 
+    def rms2(self, wa, xa, xa_off, ya, da, wb, xb, xb_off, yb, db, eps):
+        """q_norm and kv_norm as ONE dispatch (see _RMS2_SRC)."""
+        o, _ = self.cb.add("2if", da, db, eps)
+        r = BUFFER_SLOTS["sh_dsv4_rms2_k"]
+        return self._pi(
+            "sh_dsv4_rms2_k", True,
+            [(self.S[xa], r["xa"], xa_off), (self.t.add(wa), r["wa"]),
+             (self.S[xb], r["xb"], xb_off), (self.t.add(wb), r["wb"]),
+             (self.S[ya], r["ya"]), (self.S[yb], r["yb"])],
+            [(o, 8, r["params"]), (o + 8, 4, r["feps"])], (2, 1, 1), (256, 1, 1))
+
     def rms(self, w, x, y, d, eps, xoff=0):
         o, _ = self.cb.add("if", d, eps)
         r = BUFFER_SLOTS["sh_dsv4_rms_k"]
@@ -204,9 +215,9 @@ def plan_attention(pl: Planner, attn, xin: str, ring: str, out: str,
         acc += sz
     items = [
         pl.qmv(shim, xin, "xall", hidden, acc),
-        pl.rms(a.q_norm.weight, "xall", "qr", q_lora, a.eps, xoff=offs[0]),
+        pl.rms2(a.q_norm.weight, "xall", offs[0], "qr", q_lora,
+                a.kv_norm.weight, "xall", offs[1], "kvn", D, a.eps),
         pl.qmv(a.wq_b, "qr", "q_raw", q_lora, NHD),
-        pl.rms(a.kv_norm.weight, "xall", "kvn", D, a.eps, xoff=offs[1]),
     ]
     kc, plain = 0, 1
     comp_slot, cidx_slot = "dummy", "dummy_idx"

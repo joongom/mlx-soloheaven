@@ -2000,6 +2000,37 @@ _RMS_SRC = """
 # kernel (grid = cap threadgroups, buf[g] staged; q read from device and roped
 # inline) and a tiny top-k kernel, so neither needs to stage the full q
 # (n_idx_heads*idx_head_dim can be 32 KB). Follows Indexer.decode_step_math.
+_RMS2_SRC = """
+    // TWO independent RMS norms in one dispatch (threadgroup 0 -> a, 1 -> b).
+    // q_norm and kv_norm both read slices of the stacked x-projection and feed
+    // different consumers, so they have no ordering between them; pairing them
+    // halves the 4-per-layer rms dispatches. Native-only (the compiled path
+    // uses mx.fast.rms_norm), so no twin signature to keep in step.
+    uint tid = thread_position_in_threadgroup.x;
+    uint which = threadgroup_position_in_grid.x;
+    const int TG = 256;
+    const int d = params[which == 0 ? 0 : 1];
+    const float eps = feps[0];
+    threadgroup float red[8];
+    threadgroup float rn[1];
+    const device bfloat* x = (which == 0) ? xa : xb;
+    const device bfloat* w = (which == 0) ? wa : wb;
+    device bfloat* y = (which == 0) ? ya : yb;
+    float acc = 0.0f;
+    for (int i = tid; i < d; i += TG) { float v = float(x[i]); acc += v * v; }
+    acc = simd_sum(acc);
+    if ((tid & 31u) == 0) red[tid / 32] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float t = 0.0f;
+        for (int i = 0; i < TG / 32; ++i) t += red[i];
+        rn[0] = rsqrt(t / d + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float r = rn[0];
+    for (int i = tid; i < d; i += TG) y[i] = T(float(x[i]) * r * float(w[i]));
+"""
+
 _IDX_SCORE_SRC = """
     uint g = threadgroup_position_in_grid.x;   // group index
     uint tid = thread_position_in_threadgroup.x;

@@ -637,6 +637,47 @@ Remaining to 40 ms: -9.3. Next queued: hc_pre Sinkhorn on simd shuffles
 gather keeps the serial add order, so it stays bit-identical), then
 hc_mix widening, shared-expert qmv trio fusion, moe unpack LUT.
 
+### Stage 3m — hc_pre Sinkhorn on simd shuffles: 47.3 ms / 21.1 tok/s (2026-08-02)
+
+The Sinkhorn loop paid 2 threadgroup barriers per iteration (~40+6 total at
+20 iters) to sync a hcn x hcn matrix across a 1024-thread group. Now lane l
+of ONE simdgroup holds comb element (l/hcn, l%hcn); row/col sums gather
+lane-by-lane with simd_shuffle in the same serial order (bit-identical),
+and a simdgroup needs no explicit sync — kernel barrier count 46 -> 3.
+Bench (wired, 96% free, bench13):
+
+| | ms/token | tok/s |
+|---|---|---|
+| before (Stage 3l) | 49.3 | 20.3 |
+| after shuffle Sinkhorn | **47.3** | **21.1** (1.60x vs 75.6 compiled) |
+
+hc_pre isolated 5.18 -> 2.90 (-2.3, matching the wall change). Session
+cumulative 611 -> 47.3 (12.9x). General rule extracted for the ledger:
+**a threadgroup barrier on a wide TG costs ~1 us; anything iterating with
+barriers over tiny data belongs in one simdgroup with shuffles.**
+
+Profile after (bench13, isolated ms): qmv 10.85/280 · moe 10.25/86 ·
+comp_step 4.95/62 · wo_a 3.84/43 · hc_mix 3.30/86 · hc_pre 2.90/86 ·
+rms 2.74/173 · gate 2.25/80 · attn_core 1.47/43 · hc_post 1.22/86.
+Remaining to 40 ms: -7.3. Queued: hc_mix TG 1024 (committed, bench next),
+comp_step bisection, shared-expert trio fusion, moe unpack LUT.
+
+### Stage 3n — hc_mix TG 1024: 45.4 ms / 22.0 tok/s (2026-08-02)
+
+hc_mix's 24 threadgroups underfill the 64-core chip; TG 256 -> 1024
+shortens each thread's serial load chain 64 -> 16 elements. Bench (wired,
+96% free, bench14):
+
+| | ms/token | tok/s |
+|---|---|---|
+| before (Stage 3m) | 47.3 | 21.1 |
+| after hc_mix widening | **45.4** | **22.0** (1.66x vs 75.5 compiled) |
+
+hc_mix isolated 3.30 -> 1.77. Session cumulative 611 -> 45.4 (13.5x).
+Profile after (bench14, isolated ms): qmv 11.31/280 · moe 9.78/86 ·
+comp_step 5.03/62 · wo_a 3.54/43 · hc_pre 2.87/86 · rms 2.73/173 ·
+hc_mix 1.77/86 · attn_core 1.35/43. Remaining to 40 ms: **-5.4**.
+
 ## 3. Reproduce
 
 ```bash

@@ -121,10 +121,10 @@ _SPECS = {
     ),
     "dsv4_comp_step": (
         "_COMP_STEP_SRC",
-        [("kv_row", _B), ("sc_row", _B), ("kv_st", _F), ("sc_st", _F),
+        [("kv_row", _B), ("sc_row", _B), ("kv_st", "device float*"),
+         ("sc_st", "device float*"),
          ("ape", _F), ("nw", _B), ("freqs", _F), ("params", _I), ("feps", _F),
-         ("ioff", _I), ("kv_out", "device float*"), ("sc_out", "device float*"),
-         ("row_out", "device bfloat*"), ("old_row", _B)],
+         ("ioff", _I), ("row_out", "device bfloat*"), ("old_row", _B)],
     ),
 }
 

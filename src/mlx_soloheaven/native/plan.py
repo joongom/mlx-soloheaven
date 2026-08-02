@@ -105,11 +105,13 @@ def plan_compressor(pl: Planner, comp, freqs, kv_src: str, sc_src: str,
                     kv_off: int = 0, sc_off: int = 0) -> list:
     """Compressor decode step (dsv4_comp_step). ``kv_src``/``sc_src`` are the
     scratch slots holding comp.wkv/comp.wgate outputs; ``cache`` names the
-    per-layer state slots (kv_st, sc_st, kv_st2, sc_st2, buf, buf2, row).
-    ``n`` (Python) is the completed-group count so the buf write lands at row
-    n; the driver re-encodes per token (cheap: 0.65 ms/1500), so baking n as a
-    static byte offset is fine. Reads OLD state, writes NEW state (double
-    buffered to avoid an in-place hazard)."""
+    per-layer state slots (kv_st, sc_st, buf). ``n`` (Python) is the
+    completed-group count so the buf write lands at row n; the driver
+    re-encodes per token (cheap: 0.65 ms/1500), so baking n as a static byte
+    offset is fine. State updates IN PLACE: only the fresh slot row is
+    written (pooling redirects that row's reads to kv_row/sc_row), and the
+    overlap-head shift runs behind the kernel's pooling barrier — the old
+    full-state double-buffer copy cost 2.5 ms/token (Stage 3o)."""
     cs = BUFFER_SLOTS["dsv4_comp_step"]
     d, ratio, coff = comp.head_dim, comp.ratio, comp.coff
     po, _ = pl.cb.add("4i", ratio, d, coff, comp.rope_dim)
@@ -121,7 +123,6 @@ def plan_compressor(pl: Planner, comp, freqs, kv_src: str, sc_src: str,
          (pl.S[cache["kv_st"]], cs["kv_st"]), (pl.S[cache["sc_st"]], cs["sc_st"]),
          (pl.t.add(comp.ape), cs["ape"]), (pl.t.add(comp.norm.weight), cs["nw"]),
          (pl.t.add(freqs), cs["freqs"]),
-         (pl.S[cache["kv_st2"]], cs["kv_out"]), (pl.S[cache["sc_st2"]], cs["sc_out"]),
          (pl.S[cache["buf"]], cs["row_out"], row_off), (pl.S[cache["buf"]], cs["old_row"], row_off)],
         [(po, 16, cs["params"]), (fo, 4, cs["feps"]), (ioff_off, 4, cs["ioff"])],
         (1, 1, 1), (1024, 1, 1))]

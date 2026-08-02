@@ -41,13 +41,12 @@ class NativeDecoder:
         self._cap = self._round_cap(max_context)
         self.offset = 0
         # Plan cache: the built dispatch list depends only on each layer's
-        # completed-group count `n` (baked buffer row offsets) and the
-        # compressor double-buffer parity `par` (which state buffer is
-        # read/written). The token id and running offset are the ONLY
-        # per-token-varying values, and both live at fixed positions in the
-        # const blob (setBytes) — patched in place per token. `n` advances at
-        # most every ratio tokens; `par` flips every token but has 2 states.
-        # So we keep <=2 built plans for the current n and rebuild only when n
+        # completed-group count `n` (baked buffer row offsets); compressor
+        # state updates in place, so there is no buffer parity. The token id
+        # and running offset are the ONLY per-token-varying values, and both
+        # live at fixed positions in the const blob (setBytes) — patched in
+        # place per token. `n` advances at most every ratio tokens, so we
+        # keep ONE built plan for the current n and rebuild only when it
         # advances, turning the ~10 ms/token Python plan build into a patch.
         self._plan_cache: dict = {}
         self._plan_n: tuple | None = None
@@ -112,19 +111,19 @@ class NativeDecoder:
         ratio = a.layer_compress_ratio(i)
         D, ihd, p = self.D, a.index_head_dim, f"L{i}_"
         self._reg(p + "ring", self._z(self.win * D))
-        lay = {"ratio": ratio, "n": 0, "par": 0, "ring": p + "ring"}
+        lay = {"ratio": ratio, "n": 0, "ring": p + "ring"}
         if ratio:
             # Compressor state is [coff*ratio, coff*head_dim] = [rows, cd]
             # (CompressorState.reset), so the buffer is rows*cd. The dsv4_comp_step
             # kernel indexes rows = coff*ratio rows; sizing at ratio*cd (missing
             # the coff row factor) under-allocates the ratio-4 (coff=2) state and
             # the kernel reads/writes 1 group past the end into adjacent buffers.
+            # State updates IN PLACE (no double buffer): unwritten rows keep
+            # their -inf scores, which is exactly the empty mask.
             coff, cd = (2, 2 * D) if ratio == 4 else (1, D)
             st = coff * ratio * cd
             self._reg(p + "kv_a", self._z(st, mx.float32))
             self._reg(p + "sc_a", self._ninf(st))
-            self._reg(p + "kv_b", self._z(st, mx.float32))
-            self._reg(p + "sc_b", self._z(st, mx.float32))
             self._reg(p + "buf", self._z(self._cap * D))
             lay["comp"] = p
             if ratio == 4:
@@ -132,26 +131,21 @@ class NativeDecoder:
                 ist = icoff * ratio * icd
                 self._reg(p + "ikv_a", self._z(ist, mx.float32))
                 self._reg(p + "isc_a", self._ninf(ist))
-                self._reg(p + "ikv_b", self._z(ist, mx.float32))
-                self._reg(p + "isc_b", self._z(ist, mx.float32))
                 self._reg(p + "ibuf", self._z(self._cap * ihd))
                 lay["idx"] = p
         return lay
 
     @staticmethod
     def _cache_dicts(lay: dict):
-        """comp_cache / idx_cache with the double buffers oriented by parity:
-        the kernel reads *_st (last token's output) and writes *_st2."""
+        """comp_cache / idx_cache; state updates in place, so there is one
+        buffer per state and no parity orientation."""
         if "comp" not in lay:
             return None, None
-        p, par = lay["comp"], lay["par"]
-        a, b = ("a", "b") if par == 0 else ("b", "a")
-        comp = {"kv_st": p + "kv_" + a, "sc_st": p + "sc_" + a,
-                "kv_st2": p + "kv_" + b, "sc_st2": p + "sc_" + b, "buf": p + "buf"}
+        p = lay["comp"]
+        comp = {"kv_st": p + "kv_a", "sc_st": p + "sc_a", "buf": p + "buf"}
         idx = None
         if "idx" in lay:
-            idx = {"kv_st": p + "ikv_" + a, "sc_st": p + "isc_" + a,
-                   "kv_st2": p + "ikv_" + b, "sc_st2": p + "isc_" + b,
+            idx = {"kv_st": p + "ikv_a", "sc_st": p + "isc_a",
                    "buf": p + "ibuf", "i_buf": p + "ibuf"}
         return comp, idx
 
@@ -182,8 +176,7 @@ class NativeDecoder:
         if n_tuple != self._plan_n:
             self._plan_cache.clear()   # `n`-baked buffer offsets changed
             self._plan_n = n_tuple
-        par_key = tuple(lay["par"] for lay in self._layers)
-        cached = self._plan_cache.get(par_key)
+        cached = self._plan_cache.get(0)
         if cached is None:
             cb = P.ConstBlob()
             items = self._build_plan(cb, int(token))
@@ -191,7 +184,7 @@ class NativeDecoder:
                 for it in items:
                     it.barrier = 0
             cached = (items, bytearray(cb.bytes()), self._tok_off, self._ioff_off)
-            self._plan_cache[par_key] = cached
+            self._plan_cache[0] = cached
         items, blob, tok_off, ioff_off = cached
         struct.pack_into("<i", blob, tok_off, int(token))
         struct.pack_into("<i", blob, ioff_off, int(self.offset))
@@ -200,7 +193,6 @@ class NativeDecoder:
             if lay["ratio"]:
                 if (self.offset + 1) % lay["ratio"] == 0:
                     lay["n"] += 1
-                lay["par"] ^= 1
         self.offset += 1
         return self._arrays["logits"]
 

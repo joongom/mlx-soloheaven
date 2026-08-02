@@ -1069,17 +1069,14 @@ _COMP_STEP_SRC = """
     threadgroup float pooled[512];
     threadgroup float wsum[32];  // TG/32 simdgroup partials
 
-    // W(r,i) = state after this token's slot write; O = W with the overlap
-    // head shifted from the tail on completion.
-    for (int idx = tid; idx < rows * cd; idx += TG) {
-        int r = idx / cd;
-        int i = idx % cd;
-        int src = (coff == 2 && complete && r < ratio) ? r + ratio : r;
-        float kvv = (src == slot) ? float(kv_row[i]) : kv_st[src * cd + i];
-        float scv = (src == slot) ? float(sc_row[i]) + ape[filled * cd + i]
-                                  : sc_st[src * cd + i];
-        kv_out[idx] = kvv;
-        sc_out[idx] = scv;
+    // State is updated IN PLACE: only the fresh slot row is written (the
+    // Stage 3o bisection measured the old full-state double-buffer copy at
+    // 2.5 ms/token). The pooling below never reads state row `slot` (it
+    // redirects to the fresh kv_row/sc_row), so this write races nothing;
+    // the overlap-head shift happens after the pooling barrier.
+    for (int i = tid; i < cd; i += TG) {
+        kv_st[slot * cd + i] = float(kv_row[i]);
+        sc_st[slot * cd + i] = float(sc_row[i]) + ape[filled * cd + i];
     }
 
     // pooled[i] = softmax-weighted sum over rows of W (pre-shift view)
@@ -1103,7 +1100,18 @@ _COMP_STEP_SRC = """
         }
         pooled[i] = acc / den;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    // overlap-head shift on completion: head rows [0, ratio) take the tail
+    // rows [ratio, 2*ratio), which include this token's freshly written slot.
+    // Reads and writes are disjoint row ranges, and the barrier above ordered
+    // the shift after every pooling read of the old head.
+    if (coff == 2 && complete) {
+        for (int idx = tid; idx < ratio * cd; idx += TG) {
+            kv_st[idx] = kv_st[ratio * cd + idx];
+            sc_st[idx] = sc_st[ratio * cd + idx];
+        }
+    }
 
     // weighted RMS norm over d, rope the tail at the group-start position
     float ssq = 0.0f;

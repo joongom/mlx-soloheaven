@@ -86,17 +86,18 @@ class Planner:
                  (self.t.add(scale), k["scale"]), (self.t.add(base), k["base"]),
                  (self.S[x], k["y"]), (self.S[post], k["post"]), (self.S[comb], k["comb"])],
                 [(p, 8, k["params"]), (f, 8, k["feps"]), (i, 4, k["iters"])],
-                (1, 1, 1), (256, 1, 1)),
+                (1, 1, 1), (1024, 1, 1)),
         ]
 
     def hc_post(self, x, residual, post, comb, y, hc, hidden):
         p, _ = self.cb.add("2i", hc, hidden)
         k = BUFFER_SLOTS["dsv4_hc_post_k"]
+        # grid = hc * NSPLIT(8): must match the kernel's compile-time NSPLIT.
         return self._pi(
             "dsv4_hc_post_k", True,
             [(self.S[x], k["x"]), (self.S[residual], k["residual"]), (self.S[post], k["post"]),
              (self.S[comb], k["comb"]), (self.S[y], k["y"])],
-            [(p, 8, k["params"])], (hc, 1, 1), (256, 1, 1))
+            [(p, 8, k["params"])], (hc * 8, 1, 1), (256, 1, 1))
 
 
 def plan_compressor(pl: Planner, comp, freqs, kv_src: str, sc_src: str,

@@ -525,7 +525,7 @@ def test_native_hc_pre_matches_reference():
          (s["base"], sl["base"]), (s["y"], sl["y"]), (s["post"], sl["post"]),
          (s["comb"], sl["comb"])],
         [(0, 8, sl["params"]), (8, 8, sl["feps"]), (16, 4, sl["iters"])],
-        (1, 1, 1), (256, 1, 1),
+        (1, 1, 1), (1024, 1, 1),
     )
     _RT.commit([it_mix, it], table.ptrs, const, wait=True)
 
@@ -1537,7 +1537,7 @@ def test_native_ffn_half_plan_matches_reference():
          (T.add(blk.hc_ffn_scale), hp["scale"]), (T.add(blk.hc_ffn_base), hp["base"]),
          (S["x"], hp["y"]), (S["post"], hp["post"]), (S["comb"], hp["comb"])],
         [(po, 8, hp["params"]), (fo, 8, hp["feps"]), (io, 4, hp["iters"])],
-        (1, 1, 1), (256, 1, 1)))
+        (1, 1, 1), (1024, 1, 1)))
     # ffn_norm rms
     ro, _ = cb.add("if", hidden, blk.eps)
     rk = BUFFER_SLOTS["dsv4_rms_k"]
@@ -1600,7 +1600,7 @@ def test_native_ffn_half_plan_matches_reference():
         _RT, "dsv4_hc_post_k", True,
         [(S["moe_out"], hps["x"]), (S["residual"], hps["residual"]),
          (S["post"], hps["post"]), (S["comb"], hps["comb"]), (S["hout"], hps["y"])],
-        [(hpc, 8, hps["params"])], (hc, 1, 1), (256, 1, 1)))
+        [(hpc, 8, hps["params"])], (hc * 8, 1, 1), (256, 1, 1)))
 
     _RT.commit(items, T.ptrs, cb.bytes(), wait=True)
     got = np.array(scratch["hout"].astype(mx.float32))

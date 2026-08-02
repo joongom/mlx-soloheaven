@@ -2292,7 +2292,7 @@ _HC_MIX_SRC = """
 
 _HC_PRE_SRC = """
     uint tid = thread_position_in_threadgroup.x;
-    const int TG = 256;
+    const int TG = 1024;  // single threadgroup; widest allowed (comp_step precedent)
     const int hcn = params[0];
     const int d = params[1];
     const int mix = (2 + hcn) * hcn;
@@ -2300,7 +2300,7 @@ _HC_PRE_SRC = """
     const float rms_eps = feps[0];
     const float hc_eps = feps[1];
 
-    threadgroup float red[8];
+    threadgroup float red[32];  // TG/32 simdgroup partials
     threadgroup float mtg[64];
     threadgroup float pc[64];      // pre[hc], post[hc], comb[hc*hc]
     threadgroup float rms_s[1];
@@ -2380,12 +2380,20 @@ _HC_PRE_SRC = """
 
 _HC_POST_SRC = """
     // y[hc, d] = post[hc]*x[d] + sum_j comb[hc, j] * residual[j, d]
+    // grid = hcn * NSPLIT threadgroups: hcn alone (4 TGs) underfilled the
+    // chip, so each hc row is split into NSPLIT d-slices. NSPLIT is a
+    // compile-time constant — every dispatch site's grid must move with it.
     uint tid = thread_position_in_threadgroup.x;
-    uint hc_ = threadgroup_position_in_grid.x;
     const int TG = 256;
+    const int NSPLIT = 8;
     const int hcn = params[0];
     const int d = params[1];
-    for (int i = tid; i < d; i += TG) {
+    uint hc_ = threadgroup_position_in_grid.x / NSPLIT;
+    const int part = int(threadgroup_position_in_grid.x % NSPLIT);
+    const int chunk = (d + NSPLIT - 1) / NSPLIT;
+    const int lo = part * chunk;
+    const int hi = min(lo + chunk, d);
+    for (int i = lo + (int)tid; i < hi; i += TG) {
         float a = post[hc_] * float(x[i]);
         for (int j = 0; j < hcn; ++j) a += comb[hc_ * hcn + j] * float(residual[j * d + i]);
         y[hc_ * d + i] = T(a);

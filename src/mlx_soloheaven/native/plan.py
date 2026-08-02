@@ -212,22 +212,34 @@ def plan_attention(pl: Planner, attn, xin: str, ring: str, out: str,
 
 
 def plan_moe(pl: Planner, ffn, xin: str, out: str, topk: int, rscale: float,
-             limit: float) -> list:
-    """Score-layer MoE on scratch[xin] -> scratch[out]. scratch must hold:
-    scores, idx, w, hexp, y_routed, sg, su, sh, shared."""
+             limit: float, tok_off: int = 0) -> list:
+    """MoE on scratch[xin] -> scratch[out]. scratch must hold: scores, idx, w,
+    hexp, y_routed, sg, su, sh, shared. Score layers run the noaux_tc gate;
+    hash layers (the first num_hash_layers) index experts by tid2eid[token]
+    (token at ``tok_off`` in the const blob) with no top-k search or bias."""
     exp, sh = ffn.experts, ffn.shared_experts
     n_exp = ffn.gate.weight.shape[0]
     hidden = ffn.gate.weight.shape[1]
     inter = exp.gate_proj.weight.shape[1]
     items = []
-    gk = BUFFER_SLOTS["dsv4_gate_k"]
     go, _ = pl.cb.add("iiif", n_exp, hidden, topk, rscale)
-    items.append(pl._pi(
-        "dsv4_gate_k", True,
-        [(pl.S[xin], gk["x"]), (pl.t.add(ffn.gate.weight), gk["weight"]),
-         (pl.t.add(ffn.gate.bias), gk["bias"]), (pl.S["scores"], gk["scores"]),
-         (pl.S["idx"], gk["out_idx"]), (pl.S["w"], gk["out_w"])],
-        [(go, 12, gk["params"]), (go + 12, 4, gk["feps"])], (1, 1, 1), (256, 1, 1)))
+    if getattr(ffn.gate, "hash", False):
+        gh = BUFFER_SLOTS["dsv4_gate_hash_k"]
+        items.append(pl._pi(
+            "dsv4_gate_hash_k", True,
+            [(pl.S[xin], gh["x"]), (pl.t.add(ffn.gate.weight), gh["weight"]),
+             (pl.t.add(ffn.gate.tid2eid), gh["tid2eid"]),
+             (pl.S["idx"], gh["out_idx"]), (pl.S["w"], gh["out_w"])],
+            [(go, 12, gh["params"]), (go + 12, 4, gh["feps"]), (tok_off, 4, gh["ioff"])],
+            (1, 1, 1), (256, 1, 1)))
+    else:
+        gk = BUFFER_SLOTS["dsv4_gate_k"]
+        items.append(pl._pi(
+            "dsv4_gate_k", True,
+            [(pl.S[xin], gk["x"]), (pl.t.add(ffn.gate.weight), gk["weight"]),
+             (pl.t.add(ffn.gate.bias), gk["bias"]), (pl.S["scores"], gk["scores"]),
+             (pl.S["idx"], gk["out_idx"]), (pl.S["w"], gk["out_w"])],
+            [(go, 12, gk["params"]), (go + 12, 4, gk["feps"])], (1, 1, 1), (256, 1, 1)))
     mo, _ = pl.cb.add("iii", topk, hidden, inter)
     ml, _ = pl.cb.add("f", limit)
     w1 = BUFFER_SLOTS["dsv4_moe_w13"]
@@ -295,7 +307,8 @@ def plan_head(pl: Planner, model, hin: str, logits: str, hc: int, hidden: int,
 
 def plan_block(pl: Planner, blk, hin: str, ring: str, hout: str, ioff_off: int,
                topk: int, rscale: float, limit: float, comp_cache: dict | None = None,
-               idx_cache: dict | None = None, ncomp: int = 0, n: int = 0) -> list:
+               idx_cache: dict | None = None, ncomp: int = 0, n: int = 0,
+               tok_off: int = 0) -> list:
     """A full Block: hc_pre/attn_norm/attention/hc_post, then
     hc_pre/ffn_norm/MoE/hc_post. scratch[hin] in, scratch[hout] out. Dense when
     comp_cache is None; plain-compressed (comp_cache) or ratio-4 (comp_cache +
@@ -315,6 +328,6 @@ def plan_block(pl: Planner, blk, hin: str, ring: str, hout: str, ioff_off: int,
                            blk.hc_ffn_base, "hx", "post", "comb", hc, hidden,
                            blk.iters, blk.eps, blk.hc_eps))
     items.append(pl.rms(blk.ffn_norm.weight, "hx", "xn", hidden, blk.eps))
-    items += plan_moe(pl, blk.ffn, "xn", "moe_out", topk, rscale, limit)
+    items += plan_moe(pl, blk.ffn, "xn", "moe_out", topk, rscale, limit, tok_off)
     items.append(pl.hc_post("moe_out", "h1", "post", "comb", hout, hc, hidden))
     return items

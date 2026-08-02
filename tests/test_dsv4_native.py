@@ -394,6 +394,49 @@ def test_native_gate_and_rms_match_reference():
     assert np.abs(np.array(y.astype(mx.float32)) - np.array(yr)).max() < 3e-2
 
 
+def test_native_gate_hash_matches_reference():
+    """dsv4_gate_hash_k: the first num_hash_layers route experts by
+    tid2eid[token] (no top-k, no bias); weights are the UNBIASED sqrtsoftplus
+    scores at those experts, normalized and route-scaled (Gate.__call__'s hash
+    branch). Diffed through the C loop against the eager math."""
+    from mlx_soloheaven.models.deepseek_v4 import sqrtsoftplus
+    from mlx_soloheaven.native.kernels import BUFFER_SLOTS
+
+    n_exp, dim, topk, rscale, vocab = 32, 256, 6, 1.5, 40
+    rng = np.random.default_rng(11)
+    token = 17
+    x = mx.array(rng.standard_normal((dim,)).astype(np.float32)).astype(mx.bfloat16)
+    weight = mx.array(rng.standard_normal((n_exp, dim)).astype(np.float32) * 0.1).astype(mx.bfloat16)
+    tid2eid = mx.array(rng.integers(0, n_exp, size=(vocab, topk)).astype(np.int32))
+
+    idx_ref = np.array(tid2eid)[token]
+    scores = np.array(sqrtsoftplus(x.astype(mx.float32)[None] @ weight.T.astype(mx.float32)))[0]
+    w_ref = scores[idx_ref]
+    w_ref = w_ref / w_ref.sum() * rscale
+
+    rt_mod.load_custom_kernels(_RT)
+    oi = mx.zeros((topk,), dtype=mx.int32)
+    ow = mx.zeros((topk,), dtype=mx.float32)
+    mx.eval(x, weight, tid2eid, oi, ow)
+    mx.synchronize()
+    table = rt_mod.BufferTable()
+    gh = BUFFER_SLOTS["dsv4_gate_hash_k"]
+    s = {nm: table.add(a) for nm, a in
+         [("x", x), ("weight", weight), ("tid2eid", tid2eid), ("out_idx", oi), ("out_w", ow)]}
+    const = struct.pack("<iiif", n_exp, dim, topk, rscale) + struct.pack("<i", token)
+    it = rt_mod.plan_item(
+        _RT, "dsv4_gate_hash_k", True,
+        [(s["x"], gh["x"]), (s["weight"], gh["weight"]), (s["tid2eid"], gh["tid2eid"]),
+         (s["out_idx"], gh["out_idx"]), (s["out_w"], gh["out_w"])],
+        [(0, 12, gh["params"]), (12, 4, gh["feps"]), (16, 4, gh["ioff"])],
+        (1, 1, 1), (256, 1, 1),
+    )
+    _RT.commit([it], table.ptrs, const, wait=True)
+
+    assert np.array(oi).tolist() == idx_ref.tolist(), (np.array(oi).tolist(), idx_ref.tolist())
+    assert np.abs(np.array(ow) - w_ref).max() < 1e-3, np.abs(np.array(ow) - w_ref).max()
+
+
 def test_native_hc_pre_matches_reference():
     """dsv4_hc_pre_k native (explicit signature, C-loop) == _hc_pre_math (the
     reference the mx.fast twin is diffed against elsewhere). Covers the rms,
@@ -1549,7 +1592,7 @@ def test_native_decoder_full_model_matches_reference():
                num_hidden_layers=L, num_attention_heads=2, head_dim=512,
                qk_rope_head_dim=64, q_lora_rank=512, o_lora_rank=512, o_groups=2,
                moe_intermediate_size=512, n_routed_experts=2, num_experts_per_tok=2,
-               routed_scaling_factor=1.5, sliding_window=8, num_hash_layers=0,
+               routed_scaling_factor=1.5, sliding_window=8, num_hash_layers=1,
                hc_mult=2, hc_sinkhorn_iters=5, swiglu_limit=10.0,
                compress_ratios=[0, 128, 4], compress_rope_theta=160000,
                rope_theta=10000, rms_norm_eps=1e-6, hc_eps=1e-6,
@@ -1561,7 +1604,13 @@ def test_native_decoder_full_model_matches_reference():
         for nm in ("hc_attn_scale", "hc_ffn_scale", "hc_attn_base", "hc_ffn_base"):
             setattr(blk, nm, mx.random.normal(getattr(blk, nm).shape))
         blk.ffn.gate.weight = mx.random.normal(blk.ffn.gate.weight.shape) * 0.3
-        blk.ffn.gate.bias = mx.random.normal(blk.ffn.gate.bias.shape)
+        # layer 0 routes by hash (num_hash_layers=1): experts from tid2eid[token],
+        # no bias — exactly the real model's first few layers.
+        if blk.ffn.gate.hash:
+            blk.ffn.gate.tid2eid = mx.random.randint(
+                0, cfg["n_routed_experts"], blk.ffn.gate.tid2eid.shape).astype(mx.int32)
+        else:
+            blk.ffn.gate.bias = mx.random.normal(blk.ffn.gate.bias.shape)
     model.hc_head_fn = mx.random.normal(model.hc_head_fn.shape) * 0.1
     model.hc_head_scale = mx.random.normal(model.hc_head_scale.shape)
     model.hc_head_base = mx.random.normal(model.hc_head_base.shape)

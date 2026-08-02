@@ -1796,6 +1796,44 @@ _GATE_SRC = """
     }
 """
 
+# Hash-routing gate (the first `num_hash_layers` layers): the topk experts come
+# straight from tid2eid[token] (no top-k search, no bias), and the weights are
+# the UNBIASED sqrtsoftplus scores at exactly those experts, normalized and
+# route-scaled. Mirrors Gate.__call__'s hash branch. Token id arrives in ioff[0].
+_GATE_HASH_SRC = """
+    uint tid = thread_position_in_threadgroup.x;
+    const int TG = 256;
+    const int dim = params[1];
+    const int topk = params[2];
+    const float route_scale = feps[0];
+    const int token = ioff[0];
+
+    threadgroup float xs[4096];
+    for (int i = tid; i < dim; i += TG) xs[i] = float(x[i]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // one simdgroup per selected expert: score = sqrtsoftplus(x . weight[e])
+    threadgroup float sc[64];
+    uint sg = tid / 32, lane = tid % 32;
+    for (int k = sg; k < topk; k += TG / 32) {
+        int e = tid2eid[token * topk + k];
+        float a = 0.0f;
+        for (int i = lane; i < dim; i += 32) a += float(weight[e * dim + i]) * xs[i];
+        a = simd_sum(a);
+        if (lane == 0) {
+            float sp = log(1.0f + exp(-fabs(a))) + max(a, 0.0f);
+            sc[k] = sqrt(sp);
+            out_idx[k] = e;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float wsum = 0.0f;
+        for (int k = 0; k < topk; ++k) wsum += sc[k];
+        for (int k = 0; k < topk; ++k) out_w[k] = sc[k] / wsum * route_scale;
+    }
+"""
+
 _RMS_SRC = """
     uint tid = thread_position_in_threadgroup.x;
     const int TG = 256;

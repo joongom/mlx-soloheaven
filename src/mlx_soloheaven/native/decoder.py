@@ -159,7 +159,7 @@ class NativeDecoder:
             items += P.plan_block(pl, blk, cur, lay["ring"], nxt, ioff_off,
                                   self.topk, self.rscale, self.limit,
                                   comp_cache=comp, idx_cache=idx,
-                                  ncomp=lay["n"], n=lay["n"])
+                                  ncomp=lay["n"], n=lay["n"], tok_off=tok_off)
             cur, nxt = nxt, cur
         # after N layers the result is in `cur`; head reads it
         items += P.plan_head(pl, self.model, cur, "logits", self.hc, self.hidden, self.vocab)

@@ -80,6 +80,11 @@ _SPECS = {
          ("scores", "device float*"), ("out_idx", "device int*"),
          ("out_w", "device float*")],
     ),
+    "dsv4_gate_hash_k": (
+        "_GATE_HASH_SRC",
+        [("x", _B), ("weight", _B), ("tid2eid", _I), ("params", _I), ("feps", _F),
+         ("ioff", _I), ("out_idx", "device int*"), ("out_w", "device float*")],
+    ),
     "dsv4_rms_k": (
         "_RMS_SRC",
         [("x", _B), ("w", _B), ("params", _I), ("feps", _F),

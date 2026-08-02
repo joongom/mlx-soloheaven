@@ -795,6 +795,193 @@ def test_native_dense_attention_plan_matches_reference():
     assert np.abs(got - exp).max() < 2e-2, np.abs(got - exp).max()
 
 
+def _quantize_block_like_deploy(blk):
+    """Quantize a tiny Block the way the converter does: routed experts 2-bit
+    gs64, everything else 8-bit gs64, norms/gate.weight bf16."""
+    import mlx.nn as nn
+
+    def pred(p, m):
+        if not hasattr(m, "to_quantized") or "norm" in p:
+            return False
+        if ".experts." in p and "shared" not in p:
+            return {"group_size": 64, "bits": 2}
+        return {"group_size": 64, "bits": 8}
+
+    nn.quantize(blk, group_size=64, bits=8, class_predicate=pred)
+
+    def bf16(m, names):
+        for n in names:
+            sub = getattr(m, n)
+            sub.scales = sub.scales.astype(mx.bfloat16)
+            sub.biases = sub.biases.astype(mx.bfloat16)
+
+    bf16(blk.attn, ("wq_a", "wq_b", "wkv", "wo_b", "wo_a"))
+    bf16(blk.ffn.experts, ("gate_proj", "up_proj", "down_proj"))
+    bf16(blk.ffn.shared_experts, ("w1", "w2", "w3"))
+    for nm in ("q_norm", "kv_norm"):
+        m = getattr(blk.attn, nm)
+        m.weight = m.weight.astype(mx.bfloat16)
+    blk.attn_norm.weight = blk.attn_norm.weight.astype(mx.bfloat16)
+    blk.ffn_norm.weight = blk.ffn_norm.weight.astype(mx.bfloat16)
+    blk.ffn.gate.weight = blk.ffn.gate.weight.astype(mx.bfloat16)
+
+
+def test_native_ffn_half_plan_matches_reference():
+    """LADDER STEP 5: assemble the FFN half of a Block as a native plan
+    (hc_pre, ffn_norm rms, gate, moe K1/K2, shared expert w1/w3/swiglu/w2,
+    add, hc_post) and diff against the reference math. Together with the
+    proven attention half this is a full per-layer decode step."""
+
+    from mlx_soloheaven.models.deepseek_v4 import (
+        Block,
+        ModelArgs,
+        _hc_post_math,
+        _hc_pre_math,
+    )
+    from mlx_soloheaven.native.kernels import BUFFER_SLOTS
+
+    cfg = dict(model_type="deepseek_v4", hidden_size=512, num_attention_heads=2,
+               head_dim=512, qk_rope_head_dim=64, q_lora_rank=512, o_lora_rank=512,
+               o_groups=2, moe_intermediate_size=512, n_routed_experts=8,
+               num_experts_per_tok=2, routed_scaling_factor=1.5, sliding_window=8,
+               num_hash_layers=0, hc_mult=2, hc_sinkhorn_iters=5, swiglu_limit=10.0,
+               compress_ratios=[0], rope_theta=10000, num_hidden_layers=1,
+               rms_norm_eps=1e-6, hc_eps=1e-6)
+    args = ModelArgs.from_dict(cfg)
+    blk = Block(args, 0)
+    blk.hc_ffn_fn = mx.random.normal(blk.hc_ffn_fn.shape) * 0.1
+    blk.hc_ffn_scale = mx.random.normal(blk.hc_ffn_scale.shape)
+    blk.hc_ffn_base = mx.random.normal(blk.hc_ffn_base.shape)
+    blk.ffn.gate.weight = mx.random.normal(blk.ffn.gate.weight.shape) * 0.3
+    blk.ffn.gate.bias = mx.random.normal(blk.ffn.gate.bias.shape)
+    _quantize_block_like_deploy(blk)
+
+    hc, hidden, inter = args.hc_mult, 512, args.moe_intermediate_size
+    n_exp, topk, limit = args.n_routed_experts, args.num_experts_per_tok, args.swiglu_limit
+    rng = np.random.default_rng(7)
+    h = mx.array(rng.standard_normal((1, 1, hc, hidden)).astype(np.float32) * 0.3).astype(mx.bfloat16)
+    input_ids = mx.array([[0]], dtype=mx.int32)
+
+    # reference FFN half
+    residual = h
+    xr, post_r, comb_r = _hc_pre_math(h, blk.hc_ffn_fn, blk.hc_ffn_scale,
+                                      blk.hc_ffn_base, hc, blk.iters, blk.hc_eps, blk.eps)
+    xr = blk.ffn_norm(xr)
+    xr_moe = blk.ffn.decode_step_math(xr, input_ids)
+    h_ref = _hc_post_math(xr_moe, residual, post_r, comb_r)
+    mx.eval(h_ref)
+    mx.synchronize()
+
+    rt_mod.load_custom_kernels(_RT)
+    T = rt_mod.BufferTable()
+
+    def z(n, dt=mx.bfloat16):
+        a = mx.zeros((n,), dtype=dt)
+        mx.eval(a)
+        return a
+
+    scratch = dict(
+        h=h.reshape(-1), x=z(hidden), post=z(hc, mx.float32), comb=z(hc * hc, mx.float32),
+        xn=z(hidden), scores=z(n_exp, mx.float32), idx=mx.zeros((topk,), mx.int32),
+        w=z(topk, mx.float32), hexp=z(topk * inter, mx.float32), y_routed=z(hidden, mx.float32),
+        sg=z(inter), su=z(inter), sh=z(inter), shared=z(hidden), moe_out=z(hidden),
+        hout=z(hc * hidden), residual=h.reshape(-1),
+    )
+    mx.eval(*scratch.values())
+    mx.synchronize()
+    S = {k: T.add(v) for k, v in scratch.items()}
+    cb = ConstBlob()
+    items = []
+
+    def qmv(w, s, b, xs, ys, K, N):
+        ko, _ = cb.add("ii", K, N)
+        return rt_mod.plan_item(
+            _RT, "affine_qmv_fast_bfloat16_t_gs_64_b_8_batch_0", False,
+            [(T.add(w), 0), (T.add(s), 1), (T.add(b), 2), (xs, 3), (ys, 4)],
+            [(ko, 4, 5), (ko + 4, 4, 6)], (1, (N + 7) // 8, 1), (32, 2, 1))
+
+    # hc_pre(h, ffn) -> x, post, comb
+    hp = BUFFER_SLOTS["dsv4_hc_pre_k"]
+    po, _ = cb.add("2i", hc, hidden)
+    fo, _ = cb.add("2f", blk.eps, blk.hc_eps)
+    io, _ = cb.add("i", blk.iters)
+    items.append(rt_mod.plan_item(
+        _RT, "dsv4_hc_pre_k", True,
+        [(S["h"], hp["h"]), (T.add(blk.hc_ffn_fn.reshape(-1)), hp["fn"]),
+         (T.add(blk.hc_ffn_scale), hp["scale"]), (T.add(blk.hc_ffn_base), hp["base"]),
+         (S["x"], hp["y"]), (S["post"], hp["post"]), (S["comb"], hp["comb"])],
+        [(po, 8, hp["params"]), (fo, 8, hp["feps"]), (io, 4, hp["iters"])],
+        (1, 1, 1), (256, 1, 1)))
+    # ffn_norm rms
+    ro, _ = cb.add("if", hidden, blk.eps)
+    rk = BUFFER_SLOTS["dsv4_rms_k"]
+    items.append(rt_mod.plan_item(
+        _RT, "dsv4_rms_k", True,
+        [(S["x"], rk["x"]), (T.add(blk.ffn_norm.weight), rk["w"]), (S["xn"], rk["y"])],
+        [(ro, 4, rk["params"]), (ro + 4, 4, rk["feps"])], (1, 1, 1), (256, 1, 1)))
+    # gate
+    gk = BUFFER_SLOTS["dsv4_gate_k"]
+    go, _ = cb.add("iiif", n_exp, hidden, topk, args.routed_scaling_factor)
+    items.append(rt_mod.plan_item(
+        _RT, "dsv4_gate_k", True,
+        [(S["xn"], gk["x"]), (T.add(blk.ffn.gate.weight), gk["weight"]),
+         (T.add(blk.ffn.gate.bias), gk["bias"]), (S["scores"], gk["scores"]),
+         (S["idx"], gk["out_idx"]), (S["w"], gk["out_w"])],
+        [(go, 12, gk["params"]), (go + 12, 4, gk["feps"])], (1, 1, 1), (256, 1, 1)))
+    # moe K1
+    exp = blk.ffn.experts
+    w1 = BUFFER_SLOTS["dsv4_moe_w13"]
+    mo, _ = cb.add("iii", topk, hidden, inter)
+    ml, _ = cb.add("f", limit)
+    items.append(rt_mod.plan_item(
+        _RT, "dsv4_moe_w13", True,
+        [(S["xn"], w1["x"]), (T.add(exp.gate_proj.weight), w1["gw"]),
+         (T.add(exp.gate_proj.scales), w1["gs_"]), (T.add(exp.gate_proj.biases), w1["gb"]),
+         (T.add(exp.up_proj.weight), w1["uw"]), (T.add(exp.up_proj.scales), w1["us"]),
+         (T.add(exp.up_proj.biases), w1["ub"]), (S["idx"], w1["idxs"]), (S["hexp"], w1["h"])],
+        [(mo, 12, w1["params"]), (ml, 4, w1["feps"])],
+        ((topk * inter + 7) // 8, 1, 1), (256, 1, 1)))
+    # moe K2
+    w2 = BUFFER_SLOTS["dsv4_moe_w2"]
+    items.append(rt_mod.plan_item(
+        _RT, "dsv4_moe_w2", True,
+        [(S["hexp"], w2["h"]), (T.add(exp.down_proj.weight), w2["dw"]),
+         (T.add(exp.down_proj.scales), w2["ds_"]), (T.add(exp.down_proj.biases), w2["db"]),
+         (S["idx"], w2["idxs"]), (S["w"], w2["wts"]), (S["y_routed"], w2["y"])],
+        [(mo, 12, w2["params"])], ((hidden + 7) // 8, 1, 1), (256, 1, 1)))
+    # shared expert: w1, w3 -> swiglu -> w2
+    sh = blk.ffn.shared_experts
+    items.append(qmv(sh.w1.weight, sh.w1.scales, sh.w1.biases, S["xn"], S["sg"], hidden, inter))
+    items.append(qmv(sh.w3.weight, sh.w3.scales, sh.w3.biases, S["xn"], S["su"], hidden, inter))
+    sw = BUFFER_SLOTS["dsv4_swiglu_k"]
+    so, _ = cb.add("if", inter, limit)
+    items.append(rt_mod.plan_item(
+        _RT, "dsv4_swiglu_k", True,
+        [(S["sg"], sw["gate"]), (S["su"], sw["up"]), (S["sh"], sw["out"])],
+        [(so, 4, sw["params"]), (so + 4, 4, sw["feps"])], (inter, 1, 1), (256, 1, 1)))
+    items.append(qmv(sh.w2.weight, sh.w2.scales, sh.w2.biases, S["sh"], S["shared"], inter, hidden))
+    # add: y_routed + shared -> moe_out
+    ak = BUFFER_SLOTS["dsv4_add_k"]
+    ao, _ = cb.add("i", hidden)
+    items.append(rt_mod.plan_item(
+        _RT, "dsv4_add_k", True,
+        [(S["y_routed"], ak["a"]), (S["shared"], ak["b"]), (S["moe_out"], ak["out"])],
+        [(ao, 4, ak["params"])], (hidden, 1, 1), (256, 1, 1)))
+    # hc_post(moe_out, residual, post, comb) -> hout
+    hps = BUFFER_SLOTS["dsv4_hc_post_k"]
+    hpc, _ = cb.add("2i", hc, hidden)
+    items.append(rt_mod.plan_item(
+        _RT, "dsv4_hc_post_k", True,
+        [(S["moe_out"], hps["x"]), (S["residual"], hps["residual"]),
+         (S["post"], hps["post"]), (S["comb"], hps["comb"]), (S["hout"], hps["y"])],
+        [(hpc, 8, hps["params"])], (hc, 1, 1), (256, 1, 1)))
+
+    _RT.commit(items, T.ptrs, cb.bytes(), wait=True)
+    got = np.array(scratch["hout"].astype(mx.float32))
+    exp_ref = np.array(h_ref.reshape(-1).astype(mx.float32))
+    assert np.abs(got - exp_ref).max() < 3e-2, np.abs(got - exp_ref).max()
+
+
 def test_c_encode_cost_is_in_budget():
     """CPU-side encode+commit of a 1500-dispatch plan (wait=False, so GPU
     time is excluded — this is the per-token CPU cost that must fit in the

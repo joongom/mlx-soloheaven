@@ -1818,6 +1818,26 @@ _RMS_SRC = """
     for (int i = tid; i < d; i += TG) y[i] = T(float(x[i]) * r * float(w[i]));
 """
 
+_SWIGLU_SRC = """
+    // clipped SwiGLU elementwise: out[i] = silu(min(g,lim)) * clamp(u,-lim,lim)
+    uint tid = thread_position_in_grid.x;
+    const int n = params[0];
+    const float limit = feps[0];
+    if ((int)tid >= n) return;
+    float g = float(gate[tid]);
+    float u = float(up[tid]);
+    if (limit > 0.0f) { u = clamp(u, -limit, limit); g = min(g, limit); }
+    out[tid] = T((g / (1.0f + exp(-g))) * u);
+"""
+
+_ADD_SRC = """
+    // out[i] = a[i] + b[i], written in the compute dtype T
+    uint tid = thread_position_in_grid.x;
+    const int n = params[0];
+    if ((int)tid >= n) return;
+    out[tid] = T(float(a[tid]) + float(b[tid]));
+"""
+
 _RING_STORE_SRC = """
     // ring[(offset % win) * D + i] = src[i]  — the post-attention KV write.
     uint tid = thread_position_in_threadgroup.x;
@@ -1840,7 +1860,19 @@ def _get_misc_kernels():
             output_names=["ring"],
             source=_RING_STORE_SRC,
         )
-        _misc_kernels = (store,)
+        swiglu = mx.fast.metal_kernel(
+            name="dsv4_swiglu_k",
+            input_names=["gate", "up", "params", "feps"],
+            output_names=["out"],
+            source=_SWIGLU_SRC,
+        )
+        add = mx.fast.metal_kernel(
+            name="dsv4_add_k",
+            input_names=["a", "b", "params"],
+            output_names=["out"],
+            source=_ADD_SRC,
+        )
+        _misc_kernels = (store, swiglu, add)
     return _misc_kernels
 
 

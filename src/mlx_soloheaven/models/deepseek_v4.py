@@ -1042,7 +1042,7 @@ _ATTN_CORE_SRC = """
 #: projections arrive precomputed from the stacked matmul).
 _COMP_STEP_SRC = """
     uint tid = thread_position_in_threadgroup.x;
-    const int TG = 256;
+    const int TG = 1024;  // single threadgroup; widest allowed hides the state-copy latency
     const int ratio = params[0];
     const int d = params[1];
     const int coff = params[2];     // 2 = overlap, 1 = plain
@@ -1056,7 +1056,7 @@ _COMP_STEP_SRC = """
     const bool complete = ((offset + 1) % ratio) == 0;
 
     threadgroup float pooled[512];
-    threadgroup float wsum[8];
+    threadgroup float wsum[32];  // TG/32 simdgroup partials
 
     // W(r,i) = state after this token's slot write; O = W with the overlap
     // head shifted from the tail on completion.

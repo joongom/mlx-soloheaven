@@ -123,7 +123,7 @@ def plan_compressor(pl: Planner, comp, freqs, kv_src: str, sc_src: str,
          (pl.S[cache["kv_st2"]], cs["kv_out"]), (pl.S[cache["sc_st2"]], cs["sc_out"]),
          (pl.S[cache["buf"]], cs["row_out"], row_off), (pl.S[cache["buf"]], cs["old_row"], row_off)],
         [(po, 16, cs["params"]), (fo, 4, cs["feps"]), (ioff_off, 4, cs["ioff"])],
-        (1, 1, 1), (256, 1, 1))]
+        (1, 1, 1), (1024, 1, 1))]
 
 
 def plan_indexer(pl: Planner, idxr, freqs, xin: str, qr: str, idx_cache: dict,

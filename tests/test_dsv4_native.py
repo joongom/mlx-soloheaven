@@ -497,6 +497,44 @@ def test_native_moe_routed_chain_matches_mx_fast():
     assert np.abs(got - exp).max() < 2e-2, np.abs(got - exp).max()
 
 
+def test_native_qmv_reads_output_sub_range_via_offset():
+    """A plan item can bind a SUB-RANGE of a buffer with a byte offset — the
+    primitive the grouped wo_a and the x-projection split need (one registered
+    weight/activation buffer, many group dispatches at different offsets).
+    Here: write two qmv results into the two halves of ONE output buffer via
+    the y-buffer offset, and read one group's input from a sub-range."""
+    N, K = 512, 512
+    qw, sc, bi = _q8(N, K)
+    x2 = mx.random.normal((2, K)).astype(mx.bfloat16)  # two input rows, contiguous
+    y = mx.zeros((2 * N,), dtype=mx.bfloat16)           # one buffer, two halves
+    r0 = mx.quantized_matmul(x2[0][None], qw, sc, bi, transpose=True, group_size=64, bits=8)
+    r1 = mx.quantized_matmul(x2[1][None], qw, sc, bi, transpose=True, group_size=64, bits=8)
+    mx.eval(qw, sc, bi, x2, y, r0, r1)
+    mx.synchronize()
+
+    table = rt_mod.BufferTable()
+    sw, ss, sb = table.add(qw), table.add(sc), table.add(bi)
+    sx = table.add(x2.reshape(-1))
+    sy = table.add(y)
+    const = struct.pack("<ii", K, N)
+    xbytes = K * 2  # bf16 row stride
+    ybytes = N * 2
+    items = []
+    for row in range(2):
+        it = rt_mod.plan_item(
+            _RT, "affine_qmv_fast_bfloat16_t_gs_64_b_8_batch_0", False,
+            [(sw, 0), (ss, 1), (sb, 2), (sx, 3, row * xbytes), (sy, 4, row * ybytes)],
+            [(0, 4, 5), (4, 4, 6)],
+            (1, (N + 7) // 8, 1), (32, 2, 1),
+        )
+        items.append(it)
+    _RT.commit(items, table.ptrs, const, wait=True)
+
+    got = np.array(y.astype(mx.float32))
+    assert np.abs(got[:N] - np.array(r0.astype(mx.float32))[0]).max() == 0.0
+    assert np.abs(got[N:] - np.array(r1.astype(mx.float32))[0]).max() == 0.0
+
+
 def test_native_ring_store_updates_one_slot_in_place():
     """dsv4_ring_store_k writes the fresh KV into ring[offset % win] IN PLACE,
     leaving every other slot untouched — the post-attention ring write of the

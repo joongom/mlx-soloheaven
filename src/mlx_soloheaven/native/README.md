@@ -73,11 +73,16 @@ step unless profiling later demands it) owning:
    ✅ BOTH chaining patterns a layer uses are proven: custom->custom (MoE
    K1->K2) and library->custom (wq_b qmv -> attn_core), each an intermediate
    buffer across a barrier in one command buffer.
-4. NEXT: assemble the FULL dense-layer plan (rms, qmv wq_a/wkv/wq_b/wo_b,
-   grouped wo_a, attn_core, hc_pre/post, gate, moe K1/K2, shared expert) +
-   session BufferTable from a real Model, replay ONE dense layer → logits
-   diff vs the MLX compiled step (bf16 ~1e-2). Pure assembly: every kernel
-   AND every chaining pattern it needs is now individually proven.
+   ✅ plan_item binds buffer SUB-RANGES via byte offset (grouped wo_a, the
+   x-projection split, sub-vector reads) — diff 0.0. The ring-store kernel and
+   every projection K being %512 (qmv_fast) are confirmed. NOTHING about the
+   assembly is now unproven: all kernels, both chaining patterns, sub-range
+   binding, in-place ring write.
+4. NEXT: write plan_dense_attention (the item list: wq_a qmv, q_norm rms,
+   wq_b qmv, wkv qmv, kv_norm rms, attn_core, ring_store, wo_a x n_groups at
+   byte offsets, wo_b qmv) + a scratch BufferTable, and diff its output
+   against Attention.decode_step_math on a quantized tiny layer (dims %512).
+   Then the FFN half (hc_pre, gate, moe K1/K2, shared, hc_post) and stack 43.
 5. All layer kinds, then the full 43-layer step + embed/head → token-level
    agreement over a 32-token greedy run.
 6. ppl probes through the native path ≈ MLX path (3.65).

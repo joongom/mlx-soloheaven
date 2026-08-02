@@ -254,19 +254,23 @@ def load_custom_kernels(rt: Runtime) -> None:
 
 
 def plan_item(rt: Runtime, kernel: str, custom: bool,
-              buf_slots: list[tuple[int, int]],
+              buf_slots: list[tuple],
               byte_binds: list[tuple[int, int, int]],
               grid: tuple, group: tuple, barrier: bool = True) -> _PlanItem:
-    """Assemble one plan item. ``buf_slots``: (table_index, [[buffer]] slot);
-    ``byte_binds``: (const_blob_offset, length, slot). ``barrier`` inserts a
-    buffer barrier BEFORE this dispatch — default True because MLX buffers are
-    hazard-untracked and the decode chain is almost entirely dependent; set
-    False only for a dispatch provably independent of the previous one."""
+    """Assemble one plan item. ``buf_slots``: (table_index, [[buffer]] slot)
+    or (table_index, slot, byte_offset) — the offset binds a SUB-RANGE of a
+    buffer (grouped weights, sub-vector reads), so one registered array serves
+    many dispatches. ``byte_binds``: (const_blob_offset, length, slot).
+    ``barrier`` inserts a buffer barrier BEFORE this dispatch — default True
+    because MLX buffers are hazard-untracked and the decode chain is almost
+    entirely dependent; set False only for a provably independent dispatch."""
     it = _PlanItem()
     it.pso = rt.pipeline(kernel, custom=custom)
     it.n_bufs = len(buf_slots)
-    for i, (bid, slot) in enumerate(buf_slots):
-        it.buf_ids[i], it.buf_slots[i], it.buf_offs[i] = bid, slot, 0
+    for i, entry in enumerate(buf_slots):
+        bid, slot = entry[0], entry[1]
+        off = entry[2] if len(entry) > 2 else 0
+        it.buf_ids[i], it.buf_slots[i], it.buf_offs[i] = bid, slot, off
     it.n_bytes = len(byte_binds)
     for i, (off, length, slot) in enumerate(byte_binds):
         it.bytes_off[i], it.bytes_len[i], it.bytes_slot[i] = off, length, slot

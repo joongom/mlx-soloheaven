@@ -331,9 +331,12 @@ across ~5k ops/token. Paths, in effort order:
    * routed MoE 14 ms vs ~3 ms of bandwidth — MLX gather_qmm at
      single-token batch (upstream kernel territory; cf. the known MoE
      kernel issue #3402 noted in the README);
-   * HC path ~14 ms for arithmetic on 4x4 matrices — 86 compiled-chain
-     calls/token; a hand-written single-dispatch kernel (like the
-     attention one) could plausibly halve it;
+   * HC path ~14 ms — 86 compiled-chain calls/token. A single-dispatch
+     hand kernel was TRIED (2026-08-02) and REVERTED: 86 -> 133 ms/token.
+     One threadgroup doing the [24,16384] mixes GEMV starves the chip; the
+     library GEMV + compiled elementwise chain is already near-optimal.
+     Fewer dispatches is not a goal in itself — not when it costs
+     parallelism;
    * our attention kernel ~5 ms — per-thread serial 512-dim dots, no
      simdgroup reduction yet;
    * base quantized matmuls ~9 ms — near bandwidth, little headroom.

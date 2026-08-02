@@ -1740,6 +1740,106 @@ class Gate(nn.Module):
         return route(scores, self.topk, self.route_scale, self.bias)
 
 
+# --- gate + rms_norm kernels (REPLAY path) ----------------------------------
+#
+# dsv4_gate: scores = sqrtsoftplus(x @ weight^T) over n_routed experts, then
+# noaux_tc top-k on (scores + bias) with weights gathered from the UNBIASED
+# scores, normalized and route-scaled. Score layers only (hash layers index by
+# tid2eid — a trivial lookup done Python-side). One threadgroup: each simdgroup
+# scores a strip of experts, then thread 0 runs the tiny top-k selection.
+# dsv4_rms: plain RMSNorm with a weight, [d] -> [d].
+
+_GATE_SRC = """
+    uint tid = thread_position_in_threadgroup.x;
+    const int TG = 256;
+    const int n_exp = params[0];
+    const int dim = params[1];
+    const int topk = params[2];
+    const float route_scale = feps[0];
+
+    threadgroup float xs[4096];
+    for (int i = tid; i < dim; i += TG) xs[i] = float(x[i]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // each simdgroup handles experts e = sg, sg+8, ...
+    uint sg = tid / 32, lane = tid % 32;
+    for (int e = sg; e < n_exp; e += TG / 32) {
+        float a = 0.0f;
+        for (int i = lane; i < dim; i += 32) a += float(weight[e * dim + i]) * xs[i];
+        a = simd_sum(a);
+        if (lane == 0) {
+            float sp = log(1.0f + exp(-fabs(a))) + max(a, 0.0f);  // softplus
+            scores[e] = sqrt(sp);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        // top-k over (scores + bias); weights from UNBIASED scores.
+        float wsum = 0.0f;
+        bool taken[512];
+        for (int e = 0; e < n_exp; ++e) taken[e] = false;
+        for (int k = 0; k < topk; ++k) {
+            int best = -1;
+            float bestv = -INFINITY;
+            for (int e = 0; e < n_exp; ++e) {
+                if (taken[e]) continue;
+                float v = scores[e] + bias[e];
+                if (v > bestv) { bestv = v; best = e; }
+            }
+            taken[best] = true;
+            out_idx[k] = best;
+            out_w[k] = scores[best];
+            wsum += scores[best];
+        }
+        for (int k = 0; k < topk; ++k) out_w[k] = out_w[k] / wsum * route_scale;
+    }
+"""
+
+_RMS_SRC = """
+    uint tid = thread_position_in_threadgroup.x;
+    const int TG = 256;
+    const int d = params[0];
+    const float eps = feps[0];
+    threadgroup float red[8];
+    threadgroup float rn[1];
+    float acc = 0.0f;
+    for (int i = tid; i < d; i += TG) { float v = float(x[i]); acc += v * v; }
+    acc = simd_sum(acc);
+    if ((tid & 31u) == 0) red[tid / 32] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float t = 0.0f;
+        for (int i = 0; i < TG / 32; ++i) t += red[i];
+        rn[0] = rsqrt(t / d + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float r = rn[0];
+    for (int i = tid; i < d; i += TG) y[i] = T(float(x[i]) * r * float(w[i]));
+"""
+
+_gate_kernels = None
+
+
+def _get_gate_kernels():
+    global _gate_kernels
+    if _gate_kernels is None:
+        gate = mx.fast.metal_kernel(
+            name="dsv4_gate_k",
+            input_names=["x", "weight", "bias", "params", "feps"],
+            output_names=["scores", "out_idx", "out_w"],
+            source=_GATE_SRC,
+        )
+        rms = mx.fast.metal_kernel(
+            name="dsv4_rms_k",
+            input_names=["x", "w", "params", "feps"],
+            output_names=["y"],
+            source=_RMS_SRC,
+        )
+        _gate_kernels = (gate, rms)
+    return _gate_kernels
+
+
 # --- HC pre/post kernels (REPLAY path only) ---------------------------------
 #
 # hc_pre = rms(flat) -> mixes = (flat @ fn^T) * rms -> sinkhorn split ->

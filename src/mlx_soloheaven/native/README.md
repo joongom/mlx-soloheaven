@@ -64,8 +64,16 @@ step unless profiling later demands it) owning:
    the x-projection split, wq_b, wo_a/wo_b (all library qmv), the shared
    expert, HC pre/post (mixes via library gemv + a small sinkhorn kernel),
    the gate (scores + top-k) and the indexer — mechanical, same pattern.
-4. NEXT: build the per-layer plan + session BufferTable from a real Model,
-   replay ONE dense layer → logits diff vs the MLX compiled step (bf16 ~1e-2).
+   ✅ ALL custom kernels now exist and are diff-tested through the C loop:
+   attn_core, moe K1/K2, hc_pre/post, gate (sqrtsoftplus + noaux_tc top-k),
+   rms_norm. Library qmv covers wq_a/wkv/wq_b/wo_b, gate is custom, the
+   shared expert is 3 qmv + a swiglu (reuse moe_w13-style or eager), grouped
+   wo_a is 8 qmv (one per group) or gather_qmv. NOTHING custom remains
+   unbuilt for a dense layer.
+4. NEXT: assemble the per-layer PLAN + session BufferTable from a real Model
+   and replay ONE dense layer → logits diff vs the MLX compiled step
+   (bf16 ~1e-2). This is now pure assembly — every dispatch it needs is a
+   proven kernel.
 5. All layer kinds, then the full 43-layer step + embed/head → token-level
    agreement over a 32-token greedy run.
 6. ppl probes through the native path ≈ MLX path (3.65).

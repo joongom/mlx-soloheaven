@@ -309,6 +309,76 @@ def test_native_attn_core_matches_mx_fast():
     assert np.abs(ka - kb).max() < 1e-2, np.abs(ka - kb).max()
 
 
+def test_native_gate_and_rms_match_reference():
+    """dsv4_gate_k (sqrtsoftplus scores + noaux_tc top-k, weights from unbiased
+    scores) and dsv4_rms_k, both through the C loop, vs the model math. Data is
+    seeded and margin-checked so no near-tie flips the top-k set (a real
+    boundary flip is quantization noise, not a kernel bug)."""
+    from mlx_soloheaven.models.deepseek_v4 import route, sqrtsoftplus
+    from mlx_soloheaven.native.kernels import BUFFER_SLOTS
+
+    n_exp, dim, topk, rscale = 32, 256, 6, 1.5
+    rng = np.random.default_rng(3)
+    x = mx.array(rng.standard_normal((dim,)).astype(np.float32)).astype(mx.bfloat16)
+    weight = mx.array(rng.standard_normal((n_exp, dim)).astype(np.float32) * 0.1).astype(mx.bfloat16)
+    bias = mx.array(rng.standard_normal(n_exp).astype(np.float32)).astype(mx.float32)
+    scores_ref = sqrtsoftplus(x.astype(mx.float32)[None] @ weight.T.astype(mx.float32))
+    wref, iref = route(scores_ref, topk, rscale, bias)
+    biased = np.array(scores_ref)[0] + np.array(bias)
+    order = np.argsort(-biased)
+    assert biased[order[topk - 1]] - biased[order[topk]] > 1e-2, "seed hit a near-tie"
+
+    rt_mod.load_custom_kernels(_RT)
+    sc = mx.zeros((n_exp,), dtype=mx.float32)
+    oi = mx.zeros((topk,), dtype=mx.int32)
+    ow = mx.zeros((topk,), dtype=mx.float32)
+    mx.eval(x, weight, bias, wref, iref, sc, oi, ow)
+    mx.synchronize()
+    table = rt_mod.BufferTable()
+    gs = BUFFER_SLOTS["dsv4_gate_k"]
+    s = {nm: table.add(a) for nm, a in
+         [("x", x), ("weight", weight), ("bias", bias), ("scores", sc),
+          ("out_idx", oi), ("out_w", ow)]}
+    const = struct.pack("<iiif", n_exp, dim, topk, rscale)
+    it = rt_mod.plan_item(
+        _RT, "dsv4_gate_k", True,
+        [(s["x"], gs["x"]), (s["weight"], gs["weight"]), (s["bias"], gs["bias"]),
+         (s["scores"], gs["scores"]), (s["out_idx"], gs["out_idx"]),
+         (s["out_w"], gs["out_w"])],
+        [(0, 12, gs["params"]), (12, 4, gs["feps"])],
+        (1, 1, 1), (256, 1, 1),
+    )
+    _RT.commit([it], table.ptrs, const, wait=True)
+
+    got_set = sorted(np.array(oi).tolist())
+    ref_set = sorted(np.array(iref)[0].tolist())
+    assert got_set == ref_set, (got_set, ref_set)
+    gw = dict(zip(np.array(oi).tolist(), np.array(ow).tolist()))
+    rw = dict(zip(np.array(iref)[0].tolist(), np.array(wref)[0].tolist()))
+    assert all(abs(gw[k] - rw[k]) < 1e-3 for k in rw)
+
+    # rms
+    w = mx.array(rng.standard_normal(dim).astype(np.float32)).astype(mx.bfloat16)
+    y = mx.zeros((dim,), dtype=mx.bfloat16)
+    xf = x.astype(mx.float32)
+    yr = (xf * mx.rsqrt((xf ** 2).mean() + 1e-6) * w.astype(mx.float32))
+    mx.eval(w, y, yr)
+    mx.synchronize()
+    t2 = rt_mod.BufferTable()
+    rs = BUFFER_SLOTS["dsv4_rms_k"]
+    r = {nm: t2.add(a) for nm, a in [("x", x), ("w", w), ("y", y)]}
+    const2 = struct.pack("<if", dim, 1e-6)
+    it2 = rt_mod.plan_item(
+        _RT, "dsv4_rms_k", True,
+        [(r["x"], rs["x"]), (r["w"], rs["w"]), (r["y"], rs["y"])],
+        [(0, 4, rs["params"]), (4, 4, rs["feps"])],
+        (1, 1, 1), (256, 1, 1),
+    )
+    _RT.commit([it2], t2.ptrs, const2, wait=True)
+    # y is bf16 (serving dtype); values reach ~2.6 so bf16 rounding is ~1.5e-2
+    assert np.abs(np.array(y.astype(mx.float32)) - np.array(yr)).max() < 3e-2
+
+
 def test_native_hc_pre_matches_reference():
     """dsv4_hc_pre_k native (explicit signature, C-loop) == _hc_pre_math (the
     reference the mx.fast twin is diffed against elsewhere). Covers the rms,

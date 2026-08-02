@@ -42,6 +42,17 @@ _SPECS = {
          ("sink", _F), ("freqs", _F), ("params", _I), ("fscal", _F),
          ("ioff", _I), ("out", "device bfloat*"), ("kv_out", "device bfloat*")],
     ),
+    "dsv4_gate_k": (
+        "_GATE_SRC",
+        [("x", _B), ("weight", _B), ("bias", _F), ("params", _I), ("feps", _F),
+         ("scores", "device float*"), ("out_idx", "device int*"),
+         ("out_w", "device float*")],
+    ),
+    "dsv4_rms_k": (
+        "_RMS_SRC",
+        [("x", _B), ("w", _B), ("params", _I), ("feps", _F),
+         ("y", "device bfloat*")],
+    ),
     "dsv4_hc_pre_k": (
         "_HC_PRE_SRC",
         [("h", _B), ("fn", _F), ("scale", _F), ("base", _F), ("params", _I),

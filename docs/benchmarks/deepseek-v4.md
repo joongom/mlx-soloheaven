@@ -286,39 +286,6 @@ lever for ≥25 tok/s is **dispatch count** (kernel fusion — e.g. the 8 groupe
 the real model (whose large kernels are compute-dominated); a real-model number
 is required — run `validate_deepseek_v4.py bench`.
 
-### Stage 3b — the REAL-MODEL number REFUTES the replay approach (2026-08-02)
-
-`validate_deepseek_v4.py bench 48` on the 88 GB 2bit-search build (weights wired,
-nothing else loaded):
-
-| path | tok/s | ms/token |
-|---|---|---|
-| compiled (`mx.compile` decode) | **11.8** | 84.5 |
-| native replay (`NativeDecoder`) | **1.6** | 612 |
-
-**The native replay is 7× SLOWER, not faster.** This refutes the premise the
-whole Stage-3 campaign was built on ("the gap is per-op CPU dispatch overhead,
-~50 µs × ~1800 ops; a replay loop that pays that once wins"). At real-model
-scale decode is **GPU-compute-bound**, and our hand-written kernels — above all
-the batch-1 2-bit MoE (`dsv4_moe_w13`/`w2`) — are much slower than the MLX
-library kernels the compiled path uses (`gather_qmm`, steel `qmv`/gemv). Replaying
-slower kernels loses. The tiny-model profiling (which said the floor was dispatch
-count / CPU) did NOT predict this because tiny kernels have no real compute; the
-`bench` number is the one that matters and it was measured too late in the ladder.
-
-Bug this run also surfaced (fixed): the first `num_hash_layers` (3) route by
-`tid2eid[token]` with no gate bias, which `plan_moe` didn't handle — added
-`dsv4_gate_hash_k`. The `NativeDecoder` is now correct on every real layer type;
-it is just not the road to ≥25 tok/s.
-
-**Consequence / open direction.** ≥25 tok/s (≤40 ms) is not reachable by
-replaying these kernels. The compiled path (84 ms) is the honest baseline. To go
-faster the real levers are (a) faster MoE — use MLX's `gather_qmm` / a better
-batch-1 2-bit kernel rather than ours, measured per-kernel; (b) reduce the decode
-math (fewer visible groups / cheaper attention); (c) a genuinely different runtime
-(e.g. ds4's, which is a bespoke C++/Metal engine, not MLX). Per-kernel profiling
-on the real model is the next diagnostic, not more replay-loop work.
-
 ### Stage 3b/3d — REAL-MODEL bench: the native replay is 7x SLOWER (2026-08-02) ⚠️
 
 First real-88 GB-model decode bench (`validate_deepseek_v4.py bench 32`, machine
@@ -347,11 +314,19 @@ Why (analysis, not yet profiled on the real model):
 * The custom MoE/attn kernels may also be slower than MLX's steel/gather_qmm;
   unquantified until a per-kernel real-model profile.
 
+(This run first crashed before timing: the real model's first `num_hash_layers`
+(3) route experts by `tid2eid[token]` with no gate bias, which `plan_moe` didn't
+handle. Fixed by adding `dsv4_gate_hash_k` — the native path is now correct on
+every real layer type, which is why the throughput number above could be taken.)
+
 Bottom line: the ≥25 tok/s goal is **NOT met** via the replay path as designed
 (worse than the 12 tok/s compiled baseline). A rethink is required — remove the
 blanket barriers (dependency-aware, so the GPU can overlap), fuse to cut dispatch
 count, or abandon the external loop. Correctness of the native path stands (it is
 bit-deterministic and matches the reference); this is purely a throughput verdict.
+Next diagnostic BEFORE more replay work: a per-kernel real-model profile to split
+"blanket-barrier serialization" from "our kernels slower than MLX's" — the two
+candidate causes, currently unquantified.
 
 ## 3. Reproduce
 

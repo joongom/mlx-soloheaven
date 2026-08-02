@@ -321,11 +321,26 @@ across ~5k ops/token. Paths, in effort order:
    The path stays in (correctness-neutral, tests exercise it, and the
    functional state threading is the foundation for 2b) behind
    SOLOHEAVEN_DSV4_COMPILE.
-   2b. The lever that remains is KERNEL COUNT, not graph shape: stack the
-   per-layer x-projections (wq_a, wkv, compressor wkv/wgate, indexer
-   weights_proj — all take the same [1,1,4096] x) into ONE quantized matmul
-   and split the output (~5 fewer kernels x 43 layers per token), and roll
-   the compressor step into a custom kernel like the attention one.
+   2b. ~~Stacked x-projections~~ DONE (2026-08-02) — also no change
+   (86.1 ms/token; loaded Q8 weights concatenated along the output axis at
+   first decode, one quantized_matmul + split, identical numerics, tests
+   green). Two failed predictions now REFUTE the launch-tax theory at this
+   op count: calibrating on the HC result (39 ms / ~10k launches ≈ 4 µs
+   each), the remaining ~1k launches cost ~3 ms, not 70. The 85 ms is a SUM
+   of medium inefficiencies, each needing its own fix:
+   * routed MoE 14 ms vs ~3 ms of bandwidth — MLX gather_qmm at
+     single-token batch (upstream kernel territory; cf. the known MoE
+     kernel issue #3402 noted in the README);
+   * HC path ~14 ms for arithmetic on 4x4 matrices — 86 compiled-chain
+     calls/token; a hand-written single-dispatch kernel (like the
+     attention one) could plausibly halve it;
+   * our attention kernel ~5 ms — per-thread serial 512-dim dots, no
+     simdgroup reduction yet;
+   * base quantized matmuls ~9 ms — near bandwidth, little headroom.
+   Realistic hand-tuned ceiling on MLX today: ~65-70 ms (~15 tok/s). Full
+   ds4 parity (36 ms) additionally needs its command-buffer-replay runtime
+   model, which MLX does not expose — that is an upstream feature
+   conversation, not something this repo can code around.
 3. ~~A fused sparse-attention Metal kernel~~ DONE (2026-08-02), with an
    honest outcome: `dsv4_sparse_decode` (one dispatch per layer, online
    softmax + sink, both parts walked in-kernel, differential-tested against

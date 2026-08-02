@@ -589,7 +589,8 @@ class Compressor(nn.Module):
 
     def decode_step_math(
         self,
-        x: mx.array,
+        proj: tuple[mx.array, mx.array],
+        out_dtype,
         kv_state: mx.array,
         score_state: mx.array,
         buf: mx.array,
@@ -609,8 +610,8 @@ class Compressor(nn.Module):
         ratio, d = self.ratio, self.head_dim
         off_base = ratio if self.overlap else 0
         filled = offset % ratio
-        kv1 = self.wkv(x).astype(mx.float32)[:, 0]
-        sc1 = self.wgate(x).astype(mx.float32)[:, 0] + mx.take(self.ape, filled, axis=0)
+        kv1 = proj[0].astype(mx.float32)[:, 0]
+        sc1 = proj[1].astype(mx.float32)[:, 0] + mx.take(self.ape, filled, axis=0)
         slot = off_base + filled
         kv_state[:, slot] = kv1
         score_state[:, slot] = sc1
@@ -637,7 +638,7 @@ class Compressor(nn.Module):
             pooled = (kv_state * mx.softmax(score_state, axis=1)).sum(
                 axis=1, keepdims=True
             )
-        g = self.norm(pooled.astype(x.dtype))
+        g = self.norm(pooled.astype(out_dtype))
         gpos = ((offset + 1) // ratio - 1).reshape(1)
         cos, sin = rope_cos_sin(freqs * ratio, gpos)
         tail = apply_interleaved_rope(g[..., -self.rope_dim :], cos, sin)
@@ -733,21 +734,22 @@ class Indexer(nn.Module):
         idxs = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k].astype(mx.int32)
         return mx.where(idxs >= visible, MASKED_INDEX, idxs)
 
-    def decode_step_math(self, x, qr, kv_state, score_state, buf, n, offset, freqs):
+    def decode_step_math(
+        self, proj, w_raw, out_dtype, qr, kv_state, score_state, buf, n, offset, freqs
+    ):
         """Branchless single-token DSA step for the compiled decode path.
         Scores the FULL capacity buffer (invisible slots masked) so the trace
-        is capacity-keyed, not group-count-keyed."""
+        is capacity-keyed, not group-count-keyed. ``proj``/``w_raw`` come from
+        the layer's stacked x-projection."""
         kv_state, score_state, buf, n2 = self.compressor.decode_step_math(
-            x, kv_state, score_state, buf, n, offset, freqs
+            proj, out_dtype, kv_state, score_state, buf, n, offset, freqs
         )
         rd = self.rope_dim
         q = self.wq_b(qr).reshape(1, 1, self.n_heads, self.head_dim)
         cos, sin = rope_cos_sin(freqs, offset.reshape(1))
         tail = apply_interleaved_rope(q[..., -rd:], cos[:, None], sin[:, None])
         q = mx.concatenate([q[..., :-rd], tail], axis=-1)
-        w = self.weights_proj(x).astype(mx.float32) * (
-            self.head_dim**-0.5 * self.n_heads**-0.5
-        )
+        w = w_raw.astype(mx.float32) * (self.head_dim**-0.5 * self.n_heads**-0.5)
         cap = buf.shape[1]
         scores = mx.einsum(
             "bshd,bgd->bshg", q.astype(mx.float32), buf.astype(mx.float32)
@@ -1184,6 +1186,58 @@ class Attention(nn.Module):
         o = self.wo_a(o[..., None, :], groups).squeeze(-2)
         return self.wo_b(o.reshape(b, s, -1))
 
+    def _x_projections(self, x):
+        """All per-layer projections OF X as ONE matmul (decode path).
+
+        wq_a, wkv, the compressors' wkv/wgate and the indexer's weights_proj
+        all consume the same [1,1,4096] input; issuing them separately costs
+        up to 7 kernel dispatches per layer per token. Affine-quantized rows
+        are independent along the OUTPUT axis, so the loaded Q8 weights are
+        concatenated once (lazily, at first decode) and split after a single
+        quantized_matmul — no reconversion, identical numerics.
+        """
+        mods = [self.wq_a, self.wkv]
+        if self.ratio:
+            mods += [self.compressor.wkv, self.compressor.wgate]
+            if "indexer" in self:
+                mods += [
+                    self.indexer.weights_proj,
+                    self.indexer.compressor.wkv,
+                    self.indexer.compressor.wgate,
+                ]
+        st = getattr(self, "_xstack", None)
+        if st is None:
+            if isinstance(mods[0], nn.QuantizedLinear):
+                gs, bits = mods[0].group_size, mods[0].bits
+                assert all(m.group_size == gs and m.bits == bits for m in mods)
+                st = (
+                    "q",
+                    mx.concatenate([m.weight for m in mods], axis=0),
+                    mx.concatenate([m.scales for m in mods], axis=0),
+                    mx.concatenate([m.biases for m in mods], axis=0),
+                    gs,
+                    bits,
+                    [m.scales.shape[0] for m in mods],
+                )
+            else:
+                st = ("p", mx.concatenate([m.weight for m in mods], axis=0),
+                      [m.weight.shape[0] for m in mods])
+            self._xstack = st
+        if st[0] == "q":
+            _, qw, sc, bs, gs, bits, sizes = st
+            out = mx.quantized_matmul(
+                x, qw, sc, bs, transpose=True, group_size=gs, bits=bits
+            )
+        else:
+            _, w, sizes = st
+            out = x @ w.T
+        splits = []
+        acc = 0
+        for sz in sizes[:-1]:
+            acc += sz
+            splits.append(acc)
+        return mx.split(out, splits, axis=-1)
+
     def decode_step_math(self, x, ring, state_arrays, offset):
         """Branchless single-token attention for the compiled decode path.
 
@@ -1196,14 +1250,15 @@ class Attention(nn.Module):
         pos = offset.reshape(1)
         cos, sin = rope_cos_sin(self._freqs, pos)
 
-        qr = self.q_norm(self.wq_a(x))
+        xp = self._x_projections(x)
+        qr = self.q_norm(xp[0])
         q = self.wq_b(qr).reshape(1, 1, self.n_heads, self.head_dim)
         qf = q.astype(mx.float32)
         q = (qf * mx.rsqrt(qf.square().mean(-1, keepdims=True) + self.eps)).astype(q.dtype)
         q_tail = apply_interleaved_rope(q[..., -rd:], cos[:, None], sin[:, None])
         q = mx.concatenate([q[..., :-rd], q_tail], axis=-1)
 
-        kv = self.kv_norm(self.wkv(x))
+        kv = self.kv_norm(xp[1])
         kv_tail = apply_interleaved_rope(kv[..., -rd:], cos, sin)
         kv = mx.concatenate([kv[..., :-rd], kv_tail], axis=-1)
 
@@ -1214,12 +1269,13 @@ class Attention(nn.Module):
             if "indexer" in self:
                 ckv, csc, cbuf, cn, ikv, isc, ibuf, in_ = state_arrays
                 cidx, ikv, isc, ibuf, in_ = self.indexer.decode_step_math(
-                    x, qr, ikv, isc, ibuf, in_, offset, self._freqs
+                    (xp[5], xp[6]), xp[4], x.dtype, qr,
+                    ikv, isc, ibuf, in_, offset, self._freqs,
                 )
             else:
                 ckv, csc, cbuf, cn = state_arrays
             ckv, csc, cbuf, cn = self.compressor.decode_step_math(
-                x, ckv, csc, cbuf, cn, offset, self._freqs
+                (xp[2], xp[3]), x.dtype, ckv, csc, cbuf, cn, offset, self._freqs
             )
             if "indexer" not in self:
                 cap = cbuf.shape[1]

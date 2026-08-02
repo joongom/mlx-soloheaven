@@ -1162,7 +1162,7 @@ def _get_attn_core_kernel():
     global _attn_core_kernel
     if _attn_core_kernel is None:
         _attn_core_kernel = mx.fast.metal_kernel(
-            name="dsv4_attn_core",
+            name="sh_dsv4_attn_core",
             input_names=["q", "kv", "ring", "comp", "cidx", "sink", "freqs",
                          "params", "fscal", "ioff"],
             output_names=["out", "kv_out"],
@@ -1208,7 +1208,7 @@ def _get_decode_kernel():
     global _decode_kernel
     if _decode_kernel is None:
         _decode_kernel = mx.fast.metal_kernel(
-            name="dsv4_sparse_decode",
+            name="sh_dsv4_sparse_decode",
             input_names=["q", "kv1", "idxs1", "kv2", "idxs2", "sink", "scale", "params"],
             output_names=["out"],
             source=_DECODE_KERNEL_SRC,
@@ -2092,13 +2092,13 @@ def _get_idx_kernels():
     global _idx_kernels
     if _idx_kernels is None:
         score = mx.fast.metal_kernel(
-            name="dsv4_idx_score_k",
+            name="sh_dsv4_idx_score_k",
             input_names=["q", "buf", "w", "freqs", "params", "fscal", "ioff"],
             output_names=["scores"],
             source=_IDX_SCORE_SRC,
         )
         topk = mx.fast.metal_kernel(
-            name="dsv4_idx_topk_k",
+            name="sh_dsv4_idx_topk_k",
             input_names=["scores", "params", "ioff"],
             output_names=["out_idx"],
             source=_IDX_TOPK_SRC,
@@ -2279,31 +2279,31 @@ def _get_misc_kernels():
     global _misc_kernels
     if _misc_kernels is None:
         store = mx.fast.metal_kernel(
-            name="dsv4_ring_store_k",
+            name="sh_dsv4_ring_store_k",
             input_names=["src", "params", "ioff"],
             output_names=["ring"],
             source=_RING_STORE_SRC,
         )
         swiglu = mx.fast.metal_kernel(
-            name="dsv4_swiglu_k",
+            name="sh_dsv4_swiglu_k",
             input_names=["gate", "up", "params", "feps"],
             output_names=["out"],
             source=_SWIGLU_SRC,
         )
         add = mx.fast.metal_kernel(
-            name="dsv4_add_k",
+            name="sh_dsv4_add_k",
             input_names=["a", "b", "params"],
             output_names=["out"],
             source=_ADD_SRC,
         )
         embed = mx.fast.metal_kernel(
-            name="dsv4_embed_k",
+            name="sh_dsv4_embed_k",
             input_names=["weight", "scales", "biases", "params", "ioff"],
             output_names=["h"],
             source=_EMBED_SRC,
         )
         hc_head = mx.fast.metal_kernel(
-            name="dsv4_hc_head_k",
+            name="sh_dsv4_hc_head_k",
             input_names=["h", "fn", "scale", "base", "params", "feps"],
             output_names=["y"],
             source=_HC_HEAD_SRC,
@@ -2319,13 +2319,13 @@ def _get_gate_kernels():
     global _gate_kernels
     if _gate_kernels is None:
         gate = mx.fast.metal_kernel(
-            name="dsv4_gate_k",
+            name="sh_dsv4_gate_k",
             input_names=["x", "weight", "bias", "params", "feps"],
             output_names=["scores", "out_idx", "out_w"],
             source=_GATE_SRC,
         )
         rms = mx.fast.metal_kernel(
-            name="dsv4_rms_k",
+            name="sh_dsv4_rms_k",
             input_names=["x", "w", "params", "feps"],
             output_names=["y"],
             source=_RMS_SRC,
@@ -2515,13 +2515,13 @@ def _get_hc_kernels():
         # NOTE: _HC_PRE_SRC now consumes precomputed raw mixes (fn.h dots from
         # _HC_MIX_SRC) — the twin's inputs must match the body's buffer names.
         pre = mx.fast.metal_kernel(
-            name="dsv4_hc_pre_k",
+            name="sh_dsv4_hc_pre_k",
             input_names=["h", "mixes", "scale", "base", "params", "feps", "iters"],
             output_names=["y", "post", "comb"],
             source=_HC_PRE_SRC,
         )
         post = mx.fast.metal_kernel(
-            name="dsv4_hc_post_k",
+            name="sh_dsv4_hc_post_k",
             input_names=["x", "residual", "post", "comb", "params"],
             output_names=["y"],
             source=_HC_POST_SRC,
@@ -2652,13 +2652,13 @@ def _get_moe_kernels():
     global _moe_kernels
     if _moe_kernels is None:
         k1 = mx.fast.metal_kernel(
-            name="dsv4_moe_w13",
+            name="sh_dsv4_moe_w13",
             input_names=["x", "gw", "gs_", "gb", "uw", "us", "ub", "idxs", "params", "feps"],
             output_names=["h"],
             source=_MOE_K1_SRC,
         )
         k2 = mx.fast.metal_kernel(
-            name="dsv4_moe_w2",
+            name="sh_dsv4_moe_w2",
             input_names=["h", "dw", "ds_", "db", "idxs", "wts", "params"],
             output_names=["y"],
             source=_MOE_K2_SRC,

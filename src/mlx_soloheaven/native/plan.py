@@ -58,9 +58,9 @@ class Planner:
 
     def rms(self, w, x, y, d, eps, xoff=0):
         o, _ = self.cb.add("if", d, eps)
-        r = BUFFER_SLOTS["dsv4_rms_k"]
+        r = BUFFER_SLOTS["sh_dsv4_rms_k"]
         return self._pi(
-            "dsv4_rms_k", True,
+            "sh_dsv4_rms_k", True,
             [(self.S[x], r["x"], xoff), (self.t.add(w), r["w"]), (self.S[y], r["y"])],
             [(o, 4, r["params"]), (o + 4, 4, r["feps"])], (1, 1, 1), (256, 1, 1))
 
@@ -72,16 +72,16 @@ class Planner:
         f, _ = self.cb.add("2f", eps, hc_eps)
         i, _ = self.cb.add("i", iters)
         mix = (2 + hc) * hc
-        mk = BUFFER_SLOTS["dsv4_hc_mix_k"]
-        k = BUFFER_SLOTS["dsv4_hc_pre_k"]
+        mk = BUFFER_SLOTS["sh_dsv4_hc_mix_k"]
+        k = BUFFER_SLOTS["sh_dsv4_hc_pre_k"]
         return [
             self._pi(
-                "dsv4_hc_mix_k", True,
+                "sh_dsv4_hc_mix_k", True,
                 [(self.S[h], mk["h"]), (self.t.add(fn), mk["fn"]),
                  (self.S["hc_mixes"], mk["mixes"])],
                 [(p, 8, mk["params"])], (mix, 1, 1), (1024, 1, 1)),
             self._pi(
-                "dsv4_hc_pre_k", True,
+                "sh_dsv4_hc_pre_k", True,
                 [(self.S[h], k["h"]), (self.S["hc_mixes"], k["mixes"]),
                  (self.t.add(scale), k["scale"]), (self.t.add(base), k["base"]),
                  (self.S[x], k["y"]), (self.S[post], k["post"]), (self.S[comb], k["comb"])],
@@ -91,10 +91,10 @@ class Planner:
 
     def hc_post(self, x, residual, post, comb, y, hc, hidden):
         p, _ = self.cb.add("2i", hc, hidden)
-        k = BUFFER_SLOTS["dsv4_hc_post_k"]
+        k = BUFFER_SLOTS["sh_dsv4_hc_post_k"]
         # grid = hc * NSPLIT(8): must match the kernel's compile-time NSPLIT.
         return self._pi(
-            "dsv4_hc_post_k", True,
+            "sh_dsv4_hc_post_k", True,
             [(self.S[x], k["x"]), (self.S[residual], k["residual"]), (self.S[post], k["post"]),
              (self.S[comb], k["comb"]), (self.S[y], k["y"])],
             [(p, 8, k["params"])], (hc * 8, 1, 1), (256, 1, 1))
@@ -102,9 +102,9 @@ class Planner:
     def hc_post2(self, a, b, residual, post, comb, y, hc, hidden):
         """hc_post with x = a + b fused in (the MoE routed+shared add)."""
         p, _ = self.cb.add("2i", hc, hidden)
-        k = BUFFER_SLOTS["dsv4_hc_post2_k"]
+        k = BUFFER_SLOTS["sh_dsv4_hc_post2_k"]
         return self._pi(
-            "dsv4_hc_post2_k", True,
+            "sh_dsv4_hc_post2_k", True,
             [(self.S[a], k["a"]), (self.S[b], k["b"]), (self.S[residual], k["residual"]),
              (self.S[post], k["post"]), (self.S[comb], k["comb"]), (self.S[y], k["y"])],
             [(p, 8, k["params"])], (hc * 8, 1, 1), (256, 1, 1))
@@ -122,13 +122,13 @@ def plan_compressor(pl: Planner, comp, freqs, kv_src: str, sc_src: str,
     written (pooling redirects that row's reads to kv_row/sc_row), and the
     overlap-head shift runs behind the kernel's pooling barrier — the old
     full-state double-buffer copy cost 2.5 ms/token (Stage 3o)."""
-    cs = BUFFER_SLOTS["dsv4_comp_step"]
+    cs = BUFFER_SLOTS["sh_dsv4_comp_step"]
     d, ratio, coff = comp.head_dim, comp.ratio, comp.coff
     po, _ = pl.cb.add("4i", ratio, d, coff, comp.rope_dim)
     fo, _ = pl.cb.add("f", 1e-6)
     row_off = n * d * 2  # bf16 buf row stride
     return [pl._pi(
-        "dsv4_comp_step", True,
+        "sh_dsv4_comp_step", True,
         [(pl.S[kv_src], cs["kv_row"], kv_off), (pl.S[sc_src], cs["sc_row"], sc_off),
          (pl.S[cache["kv_st"]], cs["kv_st"]), (pl.S[cache["sc_st"]], cs["sc_st"]),
          (pl.t.add(comp.ape), cs["ape"]), (pl.t.add(comp.norm.weight), cs["nw"]),
@@ -156,20 +156,20 @@ def plan_indexer(pl: Planner, idxr, freqs, xin: str, qr: str, idx_cache: dict,
     items += plan_compressor(pl, idxr.compressor, freqs, "xall", "xall",
                              idx_cache, ioff_off, n,
                              kv_off=ickv_off, sc_off=icwg_off)
-    isk, itk = BUFFER_SLOTS["dsv4_idx_score_k"], BUFFER_SLOTS["dsv4_idx_topk_k"]
+    isk, itk = BUFFER_SLOTS["sh_dsv4_idx_score_k"], BUFFER_SLOTS["sh_dsv4_idx_topk_k"]
     cap = 256
     sp, _ = pl.cb.add("4i", n_h, hd, rd, cap)
     sf, _ = pl.cb.add("f", hd ** -0.5 * n_h ** -0.5)
     tp, _ = pl.cb.add("2i", cap, idxr.topk)
     items.append(pl._pi(
-        "dsv4_idx_score_k", True,
+        "sh_dsv4_idx_score_k", True,
         [(pl.S["iq"], isk["q"]), (pl.S[idx_cache["i_buf"]], isk["buf"]),
          (pl.S["xall"], isk["w"], iw_off), (pl.t.add(freqs), isk["freqs"]),
          (pl.S["scores"], isk["scores"])],
         [(sp, 16, isk["params"]), (sf, 4, isk["fscal"]), (ioff_off, 8, isk["ioff"])],
         (cap, 1, 1), (256, 1, 1)))
     items.append(pl._pi(
-        "dsv4_idx_topk_k", True,
+        "sh_dsv4_idx_topk_k", True,
         [(pl.S["scores"], itk["scores"]), (pl.S["cidx"], itk["out_idx"])],
         [(tp, 8, itk["params"]), (ioff_off, 8, itk["ioff"])], (1, 1, 1), (256, 1, 1)))
     return items
@@ -223,26 +223,25 @@ def plan_attention(pl: Planner, attn, xin: str, ring: str, out: str,
         comp_slot = comp_cache["buf"]
         # plain layers: kc = visible groups; indexer layers: kc = topk width.
         kc = a.indexer.topk if idx_cache is not None else ncomp
-    ac = BUFFER_SLOTS["dsv4_attn_core"]
+    ac = BUFFER_SLOTS["sh_dsv4_attn_core"]
     po, _ = pl.cb.add("5i", D, a.rope_dim, win, kc, plain)
     fo, _ = pl.cb.add("2f", a.scale, a.eps)
     items.append(pl._pi(
-        "dsv4_attn_core", True,
+        "sh_dsv4_attn_core", True,
         [(pl.S["q_raw"], ac["q"]), (pl.S["kvn"], ac["kv"]), (pl.S[ring], ac["ring"]),
          (pl.S[comp_slot], ac["comp"]), (pl.S[cidx_slot], ac["cidx"]),
          (pl.t.add(a.attn_sink), ac["sink"]), (pl.t.add(a._freqs), ac["freqs"]),
          (pl.S["acore"], ac["out"]), (pl.S["kv_roped"], ac["kv_out"])],
         [(po, 20, ac["params"]), (fo, 8, ac["fscal"]), (ioff_off, 8, ac["ioff"])],
         (H, 1, 1), (512, 1, 1)))
-    rs = BUFFER_SLOTS["dsv4_ring_store_k"]
     rp, _ = pl.cb.add("ii", D, win)
     # the ring write now happens inside attn_core (Stage 4h)
         # o_groups grouped 8-bit qmv as ONE dispatch (was g separate library qmv):
     # out[gi*o_lora+j] = deq(wo_a[gi,j]) . acore[gi*gin:], one simdgroup/row.
-    wa = BUFFER_SLOTS["dsv4_wo_a_k"]
+    wa = BUFFER_SLOTS["sh_dsv4_wo_a_k"]
     wo, _ = pl.cb.add("3i", g, gin, o_lora)
     items.append(pl._pi(
-        "dsv4_wo_a_k", True,
+        "sh_dsv4_wo_a_k", True,
         [(pl.S["acore"], wa["x"]), (pl.t.add(a.wo_a.weight), wa["weight"]),
          (pl.t.add(a.wo_a.scales), wa["scales"]), (pl.t.add(a.wo_a.biases), wa["biases"]),
          (pl.S["o_lora"], wa["out"])],
@@ -264,9 +263,9 @@ def plan_moe(pl: Planner, ffn, xin: str, out: str, topk: int, rscale: float,
     items = []
     go, _ = pl.cb.add("iiif", n_exp, hidden, topk, rscale)
     if getattr(ffn.gate, "hash", False):
-        gh = BUFFER_SLOTS["dsv4_gate_hash_k"]
+        gh = BUFFER_SLOTS["sh_dsv4_gate_hash_k"]
         items.append(pl._pi(
-            "dsv4_gate_hash_k", True,
+            "sh_dsv4_gate_hash_k", True,
             [(pl.S[xin], gh["x"]), (pl.t.add(ffn.gate.weight), gh["weight"]),
              (pl.t.add(ffn.gate.tid2eid), gh["tid2eid"]),
              (pl.S["idx"], gh["out_idx"]), (pl.S["w"], gh["out_w"])],
@@ -275,31 +274,31 @@ def plan_moe(pl: Planner, ffn, xin: str, out: str, topk: int, rscale: float,
     else:
         # score every expert in parallel (grid = n_exp threadgroups so the chip
         # hides the weight-fetch latency), then a tiny top-k over the scores.
-        gs = BUFFER_SLOTS["dsv4_gate_score_k"]
+        gs = BUFFER_SLOTS["sh_dsv4_gate_score_k"]
         items.append(pl._pi(
-            "dsv4_gate_score_k", True,
+            "sh_dsv4_gate_score_k", True,
             [(pl.S[xin], gs["x"]), (pl.t.add(ffn.gate.weight), gs["weight"]),
              (pl.S["scores"], gs["scores"])],
             [(go, 8, gs["params"])], (n_exp, 1, 1), (256, 1, 1)))
-        gt = BUFFER_SLOTS["dsv4_gate_topk_k"]
+        gt = BUFFER_SLOTS["sh_dsv4_gate_topk_k"]
         items.append(pl._pi(
-            "dsv4_gate_topk_k", True,
+            "sh_dsv4_gate_topk_k", True,
             [(pl.S["scores"], gt["scores"]), (pl.t.add(ffn.gate.bias), gt["bias"]),
              (pl.S["idx"], gt["out_idx"]), (pl.S["w"], gt["out_w"])],
             [(go, 12, gt["params"]), (go + 12, 4, gt["feps"])], (1, 1, 1), (256, 1, 1)))
     mo, _ = pl.cb.add("iii", topk, hidden, inter)
     ml, _ = pl.cb.add("f", limit)
-    w1 = BUFFER_SLOTS["dsv4_moe_w13"]
+    w1 = BUFFER_SLOTS["sh_dsv4_moe_w13"]
     items.append(pl._pi(
-        "dsv4_moe_w13", True,
+        "sh_dsv4_moe_w13", True,
         [(pl.S[xin], w1["x"]), (pl.t.add(exp.gate_proj.weight), w1["gw"]),
          (pl.t.add(exp.gate_proj.scales), w1["gs_"]), (pl.t.add(exp.gate_proj.biases), w1["gb"]),
          (pl.t.add(exp.up_proj.weight), w1["uw"]), (pl.t.add(exp.up_proj.scales), w1["us"]),
          (pl.t.add(exp.up_proj.biases), w1["ub"]), (pl.S["idx"], w1["idxs"]), (pl.S["hexp"], w1["h"])],
         [(mo, 12, w1["params"]), (ml, 4, w1["feps"])], ((topk * inter + 7) // 8, 1, 1), (256, 1, 1)))
-    w2 = BUFFER_SLOTS["dsv4_moe_w2"]
+    w2 = BUFFER_SLOTS["sh_dsv4_moe_w2"]
     items.append(pl._pi(
-        "dsv4_moe_w2", True,
+        "sh_dsv4_moe_w2", True,
         [(pl.S["hexp"], w2["h"]), (pl.t.add(exp.down_proj.weight), w2["dw"]),
          (pl.t.add(exp.down_proj.scales), w2["ds_"]), (pl.t.add(exp.down_proj.biases), w2["db"]),
          (pl.S["idx"], w2["idxs"]), (pl.S["w"], w2["wts"]), (pl.S["y_routed"], w2["y"])],
@@ -307,11 +306,11 @@ def plan_moe(pl: Planner, ffn, xin: str, out: str, topk: int, rscale: float,
     # shared expert w1 + w3 + clipped SwiGLU as ONE dispatch (was 2 library
     # qmv + the elementwise swiglu): one simdgroup per inter row does both
     # 8-bit dots and applies the activation in-register.
-    k13 = BUFFER_SLOTS["dsv4_sh13_k"]
+    k13 = BUFFER_SLOTS["sh_dsv4_sh13_k"]
     so, _ = pl.cb.add("2i", hidden, inter)
     sf, _ = pl.cb.add("f", limit)
     items.append(pl._pi(
-        "dsv4_sh13_k", True,
+        "sh_dsv4_sh13_k", True,
         [(pl.S[xin], k13["x"]),
          (pl.t.add(sh.w1.weight), k13["w1"]), (pl.t.add(sh.w1.scales), k13["s1"]),
          (pl.t.add(sh.w1.biases), k13["b1"]),
@@ -329,10 +328,10 @@ def plan_embed(pl: Planner, embed, hout: str, hc: int, hidden: int,
                tok_off: int) -> list:
     """Dequantize the embedding row for the token in the uniform buffer (at
     byte offset ``tok_off``) into scratch[hout] as hc replicated streams."""
-    ek = BUFFER_SLOTS["dsv4_embed_k"]
+    ek = BUFFER_SLOTS["sh_dsv4_embed_k"]
     p, _ = pl.cb.add("2i", hidden, hc)
     return [pl._pi(
-        "dsv4_embed_k", True,
+        "sh_dsv4_embed_k", True,
         [(pl.t.add(embed.weight), ek["weight"]), (pl.t.add(embed.scales), ek["scales"]),
          (pl.t.add(embed.biases), ek["biases"]), (pl.S[hout], ek["h"])],
         [(p, 8, ek["params"]), (tok_off, 4, ek["ioff"])], (hidden, 1, 1), (256, 1, 1))]
@@ -341,11 +340,11 @@ def plan_embed(pl: Planner, embed, hout: str, hc: int, hidden: int,
 def plan_head(pl: Planner, model, hin: str, logits: str, hc: int, hidden: int,
               vocab: int) -> list:
     """hc-head reduce -> final RMSNorm -> head qmv, scratch[hin] -> scratch[logits]."""
-    hk = BUFFER_SLOTS["dsv4_hc_head_k"]
+    hk = BUFFER_SLOTS["sh_dsv4_hc_head_k"]
     p, _ = pl.cb.add("2i", hc, hidden)
     f, _ = pl.cb.add("2f", model.eps, model.hc_eps)
     items = [pl._pi(
-        "dsv4_hc_head_k", True,
+        "sh_dsv4_hc_head_k", True,
         [(pl.S[hin], hk["h"]), (pl.t.add(model.hc_head_fn.reshape(-1)), hk["fn"]),
          (pl.t.add(model.hc_head_scale), hk["scale"]), (pl.t.add(model.hc_head_base), hk["base"]),
          (pl.S["headx"], hk["y"])],

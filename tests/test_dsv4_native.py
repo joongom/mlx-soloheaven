@@ -179,7 +179,7 @@ def test_native_moe_w2_kernel_matches_mx_fast():
     slots = [table.add(a) for a in (h.reshape(-1), dqw, dsc, dbi, idxs, wts, y)]
 
     it = rt_mod._PlanItem()
-    it.pso = _RT.pipeline("dsv4_moe_w2", custom=True)
+    it.pso = _RT.pipeline("sh_dsv4_moe_w2", custom=True)
     it.n_bufs = 6
     for i, (bid, slot) in enumerate(
         [(slots[0], 0), (slots[1], 1), (slots[2], 2), (slots[3], 3),
@@ -203,7 +203,7 @@ def test_native_moe_w2_kernel_matches_mx_fast():
 
 
 def test_native_moe_w13_kernel_matches_mx_fast():
-    """dsv4_moe_w13 (gate/up + clipped SwiGLU) native == mx.fast twin."""
+    """sh_dsv4_moe_w13 (gate/up + clipped SwiGLU) native == mx.fast twin."""
     from mlx_soloheaven.models.deepseek_v4 import _get_moe_kernels
 
     n_act, d_model, d_inner, E, limit = 4, 256, 192, 8, 10.0
@@ -235,7 +235,7 @@ def test_native_moe_w13_kernel_matches_mx_fast():
     h_slot = table.add(h)
 
     it = rt_mod._PlanItem()
-    it.pso = _RT.pipeline("dsv4_moe_w13", custom=True)
+    it.pso = _RT.pipeline("sh_dsv4_moe_w13", custom=True)
     it.n_bufs = len(ins) + 1
     for i, s in enumerate(slots):
         it.buf_ids[i], it.buf_slots[i], it.buf_offs[i] = s, i, 0
@@ -252,7 +252,7 @@ def test_native_moe_w13_kernel_matches_mx_fast():
 
 
 def test_native_attn_core_matches_mx_fast():
-    """dsv4_attn_core native (explicit signature, C-loop dispatch) == the
+    """sh_dsv4_attn_core native (explicit signature, C-loop dispatch) == the
     mx.fast twin, on a plain-compressed decode shape. This is the largest and
     most branch-heavy kernel; matching it validates the generated-signature
     path for the whole family."""
@@ -297,10 +297,10 @@ def test_native_attn_core_matches_mx_fast():
         out=out, kv_out=kvo,
     )
     slots = {nm: table.add(a) for nm, a in named.items()}
-    smap = BUFFER_SLOTS["dsv4_attn_core"]
+    smap = BUFFER_SLOTS["sh_dsv4_attn_core"]
 
     it = rt_mod._PlanItem()
-    it.pso = _RT.pipeline("dsv4_attn_core", custom=True)
+    it.pso = _RT.pipeline("sh_dsv4_attn_core", custom=True)
     buf_items = list(slots.items())
     it.n_bufs = len(buf_items)
     for i, (nm, s) in enumerate(buf_items):
@@ -325,7 +325,7 @@ def test_native_attn_core_matches_mx_fast():
 
 
 def test_native_gate_and_rms_match_reference():
-    """dsv4_gate_k (sqrtsoftplus scores + noaux_tc top-k, weights from unbiased
+    """sh_dsv4_gate_k (sqrtsoftplus scores + noaux_tc top-k, weights from unbiased
     scores) and dsv4_rms_k, both through the C loop, vs the model math. Data is
     seeded and margin-checked so no near-tie flips the top-k set (a real
     boundary flip is quantization noise, not a kernel bug)."""
@@ -350,13 +350,13 @@ def test_native_gate_and_rms_match_reference():
     mx.eval(x, weight, bias, wref, iref, sc, oi, ow)
     mx.synchronize()
     table = rt_mod.BufferTable()
-    gs = BUFFER_SLOTS["dsv4_gate_k"]
+    gs = BUFFER_SLOTS["sh_dsv4_gate_k"]
     s = {nm: table.add(a) for nm, a in
          [("x", x), ("weight", weight), ("bias", bias), ("scores", sc),
           ("out_idx", oi), ("out_w", ow)]}
     const = struct.pack("<iiif", n_exp, dim, topk, rscale)
     it = rt_mod.plan_item(
-        _RT, "dsv4_gate_k", True,
+        _RT, "sh_dsv4_gate_k", True,
         [(s["x"], gs["x"]), (s["weight"], gs["weight"]), (s["bias"], gs["bias"]),
          (s["scores"], gs["scores"]), (s["out_idx"], gs["out_idx"]),
          (s["out_w"], gs["out_w"])],
@@ -380,11 +380,11 @@ def test_native_gate_and_rms_match_reference():
     mx.eval(w, y, yr)
     mx.synchronize()
     t2 = rt_mod.BufferTable()
-    rs = BUFFER_SLOTS["dsv4_rms_k"]
+    rs = BUFFER_SLOTS["sh_dsv4_rms_k"]
     r = {nm: t2.add(a) for nm, a in [("x", x), ("w", w), ("y", y)]}
     const2 = struct.pack("<if", dim, 1e-6)
     it2 = rt_mod.plan_item(
-        _RT, "dsv4_rms_k", True,
+        _RT, "sh_dsv4_rms_k", True,
         [(r["x"], rs["x"]), (r["w"], rs["w"]), (r["y"], rs["y"])],
         [(0, 4, rs["params"]), (4, 4, rs["feps"])],
         (1, 1, 1), (256, 1, 1),
@@ -395,7 +395,7 @@ def test_native_gate_and_rms_match_reference():
 
 
 def test_native_gate_split_matches_reference():
-    """dsv4_gate_score_k (one threadgroup per expert) + dsv4_gate_topk_k chained
+    """sh_dsv4_gate_score_k (one threadgroup per expert) + dsv4_gate_topk_k chained
     == the model's noaux_tc route, same as the fused dsv4_gate_k but parallelized
     over the chip (the fused version was ~1.75 ms/layer on the real model)."""
     from mlx_soloheaven.models.deepseek_v4 import route, sqrtsoftplus
@@ -419,17 +419,17 @@ def test_native_gate_split_matches_reference():
     mx.eval(x, weight, bias, sc, oi, ow)
     mx.synchronize()
     table = rt_mod.BufferTable()
-    gs, gt = BUFFER_SLOTS["dsv4_gate_score_k"], BUFFER_SLOTS["dsv4_gate_topk_k"]
+    gs, gt = BUFFER_SLOTS["sh_dsv4_gate_score_k"], BUFFER_SLOTS["sh_dsv4_gate_topk_k"]
     s = {nm: table.add(a) for nm, a in
          [("x", x), ("weight", weight), ("bias", bias), ("scores", sc),
           ("out_idx", oi), ("out_w", ow)]}
     const = struct.pack("<iiif", n_exp, dim, topk, rscale)
     score_it = rt_mod.plan_item(
-        _RT, "dsv4_gate_score_k", True,
+        _RT, "sh_dsv4_gate_score_k", True,
         [(s["x"], gs["x"]), (s["weight"], gs["weight"]), (s["scores"], gs["scores"])],
         [(0, 8, gs["params"])], (n_exp, 1, 1), (256, 1, 1))
     topk_it = rt_mod.plan_item(
-        _RT, "dsv4_gate_topk_k", True,
+        _RT, "sh_dsv4_gate_topk_k", True,
         [(s["scores"], gt["scores"]), (s["bias"], gt["bias"]),
          (s["out_idx"], gt["out_idx"]), (s["out_w"], gt["out_w"])],
         [(0, 12, gt["params"]), (12, 4, gt["feps"])], (1, 1, 1), (256, 1, 1))
@@ -442,7 +442,7 @@ def test_native_gate_split_matches_reference():
 
 
 def test_native_gate_hash_matches_reference():
-    """dsv4_gate_hash_k: the first num_hash_layers route experts by
+    """sh_dsv4_gate_hash_k: the first num_hash_layers route experts by
     tid2eid[token] (no top-k, no bias); weights are the UNBIASED sqrtsoftplus
     scores at those experts, normalized and route-scaled (Gate.__call__'s hash
     branch). Diffed through the C loop against the eager math."""
@@ -467,12 +467,12 @@ def test_native_gate_hash_matches_reference():
     mx.eval(x, weight, tid2eid, oi, ow)
     mx.synchronize()
     table = rt_mod.BufferTable()
-    gh = BUFFER_SLOTS["dsv4_gate_hash_k"]
+    gh = BUFFER_SLOTS["sh_dsv4_gate_hash_k"]
     s = {nm: table.add(a) for nm, a in
          [("x", x), ("weight", weight), ("tid2eid", tid2eid), ("out_idx", oi), ("out_w", ow)]}
     const = struct.pack("<iiif", n_exp, dim, topk, rscale) + struct.pack("<i", token)
     it = rt_mod.plan_item(
-        _RT, "dsv4_gate_hash_k", True,
+        _RT, "sh_dsv4_gate_hash_k", True,
         [(s["x"], gh["x"]), (s["weight"], gh["weight"]), (s["tid2eid"], gh["tid2eid"]),
          (s["out_idx"], gh["out_idx"]), (s["out_w"], gh["out_w"])],
         [(0, 12, gh["params"]), (12, 4, gh["feps"]), (16, 4, gh["ioff"])],
@@ -485,7 +485,7 @@ def test_native_gate_hash_matches_reference():
 
 
 def test_native_hc_pre_matches_reference():
-    """dsv4_hc_pre_k native (explicit signature, C-loop) == _hc_pre_math (the
+    """sh_dsv4_hc_pre_k native (explicit signature, C-loop) == _hc_pre_math (the
     reference the mx.fast twin is diffed against elsewhere). Covers the rms,
     the mixes GEMV, the full 20-iteration Sinkhorn, and the pre-reduction."""
     from mlx_soloheaven.models.deepseek_v4 import _hc_pre_math
@@ -508,19 +508,19 @@ def test_native_hc_pre_matches_reference():
     mix = (2 + hc) * hc
     mixes = mx.zeros((mix,), dtype=mx.float32)
     mx.eval(mixes)
-    mk = BUFFER_SLOTS["dsv4_hc_mix_k"]
-    sl = BUFFER_SLOTS["dsv4_hc_pre_k"]
+    mk = BUFFER_SLOTS["sh_dsv4_hc_mix_k"]
+    sl = BUFFER_SLOTS["sh_dsv4_hc_pre_k"]
     s = {nm: table.add(a) for nm, a in
          [("h", h.reshape(-1)), ("fn", fn), ("scale", scale), ("base", base),
           ("mixes", mixes), ("y", y), ("post", post), ("comb", comb)]}
     const = struct.pack("<2i2fi", hc, d, 1e-6, 1e-6, iters)
     it_mix = rt_mod.plan_item(
-        _RT, "dsv4_hc_mix_k", True,
+        _RT, "sh_dsv4_hc_mix_k", True,
         [(s["h"], mk["h"]), (s["fn"], mk["fn"]), (s["mixes"], mk["mixes"])],
         [(0, 8, mk["params"])], (mix, 1, 1), (1024, 1, 1),
     )
     it = rt_mod.plan_item(
-        _RT, "dsv4_hc_pre_k", True,
+        _RT, "sh_dsv4_hc_pre_k", True,
         [(s["h"], sl["h"]), (s["mixes"], sl["mixes"]), (s["scale"], sl["scale"]),
          (s["base"], sl["base"]), (s["y"], sl["y"]), (s["post"], sl["post"]),
          (s["comb"], sl["comb"])],
@@ -536,7 +536,7 @@ def test_native_hc_pre_matches_reference():
 
 
 def test_native_hc_post_comb_orientation_hc4():
-    """dsv4_hc_post_k at hc=4 against _hc_post_math.
+    """sh_dsv4_hc_post_k at hc=4 against _hc_post_math.
 
     REGRESSION: the kernel read comb[k, j] where the reference sums
     comb[j, k] (einsum "bsjk,bsjd->bskd"). Every 2x2 doubly-stochastic
@@ -561,13 +561,13 @@ def test_native_hc_post_comb_orientation_hc4():
 
     rt_mod.load_custom_kernels(_RT)
     T = rt_mod.BufferTable()
-    k = BUFFER_SLOTS["dsv4_hc_post_k"]
+    k = BUFFER_SLOTS["sh_dsv4_hc_post_k"]
     s_ = {nm: T.add(a) for nm, a in [("x", x), ("residual", res.reshape(-1)),
                                      ("post", post), ("comb", comb.reshape(-1)),
                                      ("y", y)]}
     const = struct.pack("<2i", hc, d)
     it = rt_mod.plan_item(
-        _RT, "dsv4_hc_post_k", True,
+        _RT, "sh_dsv4_hc_post_k", True,
         [(s_["x"], k["x"]), (s_["residual"], k["residual"]), (s_["post"], k["post"]),
          (s_["comb"], k["comb"]), (s_["y"], k["y"])],
         [(0, 8, k["params"])], (hc * 8, 1, 1), (256, 1, 1))
@@ -631,11 +631,11 @@ def test_native_moe_routed_chain_matches_mx_fast():
         "idxs": table.add(idx1), "wts": table.add(wt1),
         "h": table.add(h), "y": table.add(y),
     }
-    w13, w2 = BUFFER_SLOTS["dsv4_moe_w13"], BUFFER_SLOTS["dsv4_moe_w2"]
+    w13, w2 = BUFFER_SLOTS["sh_dsv4_moe_w13"], BUFFER_SLOTS["sh_dsv4_moe_w2"]
     const = struct.pack("<iiif", n_act, d_model, d_inner, limit)
 
     k1 = rt_mod.plan_item(
-        _RT, "dsv4_moe_w13", True,
+        _RT, "sh_dsv4_moe_w13", True,
         [(s["x"], w13["x"]), (s["gw"], w13["gw"]), (s["gs_"], w13["gs_"]),
          (s["gb"], w13["gb"]), (s["uw"], w13["uw"]), (s["us"], w13["us"]),
          (s["ub"], w13["ub"]), (s["idxs"], w13["idxs"]), (s["h"], w13["h"])],
@@ -643,7 +643,7 @@ def test_native_moe_routed_chain_matches_mx_fast():
         ((n_act * d_inner + 7) // 8, 1, 1), (256, 1, 1),
     )
     k2 = rt_mod.plan_item(
-        _RT, "dsv4_moe_w2", True,
+        _RT, "sh_dsv4_moe_w2", True,
         [(s["h"], w2["h"]), (s["dw"], w2["dw"]), (s["ds_"], w2["ds_"]),
          (s["db"], w2["db"]), (s["idxs"], w2["idxs"]), (s["wts"], w2["wts"]),
          (s["y"], w2["y"])],
@@ -696,7 +696,7 @@ def test_native_qmv_reads_output_sub_range_via_offset():
 
 
 def test_native_ring_store_updates_one_slot_in_place():
-    """dsv4_ring_store_k writes the fresh KV into ring[offset % win] IN PLACE,
+    """sh_dsv4_ring_store_k writes the fresh KV into ring[offset % win] IN PLACE,
     leaving every other slot untouched — the post-attention ring write of the
     decode step. In-place is the point (ring is a session buffer), so this is
     tested through the native path, not mx.fast."""
@@ -713,11 +713,11 @@ def test_native_ring_store_updates_one_slot_in_place():
 
     rt_mod.load_custom_kernels(_RT)
     table = rt_mod.BufferTable()
-    rs = BUFFER_SLOTS["dsv4_ring_store_k"]
+    rs = BUFFER_SLOTS["sh_dsv4_ring_store_k"]
     s_src, s_ring = table.add(src), table.add(ring.reshape(-1))
     const = struct.pack("<iii", D, win, offset)
     it = rt_mod.plan_item(
-        _RT, "dsv4_ring_store_k", True,
+        _RT, "sh_dsv4_ring_store_k", True,
         [(s_src, rs["src"]), (s_ring, rs["ring"])],
         [(0, 8, rs["params"]), (8, 4, rs["ioff"])],
         (1, 1, 1), (256, 1, 1),
@@ -1035,7 +1035,7 @@ def test_native_indexer_kernels_match_reference():
     mx.synchronize()
 
     T = rt_mod.BufferTable()
-    isk, itk = BUFFER_SLOTS["dsv4_idx_score_k"], BUFFER_SLOTS["dsv4_idx_topk_k"]
+    isk, itk = BUFFER_SLOTS["sh_dsv4_idx_score_k"], BUFFER_SLOTS["sh_dsv4_idx_topk_k"]
     s = {nm: T.add(v) for nm, v in
          [("q", q_raw), ("buf", buf.reshape(-1)), ("w", wraw), ("freqs", fr),
           ("scores", scores), ("oi", oi)]}
@@ -1045,12 +1045,12 @@ def test_native_indexer_kernels_match_reference():
     io, _ = cb.add("2i", offset, n2)
     tp, _ = cb.add("2i", cap, topk)
     items = [
-        rt_mod.plan_item(_RT, "dsv4_idx_score_k", True,
+        rt_mod.plan_item(_RT, "sh_dsv4_idx_score_k", True,
             [(s["q"], isk["q"]), (s["buf"], isk["buf"]), (s["w"], isk["w"]),
              (s["freqs"], isk["freqs"]), (s["scores"], isk["scores"])],
             [(sp, 16, isk["params"]), (sf, 4, isk["fscal"]), (io, 8, isk["ioff"])],
             (cap, 1, 1), (256, 1, 1)),
-        rt_mod.plan_item(_RT, "dsv4_idx_topk_k", True,
+        rt_mod.plan_item(_RT, "sh_dsv4_idx_topk_k", True,
             [(s["scores"], itk["scores"]), (s["oi"], itk["out_idx"])],
             [(tp, 8, itk["params"]), (io, 8, itk["ioff"])], (1, 1, 1), (256, 1, 1)),
     ]
@@ -1297,7 +1297,7 @@ def test_native_qmv_into_attn_core_chain():
 
     rt_mod.load_custom_kernels(_RT)
     table = rt_mod.BufferTable()
-    ac = BUFFER_SLOTS["dsv4_attn_core"]
+    ac = BUFFER_SLOTS["sh_dsv4_attn_core"]
     s = {nm: table.add(a) for nm, a in [
         ("qr", qr), ("wqb_q", wqb_q), ("wqb_s", wqb_s), ("wqb_b", wqb_b),
         ("q_raw", q_raw), ("kv", kv.reshape(-1)), ("ring", ring.reshape(-1)),
@@ -1310,7 +1310,7 @@ def test_native_qmv_into_attn_core_chain():
         _RT, (s["wqb_q"], s["wqb_s"], s["wqb_b"], s["qr"], s["q_raw"]),
         QLORA, NHD, 0, 4)
     core = rt_mod.plan_item(
-        _RT, "dsv4_attn_core", True,
+        _RT, "sh_dsv4_attn_core", True,
         [(s["q_raw"], ac["q"]), (s["kv"], ac["kv"]), (s["ring"], ac["ring"]),
          (s["dummy"], ac["comp"]), (s["didx"], ac["cidx"]), (s["sink"], ac["sink"]),
          (s["freqs"], ac["freqs"]), (s["out"], ac["out"]), (s["kvo"], ac["kv_out"])],
@@ -1406,9 +1406,9 @@ def test_native_dense_attention_plan_matches_reference():
 
     def rms(w, xs, ys, d):
         o, _ = cb.add("if", d, attn.eps)
-        r = BUFFER_SLOTS["dsv4_rms_k"]
+        r = BUFFER_SLOTS["sh_dsv4_rms_k"]
         return rt_mod.plan_item(
-            _RT, "dsv4_rms_k", True, [(xs, r["x"]), (T.add(w), r["w"]), (ys, r["y"])],
+            _RT, "sh_dsv4_rms_k", True, [(xs, r["x"]), (T.add(w), r["w"]), (ys, r["y"])],
             [(o, 4, r["params"]), (o + 4, 4, r["feps"])], (1, 1, 1), (256, 1, 1))
 
     items.append(qmv(attn.wq_a.weight, attn.wq_a.scales, attn.wq_a.biases,
@@ -1420,21 +1420,21 @@ def test_native_dense_attention_plan_matches_reference():
                      S["x"], S["xp1"], hidden, D))
     items.append(rms(attn.kv_norm.weight, S["xp1"], S["kvn"], D))
 
-    ac = BUFFER_SLOTS["dsv4_attn_core"]
+    ac = BUFFER_SLOTS["sh_dsv4_attn_core"]
     po, _ = cb.add("5i", D, attn.rope_dim, win, 0, 1)
     fo, _ = cb.add("2f", attn.scale, attn.eps)
     items.append(rt_mod.plan_item(
-        _RT, "dsv4_attn_core", True,
+        _RT, "sh_dsv4_attn_core", True,
         [(S["q_raw"], ac["q"]), (S["kvn"], ac["kv"]), (S["ring"], ac["ring"]),
          (S["dummy"], ac["comp"]), (S["dummy_idx"], ac["cidx"]), (S["sink"], ac["sink"]),
          (S["freqs"], ac["freqs"]), (S["out"], ac["out"]), (S["kv_roped"], ac["kv_out"])],
         [(po, 20, ac["params"]), (fo, 8, ac["fscal"]), (ioff_off, 8, ac["ioff"])],
         (H, 1, 1), (512, 1, 1)))
 
-    rs = BUFFER_SLOTS["dsv4_ring_store_k"]
+    rs = BUFFER_SLOTS["sh_dsv4_ring_store_k"]
     rpo, _ = cb.add("ii", D, win)
     items.append(rt_mod.plan_item(
-        _RT, "dsv4_ring_store_k", True,
+        _RT, "sh_dsv4_ring_store_k", True,
         [(S["kv_roped"], rs["src"]), (S["ring"], rs["ring"])],
         [(rpo, 8, rs["params"]), (ioff_off, 4, rs["ioff"])], (1, 1, 1), (256, 1, 1)))
 
@@ -1567,18 +1567,18 @@ def test_native_ffn_half_plan_matches_reference():
             [(ko, 4, 5), (ko + 4, 4, 6)], (1, (N + 7) // 8, 1), (32, 2, 1))
 
     # hc_pre(h, ffn) -> x, post, comb — the split pair: mix GEMV then the tail
-    hm = BUFFER_SLOTS["dsv4_hc_mix_k"]
-    hp = BUFFER_SLOTS["dsv4_hc_pre_k"]
+    hm = BUFFER_SLOTS["sh_dsv4_hc_mix_k"]
+    hp = BUFFER_SLOTS["sh_dsv4_hc_pre_k"]
     po, _ = cb.add("2i", hc, hidden)
     fo, _ = cb.add("2f", blk.eps, blk.hc_eps)
     io, _ = cb.add("i", blk.iters)
     items.append(rt_mod.plan_item(
-        _RT, "dsv4_hc_mix_k", True,
+        _RT, "sh_dsv4_hc_mix_k", True,
         [(S["h"], hm["h"]), (T.add(blk.hc_ffn_fn.reshape(-1)), hm["fn"]),
          (S["hc_mixes"], hm["mixes"])],
         [(po, 8, hm["params"])], ((2 + hc) * hc, 1, 1), (1024, 1, 1)))
     items.append(rt_mod.plan_item(
-        _RT, "dsv4_hc_pre_k", True,
+        _RT, "sh_dsv4_hc_pre_k", True,
         [(S["h"], hp["h"]), (S["hc_mixes"], hp["mixes"]),
          (T.add(blk.hc_ffn_scale), hp["scale"]), (T.add(blk.hc_ffn_base), hp["base"]),
          (S["x"], hp["y"]), (S["post"], hp["post"]), (S["comb"], hp["comb"])],
@@ -1586,27 +1586,27 @@ def test_native_ffn_half_plan_matches_reference():
         (1, 1, 1), (1024, 1, 1)))
     # ffn_norm rms
     ro, _ = cb.add("if", hidden, blk.eps)
-    rk = BUFFER_SLOTS["dsv4_rms_k"]
+    rk = BUFFER_SLOTS["sh_dsv4_rms_k"]
     items.append(rt_mod.plan_item(
-        _RT, "dsv4_rms_k", True,
+        _RT, "sh_dsv4_rms_k", True,
         [(S["x"], rk["x"]), (T.add(blk.ffn_norm.weight), rk["w"]), (S["xn"], rk["y"])],
         [(ro, 4, rk["params"]), (ro + 4, 4, rk["feps"])], (1, 1, 1), (256, 1, 1)))
     # gate
-    gk = BUFFER_SLOTS["dsv4_gate_k"]
+    gk = BUFFER_SLOTS["sh_dsv4_gate_k"]
     go, _ = cb.add("iiif", n_exp, hidden, topk, args.routed_scaling_factor)
     items.append(rt_mod.plan_item(
-        _RT, "dsv4_gate_k", True,
+        _RT, "sh_dsv4_gate_k", True,
         [(S["xn"], gk["x"]), (T.add(blk.ffn.gate.weight), gk["weight"]),
          (T.add(blk.ffn.gate.bias), gk["bias"]), (S["scores"], gk["scores"]),
          (S["idx"], gk["out_idx"]), (S["w"], gk["out_w"])],
         [(go, 12, gk["params"]), (go + 12, 4, gk["feps"])], (1, 1, 1), (256, 1, 1)))
     # moe K1
     exp = blk.ffn.experts
-    w1 = BUFFER_SLOTS["dsv4_moe_w13"]
+    w1 = BUFFER_SLOTS["sh_dsv4_moe_w13"]
     mo, _ = cb.add("iii", topk, hidden, inter)
     ml, _ = cb.add("f", limit)
     items.append(rt_mod.plan_item(
-        _RT, "dsv4_moe_w13", True,
+        _RT, "sh_dsv4_moe_w13", True,
         [(S["xn"], w1["x"]), (T.add(exp.gate_proj.weight), w1["gw"]),
          (T.add(exp.gate_proj.scales), w1["gs_"]), (T.add(exp.gate_proj.biases), w1["gb"]),
          (T.add(exp.up_proj.weight), w1["uw"]), (T.add(exp.up_proj.scales), w1["us"]),
@@ -1614,9 +1614,9 @@ def test_native_ffn_half_plan_matches_reference():
         [(mo, 12, w1["params"]), (ml, 4, w1["feps"])],
         ((topk * inter + 7) // 8, 1, 1), (256, 1, 1)))
     # moe K2
-    w2 = BUFFER_SLOTS["dsv4_moe_w2"]
+    w2 = BUFFER_SLOTS["sh_dsv4_moe_w2"]
     items.append(rt_mod.plan_item(
-        _RT, "dsv4_moe_w2", True,
+        _RT, "sh_dsv4_moe_w2", True,
         [(S["hexp"], w2["h"]), (T.add(exp.down_proj.weight), w2["dw"]),
          (T.add(exp.down_proj.scales), w2["ds_"]), (T.add(exp.down_proj.biases), w2["db"]),
          (S["idx"], w2["idxs"]), (S["w"], w2["wts"]), (S["y_routed"], w2["y"])],
@@ -1625,25 +1625,25 @@ def test_native_ffn_half_plan_matches_reference():
     sh = blk.ffn.shared_experts
     items.append(qmv(sh.w1.weight, sh.w1.scales, sh.w1.biases, S["xn"], S["sg"], hidden, inter))
     items.append(qmv(sh.w3.weight, sh.w3.scales, sh.w3.biases, S["xn"], S["su"], hidden, inter))
-    sw = BUFFER_SLOTS["dsv4_swiglu_k"]
+    sw = BUFFER_SLOTS["sh_dsv4_swiglu_k"]
     so, _ = cb.add("if", inter, limit)
     items.append(rt_mod.plan_item(
-        _RT, "dsv4_swiglu_k", True,
+        _RT, "sh_dsv4_swiglu_k", True,
         [(S["sg"], sw["gate"]), (S["su"], sw["up"]), (S["sh"], sw["out"])],
         [(so, 4, sw["params"]), (so + 4, 4, sw["feps"])], (inter, 1, 1), (256, 1, 1)))
     items.append(qmv(sh.w2.weight, sh.w2.scales, sh.w2.biases, S["sh"], S["shared"], inter, hidden))
     # add: y_routed + shared -> moe_out
-    ak = BUFFER_SLOTS["dsv4_add_k"]
+    ak = BUFFER_SLOTS["sh_dsv4_add_k"]
     ao, _ = cb.add("i", hidden)
     items.append(rt_mod.plan_item(
-        _RT, "dsv4_add_k", True,
+        _RT, "sh_dsv4_add_k", True,
         [(S["y_routed"], ak["a"]), (S["shared"], ak["b"]), (S["moe_out"], ak["out"])],
         [(ao, 4, ak["params"])], (hidden, 1, 1), (256, 1, 1)))
     # hc_post(moe_out, residual, post, comb) -> hout
-    hps = BUFFER_SLOTS["dsv4_hc_post_k"]
+    hps = BUFFER_SLOTS["sh_dsv4_hc_post_k"]
     hpc, _ = cb.add("2i", hc, hidden)
     items.append(rt_mod.plan_item(
-        _RT, "dsv4_hc_post_k", True,
+        _RT, "sh_dsv4_hc_post_k", True,
         [(S["moe_out"], hps["x"]), (S["residual"], hps["residual"]),
          (S["post"], hps["post"]), (S["comb"], hps["comb"]), (S["hout"], hps["y"])],
         [(hpc, 8, hps["params"])], (hc * 8, 1, 1), (256, 1, 1)))

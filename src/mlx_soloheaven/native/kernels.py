@@ -25,113 +25,113 @@ _I = "const device int*"
 _F = "const device float*"
 
 _SPECS = {
-    "dsv4_moe_w13": (
+    "sh_dsv4_moe_w13": (
         "_MOE_K1_SRC",
         [("x", _B), ("gw", _U), ("gs_", _B), ("gb", _B), ("uw", _U), ("us", _B),
          ("ub", _B), ("idxs", _I), ("params", _I), ("feps", _F),
          ("h", "device float*")],
     ),
-    "dsv4_moe_w2": (
+    "sh_dsv4_moe_w2": (
         "_MOE_K2_SRC",
         [("h", _F), ("dw", _U), ("ds_", _B), ("db", _B), ("idxs", _I),
          ("wts", _F), ("params", _I), ("y", "device float*")],
     ),
-    "dsv4_attn_core": (
+    "sh_dsv4_attn_core": (
         "_ATTN_CORE_SRC",
         [("q", _B), ("kv", _B), ("ring", "device bfloat*"), ("comp", _B),
          ("cidx", _I),
          ("sink", _F), ("freqs", _F), ("params", _I), ("fscal", _F),
          ("ioff", _I), ("out", "device bfloat*"), ("kv_out", "device bfloat*")],
     ),
-    "dsv4_ring_store_k": (
+    "sh_dsv4_ring_store_k": (
         "_RING_STORE_SRC",
         [("src", _B), ("params", _I), ("ioff", _I), ("ring", "device bfloat*")],
     ),
-    "dsv4_wo_a_k": (
+    "sh_dsv4_wo_a_k": (
         "_WO_A_SRC",
         [("x", _B), ("weight", _U), ("scales", _B), ("biases", _B),
          ("params", _I), ("out", "device bfloat*")],
     ),
-    "dsv4_sh13_k": (
+    "sh_dsv4_sh13_k": (
         "_SH13_SRC",
         [("x", _B), ("w1", _U), ("s1", _B), ("b1", _B),
          ("w3", _U), ("s3", _B), ("b3", _B),
          ("params", _I), ("feps", _F), ("out", "device bfloat*")],
     ),
-    "dsv4_swiglu_k": (
+    "sh_dsv4_swiglu_k": (
         "_SWIGLU_SRC",
         [("gate", _B), ("up", _B), ("params", _I), ("feps", _F),
          ("out", "device bfloat*")],
     ),
-    "dsv4_add_k": (
+    "sh_dsv4_add_k": (
         "_ADD_SRC",
         [("a", _F), ("b", _B), ("params", _I), ("out", "device bfloat*")],
     ),
-    "dsv4_idx_score_k": (
+    "sh_dsv4_idx_score_k": (
         "_IDX_SCORE_SRC",
         [("q", _B), ("buf", _B), ("w", _B), ("freqs", _F), ("params", _I),
          ("fscal", _F), ("ioff", _I), ("scores", "device float*")],
     ),
-    "dsv4_idx_topk_k": (
+    "sh_dsv4_idx_topk_k": (
         "_IDX_TOPK_SRC",
         [("scores", _F), ("params", _I), ("ioff", _I), ("out_idx", "device int*")],
     ),
-    "dsv4_embed_k": (
+    "sh_dsv4_embed_k": (
         "_EMBED_SRC",
         [("weight", _U), ("scales", _B), ("biases", _B), ("params", _I),
          ("ioff", _I), ("h", "device bfloat*")],
     ),
-    "dsv4_hc_head_k": (
+    "sh_dsv4_hc_head_k": (
         "_HC_HEAD_SRC",
         [("h", _B), ("fn", _F), ("scale", _F), ("base", _F), ("params", _I),
          ("feps", _F), ("y", "device bfloat*")],
     ),
-    "dsv4_gate_k": (
+    "sh_dsv4_gate_k": (
         "_GATE_SRC",
         [("x", _B), ("weight", _B), ("bias", _F), ("params", _I), ("feps", _F),
          ("scores", "device float*"), ("out_idx", "device int*"),
          ("out_w", "device float*")],
     ),
-    "dsv4_gate_hash_k": (
+    "sh_dsv4_gate_hash_k": (
         "_GATE_HASH_SRC",
         [("x", _B), ("weight", _B), ("tid2eid", _I), ("params", _I), ("feps", _F),
          ("ioff", _I), ("out_idx", "device int*"), ("out_w", "device float*")],
     ),
-    "dsv4_gate_score_k": (
+    "sh_dsv4_gate_score_k": (
         "_GATE_SCORE_SRC",
         [("x", _B), ("weight", _B), ("params", _I), ("scores", "device float*")],
     ),
-    "dsv4_gate_topk_k": (
+    "sh_dsv4_gate_topk_k": (
         "_GATE_TOPK_SRC",
         [("scores", _F), ("bias", _F), ("params", _I), ("feps", _F),
          ("out_idx", "device int*"), ("out_w", "device float*")],
     ),
-    "dsv4_rms_k": (
+    "sh_dsv4_rms_k": (
         "_RMS_SRC",
         [("x", _B), ("w", _B), ("params", _I), ("feps", _F),
          ("y", "device bfloat*")],
     ),
-    "dsv4_hc_mix_k": (
+    "sh_dsv4_hc_mix_k": (
         "_HC_MIX_SRC",
         [("h", _B), ("fn", _F), ("params", _I), ("mixes", "device float*")],
     ),
-    "dsv4_hc_pre_k": (
+    "sh_dsv4_hc_pre_k": (
         "_HC_PRE_SRC",
         [("h", _B), ("mixes", _F), ("scale", _F), ("base", _F), ("params", _I),
          ("feps", _F), ("iters", _I), ("y", "device bfloat*"),
          ("post", "device float*"), ("comb", "device float*")],
     ),
-    "dsv4_hc_post_k": (
+    "sh_dsv4_hc_post_k": (
         "_HC_POST_SRC",
         [("x", _B), ("residual", _B), ("post", _F), ("comb", _F), ("params", _I),
          ("y", "device bfloat*")],
     ),
-    "dsv4_hc_post2_k": (
+    "sh_dsv4_hc_post2_k": (
         "_HC_POST2_SRC",
         [("a", _F), ("b", _B), ("residual", _B), ("post", _F), ("comb", _F),
          ("params", _I), ("y", "device bfloat*")],
     ),
-    "dsv4_comp_step": (
+    "sh_dsv4_comp_step": (
         "_COMP_STEP_SRC",
         [("kv_row", _B), ("sc_row", _B), ("kv_st", "device float*"),
          ("sc_st", "device float*"),

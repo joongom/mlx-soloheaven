@@ -303,6 +303,18 @@ def cmd_bench(n_tokens: int = 64, prefill: int = 8) -> None:
     print(f"speedup vs compiled: {tps_native / tps_compiled:.2f}x  "
           f"(target >=25 tok/s: {'MET' if tps_native >= 25 else 'not yet'})")
 
+    # per-kernel-type breakdown — where the native decode time goes, to pick
+    # mega-kernel fusion targets (small-grid kernels underfill the chip).
+    dec = NativeDecoder(model, max_context=cap)
+    dec.offset = len(ids)
+    for i, c in enumerate(cache):
+        if getattr(c, "ring", None) is not None:
+            dec.set_ring(i, c.ring)
+    print("\nper-kernel-type GPU time (one token's plan, isolated groups):")
+    print(f"  {'kernel':<34}{'count':>6}{'ms/token':>10}")
+    for name, count, ms in dec.profile_kernels():
+        print(f"  {name:<34}{count:>6}{ms:>10.2f}")
+
 
 def cmd_compare(ours_path: str, ds4_path: str) -> None:
     import numpy as np

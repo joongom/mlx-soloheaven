@@ -200,6 +200,33 @@ class NativeDecoder:
         self.offset += 1
         return self._arrays["logits"]
 
+    def profile_kernels(self, token: int = 5, iters: int = 20) -> list:
+        """Per-kernel-type GPU time for one token's plan. Groups the built plan
+        by pipeline and times committing each group in isolation (the kernels
+        still run; the data is stale, but the timing is what we want). Returns
+        [(kernel_name, count, total_ms_per_token)] sorted slowest first — the map
+        of where the decode time goes, to pick fusion targets."""
+        import time
+
+        cb = P.ConstBlob()
+        items = self._build_plan(cb, int(token))
+        blob = bytes(cb.bytes())
+        pso_name = {i: n for n, i in self.rt._pipelines.items()}
+        groups: dict[int, list] = {}
+        for it in items:
+            groups.setdefault(it.pso, []).append(it)
+        out = []
+        for pso, its in groups.items():
+            for _ in range(3):
+                self.rt.commit(its, self.table.ptrs, blob, wait=True)
+            t0 = time.perf_counter()
+            for _ in range(iters):
+                self.rt.commit(its, self.table.ptrs, blob, wait=True)
+            ms = (time.perf_counter() - t0) / iters * 1e3
+            out.append((pso_name.get(pso, f"pso{pso}"), len(its), ms))
+        out.sort(key=lambda r: -r[2])
+        return out
+
     def set_ring(self, layer: int, ring: mx.array) -> None:
         """Seed a layer's ring from an existing (prefilled) cache. Writes into
         the SAME MTLBuffer via its contents pointer — an mx in-place setitem

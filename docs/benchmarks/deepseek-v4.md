@@ -890,13 +890,54 @@ paths, where being "more precise" than MLX is not the same as agreeing
 with it. Note which paths already agree bit-for-bit: everything still on
 the library qmv.
 
-So the decisive next test is the opposite of the last three: put the
-quantized ops BACK on MLX's kernels inside the native replay (gather_qmm
-for the routed experts, library qmv for wo_a/sh13/the stacked projection)
-and re-measure ppl. If it lands at 3.65, the cause is confirmed and the
-tradeoff becomes explicit — a quality mode that keeps the replay's
-scheduling win while giving up the custom-kernel speedups, and a per-kernel
-search for which of them can be made bit-exact cheaply.
+**RESOLVED by layer bisection** (probe_bisect.py — one load walks all 43
+block boundaries; at offset 1 with zero caches, prefix commits are
+idempotent, so the native plan can be committed in growing prefixes and
+compared against the reference chain step by step):
+
+| layer | block-out rel. error |
+|---|---|
+| L0 | 6.13% |
+| L1 | 13.9% |
+| L5 / L14 / L21 | 9.3% / 2.9% / 9.2% |
+| L28 / L35 / L42 | 12.5% / 70% / 85% |
+
+L0 is the whole story. Its input differs from the reference's by exactly
+**one bf16 ULP** (the native path hands the embed row over in fp32; the
+reference materializes it as bf16 — `dsv4_embed_k` itself is clean, 1 ULP,
+streams identical), and its output is off by **6.13%**. That is a ~20x
+amplification of a rounding difference IN ONE BLOCK, and it compounds over
+43 of them.
+
+So the model is extraordinarily ill-conditioned with respect to rounding
+(2-bit experts + Hyper-Connections with a 20-iteration Sinkhorn), and that
+settles the question the three precision experiments were circling:
+
+* **Being more precise than the reference does not help** — it is a
+  different trajectory, and every trajectory that is not the reference's
+  lands at ~4.4 ppl. That is why fp32 streams, fp32 projections and fp32
+  output paths each measured flat.
+* **Only bit-exactness with the reference's arithmetic can close the gap.**
+  The compiled path reaches 3.65 because it IS the reference's ops in the
+  reference's order (its logits track the eager batch at 98.8% argmax);
+  the native replay reaches 4.4 because its kernels are individually
+  correct to 1-3 ULP but not identical.
+
+Consequence for the design: a replay runtime can only match this model's
+quality if it replays the reference's ops, rounding point for rounding
+point — which means using MLX's own kernels for every op that has one
+(gather_qmm for the routed experts, library qmv for wo_a/sh13/the stacked
+projection, mx.fast.rms_norm's exact reduction) and keeping bf16 exactly
+where the reference keeps it. The custom fused kernels that bought the
+speed (Stages 3d-3r) are precisely what costs the quality. Note the two
+already-shared kernels — attn_core and the MoE pair, which the compiled
+path also runs via mx.fast — are NOT part of the problem: they are
+bit-identical between the paths by construction.
+
+Next session starts here: revert the fp32 activation chain (it is
+counterproductive under this finding), then swap the native-only quantized
+kernels back to MLX's one at a time, measuring ppl after each, to find the
+subset that restores 3.65 at the least speed cost.
 
 ## 3. Reproduce
 

@@ -345,6 +345,39 @@ dispatch-count reduction (fusion), which is a ds4-scale rewrite. Correctness of
 the native path stands (bit-deterministic, matches the reference); this is purely
 a throughput verdict. Decision point for the campaign, recorded for the user.
 
+### Stage 3d — per-kernel profile → idx_topk fix: native 611 → 199 ms (2026-08-02)
+
+A per-kernel-type profile (`bench` now prints it: each pipeline's dispatches
+timed alone against a populated buffer set) split the 611 ms cleanly — it was
+NOT spread across the ~1500 dispatches, it was **one kernel**:
+
+| kernel | count | ms | share |
+|---|---|---|---|
+| `dsv4_idx_topk_k` (before fix) | 21 | **405** | **67%** |
+| `dsv4_hc_pre_k` | 86 | 70 | 12% |
+| `dsv4_gate_k` | 40 | 70 | 12% |
+| everything else (~1330 dispatches) | — | ~66 | ~11% |
+
+`dsv4_idx_topk_k` ran a **single-thread `O(cap*topk)` selection sort** (256×512 =
+131k serial iterations/layer) even when only `n2` (~8) groups are visible. Fix:
+when `n2 <= topk` every valid group is selected, so emit `0..n2-1` across all
+threads (order is irrelevant — attn softmaxes the set). Result:
+
+| path | tok/s | ms/token |
+|---|---|---|
+| compiled | 11.9 | 84.2 |
+| native (before) | 1.6 | 611.5 |
+| **native (after idx_topk fix)** | **5.0** | **199.1** |
+
+idx_topk went 405 → 0.68 ms. **3.1x native speedup from one pathological-kernel
+fix** — and it validates the profile-first method. New profile after the fix:
+`hc_pre_k` **73 ms** and `gate_k` **71 ms** are now 72% of 199 ms. Both are the
+single-threadgroup-starves-the-chip pattern (cf. the reverted HC hand-kernel at
+132 ms) — the fix is to route the HC/gate GEMV through a multi-threadgroup
+library `qmv` and keep only the sinkhorn/top-k tail custom. Native is still 2.4x
+the compiled 84 ms, and 25 tok/s (40 ms) still needs fewer dispatches (fusion),
+but the pathological floor is gone.
+
 ## 3. Reproduce
 
 ```bash

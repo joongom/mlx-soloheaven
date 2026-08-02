@@ -415,6 +415,26 @@ Target ≥25 tok/s = ≤40 ms: needs roughly qmv-count (−7) + attn_core (−8)
 comp_step (−6) + hc_pre tail (−5) + misc, i.e. most of the table — grind, but
 every step so far landed where the profile pointed.
 
+### Stage 3f — x-stack qmv + parallel Sinkhorn: 71.4 ms, 14.0 tok/s (2026-08-02)
+
+Two more steps, same discipline (profile -> fix -> diff test -> real-model bench):
+
+| step | native ms/tok | tok/s | what changed |
+|---|---|---|---|
+| + stacked x-projection (reuse the model's `_x_stack`: 7/4/2 -> 1 qmv/layer) | 78.0 | 12.8 | qmv 812 -> 624 dispatches, 19.8 -> 16.8 ms |
+| + PARALLEL gates+Sinkhorn in hc_pre (rows/cols, bit-identical) | **71.4** | **14.0** | hc_pre 13.0 -> 7.35 ms |
+
+Cumulative 611 -> 71.4 ms = 8.6x; native is 1.14x the compiled path. The
+single-thread-serial-loop pathology has now been found and killed in THREE
+kernels (gate top-k, idx top-k slow path context, hc_pre Sinkhorn) — check for
+it FIRST in any slow custom kernel.
+
+Remaining profile (71.4 ms): qmv 17.8 (624 dispatches — grouped wo_a 8->1 is the
+next count lever, -301), attn_core 16.3 (64 threadgroups underfill; split
+score/value or widen the grid), comp_step 11.8 (single threadgroup; grid over
+d), moe 13.4 (near bandwidth), hc_pre 7.4. Target 40 ms needs roughly
+attn_core + comp_step + qmv-count together.
+
 ## 3. Reproduce
 
 ```bash

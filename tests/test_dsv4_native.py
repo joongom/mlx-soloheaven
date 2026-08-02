@@ -30,6 +30,21 @@ except Exception as e:  # noqa: BLE001 — dylib/build/device issues -> skip
     pytest.skip(f"native runtime unavailable: {e}", allow_module_level=True)
 
 
+class ConstBlob:
+    """Accumulates plan-static setBytes data, returning (offset, length)."""
+
+    def __init__(self):
+        self._b = bytearray()
+
+    def add(self, fmt, *vals):
+        off = len(self._b)
+        self._b += struct.pack("<" + fmt, *vals)
+        return off, len(self._b) - off
+
+    def bytes(self):
+        return bytes(self._b)
+
+
 def _q8(N, K):
     w = mx.random.normal((N, K)).astype(mx.bfloat16)  # bf16 scales (T-typed kernel)
     qw, sc, bi = mx.quantize(w, group_size=64, bits=8)
@@ -643,6 +658,141 @@ def test_native_qmv_into_attn_core_chain():
     a = np.array(out.astype(mx.float32))
     b = np.array(out_ref.astype(mx.float32))
     assert np.abs(a - b).max() < 1e-2, np.abs(a - b).max()
+
+
+def test_native_dense_attention_plan_matches_reference():
+    """LADDER STEP 4: assemble the WHOLE dense-attention sub-block as one native
+    plan (wq_a qmv, q_norm rms, wq_b qmv, wkv qmv, kv_norm rms, attn_core,
+    ring_store, wo_a x n_groups at byte offsets, wo_b qmv) and diff its output
+    against Attention.decode_step_math on a quantized tiny layer. This is the
+    first full sub-block replayed end to end — proving the assembly, not any
+    single kernel."""
+    import mlx.nn as nn
+
+    from mlx_soloheaven.models.deepseek_v4 import Attention, ModelArgs
+    from mlx_soloheaven.native.kernels import BUFFER_SLOTS
+
+    # dims chosen so every projection K is %512 (qmv_fast) and head_dim<=512:
+    # n_heads=2, head_dim=512 -> nhd=1024, gin=nhd/g=512, o_lora=512.
+    cfg = dict(model_type="deepseek_v4", hidden_size=512, num_attention_heads=2,
+               head_dim=512, qk_rope_head_dim=64, q_lora_rank=512, o_lora_rank=512,
+               o_groups=2, sliding_window=8, compress_ratios=[0], rope_theta=10000,
+               num_hidden_layers=1, rms_norm_eps=1e-6)
+    args = ModelArgs.from_dict(cfg)
+    attn = Attention(args, 0)
+    nn.quantize(attn, group_size=64, bits=8,
+                class_predicate=lambda p, m: hasattr(m, "to_quantized") and "norm" not in p)
+    for nm in ("wq_a", "wq_b", "wkv", "wo_b", "wo_a"):
+        m = getattr(attn, nm)
+        m.scales = m.scales.astype(mx.bfloat16)
+        m.biases = m.biases.astype(mx.bfloat16)
+    # norms are bf16 in the deployed build (converter writes bf16); the rms
+    # kernel reads its weight as bfloat, so match that here.
+    attn.q_norm.weight = attn.q_norm.weight.astype(mx.bfloat16)
+    attn.kv_norm.weight = attn.kv_norm.weight.astype(mx.bfloat16)
+
+    H, D, g = attn.n_heads, attn.head_dim, attn.n_groups
+    hidden, q_lora = 512, 512
+    NHD, gin, o_lora, win = H * D, (H * D) // g, args.o_lora_rank, attn.window
+    offset = 3
+
+    rng = np.random.default_rng(5)
+    x = mx.array(rng.standard_normal((1, 1, hidden)).astype(np.float32)).astype(mx.bfloat16)
+    ring0 = mx.array(rng.standard_normal((1, win, D)).astype(np.float32)).astype(mx.bfloat16)
+    # decode_step_math writes the ring IN PLACE; give the reference its own
+    # copy (bf16->f32->bf16 round-trip is lossless) so the native ring stays
+    # pristine.
+    ring_for_ref = ring0.astype(mx.float32).astype(mx.bfloat16)
+    out_ref, ring_ref = attn.decode_step_math(
+        x, ring_for_ref, (), mx.array(offset, dtype=mx.int32))
+    mx.eval(out_ref, ring_ref)
+    mx.synchronize()
+
+    rt_mod.load_custom_kernels(_RT)
+    T = rt_mod.BufferTable()
+
+    # scratch (session/per-token) buffers
+    def z(n, dt=mx.bfloat16):
+        a = mx.zeros((n,), dtype=dt)
+        mx.eval(a)
+        return a
+
+    ring = (ring0.astype(mx.float32).astype(mx.bfloat16)).reshape(-1)
+    scratch = dict(
+        x=x.reshape(-1), ring=ring, xp0=z(q_lora), qr=z(q_lora), q_raw=z(NHD),
+        xp1=z(D), kvn=z(D), out=z(NHD), kv_roped=z(D), o_lora=z(g * o_lora),
+        attn_out=z(hidden), dummy=z(D), dummy_idx=mx.full((1,), -1, dtype=mx.int32),
+        sink=attn.attn_sink, freqs=attn._freqs, ioff=mx.array([offset, 0], dtype=mx.int32),
+    )
+    mx.eval(*scratch.values())
+    mx.synchronize()
+    S = {k: T.add(v) for k, v in scratch.items()}
+
+    cb = ConstBlob()
+    ioff_off, _ = cb.add("2i", offset, 0)
+    items = []
+
+    def qmv(w, s, b, xs, ys, K, N, w_off=0, s_off=0, b_off=0, xoff=0, yoff=0):
+        ko, _ = cb.add("ii", K, N)
+        return rt_mod.plan_item(
+            _RT, "affine_qmv_fast_bfloat16_t_gs_64_b_8_batch_0", False,
+            [(T.add(w), 0, w_off), (T.add(s), 1, s_off), (T.add(b), 2, b_off),
+             (xs, 3, xoff), (ys, 4, yoff)],
+            [(ko, 4, 5), (ko + 4, 4, 6)], (1, (N + 7) // 8, 1), (32, 2, 1))
+
+    def rms(w, xs, ys, d):
+        o, _ = cb.add("if", d, attn.eps)
+        r = BUFFER_SLOTS["dsv4_rms_k"]
+        return rt_mod.plan_item(
+            _RT, "dsv4_rms_k", True, [(xs, r["x"]), (T.add(w), r["w"]), (ys, r["y"])],
+            [(o, 4, r["params"]), (o + 4, 4, r["feps"])], (1, 1, 1), (256, 1, 1))
+
+    items.append(qmv(attn.wq_a.weight, attn.wq_a.scales, attn.wq_a.biases,
+                     S["x"], S["xp0"], hidden, q_lora))
+    items.append(rms(attn.q_norm.weight, S["xp0"], S["qr"], q_lora))
+    items.append(qmv(attn.wq_b.weight, attn.wq_b.scales, attn.wq_b.biases,
+                     S["qr"], S["q_raw"], q_lora, NHD))
+    items.append(qmv(attn.wkv.weight, attn.wkv.scales, attn.wkv.biases,
+                     S["x"], S["xp1"], hidden, D))
+    items.append(rms(attn.kv_norm.weight, S["xp1"], S["kvn"], D))
+
+    ac = BUFFER_SLOTS["dsv4_attn_core"]
+    po, _ = cb.add("5i", D, attn.rope_dim, win, 0, 1)
+    fo, _ = cb.add("2f", attn.scale, attn.eps)
+    items.append(rt_mod.plan_item(
+        _RT, "dsv4_attn_core", True,
+        [(S["q_raw"], ac["q"]), (S["kvn"], ac["kv"]), (S["ring"], ac["ring"]),
+         (S["dummy"], ac["comp"]), (S["dummy_idx"], ac["cidx"]), (S["sink"], ac["sink"]),
+         (S["freqs"], ac["freqs"]), (S["out"], ac["out"]), (S["kv_roped"], ac["kv_out"])],
+        [(po, 20, ac["params"]), (fo, 8, ac["fscal"]), (ioff_off, 8, ac["ioff"])],
+        (H, 1, 1), (128, 1, 1)))
+
+    rs = BUFFER_SLOTS["dsv4_ring_store_k"]
+    rpo, _ = cb.add("ii", D, win)
+    items.append(rt_mod.plan_item(
+        _RT, "dsv4_ring_store_k", True,
+        [(S["kv_roped"], rs["src"]), (S["ring"], rs["ring"])],
+        [(rpo, 8, rs["params"]), (ioff_off, 4, rs["ioff"])], (1, 1, 1), (256, 1, 1)))
+
+    # wo_a: per group, weight[g] bound at byte offsets; read out[g*gin], write
+    # o_lora[g*o_lora]. wo_a is 8-bit: packed words per row = gin*8/32 = gin/4
+    # (uint32, x4 bytes); scales/biases are gin/group_size = gin/64 (bf16, x2).
+    for gi in range(g):
+        items.append(qmv(
+            attn.wo_a.weight, attn.wo_a.scales, attn.wo_a.biases,
+            S["out"], S["o_lora"], gin, o_lora,
+            w_off=gi * o_lora * (gin // 4) * 4,
+            s_off=gi * o_lora * (gin // 64) * 2,
+            b_off=gi * o_lora * (gin // 64) * 2,
+            xoff=gi * gin * 2, yoff=gi * o_lora * 2))
+    items.append(qmv(attn.wo_b.weight, attn.wo_b.scales, attn.wo_b.biases,
+                     S["o_lora"], S["attn_out"], g * o_lora, hidden))
+
+    _RT.commit(items, T.ptrs, cb.bytes(), wait=True)
+
+    got = np.array(scratch["attn_out"].astype(mx.float32))
+    exp = np.array(out_ref.reshape(-1).astype(mx.float32))
+    assert np.abs(got - exp).max() < 2e-2, np.abs(got - exp).max()
 
 
 def test_c_encode_cost_is_in_budget():

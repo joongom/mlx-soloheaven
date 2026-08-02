@@ -78,11 +78,19 @@ step unless profiling later demands it) owning:
    every projection K being %512 (qmv_fast) are confirmed. NOTHING about the
    assembly is now unproven: all kernels, both chaining patterns, sub-range
    binding, in-place ring write.
-4. NEXT: write plan_dense_attention (the item list: wq_a qmv, q_norm rms,
-   wq_b qmv, wkv qmv, kv_norm rms, attn_core, ring_store, wo_a x n_groups at
-   byte offsets, wo_b qmv) + a scratch BufferTable, and diff its output
-   against Attention.decode_step_math on a quantized tiny layer (dims %512).
-   Then the FFN half (hc_pre, gate, moe K1/K2, shared, hc_post) and stack 43.
+4. ✅ DONE: the whole dense-attention sub-block is assembled as ONE native
+   plan (wq_a qmv, q_norm rms, wq_b qmv, wkv qmv, kv_norm rms, attn_core,
+   ring_store, wo_a x n_groups at byte offsets, wo_b qmv — 10 dispatches, one
+   command buffer) and matches Attention.decode_step_math on a quantized tiny
+   layer (test_native_dense_attention_plan_matches_reference). First full
+   sub-block replayed end to end. Bug found and recorded: wo_a is 8-bit, so
+   its per-group packed stride is gin/4 (not the 2-bit gin/16).
+5. NEXT: the FFN half plan — hc_pre (attn), hc_post, ffn_norm rms, gate, moe
+   K1/K2 (chain proven), shared expert (3 qmv + swiglu), hc_post — diffed
+   against MoE.decode_step_math + the Block HC wrapping. Then compose the two
+   halves into a full Block plan vs Block.decode_step_math, build the session
+   BufferTable from a real Model, stack 43 layers + embed/head, and integrate
+   behind SOLOHEAVEN_DSV4_NATIVE with the existing fallback. Then bench.
 5. All layer kinds, then the full 43-layer step + embed/head → token-level
    agreement over a 32-token greedy run.
 6. ppl probes through the native path ≈ MLX path (3.65).

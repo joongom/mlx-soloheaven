@@ -79,7 +79,7 @@ class Planner:
                 "dsv4_hc_mix_k", True,
                 [(self.S[h], mk["h"]), (self.t.add(fn), mk["fn"]),
                  (self.S["hc_mixes"], mk["mixes"])],
-                [(p, 8, mk["params"])], (mix, 1, 1), (256, 1, 1)),
+                [(p, 8, mk["params"])], (mix, 1, 1), (1024, 1, 1)),
             self._pi(
                 "dsv4_hc_pre_k", True,
                 [(self.S[h], k["h"]), (self.S["hc_mixes"], k["mixes"]),

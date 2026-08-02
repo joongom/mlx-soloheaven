@@ -517,7 +517,7 @@ def test_native_hc_pre_matches_reference():
     it_mix = rt_mod.plan_item(
         _RT, "dsv4_hc_mix_k", True,
         [(s["h"], mk["h"]), (s["fn"], mk["fn"]), (s["mixes"], mk["mixes"])],
-        [(0, 8, mk["params"])], (mix, 1, 1), (256, 1, 1),
+        [(0, 8, mk["params"])], (mix, 1, 1), (1024, 1, 1),
     )
     it = rt_mod.plan_item(
         _RT, "dsv4_hc_pre_k", True,
@@ -1530,7 +1530,7 @@ def test_native_ffn_half_plan_matches_reference():
         _RT, "dsv4_hc_mix_k", True,
         [(S["h"], hm["h"]), (T.add(blk.hc_ffn_fn.reshape(-1)), hm["fn"]),
          (S["hc_mixes"], hm["mixes"])],
-        [(po, 8, hm["params"])], ((2 + hc) * hc, 1, 1), (256, 1, 1)))
+        [(po, 8, hm["params"])], ((2 + hc) * hc, 1, 1), (1024, 1, 1)))
     items.append(rt_mod.plan_item(
         _RT, "dsv4_hc_pre_k", True,
         [(S["h"], hp["h"]), (S["hc_mixes"], hp["mixes"]),

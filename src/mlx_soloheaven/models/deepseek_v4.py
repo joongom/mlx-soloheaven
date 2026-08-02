@@ -2276,12 +2276,12 @@ _HC_MIX_SRC = """
     // latency. rms and everything downstream stay in dsv4_hc_pre_k, which just
     // reads these raw dots.
     uint tid = thread_position_in_threadgroup.x;
-    const int TG = 256;
+    const int TG = 1024;  // 24 threadgroups underfill the chip; shorten each thread's chain instead
     const int hcn = params[0];
     const int d = params[1];
     const int hcd = hcn * d;
     uint r = threadgroup_position_in_grid.x;
-    threadgroup float red[8];
+    threadgroup float red[32];  // TG/32 simdgroup partials
     float a = 0.0f;
     for (int i = tid; i < hcd; i += TG) a += float(fn[r * hcd + i]) * float(h[i]);
     a = simd_sum(a);

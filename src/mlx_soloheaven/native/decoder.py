@@ -127,7 +127,8 @@ class NativeDecoder:
         s = dict(
             ha=self._z(hc * hidden), hb=self._z(hc * hidden), hx=self._z(hidden),
             post=self._z(hc, mx.float32), comb=self._z(hc * hc, mx.float32), xn=self._z(hidden),
-            hc_mixes=self._z((2 + hc) * hc, mx.float32),
+            # +1: dsv4_hc_mix_k parks sum(h^2) past the mix rows for hc_pre's rms
+            hc_mixes=self._z((2 + hc) * hc + 1, mx.float32),
             # xall: the stacked x-projection output, sized for the widest layer
             # kind (ratio-4: q_lora + D + 2*(2D) + idx heads + 2*(2*idx_hd)).
             xall=self._z(q_lora + D + 4 * D + i_nh + 4 * ihd),

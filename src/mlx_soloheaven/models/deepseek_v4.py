@@ -2406,43 +2406,61 @@ _HC_MIX_SRC = """
     const int hcd = hcn * d;
     uint r = threadgroup_position_in_grid.x;
     threadgroup float red[32];  // TG/32 simdgroup partials
-    float a = 0.0f;
-    for (int i = tid; i < hcd; i += TG) a += float(fn[r * hcd + i]) * float(h[i]);
+    threadgroup float redq[32];
+    // Threadgroup 0 also reduces sum(h^2) into mixes[nmix] — hc_pre's rms
+    // input. It already streams every element of h for its own dot, so the
+    // squares are ~free here, and hc_pre is then freed from making its OWN
+    // full pass over h. That pass is what forced hc_pre into ONE threadgroup
+    // (~1/64 of the chip's bandwidth); see Stage 4l. Reduction shape is
+    // identical to the pass it replaces, so the rms stays bit-identical.
+    const int nmix = (2 + hcn) * hcn;
+    float a = 0.0f, q = 0.0f;
+    for (int i = tid; i < hcd; i += TG) {
+        float hv = float(h[i]);
+        a += float(fn[r * hcd + i]) * hv;
+        if (r == 0) q += hv * hv;
+    }
     a = simd_sum(a);
     if ((tid & 31u) == 0) red[tid / 32] = a;
+    if (r == 0) {                          // r is uniform across the group
+        q = simd_sum(q);
+        if ((tid & 31u) == 0) redq[tid / 32] = q;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) {
         float t = 0.0f;
         for (int i = 0; i < TG / 32; ++i) t += red[i];
         mixes[r] = t;
+        if (r == 0) {
+            float s = 0.0f;
+            for (int i = 0; i < TG / 32; ++i) s += redq[i];
+            mixes[nmix] = s;
+        }
     }
 """
 
 _HC_PRE_SRC = """
     uint tid = thread_position_in_threadgroup.x;
-    const int TG = 1024;  // single threadgroup; widest allowed (comp_step precedent)
+    const int TG = 1024;
+    // HC_PRE_SPLIT threadgroups over the output dim d. This kernel used to be
+    // a SINGLE threadgroup because it had to reduce sum(h^2) over all of h
+    // before it could do anything else — and one threadgroup gets ~1/64 of
+    // this chip's bandwidth. dsv4_hc_mix_k now hands that sum over (it
+    // already streams all of h), so the only thing left is the per-output
+    // reduction, which splits cleanly. The gates and Sinkhorn are recomputed
+    // in every part: they are 16 floats of simdgroup-local work, far cheaper
+    // than another dispatch and its barrier.
+    const int NSPLIT = HC_PRE_SPLIT;
     const int hcn = params[0];
     const int d = params[1];
     const int hcd = hcn * d;
     const float rms_eps = feps[0];
     const float hc_eps = feps[1];
+    const int part = int(threadgroup_position_in_grid.x);
 
-    threadgroup float red[32];  // TG/32 simdgroup partials
     threadgroup float pc[64];      // pre[hc], post[hc], comb[hc*hc]
-    threadgroup float rms_s[1];
 
-    float acc = 0.0f;
-    for (int i = tid; i < hcd; i += TG) { float v = float(h[i]); acc += v * v; }
-    acc = simd_sum(acc);
-    if ((tid & 31u) == 0) red[tid / 32] = acc;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        float t = 0.0f;
-        for (int i = 0; i < TG / 32; ++i) t += red[i];
-        rms_s[0] = rsqrt(t / hcd + rms_eps);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float rms = rms_s[0];
+    float rms = rsqrt(mixes[(2 + hcn) * hcn] / hcd + rms_eps);
 
     // Gates + Sinkhorn on ONE simdgroup: lane l < hcn*hcn holds comb element
     // (l/hcn, l%hcn); row/col sums are gathered lane-by-lane with simd_shuffle
@@ -2476,9 +2494,11 @@ _HC_PRE_SRC = """
             for (int k = 0; k < hcn; ++k) s += simd_shuffle(cb, c + hcn * k);
             cb /= (s + hc_eps);
         }
+        // every part computes identical values; only part 0 publishes the
+        // shared post/comb outputs that dsv4_hc_post_k reads next.
         if (l < hcn * hcn) {
             pc[2 * hcn + l] = cb;
-            comb[l] = cb;
+            if (part == 0) comb[l] = cb;
         }
         if (l < hcn) {
             float mt0 = float(mixes[l]) * rms;
@@ -2486,12 +2506,15 @@ _HC_PRE_SRC = """
             float pst = 2.0f / (1.0f + exp(-(mt1 * scale[1] + base[hcn + l])));
             pc[l] = 1.0f / (1.0f + exp(-(mt0 * scale[0] + base[l]))) + hc_eps;
             pc[hcn + l] = pst;
-            post[l] = pst;
+            if (part == 0) post[l] = pst;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (int i = tid; i < d; i += TG) {
+    const int chunk = (d + NSPLIT - 1) / NSPLIT;
+    const int lo = part * chunk;
+    const int hi = min(lo + chunk, d);
+    for (int i = lo + (int)tid; i < hi; i += TG) {
         float a = 0.0f;
         for (int j = 0; j < hcn; ++j) a += pc[j] * float(h[j * d + i]);
         y[i] = T(a);
@@ -2566,6 +2589,7 @@ def _get_hc_kernels():
             input_names=["h", "mixes", "scale", "base", "params", "feps", "iters"],
             output_names=["y", "post", "comb"],
             source=_HC_PRE_SRC,
+            header=_KERNEL_DEFINES,
         )
         post = mx.fast.metal_kernel(
             name="sh_dsv4_hc_post_k",
@@ -2654,7 +2678,18 @@ _MOE_K1_SRC = """
 #: The shared body is compiled twice — native replay and the mx.fast twin — so
 #: the value ships as a #define from this one constant.
 _W2_ROWS = 4
-_W2_ROWS_HEADER = f"#define W2_ROWS {_W2_ROWS}\n"
+
+#: Threadgroups dsv4_hc_pre_k splits the output dim over (see the kernel body).
+_HC_PRE_SPLIT = 4
+
+#: Compile-time constants the shared kernel bodies read. The bodies are built
+#: twice — once into the native replay library, once per mx.fast twin — so both
+#: get this same text and there is exactly one source of truth for the values.
+_KERNEL_DEFINES = (
+    f"#define W2_ROWS {_W2_ROWS}\n"
+    f"#define HC_PRE_SPLIT {_HC_PRE_SPLIT}\n"
+)
+_W2_ROWS_HEADER = _KERNEL_DEFINES
 
 _MOE_K2_SRC = """
     // threadgroup covers 8 output dims; h read straight from device — the
@@ -2747,7 +2782,7 @@ def _get_moe_kernels():
             input_names=["h", "dw", "ds_", "db", "idxs", "wts", "params"],
             output_names=["y"],
             source=_MOE_K2_SRC,
-            header=_W2_ROWS_HEADER,
+            header=_KERNEL_DEFINES,
         )
         _moe_kernels = (k1, k2)
     return _moe_kernels

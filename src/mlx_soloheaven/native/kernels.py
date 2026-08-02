@@ -173,9 +173,9 @@ def _wrap(name: str, body: str, bufs: list[tuple[str, str]]) -> str:
 
 def build_source() -> str:
     """The complete native/kernels source, generated from the model bodies."""
-    # file-scope #defines the shared bodies read (moe_w2 tile width)
+    # file-scope #defines the shared bodies read (tile widths/splits)
     parts = ["#include <metal_stdlib>", "using namespace metal;", "",
-             _m._W2_ROWS_HEADER]
+             _m._KERNEL_DEFINES]
     for name, (attr, bufs) in _SPECS.items():
         parts.append(_wrap(name, getattr(_m, attr), bufs))
     return "\n".join(parts)

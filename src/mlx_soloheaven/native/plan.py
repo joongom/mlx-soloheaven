@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import struct
 
-from mlx_soloheaven.models.deepseek_v4 import _W2_ROWS
+from mlx_soloheaven.models.deepseek_v4 import _HC_PRE_SPLIT, _W2_ROWS
 from mlx_soloheaven.native.kernels import BUFFER_SLOTS
 
 _QMV = "affine_qmv_fast_bfloat16_t_gs_64_b_8_batch_0"
@@ -98,7 +98,7 @@ class Planner:
                  (self.t.add(scale), k["scale"]), (self.t.add(base), k["base"]),
                  (self.S[x], k["y"]), (self.S[post], k["post"]), (self.S[comb], k["comb"])],
                 [(p, 8, k["params"]), (f, 8, k["feps"]), (i, 4, k["iters"])],
-                (1, 1, 1), (1024, 1, 1)),
+                (_HC_PRE_SPLIT, 1, 1), (1024, 1, 1)),
         ]
 
     def hc_post(self, x, residual, post, comb, y, hc, hidden):

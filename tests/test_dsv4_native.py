@@ -488,7 +488,7 @@ def test_native_hc_pre_matches_reference():
     """sh_dsv4_hc_pre_k native (explicit signature, C-loop) == _hc_pre_math (the
     reference the mx.fast twin is diffed against elsewhere). Covers the rms,
     the mixes GEMV, the full 20-iteration Sinkhorn, and the pre-reduction."""
-    from mlx_soloheaven.models.deepseek_v4 import _hc_pre_math
+    from mlx_soloheaven.models.deepseek_v4 import _HC_PRE_SPLIT, _hc_pre_math
     from mlx_soloheaven.native.kernels import BUFFER_SLOTS
 
     hc, d, iters = 4, 256, 20
@@ -506,7 +506,8 @@ def test_native_hc_pre_matches_reference():
     rt_mod.load_custom_kernels(_RT)
     table = rt_mod.BufferTable()
     mix = (2 + hc) * hc
-    mixes = mx.zeros((mix,), dtype=mx.float32)
+    # +1 slot: hc_mix parks sum(h^2) there for hc_pre's rms
+    mixes = mx.zeros((mix + 1,), dtype=mx.float32)
     mx.eval(mixes)
     mk = BUFFER_SLOTS["sh_dsv4_hc_mix_k"]
     sl = BUFFER_SLOTS["sh_dsv4_hc_pre_k"]
@@ -525,7 +526,7 @@ def test_native_hc_pre_matches_reference():
          (s["base"], sl["base"]), (s["y"], sl["y"]), (s["post"], sl["post"]),
          (s["comb"], sl["comb"])],
         [(0, 8, sl["params"]), (8, 8, sl["feps"]), (16, 4, sl["iters"])],
-        (1, 1, 1), (1024, 1, 1),
+        (_HC_PRE_SPLIT, 1, 1), (1024, 1, 1),
     )
     _RT.commit([it_mix, it], table.ptrs, const, wait=True)
 
@@ -832,7 +833,7 @@ def test_native_full_model_logits_match_reference():
 
     block_scratch = dict(
         hx=z(hidden), post=z(hc, mx.float32), comb=z(hc * hc, mx.float32), xn=z(hidden),
-        hc_mixes=z((2 + hc) * hc, mx.float32),
+        hc_mixes=z((2 + hc) * hc + 1, mx.float32),   # +1: hc_mix's sum(h^2)
         xall=z(8192), xp0=z(512), qr=z(512), q_raw=z(hidden * 2 // 2 * 2), xp1=z(D), kvn=z(D),
         acore=z(2 * D), kv_roped=z(D), o_lora=z(2 * 512), attn_out=z(hidden), h1=z(hc * hidden),
         scores=z(8, mx.float32), idx=mx.zeros((topk,), mx.int32), w=z(topk, mx.float32),
@@ -1220,7 +1221,7 @@ def test_native_full_block_plan_matches_reference():
     scratch_arrays = dict(
         hin=hval.reshape(-1), ring=ring0.astype(mx.float32).astype(mx.bfloat16).reshape(-1),
         hx=z(hidden), post=z(hc, mx.float32), comb=z(hc * hc, mx.float32), xn=z(hidden),
-        hc_mixes=z((2 + hc) * hc, mx.float32),
+        hc_mixes=z((2 + hc) * hc + 1, mx.float32),   # +1: hc_mix's sum(h^2)
         xall=z(8192), xp0=z(q_lora), qr=z(q_lora), q_raw=z(NHD), xp1=z(D), kvn=z(D), acore=z(NHD),
         kv_roped=z(D), o_lora=z(g * o_lora), attn_out=z(hidden), h1=z(hc * hidden),
         scores=z(n_exp, mx.float32), idx=mx.zeros((topk,), mx.int32), w=z(topk, mx.float32),
@@ -1499,6 +1500,7 @@ def test_native_ffn_half_plan_matches_reference():
     from mlx_soloheaven.models.deepseek_v4 import (
         Block,
         ModelArgs,
+        _HC_PRE_SPLIT,
         _hc_post_math,
         _hc_pre_math,
     )
@@ -1551,7 +1553,7 @@ def test_native_ffn_half_plan_matches_reference():
         w=z(topk, mx.float32), hexp=z(topk * inter, mx.float32), y_routed=z(hidden, mx.float32),
         sg=z(inter), su=z(inter), sh=z(inter), shared=z(hidden), moe_out=z(hidden),
         hout=z(hc * hidden), residual=h.reshape(-1),
-        hc_mixes=z((2 + hc) * hc, mx.float32),
+        hc_mixes=z((2 + hc) * hc + 1, mx.float32),   # +1: hc_mix's sum(h^2)
     )
     mx.eval(*scratch.values())
     mx.synchronize()
@@ -1583,7 +1585,7 @@ def test_native_ffn_half_plan_matches_reference():
          (T.add(blk.hc_ffn_scale), hp["scale"]), (T.add(blk.hc_ffn_base), hp["base"]),
          (S["x"], hp["y"]), (S["post"], hp["post"]), (S["comb"], hp["comb"])],
         [(po, 8, hp["params"]), (fo, 8, hp["feps"]), (io, 4, hp["iters"])],
-        (1, 1, 1), (1024, 1, 1)))
+        (_HC_PRE_SPLIT, 1, 1), (1024, 1, 1)))
     # ffn_norm rms
     ro, _ = cb.add("if", hidden, blk.eps)
     rk = BUFFER_SLOTS["sh_dsv4_rms_k"]

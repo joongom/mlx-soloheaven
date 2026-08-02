@@ -274,23 +274,33 @@ def cmd_bench(n_tokens: int = 64, prefill: int = 8) -> None:
     # --- native replay path ---
     from mlx_soloheaven.native.decoder import NativeDecoder
 
-    dec = NativeDecoder(model, max_context=int(os.environ.get(
-        "SOLOHEAVEN_DSV4_MAX_CONTEXT", "8192")))
-    dec.offset = len(ids)
-    for i, c in enumerate(cache):
-        if getattr(c, "ring", None) is not None:
-            dec.set_ring(i, c.ring)
-    seed_tok = int(logits[0, -1].argmax())
+    cap = int(os.environ.get("SOLOHEAVEN_DSV4_MAX_CONTEXT", "8192"))
 
-    def step_native():
-        nonlocal seed_tok
-        lg = dec.decode(seed_tok)
-        mx.eval(lg)
-        seed_tok = int(lg.argmax())
+    def native_tps(barriers: bool) -> float:
+        dec = NativeDecoder(model, max_context=cap, barriers=barriers)
+        dec.offset = len(ids)
+        for i, c in enumerate(cache):
+            if getattr(c, "ring", None) is not None:
+                dec.set_ring(i, c.ring)
+        seed = int(logits[0, -1].argmax())
 
-    tps_native = timed(step_native)
+        def step():
+            nonlocal seed
+            lg = dec.decode(seed)
+            mx.eval(lg)
+            seed = int(lg.argmax())
+
+        return timed(step)
+
+    tps_native = native_tps(True)
     print(f"native  decode:   {tps_native:5.1f} tok/s  ({1e3 / tps_native:.1f} ms/token)")
-    print(f"speedup:          {tps_native / tps_compiled:.2f}x  "
+    # DIAGNOSTIC (not correct output): strip the per-dispatch barriers. If this is
+    # much faster, the cost is blanket-barrier serialization (fix: dependency-aware
+    # barriers); if it's the same, our kernels are simply slower than MLX's.
+    tps_nobar = native_tps(False)
+    print(f"native (no barr): {tps_nobar:5.1f} tok/s  ({1e3 / tps_nobar:.1f} ms/token)  "
+          f"[diagnostic — wrong output]")
+    print(f"speedup vs compiled: {tps_native / tps_compiled:.2f}x  "
           f"(target >=25 tok/s: {'MET' if tps_native >= 25 else 'not yet'})")
 
 

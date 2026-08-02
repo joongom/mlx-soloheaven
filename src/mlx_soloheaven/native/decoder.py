@@ -23,8 +23,13 @@ from mlx_soloheaven.native import runtime as rt
 
 
 class NativeDecoder:
-    def __init__(self, model, max_context: int = 32768):
+    def __init__(self, model, max_context: int = 32768, barriers: bool = True):
         self.model = model
+        # barriers=False strips the per-dispatch buffer barrier — UNSAFE for
+        # correctness (hazards), for throughput DIAGNOSIS only: it isolates how
+        # much of the decode time is blanket-barrier serialization vs kernel
+        # compute (see docs/benchmarks/deepseek-v4.md, real-model bench entry).
+        self._barriers = barriers
         a = model.args
         self.rt = rt.Runtime()
         rt.load_custom_kernels(self.rt)
@@ -178,6 +183,9 @@ class NativeDecoder:
         if cached is None:
             cb = P.ConstBlob()
             items = self._build_plan(cb, int(token))
+            if not self._barriers:
+                for it in items:
+                    it.barrier = 0
             cached = (items, bytearray(cb.bytes()), self._tok_off, self._ioff_off)
             self._plan_cache[par_key] = cached
         items, blob, tok_off, ioff_off = cached

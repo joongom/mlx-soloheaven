@@ -69,6 +69,34 @@ support through mlx-vlm. (`--backend mlx-lm` forces the mlx-lm path;
 | **GLM4V / GLM-OCR** | mlx-vlm | Per-model | Vision variants. |
 | **GPT-OSS** (`gpt_oss`, e.g. 20B/120B) | mlx-lm | Standard `KVCache` mix | **Harmony format** (family `harmony`): `<\|start\|>`/`<\|channel\|>`/`<\|message\|>` channel framing. The server parses the channels — `analysis` → `reasoning_content`, `final` → `content`, `commentary to=functions.*` → OpenAI `tool_calls` — so raw markers never leak into `content`. Thinking-budget forcing is disabled (the analysis→final transition is multi-token; no single close token exists). Natural stops record `<\|return\|>`/`<\|call\|>`; the HIT-splice reconciles them against the template's `<\|end\|>` history rendering (see suffix reconciliation below). |
 | **MiniMax** | mlx-lm | Standard `KVCache` | ChatML. |
+| **EXAONE-4.5** (`exaone4_5`, 33B) | mlx-lm via our shim (`models/exaone4_5.py`) | `RotatingKVCache` (48 sliding, window 4096) + `KVCache` (16 NoPE full-attn) | Convert first with `convert_exaone4_5.py` (output loads on stock mlx-lm as `exaone4`). ChatML-EXAONE dialect (`<\|user\|>`/`<\|endofturn\|>`). |
+| **DeepSeek-V4-Flash** (`deepseek_v4`, 284B MoE) | mlx-lm via our shim (`models/deepseek_v4.py` — full from-scratch port) | `DeepSeekV4Cache` per layer: 128-slot sliding ring + learned-pooling compressed KV (append-only) | MLA (one 512-wide KV latent), DSA indexer, hash routing, Hyper-Connections, fused Metal decode attention. Family `deepseek` (`<｜User｜>`/`<｜Assistant｜>`, eos closes assistant turns only). Append-only prefix reuse works; cache not trimmable → branch/PLD cold-fill. See conversion below. |
+
+### DeepSeek-V4-Flash: build the weights first
+
+MLX cannot read the official fp8/fp4 checkpoint, and no usable MLX weights
+exist on the Hub — the converter decodes the formats itself and writes a
+mixed-quant build (routed experts 2-bit with **error-searched scales**, the
+detail that makes 2-bit usable at all; everything else 8-bit; 94.5 GB):
+
+```bash
+# 1) download the official checkpoint (167 GB)
+#    deepseek-ai/DeepSeek-V4-Flash-0731 -> ~/.lmstudio/models/deepseek-ai/...
+# 2) convert (~34 min, resumable per layer, self-verifying)
+.venv/bin/python convert_deepseek_v4.py \
+  ~/.lmstudio/models/deepseek-ai/DeepSeek-V4-Flash-0731 \
+  ~/.lmstudio/models/mlx-soloheaven/DeepSeek-V4-Flash-0731-MLX-2bit-search
+# 3) sanity-check the build (Korean probes first — they degrade before English)
+.venv/bin/python validate_deepseek_v4.py smoke
+.venv/bin/python validate_deepseek_v4.py ppl
+# 4) serve
+./start_deepseek_v4_flash_0731.sh
+```
+
+Weights are ~88 GiB resident — close other model servers first. The full
+story (why 2-bit min/max scales corrupt Korean, the ds4 oracle methodology,
+the decode-speed analysis) is in
+[`docs/specs/deepseek-v4-mlx-port.md`](docs/specs/deepseek-v4-mlx-port.md).
 
 **Note on mxfp4/mxfp8 quantization**: MLX currently has kernel inefficiencies for
 MoE matmul under mxfp4/mxfp8 modes (see [mlx issue #3402](https://github.com/ml-explore/mlx/issues/3402)).
@@ -1463,6 +1491,8 @@ A future option could split GPU resources for concurrent processing:
 - [FastAPI](https://fastapi.tiangolo.com/) — High-performance async web framework
 - [Highlight.js](https://highlightjs.org/) & [marked.js](https://marked.js.org/) — Code highlighting and Markdown rendering for the web UI
 - [OpenCode](https://github.com/opencode-ai/opencode) — The terminal AI assistant that inspired the KV cache optimization work
+- [DeepSeek](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) — the DeepSeek-V4 MLX port (`models/deepseek_v4.py`) is a translation of DeepSeek's own MIT-licensed reference (`inference/model.py`, `kernel.py`); the chat template renders their `encoding_dsv4.py` rules
+- [ds4 / DwarfStar](https://github.com/antirez/ds4) (antirez, MIT) — used as the numerical oracle that validated the V4 port (logit dumps, teacher-forced agreement), as the performance reference for the decode-path work, and as the source of the mixed 2-bit quantization recipe our converter mirrors
 
 Special thanks to [Clover Games](https://www.clovergames.com) — Lord of Heroes, It's Me (#Me), Heaven x Hells, and Ayakashi Rise forever.
 

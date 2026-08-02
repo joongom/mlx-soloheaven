@@ -307,14 +307,22 @@ across ~5k ops/token. Paths, in effort order:
 
 1. Pad the Indexer's top-k to a fixed `index_topk` width and gather the
    compressed cache at CAPACITY (it grows in 256-group steps) — that makes
-   decode shapes stable, which makes `sparse_attend` and the rope helpers
-   mx.compile-able without retrace churn. Est. reach: ~15-16 tok/s.
+   decode shapes stable, which makes the remaining decode ops
+   mx.compile-able without retrace churn.
 2. Restructure layer caches to functional state (no setitem) so the whole
    per-layer decode step compiles — the MLX approximation of ds4's resident
    graph. Big surgery; the shapes are already fixed except the compressed
-   cache, so it is feasible. Est. reach: ~20+ tok/s.
-3. A fused sparse-attention Metal kernel via mx.fast.metal_kernel, like
-   ds4's. Largest single win after (2), largest effort.
+   cache, so it is feasible. Est. reach: ~20+ tok/s. **This is where the
+   real jump lives** — see the kernel outcome below.
+3. ~~A fused sparse-attention Metal kernel~~ DONE (2026-08-02), with an
+   honest outcome: `dsv4_sparse_decode` (one dispatch per layer, online
+   softmax + sink, both parts walked in-kernel, differential-tested against
+   the eager path AND cross-checked by the decode-consistency suite) bought
+   87.3 -> 83.7 ms/token (11.5 -> 12.0 tok/s) — 3.6 ms of the ablation's
+   10.7, because the ablation removed compute+dispatch while the kernel
+   still pays call preparation. Lesson recorded: single-op fusion picks off
+   a few ms each; the spread dispatch tax needs (2), not more of (3).
+   Eager path stays canonical (`SOLOHEAVEN_DSV4_METAL=0` to disable).
 
 ## Sequence
 

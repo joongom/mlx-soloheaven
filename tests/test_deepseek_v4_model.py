@@ -174,6 +174,39 @@ def test_sinkhorn_split_matches_reference_transcription():
     assert np.allclose(np.array(comb).sum(-2), 1.0, atol=1e-2)
 
 
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Metal not available")
+@pytest.mark.parametrize("two_parts", [False, True])
+@pytest.mark.parametrize("masked", [False, True])
+def test_metal_decode_kernel_matches_eager(two_parts, masked):
+    """The fused decode kernel must reproduce the eager path (which is itself
+    NumPy-verified) — including masked slots, the sink, and the dense-layer
+    single-part case."""
+    from mlx_soloheaven.models.deepseek_v4 import (
+        _sparse_attend_decode_metal,
+        _sparse_attend_eager,
+    )
+
+    rng = np.random.default_rng(4)
+    h, d = 4, 32
+    q = mx.array(rng.standard_normal((1, 1, h, d)).astype(np.float32))
+    sink = mx.array(rng.standard_normal(h).astype(np.float32))
+    kv1 = mx.array(rng.standard_normal((1, 9, d)).astype(np.float32))
+    i1 = rng.integers(0, 9, (1, 1, 7)).astype(np.int32)
+    if masked:
+        i1[0, 0, 2:4] = -1
+    parts = [(kv1, mx.array(i1))]
+    if two_parts:
+        kv2 = mx.array(rng.standard_normal((1, 5, d)).astype(np.float32))
+        i2 = rng.integers(0, 5, (1, 1, 3)).astype(np.int32)
+        if masked:
+            i2[0, 0, 0] = -1
+        parts.append((kv2, mx.array(i2)))
+
+    got = np.array(_sparse_attend_decode_metal(q, parts, sink, 0.4))
+    ref = np.array(_sparse_attend_eager(q, parts, sink, 0.4))
+    assert np.allclose(got, ref, atol=1e-5), np.abs(got - ref).max()
+
+
 # --- rope ------------------------------------------------------------------
 
 

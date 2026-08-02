@@ -23,6 +23,7 @@ instead of saying "model type not supported", which is a worse error.
 from __future__ import annotations
 
 import functools
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -674,7 +675,195 @@ class Indexer(nn.Module):
         return mx.where(idxs >= visible, MASKED_INDEX, idxs)
 
 
+# --- fused decode attention (Metal) ----------------------------------------
+#
+# Eager sparse_attend issues ~25 ops per layer per decoded token (gathers,
+# fp32 einsums, softmax pieces); the dispatch gaps between them are pure tax
+# (see the decode-speed section of the port spec — ds4 solves the same
+# problem with a fused kernel). This kernel does the whole thing in ONE
+# dispatch per layer: one threadgroup per head, online softmax with the sink
+# in the denominator, MASKED_INDEX slots skipped, both parts (ring buffer +
+# compressed cache) walked inside the kernel. Decode only (b=1, s=1);
+# everything else takes the eager path, which stays the canonical reference
+# the kernel is differential-tested against.
+#
+# The structure follows DeepSeek's MIT-licensed sparse_attn_kernel
+# (inference/kernel.py) — see LICENSE notes in the README acknowledgments.
+
+_DECODE_TG = 128  # threads per threadgroup (one threadgroup per head)
+_DECODE_MAX_D = 512
+_DECODE_MAX_K = 1024
+
+_DECODE_KERNEL_SRC = """
+    uint h = threadgroup_position_in_grid.x;
+    uint tid = thread_position_in_threadgroup.x;
+    const int D = params[0];
+    const int K1 = params[1];
+    const int K2 = params[2];
+    const int K = K1 + K2;
+    const int TG = 128;
+
+    threadgroup float qh[512];
+    threadgroup float sc[1024];
+    threadgroup float red[128];
+
+    for (int d = tid; d < D; d += TG) qh[d] = float(q[h * D + d]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // scores (masked slots stay -INFINITY)
+    for (int j = tid; j < K; j += TG) {
+        float s = -INFINITY;
+        if (j < K1) {
+            int idx = idxs1[j];
+            if (idx >= 0) {
+                float acc = 0.0f;
+                for (int d = 0; d < D; ++d) acc += qh[d] * float(kv1[idx * D + d]);
+                s = acc * scale[0];
+            }
+        } else {
+            int idx = idxs2[j - K1];
+            if (idx >= 0) {
+                float acc = 0.0f;
+                for (int d = 0; d < D; ++d) acc += qh[d] * float(kv2[idx * D + d]);
+                s = acc * scale[0];
+            }
+        }
+        sc[j] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // max over scores, then include the sink
+    float lm = -INFINITY;
+    for (int j = tid; j < K; j += TG) lm = max(lm, sc[j]);
+    red[tid] = lm;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int off = TG / 2; off > 0; off >>= 1) {
+        if (tid < (uint)off) red[tid] = max(red[tid], red[tid + off]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float m = max(red[0], sink[h]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // exp + sum; the sink joins the DENOMINATOR only
+    float ls = 0.0f;
+    for (int j = tid; j < K; j += TG) {
+        float p = exp(sc[j] - m);
+        sc[j] = p;
+        ls += p;
+    }
+    red[tid] = ls;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int off = TG / 2; off > 0; off >>= 1) {
+        if (tid < (uint)off) red[tid] += red[tid + off];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float denom = red[0] + exp(sink[h] - m);
+
+    // weighted values (p == 0 covers masked slots, so idx is never read there)
+    for (int d = tid; d < D; d += TG) {
+        float acc = 0.0f;
+        for (int j = 0; j < K1; ++j) {
+            float p = sc[j];
+            if (p > 0.0f) acc += p * float(kv1[idxs1[j] * D + d]);
+        }
+        for (int j = 0; j < K2; ++j) {
+            float p = sc[K1 + j];
+            if (p > 0.0f) acc += p * float(kv2[idxs2[j] * D + d]);
+        }
+        out[h * D + d] = acc / denom;
+    }
+"""
+
+_decode_kernel = None
+
+
+@functools.lru_cache(maxsize=1024)
+def _kernel_params(d: int, k1: int, k2: int) -> mx.array:
+    """Host->device upload of the tiny params array happens once per shape,
+    not once per layer per token (86 uploads/token otherwise)."""
+    return mx.array([d, k1, k2], dtype=mx.int32)
+
+
+@functools.lru_cache(maxsize=64)
+def _kernel_scale(scale: float) -> mx.array:
+    return mx.array([scale], dtype=mx.float32)
+
+
+@functools.lru_cache(maxsize=8)
+def _kernel_dummy_part(d: int, dtype_name: str):
+    kv = mx.zeros((1, 1, d), dtype=getattr(mx, dtype_name))
+    idx = mx.full((1, 1, 1), MASKED_INDEX, dtype=mx.int32)
+    return kv, idx
+
+
+def _get_decode_kernel():
+    global _decode_kernel
+    if _decode_kernel is None:
+        _decode_kernel = mx.fast.metal_kernel(
+            name="dsv4_sparse_decode",
+            input_names=["q", "kv1", "idxs1", "kv2", "idxs2", "sink", "scale", "params"],
+            output_names=["out"],
+            source=_DECODE_KERNEL_SRC,
+        )
+    return _decode_kernel
+
+
+def _sparse_attend_decode_metal(
+    q: mx.array,
+    parts: list[tuple[mx.array, mx.array]],
+    attn_sink: mx.array,
+    scale: float,
+) -> mx.array:
+    h, d = q.shape[2], q.shape[3]
+    kv1, i1 = parts[0]
+    if len(parts) == 2:
+        kv2, i2 = parts[1]
+    else:  # dense layer: dummy second part, one fully-masked slot
+        kv2, i2 = _kernel_dummy_part(d, str(q.dtype).split(".")[-1])
+    out = _get_decode_kernel()(
+        inputs=[
+            q.reshape(h, d),
+            kv1.reshape(-1, d),
+            i1.reshape(-1),
+            kv2.reshape(-1, d),
+            i2.reshape(-1),
+            attn_sink,
+            _kernel_scale(scale),
+            _kernel_params(d, i1.size, i2.size),
+        ],
+        grid=(h * _DECODE_TG, 1, 1),
+        threadgroup=(_DECODE_TG, 1, 1),
+        output_shapes=[(h, d)],
+        output_dtypes=[mx.float32],
+    )[0]
+    return out.reshape(1, 1, h, d).astype(q.dtype)
+
+
+def _decode_kernel_usable(q: mx.array, parts) -> bool:
+    if os.environ.get("SOLOHEAVEN_DSV4_METAL", "1") == "0":
+        return False
+    if not mx.metal.is_available():
+        return False
+    if q.shape[0] != 1 or q.shape[1] != 1 or len(parts) > 2:
+        return False
+    if q.shape[3] > _DECODE_MAX_D:
+        return False
+    k = sum(p[1].shape[-1] for p in parts)
+    return k + (1 if len(parts) == 1 else 0) <= _DECODE_MAX_K
+
+
 def sparse_attend(
+    q: mx.array,
+    parts: list[tuple[mx.array, mx.array]],
+    attn_sink: mx.array,
+    scale: float,
+) -> mx.array:
+    if _decode_kernel_usable(q, parts):
+        return _sparse_attend_decode_metal(q, parts, attn_sink, scale)
+    return _sparse_attend_eager(q, parts, attn_sink, scale)
+
+
+def _sparse_attend_eager(
     q: mx.array,
     parts: list[tuple[mx.array, mx.array]],
     attn_sink: mx.array,

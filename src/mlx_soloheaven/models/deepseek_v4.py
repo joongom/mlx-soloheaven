@@ -1740,6 +1740,134 @@ class Gate(nn.Module):
         return route(scores, self.topk, self.route_scale, self.bias)
 
 
+# --- HC pre/post kernels (REPLAY path only) ---------------------------------
+#
+# hc_pre = rms(flat) -> mixes = (flat @ fn^T) * rms -> sinkhorn split ->
+#          y = sum_hc pre[hc] * flat[hc]. hc_post = post*x + comb@residual.
+# A single-dispatch kernel each. These are NOT wired into the mx.compile decode
+# path — there, one threadgroup doing the [mix, hc*d] GEMV starved the chip and
+# regressed decode (docs/benchmarks/deepseek-v4.md). In the external replay
+# loop there is no per-op floor to amortize, so the single dispatch is the
+# right shape. Exposed for the native runtime and diff-tested against
+# _hc_pre_math / _hc_post_math.
+
+_HC_PRE_SRC = """
+    uint tid = thread_position_in_threadgroup.x;
+    const int TG = 256;
+    const int hcn = params[0];
+    const int d = params[1];
+    const int mix = (2 + hcn) * hcn;
+    const int hcd = hcn * d;
+    const float rms_eps = feps[0];
+    const float hc_eps = feps[1];
+
+    threadgroup float red[8];
+    threadgroup float mixes[64];
+    threadgroup float pc[64];      // pre[hc], post[hc], comb[hc*hc]
+    threadgroup float rms_s[1];
+
+    float acc = 0.0f;
+    for (int i = tid; i < hcd; i += TG) { float v = float(h[i]); acc += v * v; }
+    acc = simd_sum(acc);
+    if ((tid & 31u) == 0) red[tid / 32] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float t = 0.0f;
+        for (int i = 0; i < TG / 32; ++i) t += red[i];
+        rms_s[0] = rsqrt(t / hcd + rms_eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rms = rms_s[0];
+
+    for (int r = tid / 32; r < mix; r += TG / 32) {
+        float a = 0.0f;
+        for (int i = tid % 32; i < hcd; i += 32) a += float(fn[r * hcd + i]) * float(h[i]);
+        a = simd_sum(a);
+        if ((tid & 31u) == 0) mixes[r] = a * rms;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        for (int j = 0; j < hcn; ++j)
+            pc[j] = 1.0f / (1.0f + exp(-(mixes[j] * scale[0] + base[j]))) + hc_eps;
+        for (int j = 0; j < hcn; ++j)
+            pc[hcn + j] = 2.0f / (1.0f + exp(-(mixes[hcn + j] * scale[1] + base[hcn + j])));
+        float cb[16];
+        for (int j = 0; j < hcn * hcn; ++j)
+            cb[j] = mixes[2 * hcn + j] * scale[2] + base[2 * hcn + j];
+        for (int r = 0; r < hcn; ++r) {
+            float m = cb[r * hcn];
+            for (int c = 1; c < hcn; ++c) m = max(m, cb[r * hcn + c]);
+            float s = 0.0f;
+            for (int c = 0; c < hcn; ++c) { cb[r * hcn + c] = exp(cb[r * hcn + c] - m); s += cb[r * hcn + c]; }
+            for (int c = 0; c < hcn; ++c) cb[r * hcn + c] = cb[r * hcn + c] / s + hc_eps;
+        }
+        for (int c = 0; c < hcn; ++c) {
+            float s = 0.0f;
+            for (int r = 0; r < hcn; ++r) s += cb[r * hcn + c];
+            for (int r = 0; r < hcn; ++r) cb[r * hcn + c] /= (s + hc_eps);
+        }
+        for (int it = 0; it < iters[0] - 1; ++it) {
+            for (int r = 0; r < hcn; ++r) {
+                float s = 0.0f;
+                for (int c = 0; c < hcn; ++c) s += cb[r * hcn + c];
+                for (int c = 0; c < hcn; ++c) cb[r * hcn + c] /= (s + hc_eps);
+            }
+            for (int c = 0; c < hcn; ++c) {
+                float s = 0.0f;
+                for (int r = 0; r < hcn; ++r) s += cb[r * hcn + c];
+                for (int r = 0; r < hcn; ++r) cb[r * hcn + c] /= (s + hc_eps);
+            }
+        }
+        for (int j = 0; j < hcn * hcn; ++j) pc[2 * hcn + j] = cb[j];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int i = tid; i < d; i += TG) {
+        float a = 0.0f;
+        for (int j = 0; j < hcn; ++j) a += pc[j] * float(h[j * d + i]);
+        y[i] = T(a);
+    }
+    for (int i = tid; i < hcn; ++i) post[i] = pc[hcn + i];
+    for (int i = tid; i < hcn * hcn; i += TG) comb[i] = pc[2 * hcn + i];
+"""
+
+_HC_POST_SRC = """
+    // y[hc, d] = post[hc]*x[d] + sum_j comb[hc, j] * residual[j, d]
+    uint tid = thread_position_in_threadgroup.x;
+    uint hc_ = threadgroup_position_in_grid.x;
+    const int TG = 256;
+    const int hcn = params[0];
+    const int d = params[1];
+    for (int i = tid; i < d; i += TG) {
+        float a = post[hc_] * float(x[i]);
+        for (int j = 0; j < hcn; ++j) a += comb[hc_ * hcn + j] * float(residual[j * d + i]);
+        y[hc_ * d + i] = T(a);
+    }
+"""
+
+_hc_kernels = None
+
+
+def _get_hc_kernels():
+    global _hc_kernels
+    if _hc_kernels is None:
+        pre = mx.fast.metal_kernel(
+            name="dsv4_hc_pre_k",
+            input_names=["h", "fn", "scale", "base", "params", "feps", "iters"],
+            output_names=["y", "post", "comb"],
+            source=_HC_PRE_SRC,
+        )
+        post = mx.fast.metal_kernel(
+            name="dsv4_hc_post_k",
+            input_names=["x", "residual", "post", "comb", "params"],
+            output_names=["y"],
+            source=_HC_POST_SRC,
+        )
+        _hc_kernels = (pre, post)
+    return _hc_kernels
+
+
 # --- fused batch-1 MoE kernels (decode) -------------------------------------
 #
 # gather_qmm at batch 1 measured 14 ms/token against ~3 ms of pure bandwidth

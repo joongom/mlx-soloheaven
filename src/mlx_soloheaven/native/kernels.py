@@ -42,6 +42,17 @@ _SPECS = {
          ("sink", _F), ("freqs", _F), ("params", _I), ("fscal", _F),
          ("ioff", _I), ("out", "device bfloat*"), ("kv_out", "device bfloat*")],
     ),
+    "dsv4_hc_pre_k": (
+        "_HC_PRE_SRC",
+        [("h", _B), ("fn", _F), ("scale", _F), ("base", _F), ("params", _I),
+         ("feps", _F), ("iters", _I), ("y", "device bfloat*"),
+         ("post", "device float*"), ("comb", "device float*")],
+    ),
+    "dsv4_hc_post_k": (
+        "_HC_POST_SRC",
+        [("x", _B), ("residual", _B), ("post", _F), ("comb", _F), ("params", _I),
+         ("y", "device bfloat*")],
+    ),
     "dsv4_comp_step": (
         "_COMP_STEP_SRC",
         [("kv_row", _B), ("sc_row", _B), ("kv_st", _F), ("sc_st", _F),

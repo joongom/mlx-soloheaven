@@ -309,6 +309,48 @@ def test_native_attn_core_matches_mx_fast():
     assert np.abs(ka - kb).max() < 1e-2, np.abs(ka - kb).max()
 
 
+def test_native_hc_pre_matches_reference():
+    """dsv4_hc_pre_k native (explicit signature, C-loop) == _hc_pre_math (the
+    reference the mx.fast twin is diffed against elsewhere). Covers the rms,
+    the mixes GEMV, the full 20-iteration Sinkhorn, and the pre-reduction."""
+    from mlx_soloheaven.models.deepseek_v4 import _hc_pre_math
+    from mlx_soloheaven.native.kernels import BUFFER_SLOTS
+
+    hc, d, iters = 4, 256, 20
+    h = mx.random.normal((1, 1, hc, d)).astype(mx.bfloat16)
+    fn = mx.random.normal((24, hc * d)).astype(mx.float32)
+    scale = mx.random.normal((3,)).astype(mx.float32)
+    base = mx.random.normal((24,)).astype(mx.float32)
+    yref, pref, cref = _hc_pre_math(h, fn, scale, base, hc, iters, 1e-6, 1e-6)
+    y = mx.zeros((d,), dtype=mx.bfloat16)
+    post = mx.zeros((hc,), dtype=mx.float32)
+    comb = mx.zeros((hc * hc,), dtype=mx.float32)
+    mx.eval(h, fn, scale, base, yref, pref, cref, y, post, comb)
+    mx.synchronize()
+
+    rt_mod.load_custom_kernels(_RT)
+    table = rt_mod.BufferTable()
+    sl = BUFFER_SLOTS["dsv4_hc_pre_k"]
+    s = {nm: table.add(a) for nm, a in
+         [("h", h.reshape(-1)), ("fn", fn), ("scale", scale), ("base", base),
+          ("y", y), ("post", post), ("comb", comb)]}
+    const = struct.pack("<2i2fi", hc, d, 1e-6, 1e-6, iters)
+    it = rt_mod.plan_item(
+        _RT, "dsv4_hc_pre_k", True,
+        [(s["h"], sl["h"]), (s["fn"], sl["fn"]), (s["scale"], sl["scale"]),
+         (s["base"], sl["base"]), (s["y"], sl["y"]), (s["post"], sl["post"]),
+         (s["comb"], sl["comb"])],
+        [(0, 8, sl["params"]), (8, 8, sl["feps"]), (16, 4, sl["iters"])],
+        (1, 1, 1), (256, 1, 1),
+    )
+    _RT.commit([it], table.ptrs, const, wait=True)
+
+    assert np.abs(np.array(y.astype(mx.float32))
+                  - np.array(yref.reshape(-1).astype(mx.float32))).max() < 1e-2
+    assert np.abs(np.array(post) - np.array(pref.reshape(-1))).max() < 1e-4
+    assert np.abs(np.array(comb) - np.array(cref.reshape(-1))).max() < 1e-4
+
+
 def test_native_moe_routed_chain_matches_mx_fast():
     """A TWO-item plan (K1 -> K2) sharing an intermediate h buffer, committed
     once, must reproduce the model's routed-expert output. This is the first

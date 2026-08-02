@@ -535,6 +535,52 @@ def test_native_hc_pre_matches_reference():
     assert np.abs(np.array(comb) - np.array(cref.reshape(-1))).max() < 1e-4
 
 
+def test_native_hc_post_comb_orientation_hc4():
+    """dsv4_hc_post_k at hc=4 against _hc_post_math.
+
+    REGRESSION: the kernel read comb[k, j] where the reference sums
+    comb[j, k] (einsum "bsjk,bsjd->bskd"). Every 2x2 doubly-stochastic
+    matrix is symmetric, so the hc=2 configs every other test uses cannot
+    see a transposed mixing matrix; the shipped model is hc_mult=4, where
+    it moved a block's output by 14.5%."""
+    from mlx_soloheaven.models.deepseek_v4 import _hc_post_math
+    from mlx_soloheaven.native.kernels import BUFFER_SLOTS
+
+    hc, d = 4, 512
+    rng = np.random.default_rng(77)
+    x = mx.array(rng.standard_normal(d).astype(np.float32)).astype(mx.bfloat16)
+    res = mx.array(rng.standard_normal((hc, d)).astype(np.float32)).astype(mx.bfloat16)
+    post = mx.array(rng.standard_normal(hc).astype(np.float32))
+    # a NON-symmetric doubly-stochastic-ish comb — the orientation must matter
+    comb = mx.array(np.array([[0.7, 0.1, 0.1, 0.1], [0.05, 0.8, 0.1, 0.05],
+                              [0.2, 0.05, 0.7, 0.05], [0.05, 0.05, 0.1, 0.8]],
+                             dtype=np.float32))
+    y = mx.zeros((hc * d,), dtype=mx.bfloat16)
+    mx.eval(x, res, post, comb, y)
+    mx.synchronize()
+
+    rt_mod.load_custom_kernels(_RT)
+    T = rt_mod.BufferTable()
+    k = BUFFER_SLOTS["dsv4_hc_post_k"]
+    s_ = {nm: T.add(a) for nm, a in [("x", x), ("residual", res.reshape(-1)),
+                                     ("post", post), ("comb", comb.reshape(-1)),
+                                     ("y", y)]}
+    const = struct.pack("<2i", hc, d)
+    it = rt_mod.plan_item(
+        _RT, "dsv4_hc_post_k", True,
+        [(s_["x"], k["x"]), (s_["residual"], k["residual"]), (s_["post"], k["post"]),
+         (s_["comb"], k["comb"]), (s_["y"], k["y"])],
+        [(0, 8, k["params"])], (hc * 8, 1, 1), (256, 1, 1))
+    _RT.commit([it], T.ptrs, const, wait=True)
+
+    ref = _hc_post_math(x.reshape(1, 1, d), res.reshape(1, 1, hc, d),
+                        post.reshape(1, 1, hc), comb.reshape(1, 1, hc, hc))
+    mx.eval(ref)
+    got = np.array(y.astype(mx.float32))
+    exp = np.array(ref.astype(mx.float32)).reshape(-1)
+    assert np.abs(got - exp).max() < 2e-2, np.abs(got - exp).max()
+
+
 def test_native_moe_routed_chain_matches_mx_fast():
     """A TWO-item plan (K1 -> K2) sharing an intermediate h buffer, committed
     once, must reproduce the model's routed-expert output. This is the first

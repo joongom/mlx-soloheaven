@@ -2462,13 +2462,20 @@ _HC_POST2_SRC = """
     for (int i = lo + (int)tid; i < hi; i += TG) {
         float xv = float(T(float(a[i]) + float(b[i])));
         float acc = post[hc_] * xv;
-        for (int j = 0; j < hcn; ++j) acc += comb[hc_ * hcn + j] * float(residual[j * d + i]);
+        for (int j = 0; j < hcn; ++j) acc += comb[j * hcn + hc_] * float(residual[j * d + i]);
         y[hc_ * d + i] = T(acc);
     }
 """
 
 _HC_POST_SRC = """
-    // y[hc, d] = post[hc]*x[d] + sum_j comb[hc, j] * residual[j, d]
+    // y[k, d] = post[k]*x[d] + sum_j comb[j, k] * residual[j, d]
+    // NOTE the comb index order: the reference is
+    //   einsum("bsjk,bsjd->bskd", comb, residual)
+    // so the SOURCE stream j is comb's first axis and the OUTPUT stream k
+    // its second. Reading comb[k*hcn + j] transposes the mixing matrix —
+    // invisible at hc=2 (every 2x2 doubly-stochastic matrix is symmetric,
+    // which is why the tiny-config tests passed) and worth 14.5% of the
+    // block output at the real hc_mult=4.
     // grid = hcn * NSPLIT threadgroups: hcn alone (4 TGs) underfilled the
     // chip, so each hc row is split into NSPLIT d-slices. NSPLIT is a
     // compile-time constant — every dispatch site's grid must move with it.
@@ -2484,7 +2491,7 @@ _HC_POST_SRC = """
     const int hi = min(lo + chunk, d);
     for (int i = lo + (int)tid; i < hi; i += TG) {
         float a = post[hc_] * float(x[i]);
-        for (int j = 0; j < hcn; ++j) a += comb[hc_ * hcn + j] * float(residual[j * d + i]);
+        for (int j = 0; j < hcn; ++j) a += comb[j * hcn + hc_] * float(residual[j * d + i]);
         y[hc_ * d + i] = T(a);
     }
 """

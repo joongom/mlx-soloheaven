@@ -874,14 +874,29 @@ the COMPLETION path (pooled row 0.36%, state bit-exact), MoE gate incl.
 hash routing (expert sets identical, weights to 1e-7), hc_pre (bit-exact),
 comp/indexer state seeding, borrow-mode buffer registration (byte-exact).
 
-**Where to look next**: the FFN half still shows ~1.1% output error at L5
-with an EXACT input and matching expert picks, and per-block error is
-uneven (L0 4.2% vs L5 1.1%). The one surface never compared against MLX on
-REAL weights is the 2-bit routed-expert pair (`dsv4_moe_w13`/`w2`) vs
-`gather_qmm` — the unit tests only cover a tiny synthetic 2-bit config. A
-systematic 2-bit unpack/group-stride discrepancy at the real shapes
-(d_model 4096, inter 2048) would produce exactly this: a consistent
-per-layer FFN error, invariant to activation precision.
+**The 2-bit experts are clean too** (probe_moe_real.py, real weights, same
+x and same expert indices into both): hexp max 0.022 / mean 0.0009 against
+|ref| 1.75; y_routed max 0.004 / mean 0.0009 against |ref| 0.46. So EVERY
+component matches the reference to ~1-3 ULP, yet the assembled 43-layer
+path is 21% worse in ppl and flips 35% of argmaxes.
+
+**Reading of the evidence, and the next experiment.** What is left is not a
+bug but a property: our quantized-matmul kernels (wo_a, moe_w13/w2, sh13,
+qmv8, embed, gate) are each correct to ~1 ULP but not BIT-IDENTICAL to
+MLX's, and this build's 2-bit experts are sensitive enough that 43 layers
+of that compound into real quality loss. Raising activation precision
+cannot fix it — the residual difference lives in the quantized WEIGHT
+paths, where being "more precise" than MLX is not the same as agreeing
+with it. Note which paths already agree bit-for-bit: everything still on
+the library qmv.
+
+So the decisive next test is the opposite of the last three: put the
+quantized ops BACK on MLX's kernels inside the native replay (gather_qmm
+for the routed experts, library qmv for wo_a/sh13/the stacked projection)
+and re-measure ppl. If it lands at 3.65, the cause is confirmed and the
+tradeoff becomes explicit — a quality mode that keeps the replay's
+scheduling win while giving up the custom-kernel speedups, and a per-kernel
+search for which of them can be made bit-exact cheaply.
 
 ## 3. Reproduce
 

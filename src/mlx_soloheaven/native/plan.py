@@ -297,14 +297,22 @@ def plan_moe(pl: Planner, ffn, xin: str, out: str, topk: int, rscale: float,
          (pl.t.add(exp.down_proj.scales), w2["ds_"]), (pl.t.add(exp.down_proj.biases), w2["db"]),
          (pl.S["idx"], w2["idxs"]), (pl.S["w"], w2["wts"]), (pl.S["y_routed"], w2["y"])],
         [(mo, 12, w2["params"])], ((hidden + 7) // 8, 1, 1), (256, 1, 1)))
-    items.append(pl.qmv(sh.w1, xin, "sg", hidden, inter))
-    items.append(pl.qmv(sh.w3, xin, "su", hidden, inter))
-    sw = BUFFER_SLOTS["dsv4_swiglu_k"]
-    so, _ = pl.cb.add("if", inter, limit)
+    # shared expert w1 + w3 + clipped SwiGLU as ONE dispatch (was 2 library
+    # qmv + the elementwise swiglu): one simdgroup per inter row does both
+    # 8-bit dots and applies the activation in-register.
+    k13 = BUFFER_SLOTS["dsv4_sh13_k"]
+    so, _ = pl.cb.add("2i", hidden, inter)
+    sf, _ = pl.cb.add("f", limit)
     items.append(pl._pi(
-        "dsv4_swiglu_k", True,
-        [(pl.S["sg"], sw["gate"]), (pl.S["su"], sw["up"]), (pl.S["sh"], sw["out"])],
-        [(so, 4, sw["params"]), (so + 4, 4, sw["feps"])], (inter, 1, 1), (256, 1, 1)))
+        "dsv4_sh13_k", True,
+        [(pl.S[xin], k13["x"]),
+         (pl.t.add(sh.w1.weight), k13["w1"]), (pl.t.add(sh.w1.scales), k13["s1"]),
+         (pl.t.add(sh.w1.biases), k13["b1"]),
+         (pl.t.add(sh.w3.weight), k13["w3"]), (pl.t.add(sh.w3.scales), k13["s3"]),
+         (pl.t.add(sh.w3.biases), k13["b3"]),
+         (pl.S["sh"], k13["out"])],
+        [(so, 8, k13["params"]), (sf, 4, k13["feps"])],
+        ((inter + 7) // 8, 1, 1), (256, 1, 1)))
     items.append(pl.qmv(sh.w2, "sh", "shared", inter, hidden))
     ak = BUFFER_SLOTS["dsv4_add_k"]
     ao, _ = pl.cb.add("i", hidden)

@@ -2193,6 +2193,49 @@ _WO_A_SRC = """
     if (lane == 0) out[row] = T(a);
 """
 
+_SH13_SRC = """
+    // Fused shared-expert w1/w3 + clipped SwiGLU: one simdgroup per inter
+    // row j computes both 8-bit gs64 affine dots against x and writes
+    // silu(min(g,lim)) * clamp(u,-lim,lim) — replacing two library qmv
+    // dispatches and the elementwise swiglu per MoE layer.
+    uint sg_id = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint row = threadgroup_position_in_grid.x * 8 + sg_id;
+    const int hidden = params[0];
+    const int inter = params[1];
+    const float limit = feps[0];
+    if (row >= (uint)inter) return;
+    const int words = hidden / 4;
+    const uint wbase = row * (uint)words;
+    const uint sbase = row * (uint)(hidden / 64);
+    float a1 = 0.0f, a3 = 0.0f;
+    for (int w = lane; w < words; w += 32) {
+        uint p1 = w1[wbase + w];
+        uint p3 = w3[wbase + w];
+        float sc1 = float(s1[sbase + w / 16]);
+        float bi1 = float(b1[sbase + w / 16]);
+        float sc3 = float(s3[sbase + w / 16]);
+        float bi3 = float(b3[sbase + w / 16]);
+        float aw1 = 0.0f, aw3 = 0.0f, sx = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            float xk = float(x[w * 4 + k]);
+            aw1 += float((p1 >> (8 * k)) & 0xFFu) * xk;
+            aw3 += float((p3 >> (8 * k)) & 0xFFu) * xk;
+            sx += xk;
+        }
+        a1 += aw1 * sc1 + sx * bi1;
+        a3 += aw3 * sc3 + sx * bi3;
+    }
+    a1 = simd_sum(a1);
+    a3 = simd_sum(a3);
+    if (lane == 0) {
+        float g = a1, u = a3;
+        if (limit > 0.0f) { u = clamp(u, -limit, limit); g = min(g, limit); }
+        out[row] = T((g / (1.0f + exp(-g))) * u);
+    }
+"""
+
 _RING_STORE_SRC = """
     // ring[(offset % win) * D + i] = src[i]  — the post-attention KV write.
     uint tid = thread_position_in_threadgroup.x;

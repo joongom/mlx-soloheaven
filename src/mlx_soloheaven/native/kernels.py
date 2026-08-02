@@ -51,6 +51,12 @@ _SPECS = {
         [("x", _B), ("weight", _U), ("scales", _B), ("biases", _B),
          ("params", _I), ("out", "device bfloat*")],
     ),
+    "dsv4_sh13_k": (
+        "_SH13_SRC",
+        [("x", _B), ("w1", _U), ("s1", _B), ("b1", _B),
+         ("w3", _U), ("s3", _B), ("b3", _B),
+         ("params", _I), ("feps", _F), ("out", "device bfloat*")],
+    ),
     "dsv4_swiglu_k": (
         "_SWIGLU_SRC",
         [("gate", _B), ("up", _B), ("params", _I), ("feps", _F),

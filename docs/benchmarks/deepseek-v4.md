@@ -37,6 +37,16 @@ Open work, in priority order:
    prologue forces a single-threadgroup shape (Stage 4l names
    `sh_dsv4_hc_head_k` as the last one).
 
+**What the native path accepts (2026-08-03).** Architecture `deepseek_v4`
+only — the plan builders replay V4's block (MLA + compressor + DSA indexer +
+hyper-connections), so it is not a switch other models can flip. The weight
+PACKING, however, is no longer fixed: `QuantSpec.from_model` derives (bits,
+group_size) for the routed experts and for everything dense, and the kernels
+index packed words from those. Supported: 2/4/8-bit at group size 32/64/128,
+bf16 scales, one recipe per class. Anything else raises inside the decoder's
+constructor and falls back to the compiled path — it used to be read at the
+wrong stride and returned plausible garbage instead.
+
 Machine rule that still bites: never load the 94.5 GB model while another
 copy is up (server or a bench) — check `memory_pressure` first.
 

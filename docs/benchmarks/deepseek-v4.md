@@ -166,6 +166,30 @@ compressor step non-matmul math (~12 x 61 calls -> one small-state kernel),
 HC sinkhorn tail (keep the [24,16384] GEMV in the library, fuse the rest),
 cast/astype hygiene across the step.
 
+### Campaign Stage 1 close-out (2026-08-02): the in-MLX plateau is ~87 ms
+
+| attempt | result |
+|---|---|
+| v2 fused attention core (in-kernel rope table, q-RMS, window indices, inverse rope, roped-kv emission; template-cast for bf16) | 89.0 → 87.3 ms — glue was already compile-fused |
+| MoE K1/K2 vectorization (threadgroup x/h staging, unrolled unpack) | 0.303 → 0.296 ms/layer — call-chain floor, not kernel time |
+
+Micro-truths that settle the accounting (kbench2):
+* big library qmv at decode shapes are AT bandwidth (x0.8-1.2) — nothing
+  to win there; head costs 0.94 ms/token (x1.2);
+* a bare `astype(fp32)` on 16 KB costs 67 µs — the per-op floor made
+  visible; `rms_norm` at 4.5 µs shows the floor is per-DEPENDENT-op
+  (independent micro-loops pipeline, chains do not — the micro harness
+  measures throughput, the decode chain pays latency);
+* therefore the ~87 ms ≈ (big matmuls ~15 ms) + (attention/MoE/HC/comp
+  kernels ~15 ms) + (~1,000+ chained small ops x ~40-70 µs).
+
+**Stage-1 verdict**: inside MLX's per-op execution model the decode
+plateaus around ~80-87 ms (12 tok/s). The 25 tok/s goal requires the
+external command-buffer loop (Stage 3), where the per-op floor does not
+exist — ds4 runs its whole step in 36 ms. Every kernel built in Stage 1
+(attention core, MoE pair, compressor step) is exactly what the external
+loop encodes, so none of this work is lost.
+
 Standing conclusions:
 * Per-launch overhead is ~4 µs (39 ms / ~10k launches) — the remaining ~1k
   launches cost ~3 ms. The 85 ms is a SUM of medium inefficiencies, not one

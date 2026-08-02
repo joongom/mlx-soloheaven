@@ -418,6 +418,43 @@ def test_chunked_prefill_consistency_full_model(plan):
     assert np.allclose(np.array(got), np.array(ref), atol=2e-4), (
         f"max abs diff {np.abs(np.array(got) - np.array(ref)).max()}"
     )
+    # The compiled path silently falls back to eager on a trace error — a
+    # green consistency run must not hide that (it did once: a None cidx on
+    # plain layers only broke at the first ratio-128 layer).
+    import mlx_soloheaven.models.deepseek_v4 as v4
+
+    assert not v4._COMPILED_DECODE_BROKEN, "compiled decode fell back to eager"
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Metal not available")
+def test_decode_consistency_bf16():
+    """The serving dtype. fp32-only tests missed a Metal bfloat implicit-
+    conversion compile error (bfloat rejects float assignment); this runs the
+    same consistency check at bf16 and refuses the silent eager fallback."""
+    from mlx.utils import tree_map
+
+    import mlx_soloheaven.models.deepseek_v4 as v4
+
+    model = build_tiny()
+    model.update(
+        tree_map(
+            lambda a: a.astype(mx.bfloat16) if a.dtype == mx.float32 else a,
+            model.parameters(),
+        )
+    )
+    for layer in model.layers:  # fp32-by-design params stay fp32
+        layer.attn.attn_sink = layer.attn.attn_sink.astype(mx.float32)
+    ids = mx.array([TOKENS])
+    ref = model(ids)
+    cache = model.make_cache()
+    out = [model(ids[:, :11], cache)]
+    for p in range(11, len(TOKENS)):
+        out.append(model(ids[:, p : p + 1], cache))
+    got = mx.concatenate(out, axis=1)
+    assert not v4._COMPILED_DECODE_BROKEN, "compiled decode fell back to eager"
+    a = np.array(got.astype(mx.float32))
+    b = np.array(ref.astype(mx.float32))
+    assert np.allclose(a, b, atol=5e-2), np.abs(a - b).max()  # bf16 tolerance
 
 
 def test_cache_state_round_trips_mid_session():

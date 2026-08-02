@@ -861,6 +861,295 @@ _DECODE_KERNEL_SRC = """
     }
 """
 
+#: v2 "attention core": absorbs the decode glue that the per-op cost model
+#: (docs/benchmarks/deepseek-v4.md) says dominates — in-kernel rope table
+#: from (offset x freqs), parameterless per-head q-RMS, q/kv rope, window
+#: index generation, plain-comp visibility indices, online-softmax attention
+#: with the sink, and the inverse rope on the output tail. Emits the roped
+#: kv row for the (python-side) ring write. One dispatch replaces ~30 ops.
+_ATTN_CORE_SRC = """
+    // grid: one threadgroup (128 threads) per head; head h.
+    uint h_ = threadgroup_position_in_grid.x;
+    uint tid = thread_position_in_threadgroup.x;
+    const int TG = 128;
+    const int D = params[0];        // head_dim (512)
+    const int RD = params[1];       // rope dim (64)
+    const int WIN = params[2];      // sliding window
+    const int KC = params[3];       // comp part width (0 = none)
+    const int PLAIN = params[4];    // 1: cidx generated in-kernel from n
+    const float scale = fscal[0];
+    const float eps = fscal[1];
+    const int offset = ioff[0];
+    const int NCOMP = ioff[1];      // valid comp groups (traced; plain mask)
+
+    threadgroup float qh[512];
+    threadgroup float kvr[512];     // roped kv row (fresh token)
+    threadgroup float cs[64];       // cos/sin for RD/2 pairs at pos=offset
+    threadgroup float sc[2176];
+    threadgroup float red[128];
+
+    // rope table for position = offset
+    for (int i = tid; i < RD / 2; i += TG) {
+        float ang = float(offset) * freqs[i];
+        cs[2 * i] = cos(ang);
+        cs[2 * i + 1] = sin(ang);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // roped kv row (computed redundantly per TG; 512 dims, trivial)
+    for (int i = tid; i < D; i += TG) kvr[i] = float(kv[i]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int p = tid; p < RD / 2; p += TG) {
+        int i0 = D - RD + 2 * p;
+        float c = cs[2 * p], s = cs[2 * p + 1];
+        float e = kvr[i0], o = kvr[i0 + 1];
+        kvr[i0] = e * c - o * s;
+        kvr[i0 + 1] = e * s + o * c;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (h_ == 0) {
+        for (int i = tid; i < D; i += TG) kv_out[i] = T(kvr[i]);
+    }
+
+    // q: load head h, parameterless RMS over D, rope the tail
+    float ss = 0.0f;
+    for (int i = tid; i < D; i += TG) {
+        float v = float(q[h_ * D + i]);
+        qh[i] = v;
+        ss += v * v;
+    }
+    ss = simd_sum(ss);
+    if ((tid & 31u) == 0) red[tid / 32] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float t = 0.0f;
+        for (int i = 0; i < TG / 32; ++i) t += red[i];
+        red[0] = rsqrt(t / D + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rn = red[0];
+    for (int i = tid; i < D; i += TG) qh[i] *= rn;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int p = tid; p < RD / 2; p += TG) {
+        int i0 = D - RD + 2 * p;
+        float c = cs[2 * p], s = cs[2 * p + 1];
+        float e = qh[i0], o = qh[i0 + 1];
+        qh[i0] = e * c - o * s;
+        qh[i0 + 1] = e * s + o * c;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // scores: window part (ring slots computed inline; slot==offset%WIN is
+    // the fresh token -> use kvr) then comp part
+    const int K = WIN + KC;
+    for (int j = tid; j < K; j += TG) {
+        float s = -INFINITY;
+        if (j < WIN) {
+            int qpos = offset - WIN + 1 + j;
+            if (qpos >= 0) {
+                float a = 0.0f;
+                if (qpos == offset) {
+                    for (int i = 0; i < D; ++i) a += qh[i] * kvr[i];
+                } else {
+                    int slot = qpos % WIN;
+                    for (int i = 0; i < D; ++i) a += qh[i] * float(ring[slot * D + i]);
+                }
+                s = a * scale;
+            }
+        } else {
+            int jc = j - WIN;
+            int idx = PLAIN ? (jc < NCOMP ? jc : -1) : cidx[jc];
+            if (idx >= 0) {
+                float a = 0.0f;
+                for (int i = 0; i < D; ++i) a += qh[i] * float(comp[idx * D + i]);
+                s = a * scale;
+            }
+        }
+        sc[j] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float lm = -INFINITY;
+    for (int j = tid; j < K; j += TG) lm = max(lm, sc[j]);
+    lm = simd_max(lm);
+    if ((tid & 31u) == 0) red[tid / 32] = lm;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float m = sink[h_];
+        for (int i = 0; i < TG / 32; ++i) m = max(m, red[i]);
+        red[0] = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float m = red[0];
+    float ls = 0.0f;
+    for (int j = tid; j < K; j += TG) {
+        float p = exp(sc[j] - m);
+        sc[j] = p;
+        ls += p;
+    }
+    ls = simd_sum(ls);
+    if ((tid & 31u) == 0) red[tid / 32] = ls;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float t = exp(sink[h_] - m);
+        for (int i = 0; i < TG / 32; ++i) t += red[i];
+        red[0] = t;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float denom = red[0];
+
+    // values, pairwise so the inverse rope on the tail applies in-register
+    for (int p = tid; p < D / 2; p += TG) {
+        int i0 = 2 * p;
+        float a0 = 0.0f, a1 = 0.0f;
+        for (int j = 0; j < K; ++j) {
+            float pj = sc[j];
+            if (pj <= 0.0f) continue;
+            if (j < WIN) {
+                int qpos = offset - WIN + 1 + j;
+                if (qpos == offset) { a0 += pj * kvr[i0]; a1 += pj * kvr[i0 + 1]; }
+                else {
+                    int slot = qpos % WIN;
+                    a0 += pj * float(ring[slot * D + i0]);
+                    a1 += pj * float(ring[slot * D + i0 + 1]);
+                }
+            } else {
+                int idx = PLAIN ? (j - WIN) : cidx[j - WIN];
+                a0 += pj * float(comp[idx * D + i0]);
+                a1 += pj * float(comp[idx * D + i0 + 1]);
+            }
+        }
+        a0 /= denom;
+        a1 /= denom;
+        if (i0 >= D - RD) {                    // inverse rope (conjugate)
+            int pr = (i0 - (D - RD)) / 2;
+            float c = cs[2 * pr], s = cs[2 * pr + 1];
+            float e = a0, o = a1;
+            a0 = e * c + o * s;
+            a1 = o * c - e * s;
+        }
+        out[h_ * D + i0] = T(a0);
+        out[h_ * D + i0 + 1] = T(a1);
+    }
+"""
+
+#: Fused compressor decode step: the whole branchless state machine —
+#: state-slot write (+ape), completion mask, overlap/plain pooling, RMS-norm,
+#: group rope, state shift — as ONE dispatch. Called 61x per token
+#: (comp x41 + indexer-comp x21 - dense); replaces ~12 small ops each.
+#: State is [coff*ratio, coff*d] (tiny), so a single threadgroup is
+#: appropriate here — there is no large GEMV inside to starve (the
+#: projections arrive precomputed from the stacked matmul).
+_COMP_STEP_SRC = """
+    uint tid = thread_position_in_threadgroup.x;
+    const int TG = 256;
+    const int ratio = params[0];
+    const int d = params[1];
+    const int coff = params[2];     // 2 = overlap, 1 = plain
+    const int RD = params[3];
+    const int offset = ioff[0];
+    const float eps = feps[0];
+    const int cd = coff * d;
+    const int rows = coff * ratio;
+    const int filled = offset % ratio;
+    const int slot = (coff == 2 ? ratio : 0) + filled;
+    const bool complete = ((offset + 1) % ratio) == 0;
+
+    threadgroup float pooled[512];
+    threadgroup float wsum[8];
+
+    // W(r,i) = state after this token's slot write; O = W with the overlap
+    // head shifted from the tail on completion.
+    for (int idx = tid; idx < rows * cd; idx += TG) {
+        int r = idx / cd;
+        int i = idx % cd;
+        int src = (coff == 2 && complete && r < ratio) ? r + ratio : r;
+        float kvv = (src == slot) ? float(kv_row[i]) : kv_st[src * cd + i];
+        float scv = (src == slot) ? float(sc_row[i]) + ape[filled * cd + i]
+                                  : sc_st[src * cd + i];
+        kv_out[idx] = kvv;
+        sc_out[idx] = scv;
+    }
+
+    // pooled[i] = softmax-weighted sum over rows of W (pre-shift view)
+    for (int i = tid; i < d; i += TG) {
+        float m = -INFINITY;
+        for (int r = 0; r < rows; ++r) {
+            int col = (coff == 2) ? ((r < ratio) ? i : i + d) : i;
+            float scv = (r == slot) ? float(sc_row[col]) + ape[filled * cd + col]
+                                    : sc_st[r * cd + col];
+            m = max(m, scv);
+        }
+        float den = 0.0f, acc = 0.0f;
+        for (int r = 0; r < rows; ++r) {
+            int col = (coff == 2) ? ((r < ratio) ? i : i + d) : i;
+            float scv = (r == slot) ? float(sc_row[col]) + ape[filled * cd + col]
+                                    : sc_st[r * cd + col];
+            float kvv = (r == slot) ? float(kv_row[col]) : kv_st[r * cd + col];
+            float e = exp(scv - m);
+            den += e;
+            acc += e * kvv;
+        }
+        pooled[i] = acc / den;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // weighted RMS norm over d, rope the tail at the group-start position
+    float ssq = 0.0f;
+    for (int i = tid; i < d; i += TG) ssq += pooled[i] * pooled[i];
+    ssq = simd_sum(ssq);
+    if ((tid & 31u) == 0) wsum[tid / 32] = ssq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float t = 0.0f;
+        for (int i = 0; i < TG / 32; ++i) t += wsum[i];
+        wsum[0] = rsqrt(t / d + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rn = wsum[0];
+    int gpos = (offset + 1) / ratio - 1;
+    for (int i = tid; i < d; i += TG) {
+        float v = pooled[i] * rn * float(nw[i]);
+        if (i >= d - RD) {
+            int p2 = (i - (d - RD)) / 2;
+            bool hi = ((i - (d - RD)) & 1) == 1;
+            float ang = float(gpos) * float(freqs[p2]) * float(ratio);
+            float c = cos(ang), s = sin(ang);
+            int i0 = d - RD + 2 * p2;
+            float e = pooled[i0] * rn * float(nw[i0]);
+            float o = pooled[i0 + 1] * rn * float(nw[i0 + 1]);
+            v = hi ? (e * s + o * c) : (e * c - o * s);
+        }
+        row_out[i] = T(complete ? v : float(old_row[i]));
+    }
+"""
+
+_attn_core_kernel = None
+
+
+def _get_attn_core_kernel():
+    global _attn_core_kernel
+    if _attn_core_kernel is None:
+        _attn_core_kernel = mx.fast.metal_kernel(
+            name="dsv4_attn_core",
+            input_names=["q", "kv", "ring", "comp", "cidx", "sink", "freqs",
+                         "params", "fscal", "ioff"],
+            output_names=["out", "kv_out"],
+            source=_ATTN_CORE_SRC,
+        )
+    return _attn_core_kernel
+
+
+@functools.lru_cache(maxsize=256)
+def _attn_core_params(d, rd, win, kc, plain):
+    return mx.array([d, rd, win, kc, plain], dtype=mx.int32)
+
+
+@functools.lru_cache(maxsize=64)
+def _attn_core_fscal(scale: float, eps: float):
+    return mx.array([scale, eps], dtype=mx.float32)
+
+
 _decode_kernel = None
 
 
@@ -1238,33 +1527,68 @@ class Attention(nn.Module):
             splits.append(acc)
         return mx.split(out, splits, axis=-1)
 
+    def _attn_core_call(self, q_raw, kv_normed, ring, comp, cidx, plain, ncomp, offset):
+        """Invoke the fused v2 attention-core kernel. All inputs traced; the
+        outputs come back already de-rotated (o) and roped (kv row)."""
+        h, d, rd, win = self.n_heads, self.head_dim, self.rope_dim, self.window
+        if comp is None:
+            comp, cidx = _kernel_dummy_part(d, str(q_raw.dtype).split(".")[-1])
+            kc = 0
+        elif plain:
+            kc = comp.shape[1]
+            # PLAIN mode generates indices in-kernel; cidx is an unread dummy
+            cidx = _kernel_dummy_part(d, str(q_raw.dtype).split(".")[-1])[1]
+        else:
+            kc = cidx.shape[-1]
+        out, kv_out = _get_attn_core_kernel()(
+            inputs=[
+                q_raw.reshape(-1),
+                kv_normed.reshape(-1),
+                ring.reshape(-1),
+                comp.reshape(-1, d).reshape(-1),
+                cidx.reshape(-1),
+                self.attn_sink,
+                self._freqs,
+                _attn_core_params(d, rd, win, kc, 1 if plain else 0),
+                _attn_core_fscal(self.scale, self.eps),
+                mx.stack([offset.astype(mx.int32), ncomp.astype(mx.int32)]),
+            ],
+            template=[("T", q_raw.dtype)],
+            grid=(h * 128, 1, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(h * d,), (d,)],
+            output_dtypes=[q_raw.dtype, ring.dtype],
+        )
+        return out, kv_out
+
+    def _attn_core_usable(self, kc: int, q_dtype, ring_dtype) -> bool:
+        return (
+            os.environ.get("SOLOHEAVEN_DSV4_METAL", "1") != "0"
+            and mx.metal.is_available()
+            and self.head_dim <= 512
+            and self.window + kc <= 2176
+            and q_dtype == ring_dtype  # single template T covers both outputs
+        )
+
     def decode_step_math(self, x, ring, state_arrays, offset):
         """Branchless single-token attention for the compiled decode path.
 
         ``state_arrays``: () for dense layers, (ckv, csc, cbuf, cn) for
         plain-compressed, plus (ikv, isc, ibuf, in_) for indexer layers.
         Returns (out, new_ring, *new_state_arrays). Same math as __call__'s
-        continuation branch, with offset as a traced scalar.
+        continuation branch, with offset as a traced scalar. The glue
+        (ropes, q-RMS, window indices, de-rotation) lives inside the v2
+        kernel when usable; the expanded math below is the reference path.
         """
-        rd, win = self.rope_dim, self.window
-        pos = offset.reshape(1)
-        cos, sin = rope_cos_sin(self._freqs, pos)
-
         xp = self._x_projections(x)
         qr = self.q_norm(xp[0])
-        q = self.wq_b(qr).reshape(1, 1, self.n_heads, self.head_dim)
-        qf = q.astype(mx.float32)
-        q = (qf * mx.rsqrt(qf.square().mean(-1, keepdims=True) + self.eps)).astype(q.dtype)
-        q_tail = apply_interleaved_rope(q[..., -rd:], cos[:, None], sin[:, None])
-        q = mx.concatenate([q[..., :-rd], q_tail], axis=-1)
+        q_raw = self.wq_b(qr)
+        kvn = self.kv_norm(xp[1])
 
-        kv = self.kv_norm(xp[1])
-        kv_tail = apply_interleaved_rope(kv[..., -rd:], cos, sin)
-        kv = mx.concatenate([kv[..., :-rd], kv_tail], axis=-1)
-
-        buffer = mx.concatenate([ring, kv], axis=1)
-        parts = [(buffer, _decode_window_indices_scalar(win, offset))]
         new_state: tuple = ()
+        comp = cidx = None
+        plain = False
+        ncomp = offset  # dummy scalar when unused
         if self.ratio:
             if "indexer" in self:
                 ckv, csc, cbuf, cn, ikv, isc, ibuf, in_ = state_arrays
@@ -1277,14 +1601,58 @@ class Attention(nn.Module):
             ckv, csc, cbuf, cn = self.compressor.decode_step_math(
                 (xp[2], xp[3]), x.dtype, ckv, csc, cbuf, cn, offset, self._freqs
             )
-            if "indexer" not in self:
-                cap = cbuf.shape[1]
-                base = mx.arange(cap, dtype=mx.int32)[None, None]
-                cidx = mx.where(base >= cn, MASKED_INDEX, base)
+            comp = cbuf
+            plain = "indexer" not in self
+            ncomp = cn
+            if plain:
                 new_state = (ckv, csc, cbuf, cn)
             else:
                 new_state = (ckv, csc, cbuf, cn, ikv, isc, ibuf, in_)
-            parts.append((cbuf, cidx))
+
+        kc = 0 if comp is None else (comp.shape[1] if plain else cidx.shape[-1])
+        if self._attn_core_usable(kc, q_raw.dtype, ring.dtype):
+            b = 1
+            o_flat, kv_roped = self._attn_core_call(
+                q_raw, kvn, ring, comp, cidx, plain, ncomp, offset
+            )
+            new_ring = ring
+            new_ring[:, offset % self.window] = kv_roped[None]
+            o = o_flat.reshape(b, 1, self.n_groups, -1)
+            groups = mx.broadcast_to(
+                mx.arange(self.n_groups)[None, None], (b, 1, self.n_groups)
+            )
+            o = self.wo_a(o[..., None, :], groups).squeeze(-2)
+            return (self.wo_b(o.reshape(b, 1, -1)), new_ring, *new_state)
+        return self._decode_attn_reference(
+            x, q_raw, kvn, ring, comp, cidx, plain, ncomp, offset, new_state
+        )
+
+    def _decode_attn_reference(
+        self, x, q_raw, kvn, ring, comp, cidx, plain, ncomp, offset, new_state
+    ):
+        """The expanded decode attention math — canonical reference for the
+        v2 kernel (cross-checked by the decode-consistency suite)."""
+        rd, win = self.rope_dim, self.window
+        pos = offset.reshape(1)
+        cos, sin = rope_cos_sin(self._freqs, pos)
+
+        q = q_raw.reshape(1, 1, self.n_heads, self.head_dim)
+        qf = q.astype(mx.float32)
+        q = (qf * mx.rsqrt(qf.square().mean(-1, keepdims=True) + self.eps)).astype(q.dtype)
+        q_tail = apply_interleaved_rope(q[..., -rd:], cos[:, None], sin[:, None])
+        q = mx.concatenate([q[..., :-rd], q_tail], axis=-1)
+
+        kv_tail = apply_interleaved_rope(kvn[..., -rd:], cos, sin)
+        kv = mx.concatenate([kvn[..., :-rd], kv_tail], axis=-1)
+
+        buffer = mx.concatenate([ring, kv], axis=1)
+        parts = [(buffer, _decode_window_indices_scalar(win, offset))]
+        if comp is not None:
+            if plain:
+                cap = comp.shape[1]
+                base = mx.arange(cap, dtype=mx.int32)[None, None]
+                cidx = mx.where(base >= ncomp, MASKED_INDEX, base)
+            parts.append((comp, cidx))
 
         new_ring = ring
         new_ring[:, offset % win] = kv[:, 0]
@@ -1369,22 +1737,30 @@ class Gate(nn.Module):
 # per word) happens in-register. Quantized builds only (bits=2, gs=64).
 
 _MOE_K1_SRC = """
-    // one simdgroup per (expert_slot, inner_row): gate & up dots + swiglu
-    uint sg_global = threadgroup_position_in_grid.x * 8 + simdgroup_index_in_threadgroup;
+    // one simdgroup per (expert_slot, inner_row); x staged in threadgroup
+    uint sg_id = simdgroup_index_in_threadgroup;
+    uint sg_global = threadgroup_position_in_grid.x * 8 + sg_id;
     uint lane = thread_index_in_simdgroup;
+    uint tid = thread_position_in_threadgroup.x;
+    const int TG = 256;
     const int n_act = params[0];
     const int d_model = params[1];
     const int d_inner = params[2];
     const float limit = feps[0];
+
+    threadgroup float xs[4096];
+    for (int i = tid; i < d_model; i += TG) xs[i] = float(x[i]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     uint e_slot = sg_global / (uint)d_inner;
     uint row = sg_global % (uint)d_inner;
     if (e_slot >= (uint)n_act) return;
     int e = idxs[e_slot];
     if (e < 0) { if (lane == 0) h[e_slot * d_inner + row] = 0.0f; return; }
 
-    const int words = d_model / 16;          // packed uint32 per row
+    const int words = d_model / 16;
+    const int wpg = 4;                        // 64-value group = 4 words
     const uint gbase = ((uint)e * (uint)d_inner + row) * (uint)words;
-    const int wpg = 64 / 16;                  // words per quant group
     const uint sbase = ((uint)e * (uint)d_inner + row) * (uint)(d_model / 64);
 
     float acc_g = 0.0f;
@@ -1392,16 +1768,22 @@ _MOE_K1_SRC = """
     for (int w = lane; w < words; w += 32) {
         uint pg = gw[gbase + w];
         uint pu = uw[gbase + w];
-        float sg_ = float(gs_[sbase + w / wpg]);
-        float bg = float(gb[sbase + w / wpg]);
-        float su = float(us[sbase + w / wpg]);
-        float bu = float(ub[sbase + w / wpg]);
-        int base = w * 16;
+        uint g_ = w / wpg;
+        float sgv = float(gs_[sbase + g_]);
+        float bgv = float(gb[sbase + g_]);
+        float suv = float(us[sbase + g_]);
+        float buv = float(ub[sbase + g_]);
+        threadgroup const float* xv = xs + w * 16;
+        float ag = 0.0f, au = 0.0f, sx = 0.0f;
+        #pragma unroll
         for (int j = 0; j < 16; ++j) {
-            float xv = float(x[base + j]);
-            acc_g += (float((pg >> (2 * j)) & 3u) * sg_ + bg) * xv;
-            acc_u += (float((pu >> (2 * j)) & 3u) * su + bu) * xv;
+            float xj = xv[j];
+            ag += float((pg >> (2 * j)) & 3u) * xj;
+            au += float((pu >> (2 * j)) & 3u) * xj;
+            sx += xj;
         }
+        acc_g += ag * sgv + sx * bgv;
+        acc_u += au * suv + sx * buv;
     }
     acc_g = simd_sum(acc_g);
     acc_u = simd_sum(acc_u);
@@ -1415,35 +1797,56 @@ _MOE_K1_SRC = """
 """
 
 _MOE_K2_SRC = """
-    // one simdgroup per OUTPUT dim: sum over active experts of w_e * (down_e[d] . h[e])
-    uint sg_global = threadgroup_position_in_grid.x * 8 + simdgroup_index_in_threadgroup;
+    // threadgroup covers 8 output dims; h staged per active expert
+    uint sg_id = simdgroup_index_in_threadgroup;
     uint lane = thread_index_in_simdgroup;
+    uint tid = thread_position_in_threadgroup.x;
+    const int TG = 256;
+    uint dim = threadgroup_position_in_grid.x * 8 + sg_id;
     const int n_act = params[0];
     const int d_model = params[1];
     const int d_inner = params[2];
-    if (sg_global >= (uint)d_model) return;
     const int words = d_inner / 16;
-    const int wpg = 64 / 16;
+    const int wpg = 4;
+
+    threadgroup float hs[2048];
+
     float acc = 0.0f;
     for (int s = 0; s < n_act; ++s) {
         int e = idxs[s];
-        if (e < 0) continue;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (e >= 0) {
+            for (int i = tid; i < d_inner; i += TG) hs[i] = h[s * d_inner + i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (e < 0 || dim >= (uint)d_model) continue;
         float we = wts[s];
-        const uint base = ((uint)e * (uint)d_model + sg_global) * (uint)words;
-        const uint sbase = ((uint)e * (uint)d_model + sg_global) * (uint)(d_inner / 64);
-        float a = 0.0f;
+        const uint base = ((uint)e * (uint)d_model + dim) * (uint)words;
+        const uint sbase = ((uint)e * (uint)d_model + dim) * (uint)(d_inner / 64);
+        float a = 0.0f, sh = 0.0f, gacc = 0.0f;
+        int cur_g = -1;
+        float sc = 0.0f, bi = 0.0f;
         for (int w = lane; w < words; w += 32) {
             uint p = dw[base + w];
-            float sc = float(ds_[sbase + w / wpg]);
-            float bi = float(db[sbase + w / wpg]);
-            int hb = s * d_inner + w * 16;
-            for (int j = 0; j < 16; ++j)
-                a += (float((p >> (2 * j)) & 3u) * sc + bi) * h[hb + j];
+            uint g_ = w / wpg;
+            sc = float(ds_[sbase + g_]);
+            bi = float(db[sbase + g_]);
+            threadgroup const float* hv = hs + w * 16;
+            float aw = 0.0f, sw = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                float hj = hv[j];
+                aw += float((p >> (2 * j)) & 3u) * hj;
+                sw += hj;
+            }
+            a += aw * sc + sw * bi;
         }
+        (void)cur_g; (void)gacc; (void)sh;
         acc += we * a;
     }
+    if (dim >= (uint)d_model) return;
     acc = simd_sum(acc);
-    if (lane == 0) y[sg_global] = acc;
+    if (lane == 0) y[dim] = acc;
 """
 
 _moe_kernels = None

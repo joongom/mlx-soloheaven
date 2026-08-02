@@ -21,25 +21,53 @@ import mlx.core as mx
 from mlx_soloheaven.native import plan as P
 from mlx_soloheaven.native import runtime as rt
 
+_shared_runtime = None
+
+
+def shared_runtime():
+    """One Runtime (with its compiled kernel PSOs) per process: rebinding a
+    NativeDecoder to fresh cache arrays after every prefill must not pay the
+    ~second of Metal source compilation again."""
+    global _shared_runtime
+    if _shared_runtime is None:
+        r = rt.Runtime()
+        rt.load_custom_kernels(r)
+        _shared_runtime = r
+    return _shared_runtime
+
 
 class NativeDecoder:
-    def __init__(self, model, max_context: int = 32768, barriers: bool = True):
+    def __init__(self, model, max_context: int = 32768, barriers: bool = True,
+                 cache=None, runtime=None):
+        """``cache`` (a list of DeepSeekV4Cache) switches on BORROW mode: the
+        per-layer ring/compressor/indexer state buffers are the cache's own
+        arrays, registered zero-copy — every native write IS a cache write,
+        so the engine's session machinery (state snapshots, prefix reuse of
+        decoded tokens) reads current state with no sync step. The caller
+        must not replace those arrays while this decoder is live; any prefill
+        or state-restore does (mx setitem allocates new buffers), so the
+        model integration rebinds — cheaply, when ``runtime`` (with its
+        compiled kernels) is shared across rebuilds."""
         self.model = model
+        self.cache = cache
         # barriers=False strips the per-dispatch buffer barrier — UNSAFE for
         # correctness (hazards), for throughput DIAGNOSIS only: it isolates how
         # much of the decode time is blanket-barrier serialization vs kernel
         # compute (see docs/benchmarks/deepseek-v4.md, real-model bench entry).
         self._barriers = barriers
         a = model.args
-        self.rt = rt.Runtime()
-        rt.load_custom_kernels(self.rt)
+        if runtime is not None:
+            self.rt = runtime
+        else:
+            self.rt = rt.Runtime()
+            rt.load_custom_kernels(self.rt)
         self.hc, self.hidden, self.D = a.hc_mult, a.hidden_size, a.head_dim
         self.win, self.vocab = a.sliding_window, a.vocab_size
         self.topk, self.rscale, self.limit = (a.num_experts_per_tok,
                                               a.routed_scaling_factor, a.swiglu_limit)
         self.n_layers = a.num_hidden_layers
         self._cap = self._round_cap(max_context)
-        self.offset = 0
+        self.offset = 0 if cache is None else int(cache[0].offset)
         # Plan cache: the built dispatch list depends only on each layer's
         # completed-group count `n` (baked buffer row offsets); compressor
         # state updates in place, so there is no buffer parity. The token id
@@ -59,6 +87,10 @@ class NativeDecoder:
         self._alloc_scratch()
         self._logits = self._reg("logits", mx.zeros((self.vocab,), mx.bfloat16))
         self._layers = [self._alloc_layer(i) for i in range(self.n_layers)]
+        if cache is not None:
+            # Prefill wrote these buffers on MLX's queue; our queue must not
+            # read them until those writes have landed.
+            mx.synchronize()
 
     @staticmethod
     def _round_cap(ctx: int, ratio_min: int = 4, growth: int = 256) -> int:
@@ -110,7 +142,13 @@ class NativeDecoder:
         a = self.model.args
         ratio = a.layer_compress_ratio(i)
         D, ihd, p = self.D, a.index_head_dim, f"L{i}_"
-        self._reg(p + "ring", self._z(self.win * D))
+        c = self.cache[i] if self.cache is not None else None
+        if c is not None:
+            if c.ring is None:
+                raise RuntimeError(f"layer {i}: cache has no ring — prefill first")
+            self._reg(p + "ring", c.ring)
+        else:
+            self._reg(p + "ring", self._z(self.win * D))
         lay = {"ratio": ratio, "n": 0, "ring": p + "ring"}
         if ratio:
             # Compressor state is [coff*ratio, coff*head_dim] = [rows, cd]
@@ -122,16 +160,45 @@ class NativeDecoder:
             # their -inf scores, which is exactly the empty mask.
             coff, cd = (2, 2 * D) if ratio == 4 else (1, D)
             st = coff * ratio * cd
-            self._reg(p + "kv_a", self._z(st, mx.float32))
-            self._reg(p + "sc_a", self._ninf(st))
-            self._reg(p + "buf", self._z(self._cap * D))
+            if c is not None:
+                # BORROW: the session cache's own state arrays, at the
+                # session-stable capacity the compiled path also uses.
+                from mlx_soloheaven.models.deepseek_v4 import _ensure_comp_capacity
+                cs = c.comp
+                if cs.kv_state is None:
+                    cs.reset(1, ratio, coff, D)
+                _ensure_comp_capacity(cs, self.model.layers[i].attn.compressor,
+                                      mx.bfloat16)
+                self._reg(p + "kv_a", cs.kv_state)
+                self._reg(p + "sc_a", cs.score_state)
+                self._reg(p + "buf", cs.cache)
+                lay["n"] = int(cs.n)
+            else:
+                self._reg(p + "kv_a", self._z(st, mx.float32))
+                self._reg(p + "sc_a", self._ninf(st))
+                self._reg(p + "buf", self._z(self._cap * D))
             lay["comp"] = p
             if ratio == 4:
                 icoff, icd = 2, 2 * ihd
                 ist = icoff * ratio * icd
-                self._reg(p + "ikv_a", self._z(ist, mx.float32))
-                self._reg(p + "isc_a", self._ninf(ist))
-                self._reg(p + "ibuf", self._z(self._cap * ihd))
+                if c is not None:
+                    from mlx_soloheaven.models.deepseek_v4 import _ensure_comp_capacity
+                    ics = c.idx
+                    if ics.kv_state is None:
+                        ics.reset(1, ratio, icoff, ihd)
+                    _ensure_comp_capacity(
+                        ics, self.model.layers[i].attn.indexer.compressor,
+                        mx.bfloat16)
+                    self._reg(p + "ikv_a", ics.kv_state)
+                    self._reg(p + "isc_a", ics.score_state)
+                    self._reg(p + "ibuf", ics.cache)
+                    if int(ics.n) != lay["n"]:
+                        raise RuntimeError(
+                            f"layer {i}: comp n {lay['n']} != idx n {int(ics.n)}")
+                else:
+                    self._reg(p + "ikv_a", self._z(ist, mx.float32))
+                    self._reg(p + "isc_a", self._ninf(ist))
+                    self._reg(p + "ibuf", self._z(self._cap * ihd))
                 lay["idx"] = p
         return lay
 
@@ -193,6 +260,16 @@ class NativeDecoder:
             if lay["ratio"]:
                 if (self.offset + 1) % lay["ratio"] == 0:
                     lay["n"] += 1
+        if self.cache is not None:
+            # Mirror the step onto the borrowed session caches: the arrays are
+            # already current (written in place), only the Python bookkeeping
+            # (offset, completed-group counts) needs to advance with us.
+            for lay, c in zip(self._layers, self.cache):
+                c.offset += 1
+                if lay["ratio"]:
+                    c.comp.n = lay["n"]
+                    if c.idx is not None:
+                        c.idx.n = lay["n"]
         self.offset += 1
         return self._arrays["logits"]
 

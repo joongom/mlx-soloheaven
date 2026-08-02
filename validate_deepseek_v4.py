@@ -331,6 +331,129 @@ def cmd_compare(ours_path: str, ds4_path: str) -> None:
     print(f"KL(ds4 || ours): {kl:.4f}")
 
 
+def cmd_ppl_native() -> None:
+    """Teacher-forced perplexity THROUGH THE NATIVE DECODE PATH — the quality
+    gate for serving with SOLOHEAVEN_DSV4_NATIVE=1. Same probes and metric as
+    cmd_ppl: position 0 is scored from the (eager) one-token prefill logits,
+    every later position from a borrow-mode native decode step fed the true
+    token. Run: `python validate_deepseek_v4.py pplnative [--force]`."""
+    import math
+
+    import mlx.core as mx
+
+    mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
+    model, tokenizer = load()
+    total_nll = total_n = 0.0
+    for name, text in PPL_TEXTS.items():
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        cache = model.make_cache()
+        lg = model(mx.array([[ids[0]]]), cache)
+        mx.eval(lg)
+        steps = [lg[0, -1].astype(mx.float32)]
+        for t in range(1, len(ids) - 1):
+            lgt = model._decode_native(mx.array([[ids[t]]]), cache)
+            steps.append(lgt.reshape(-1).astype(mx.float32))
+        nll_sum = 0.0
+        for t, lgv in enumerate(steps):
+            lp = lgv - mx.logsumexp(lgv)
+            nll_sum += -float(lp[ids[t + 1]])
+        n = len(ids) - 1
+        total_nll += nll_sum
+        total_n += n
+        print(f"  {name:<5} tokens={n:<4} nll={nll_sum / n:.4f}  "
+              f"ppl={math.exp(nll_sum / n):.2f}", flush=True)
+    print(f"  {'ALL':<5} tokens={int(total_n):<4} nll={total_nll / total_n:.4f}  "
+          f"ppl={math.exp(total_nll / total_n):.2f}")
+
+
+def cmd_nativecheck(prefill: int = 200, n_tokens: int = 24) -> None:
+    """Serving-readiness check of the borrow-mode native path on the REAL
+    model: prefill crosses the ring wrap (window=128) and comp-group
+    boundaries, then compiled vs native decode from IDENTICAL state, native
+    determinism, and a mini second turn (batch prefill over natively-written
+    caches). Run: `python validate_deepseek_v4.py nativecheck [--force]`."""
+    import mlx.core as mx
+    import numpy as np
+
+    mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
+    model, tokenizer = load()
+    text = " ".join(
+        f"Chapter {i}: the quick brown fox number {i} jumps over the lazy "
+        f"dog beside river {i} while the miller counts {i * 7} sacks."
+        for i in range(40)
+    )
+    ids = tokenizer.encode(text, add_special_tokens=False)[:prefill]
+    assert len(ids) == prefill, f"prompt too short: {len(ids)}"
+
+    def fresh_prefilled():
+        cache = model.make_cache()
+        lg = model(mx.array([ids]), cache)
+        mx.eval(lg)
+        mx.synchronize()
+        return cache, int(lg[0, -1].argmax())
+
+    # --- compiled reference run ---
+    cache, seed = fresh_prefilled()
+    comp_toks, comp_logits = [], []
+    tok = seed
+    for _ in range(n_tokens):
+        lg = model._decode_compiled(mx.array([[tok]]), cache)
+        mx.eval(lg)
+        comp_logits.append(np.array(lg.reshape(-1).astype(mx.float32)))
+        tok = int(lg[0, -1].argmax())
+        comp_toks.append(tok)
+
+    # --- native run from identical (fresh re-prefilled) state ---
+    def native_run():
+        c2, tok = fresh_prefilled()
+        toks, logits = [], []
+        for _ in range(n_tokens):
+            lg = model._decode_native(mx.array([[tok]]), c2)
+            logits.append(np.array(lg.reshape(-1).astype(mx.float32)))
+            tok = int(lg[0, -1].argmax())
+            toks.append(tok)
+        return toks, logits, c2
+
+    nat_toks, nat_logits, c2 = native_run()
+    nat_toks2, nat_logits2, _ = native_run()
+
+    det = max(float(np.abs(a - b).max()) for a, b in zip(nat_logits, nat_logits2))
+    print(f"native determinism: max |diff| over {n_tokens} steps = {det}")
+
+    agree = sum(a == b for a, b in zip(comp_toks, nat_toks))
+    first_div = next((i for i, (a, b) in enumerate(zip(comp_toks, nat_toks))
+                      if a != b), None)
+    gap0 = float(np.abs(comp_logits[0] - nat_logits[0]).max())
+    print(f"compiled vs native greedy tokens: {agree}/{n_tokens} agree"
+          f"  (first divergence: {first_div})")
+    print(f"step-0 logits max |diff|: {gap0:.4f}")
+    if first_div is not None:
+        lg = comp_logits[first_div]
+        top2 = np.sort(lg)[-2:]
+        print(f"  at divergence, compiled top1-top2 margin: {top2[1] - top2[0]:.4f}")
+    print(f"compiled: {tokenizer.decode(comp_toks)!r}")
+    print(f"native:   {tokenizer.decode(nat_toks)!r}")
+
+    # --- bookkeeping mirrored onto the borrowed caches ---
+    assert c2[0].offset == prefill + n_tokens, c2[0].offset
+    for i, c in enumerate(c2):
+        if c.comp is not None:
+            want = (prefill + n_tokens) // model.args.layer_compress_ratio(i)
+            assert c.comp.n == want, (i, c.comp.n, want)
+
+    # --- mini second turn: batch prefill OVER natively-written caches ---
+    more = tokenizer.encode(" The village elder spoke:", add_special_tokens=False)
+    lg = model(mx.array([more]), c2)
+    mx.eval(lg)
+    nxt = int(lg[0, -1].argmax())
+    lg2 = model._decode_native(mx.array([[nxt]]), c2)  # forces a rebind
+    mx.eval(lg2)
+    ok = bool(np.isfinite(np.array(lg2.astype(mx.float32))).all())
+    print(f"second-turn prefill over native state + rebind decode: "
+          f"{'finite logits OK' if ok else 'NON-FINITE LOGITS'}")
+    assert ok
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "smoke"
     if cmd == "smoke":
@@ -346,5 +469,9 @@ if __name__ == "__main__":
     elif cmd == "bench":
         n = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 64
         cmd_bench(n_tokens=n)
+    elif cmd == "nativecheck":
+        cmd_nativecheck()
+    elif cmd == "pplnative":
+        cmd_ppl_native()
     else:
         raise SystemExit(__doc__)

@@ -1283,6 +1283,19 @@ def _COMPILED_DECODE_ENABLED() -> bool:
     )
 
 
+# Native Metal replay decode (external command-buffer loop, ~1.85x the
+# compiled path — docs/benchmarks/deepseek-v4.md Stage 3). Opt-in; any
+# failure falls back to the compiled/eager path for the process lifetime.
+_NATIVE_DECODE_BROKEN = False
+
+
+def _NATIVE_DECODE_ENABLED() -> bool:
+    return (
+        not _NATIVE_DECODE_BROKEN
+        and os.environ.get("SOLOHEAVEN_DSV4_NATIVE", "0") == "1"
+    )
+
+
 @functools.lru_cache(maxsize=4096)
 def _scalar_i32(v: int) -> mx.array:
     return mx.array(v, dtype=mx.int32)
@@ -2924,12 +2937,22 @@ class Model(nn.Module):
     def __call__(self, inputs: mx.array, cache=None) -> mx.array:
         if cache is None:
             cache = self.make_cache()
-        if (
-            _COMPILED_DECODE_ENABLED()
-            and inputs.shape[0] == 1
-            and inputs.shape[1] == 1
-            and cache[0].offset > 0
-        ):
+        is_decode = (
+            inputs.shape[0] == 1 and inputs.shape[1] == 1 and cache[0].offset > 0
+        )
+        if is_decode and _NATIVE_DECODE_ENABLED():
+            try:
+                return self._decode_native(inputs, cache)
+            except Exception:  # noqa: BLE001 — fall back to compiled/eager once
+                global _NATIVE_DECODE_BROKEN
+                if not _NATIVE_DECODE_BROKEN:
+                    _NATIVE_DECODE_BROKEN = True
+                    import logging
+
+                    logging.getLogger(__name__).exception(
+                        "[deepseek_v4] native decode failed — compiled/eager fallback"
+                    )
+        if is_decode and _COMPILED_DECODE_ENABLED():
             try:
                 return self._decode_compiled(inputs, cache)
             except Exception:  # noqa: BLE001 — fall back to the eager path once
@@ -2949,6 +2972,45 @@ class Model(nn.Module):
         pre = mx.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.hc_eps
         x = (pre[..., None] * flat.reshape(h.shape)).sum(axis=2).astype(h.dtype)
         return self.head(self.norm(x))
+
+    def _native_stale(self, dec, cache) -> bool:
+        """The native decoder borrows the cache's arrays; it is stale the
+        moment anything replaced them — a prefill batch, a state restore, a
+        different session's cache list — detectable as list identity, offset
+        divergence, or per-layer array identity changes (mx setitem allocates
+        new buffers, so ANY non-native touch changes identity)."""
+        if dec is None or dec.cache is not cache or dec.offset != cache[0].offset:
+            return True
+        for i, c in enumerate(cache):
+            if dec._arrays[f"L{i}_ring"] is not c.ring:
+                return True
+            if c.comp is not None and (
+                dec._arrays[f"L{i}_kv_a"] is not c.comp.kv_state
+                or dec._arrays[f"L{i}_buf"] is not c.comp.cache
+            ):
+                return True
+        return False
+
+    def _decode_native(self, inputs: mx.array, cache) -> mx.array:
+        from mlx_soloheaven.native import decoder as _nd
+
+        dec = getattr(self, "_native_dec", None)
+        if self._native_stale(dec, cache):
+            mx.synchronize()  # cache arrays were written on MLX's queue
+            max_ctx = int(os.environ.get("SOLOHEAVEN_DSV4_MAX_CONTEXT", "32768"))
+            dec = _nd.NativeDecoder(
+                self, max_context=max_ctx, cache=cache,
+                runtime=_nd.shared_runtime(),
+            )
+            self._native_dec = dec
+        token = int(inputs.reshape(-1)[0])
+        logits = dec.decode(token)
+        # Copy AND evaluate before returning: the decoder reuses its logits
+        # buffer next step, and a lazy copy would read whatever is there when
+        # the engine's sampling graph finally evaluates.
+        out = mx.array(logits).reshape(1, 1, -1)
+        mx.eval(out)
+        return out
 
     def _decode_compiled(self, inputs: mx.array, cache) -> mx.array:
         """One decoded token through the per-layer compiled steps.

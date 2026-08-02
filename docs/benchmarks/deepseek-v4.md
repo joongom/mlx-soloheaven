@@ -678,6 +678,30 @@ Profile after (bench14, isolated ms): qmv 11.31/280 · moe 9.78/86 ·
 comp_step 5.03/62 · wo_a 3.54/43 · hc_pre 2.87/86 · rms 2.73/173 ·
 hc_mix 1.77/86 · attn_core 1.35/43. Remaining to 40 ms: **-5.4**.
 
+### Stage 3o — comp_step state in place: 41.7 ms / 24.0 tok/s (2026-08-02)
+
+Bisection (probe_comp.py, same one-load method): comp_step's 5.0 ms =
+state double-buffer copy 2.5 + softmax pooling 2.3 + rms/rope ~0. The
+kernel now writes ONLY the fresh slot row in place (the pooling loop never
+reads that row — it redirects to the fresh kv_row/sc_row), and the
+overlap-head shift (head rows [0,ratio) take tail rows [ratio,2*ratio),
+disjoint ranges) runs behind the pooling barrier upgraded to mem_device.
+Side wins: the decoder's b-side state buffers are gone and the plan cache
+loses its parity dimension (ONE cached plan per n, not two). Unwritten
+rows keep their -inf scores — exactly the empty mask. Bench (wired, 96%
+free, bench15):
+
+| | ms/token | tok/s |
+|---|---|---|
+| before (Stage 3n) | 45.4 | 22.0 |
+| after in-place state | **41.7** | **24.0** (1.85x vs 76.9 compiled) |
+
+Session cumulative 611 -> 41.7 (14.7x). Profile after (bench15, isolated
+ms): qmv 11.12/280 · moe 10.11/86 · comp_step 4.20/62 · wo_a 3.77/43 ·
+hc_pre 2.81/86 · rms 2.66/173 · hc_mix 1.56/86 · attn_core 1.40/43.
+Remaining to 40 ms: **-1.7**. The pooling column-scatter half of comp_step
+(-2.3 candidate, online-softmax rewrite) stays queued if needed.
+
 ## 3. Reproduce
 
 ```bash

@@ -2428,6 +2428,32 @@ _HC_PRE_SRC = """
     }
 """
 
+_HC_POST2_SRC = """
+    // hc_post with the routed+shared add fused: x = T(a + b) computed
+    // in-register (the T() round matches what the standalone dsv4_add_k
+    // wrote, so results are bit-identical to the two-dispatch form).
+    // NOTE a is float32 (moe_w2's y_routed), b is bfloat (shared) — the
+    // same asymmetry dsv4_add_k had; binding both as bfloat reinterprets
+    // the float buffer and NaNs the whole block (found the hard way).
+    // Same grid contract as dsv4_hc_post_k: hcn * NSPLIT threadgroups.
+    uint tid = thread_position_in_threadgroup.x;
+    const int TG = 256;
+    const int NSPLIT = 8;
+    const int hcn = params[0];
+    const int d = params[1];
+    uint hc_ = threadgroup_position_in_grid.x / NSPLIT;
+    const int part = int(threadgroup_position_in_grid.x % NSPLIT);
+    const int chunk = (d + NSPLIT - 1) / NSPLIT;
+    const int lo = part * chunk;
+    const int hi = min(lo + chunk, d);
+    for (int i = lo + (int)tid; i < hi; i += TG) {
+        float xv = float(T(float(a[i]) + float(b[i])));
+        float acc = post[hc_] * xv;
+        for (int j = 0; j < hcn; ++j) acc += comb[hc_ * hcn + j] * float(residual[j * d + i]);
+        y[hc_ * d + i] = T(acc);
+    }
+"""
+
 _HC_POST_SRC = """
     // y[hc, d] = post[hc]*x[d] + sum_j comb[hc, j] * residual[j, d]
     // grid = hcn * NSPLIT threadgroups: hcn alone (4 TGs) underfilled the

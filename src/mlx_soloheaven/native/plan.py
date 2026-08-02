@@ -99,6 +99,16 @@ class Planner:
              (self.S[comb], k["comb"]), (self.S[y], k["y"])],
             [(p, 8, k["params"])], (hc * 8, 1, 1), (256, 1, 1))
 
+    def hc_post2(self, a, b, residual, post, comb, y, hc, hidden):
+        """hc_post with x = a + b fused in (the MoE routed+shared add)."""
+        p, _ = self.cb.add("2i", hc, hidden)
+        k = BUFFER_SLOTS["dsv4_hc_post2_k"]
+        return self._pi(
+            "dsv4_hc_post2_k", True,
+            [(self.S[a], k["a"]), (self.S[b], k["b"]), (self.S[residual], k["residual"]),
+             (self.S[post], k["post"]), (self.S[comb], k["comb"]), (self.S[y], k["y"])],
+            [(p, 8, k["params"])], (hc * 8, 1, 1), (256, 1, 1))
+
 
 def plan_compressor(pl: Planner, comp, freqs, kv_src: str, sc_src: str,
                     cache: dict, ioff_off: int, n: int,
@@ -314,12 +324,7 @@ def plan_moe(pl: Planner, ffn, xin: str, out: str, topk: int, rscale: float,
         [(so, 8, k13["params"]), (sf, 4, k13["feps"])],
         ((inter + 7) // 8, 1, 1), (256, 1, 1)))
     items.append(pl.qmv(sh.w2, "sh", "shared", inter, hidden))
-    ak = BUFFER_SLOTS["dsv4_add_k"]
-    ao, _ = pl.cb.add("i", hidden)
-    items.append(pl._pi(
-        "dsv4_add_k", True,
-        [(pl.S["y_routed"], ak["a"]), (pl.S["shared"], ak["b"]), (pl.S[out], ak["out"])],
-        [(ao, 4, ak["params"])], (hidden, 1, 1), (256, 1, 1)))
+    # No add here: the block's hc_post2 fuses y_routed + shared into its x.
     return items
 
 
@@ -377,5 +382,5 @@ def plan_block(pl: Planner, blk, hin: str, ring: str, hout: str, ioff_off: int,
                        blk.iters, blk.eps, blk.hc_eps)
     items.append(pl.rms(blk.ffn_norm.weight, "hx", "xn", hidden, blk.eps))
     items += plan_moe(pl, blk.ffn, "xn", "moe_out", topk, rscale, limit, tok_off)
-    items.append(pl.hc_post("moe_out", "h1", "post", "comb", hout, hc, hidden))
+    items.append(pl.hc_post2("y_routed", "shared", "h1", "post", "comb", hout, hc, hidden))
     return items

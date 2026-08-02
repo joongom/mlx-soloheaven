@@ -125,6 +125,11 @@ _SPECS = {
         [("x", _B), ("residual", _B), ("post", _F), ("comb", _F), ("params", _I),
          ("y", "device bfloat*")],
     ),
+    "dsv4_hc_post2_k": (
+        "_HC_POST2_SRC",
+        [("a", _F), ("b", _B), ("residual", _B), ("post", _F), ("comb", _F),
+         ("params", _I), ("y", "device bfloat*")],
+    ),
     "dsv4_comp_step": (
         "_COMP_STEP_SRC",
         [("kv_row", _B), ("sc_row", _B), ("kv_st", "device float*"),

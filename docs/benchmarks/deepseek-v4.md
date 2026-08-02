@@ -106,6 +106,22 @@ Component ablation of the 82.4 ms baseline (removing compute+dispatch):
 | HC (after fusion) | ~14 |
 | base quantized matmuls | ~9 (near bandwidth) |
 
+### MLX 0.32.0 upgrade regression check (2026-08-02, Stage 0)
+
+| metric | 0.31.2 | 0.32.0 |
+|---|---|---|
+| ppl ALL (ko/en/code) | 3.69 (6.60/4.12/1.46) | **3.65 (6.51/4.07/1.46)** |
+| compiled decode | 86.1 ms | 89.0 ms (within bench noise) |
+| suite | 1371 passed | 1371 passed |
+
+Spike finding for the external-loop plan: `mlx.metallib` (154 MiB, in the
+wheel) contains FULLY SPECIALIZED kernel entry names — e.g.
+`qmv_bfloat16_t_gs_128_b_2`, `steel_gather_mm_rhs_nax_nn_bfloat16_...` —
+with `MTL_FC_INIT` function constants, i.e. loadable by name via MTLLibrary
+and instantiable with MTLFunctionConstantValues. Path A (reuse MLX's
+compiled kernels from our own encoder) is viable at the naming level;
+argument layouts to be read from the matching-version .metal sources (MIT).
+
 Standing conclusions:
 * Per-launch overhead is ~4 µs (39 ms / ~10k launches) — the remaining ~1k
   launches cost ~3 ms. The 85 ms is a SUM of medium inefficiencies, not one

@@ -22,6 +22,9 @@ classifiers = [
 ]
 dependencies = [
     "mlx>=0.31.2",
+    # 0.32 is required by the DeepSeek-V4 decode roadmap (DLPack zero-copy
+    # Metal buffer sharing, mlx#3531) — see docs/specs/deepseek-v4-mlx-port.md.
+    "mlx>=0.32.0",
     "mlx-lm>=0.31.3",
     "mlx-vlm>=0.5,<0.6",
     "fastapi>=0.104",

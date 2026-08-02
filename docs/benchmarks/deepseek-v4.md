@@ -830,6 +830,59 @@ Serving guidance recorded: SOLOHEAVEN_DSV4_NATIVE=1 is a SPEED mode
 hc streams end-to-end, which could pass the compiled path's quality
 rather than chase it).
 
+### Stage 4c-4e — the native quality gap: two real bugs fixed, precision REFUTED as the cause (2026-08-02)
+
+Goal: native decode quality at or above the compiled path. Baseline
+(decode-vs-decode ppl on the shipped build, same probes): compiled **3.65**,
+native **4.41**.
+
+**Two real native-only bugs, found and fixed** (both were invisible below
+offset 128, where the sliding window covers everything):
+
+1. `ncomp` was baked 0 for every layer (one shared ioff blob) — the whole
+   compressed region and the indexer's n2 were masked. Fixed by per-layer
+   blobs (e7d9026). Long-context logit error vs the eager batch: 19.3 -> 4.25
+   at P=200, argmax restored.
+2. The visible group count was the compressor's PRE-step count, but the
+   reference attends to the POST-step count (`ncomp = cn`) — native dropped
+   the group the current token had just completed, i.e. the most recent
+   summary, on every ratio-th token.
+
+**Three precision upgrades — all REFUTED as the cause** (each measured on
+the real model, each kept because it is strictly more precision than the
+compiled path carries, none moved quality):
+
+| change | native ppl |
+|---|---|
+| baseline (both bugs fixed) | 4.412 |
+| + fp32 HC residual streams + fp32 MoE-gate input | 4.440 |
+| + fp32 stacked x-projection (new `dsv4_qmv8_k`) | 4.44 (argmax-agree 62.5% -> 65.0%) |
+| + fp32 attention/FFN output path (acore, o_lora, attn_out, sh, shared) | 4.441 |
+
+So the gap is **not** bf16 rounding. The hypothesis it killed, recorded so
+nobody re-runs it: "an independent kernel set differs by ~1 ULP at every
+bf16 buffer and the 43-layer HC ladder amplifies that ~240x." Evidence
+for the shape of the error, from `probe_growth.py`: per-position error vs
+the eager batch is FLAT (native 11-15, compiled 0.8-1.5; argmax agreement
+65% vs 98.8%), so nothing accumulates in the session state — every step
+diverges by the same amount.
+
+**Components cleared by isolation probes on the REAL model** (identical
+inputs into native and the reference, scratch probes kept in the session
+scratchpad): attention half (attn_out 0.4% = 1 ULP), compressor including
+the COMPLETION path (pooled row 0.36%, state bit-exact), MoE gate incl.
+hash routing (expert sets identical, weights to 1e-7), hc_pre (bit-exact),
+comp/indexer state seeding, borrow-mode buffer registration (byte-exact).
+
+**Where to look next**: the FFN half still shows ~1.1% output error at L5
+with an EXACT input and matching expert picks, and per-block error is
+uneven (L0 4.2% vs L5 1.1%). The one surface never compared against MLX on
+REAL weights is the 2-bit routed-expert pair (`dsv4_moe_w13`/`w2`) vs
+`gather_qmm` — the unit tests only cover a tiny synthetic 2-bit config. A
+systematic 2-bit unpack/group-stride discrepancy at the real shapes
+(d_model 4096, inter 2048) would produce exactly this: a consistent
+per-layer FFN error, invariant to activation precision.
+
 ## 3. Reproduce
 
 ```bash

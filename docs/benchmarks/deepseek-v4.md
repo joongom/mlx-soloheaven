@@ -985,6 +985,38 @@ with the session's exact sampling settings, not through `Model.__call__`.
 Until then SOLOHEAVEN_DSV4_NATIVE=1 is single-turn only; the compiled path
 is unaffected.
 
+### Stage 4h — dispatch folding after the correctness work (2026-08-02)
+
+Starting point after the quality fixes: 41.2 ms / 24.3 tok/s.
+
+| change | dispatches removed | ms/token | tok/s |
+|---|---|---|---|
+| ring write folded into attn_core | -43 | 39.3 | 25.5 |
+| q_norm+kv_norm paired (`sh_dsv4_rms2_k`) | -43 | 39.0 | 25.6 |
+
+The second fold returned only -0.3 ms against a -0.7 ms estimate, which
+re-confirms Stage 3h: **on this replay path dispatch COUNT is a weak
+lever** (launches are ~4 us). The remaining distance to ds4's 27 tok/s
+(37.0 ms) is -2.0 ms and will not come from folding.
+
+Where the time actually is (bench_rms2, isolated ms): library qmv 9.02/194,
+moe w13+w2 9.50/86, wo_a 4.06/43, comp_step ~3.5/62, hc_pre 2.91/86,
+gate 2.3/80, rms 2.2/130, sh13 2.2/43, hc_mix 1.8/86, hc_post 1.8/86,
+attn_core 1.3/43. Two observations for the next session:
+
+* **moe is ~4x off its bandwidth bound** (22 MB of 2-bit expert weights per
+  token = ~27 us at this machine's ~800 GB/s, measured 110 us/dispatch).
+  The 2-bit unpack does 16 shift/mask/convert per 4 bytes read, so it is
+  ALU-bound, not bandwidth-bound — a LUT or a wider unpack is the lever,
+  and the Stage 3l probe already showed float4/uint4 loads are NOT it.
+* **wo_a is ~2x off** (33.5 MB, ~42 us bound, measured 94 us).
+* The no-barrier diagnostic is now identical to the barriered run, so no
+  scheduling win remains.
+
+Naming note: kernels are `sh_dsv4_*` as of this stage — `sh` for this
+project, `dsv4` for the architecture. Nothing is copied from ds4; it is
+consulted as a numerical oracle only.
+
 ## 3. Reproduce
 
 ```bash

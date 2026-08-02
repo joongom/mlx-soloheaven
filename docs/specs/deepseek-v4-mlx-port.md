@@ -7,6 +7,14 @@ turns), thinking-mode routing, per-request sampling. ds4 oracle on identical
 raw-tokenized input: top-1 match, KL 0.18; teacher-forced over 32
 continuation positions: top-1 27/32, ours-in-ds4-top5 31/32.
 
+**Decode speed (2026-08-02)**: the native Metal replay runtime hit the
+25 tok/s target — **38.9 ms/token, 25.7 tok/s**, 1.85x the compiled path,
+15.7x the first native measurement (611 ms). Full campaign, per-stage
+methods, and the refuted attempts: `docs/benchmarks/deepseek-v4.md`
+Stages 3a-3r. NOT yet wired into serving: the native path still needs a
+ppl run through the native decoder, the SOLOHEAVEN_DSV4_NATIVE=1 opt-in
+with eager fallback, and a multi-turn server check (native/README ladder).
+
 Generation quality was broken (Korean corrupted at the token level) until the
 converter stopped using MLX's min/max scales — see "The quantization ceiling"
 below. With the error-searched scales, teacher-forced perplexity is 3.69

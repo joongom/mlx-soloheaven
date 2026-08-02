@@ -717,6 +717,38 @@ max-then-sum twice (the second half of the Stage 3o bisection). The
 mn > -inf guard skips empty rows so the -inf - -inf NaN intermediate never
 forms. Bench17: 40.2 ms / 24.9 tok/s; comp_step isolated 4.00 -> 3.41.
 
+### Stage 3r — TARGET MET: 38.9 ms / 25.7 tok/s (2026-08-02) ✅
+
+`dsv4_hc_post2_k` fuses the MoE routed+shared add into the ffn-half hc_post
+(x = T(a + b) in-register; a is FLOAT32 y_routed, b bfloat shared — binding
+both as bfloat reinterprets the float buffer and NaNs the block, caught by
+the plan tests). -43 dispatches. Bench (wired, 96% free, bench18):
+
+| | ms/token | tok/s |
+|---|---|---|
+| before (Stage 3q) | 40.2 | 24.9 |
+| after add fusion | **38.9** | **25.7** (1.85x vs 72.0 compiled) — **>= 25 tok/s MET** |
+
+**The campaign: 611 -> 38.9 ms/token, 15.7x, in one day.** Every stage above
+records its method; the losers (wo_a wall-time ~0, float4/uint4 loads,
+threadgroup staging) are recorded next to the winners. Where the time went,
+start to finish: pathological serial loops (Stage 3d-3f), threadgroup
+widening (3g), O(capacity) loop bounds (3i), one-thread-per-row latency
+exposure (3k), threadgroup staging vs residency (3l), barrier stacks on tiny
+data (3m), double-buffer state copy (3o), and dispatch fusion (3p-3r).
+
+Final profile (bench18, isolated ms): qmv 9.16/194 · moe w13+w2 9.71/86 ·
+wo_a 3.57/43 · comp_step 3.20/62 · hc_pre 2.64/86 · rms 2.38/173 ·
+sh13 2.00/43 · hc_mix 1.47/86 · attn_core 1.17/43 · gate 2.07/80 ·
+hc_post+post2 1.56/86.
+
+Paths beyond 25 tok/s, if wanted (in expected-value order): hc_pre rms
+fusion (-1.0, designed), moe unpack ALU LUT (~-1), wo_a load widening
+(~-1?), gate score+topk merge (~-0.5). Still OPEN before serving defaults
+to the native path: ppl through the native decoder (quality gate), the
+SOLOHEAVEN_DSV4_NATIVE=1 integration with eager fallback, and a multi-turn
+server check — the native/README ladder items.
+
 ## 3. Reproduce
 
 ```bash

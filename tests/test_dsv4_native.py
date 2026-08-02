@@ -587,6 +587,90 @@ def test_native_ring_store_updates_one_slot_in_place():
             assert np.array_equal(after[i], before[i]), f"slot {i} changed"
 
 
+def test_native_full_block_plan_matches_reference():
+    """LADDER STEP 6: the WHOLE dense Block as one native plan (both HC-wrapped
+    halves, ~26 dispatches, one command buffer) via native/plan.plan_block,
+    diffed against Block.decode_step_math. This is a complete per-layer decode
+    step replayed externally — the unit the 43-layer model is made of."""
+
+    from mlx_soloheaven.models.deepseek_v4 import Block, ModelArgs
+    from mlx_soloheaven.native import plan as plan_mod
+
+    cfg = dict(model_type="deepseek_v4", hidden_size=512, num_attention_heads=2,
+               head_dim=512, qk_rope_head_dim=64, q_lora_rank=512, o_lora_rank=512,
+               o_groups=2, moe_intermediate_size=512, n_routed_experts=8,
+               num_experts_per_tok=2, routed_scaling_factor=1.5, sliding_window=8,
+               num_hash_layers=0, hc_mult=2, hc_sinkhorn_iters=5, swiglu_limit=10.0,
+               compress_ratios=[0], rope_theta=10000, num_hidden_layers=1,
+               rms_norm_eps=1e-6, hc_eps=1e-6)
+    args = ModelArgs.from_dict(cfg)
+    blk = Block(args, 0)
+    for nm in ("hc_attn_fn", "hc_ffn_fn"):
+        setattr(blk, nm, mx.random.normal(getattr(blk, nm).shape) * 0.1)
+    for nm in ("hc_attn_scale", "hc_ffn_scale", "hc_attn_base", "hc_ffn_base"):
+        setattr(blk, nm, mx.random.normal(getattr(blk, nm).shape))
+    blk.ffn.gate.weight = mx.random.normal(blk.ffn.gate.weight.shape) * 0.3
+    blk.ffn.gate.bias = mx.random.normal(blk.ffn.gate.bias.shape)
+    _quantize_block_like_deploy(blk)
+
+    hc, hidden, inter = args.hc_mult, 512, args.moe_intermediate_size
+    H, D, g = blk.attn.n_heads, blk.attn.head_dim, blk.attn.n_groups
+    NHD, o_lora, win = H * D, args.o_lora_rank, blk.attn.window
+    q_lora, topk = 512, args.num_experts_per_tok
+    n_exp, rscale, limit = args.n_routed_experts, args.routed_scaling_factor, args.swiglu_limit
+    offset = 3
+
+    rng = np.random.default_rng(8)
+    hval = mx.array(rng.standard_normal((1, 1, hc, hidden)).astype(np.float32) * 0.3).astype(mx.bfloat16)
+    ring0 = mx.array(rng.standard_normal((1, win, D)).astype(np.float32) * 0.1).astype(mx.bfloat16)
+
+    ring_ref = ring0.astype(mx.float32).astype(mx.bfloat16)
+    h_ref, _ring = blk.decode_step_math(
+        hval, mx.array([[0]], dtype=mx.int32), mx.array(offset, dtype=mx.int32), ring_ref)
+    mx.eval(h_ref)
+    mx.synchronize()
+
+    rt_mod.load_custom_kernels(_RT)
+    T = rt_mod.BufferTable()
+
+    def z(n, dt=mx.bfloat16):
+        a = mx.zeros((n,), dtype=dt)
+        mx.eval(a)
+        return a
+
+    scratch_arrays = dict(
+        hin=hval.reshape(-1), ring=ring0.astype(mx.float32).astype(mx.bfloat16).reshape(-1),
+        hx=z(hidden), post=z(hc, mx.float32), comb=z(hc * hc, mx.float32), xn=z(hidden),
+        xp0=z(q_lora), qr=z(q_lora), q_raw=z(NHD), xp1=z(D), kvn=z(D), acore=z(NHD),
+        kv_roped=z(D), o_lora=z(g * o_lora), attn_out=z(hidden), h1=z(hc * hidden),
+        scores=z(n_exp, mx.float32), idx=mx.zeros((topk,), mx.int32), w=z(topk, mx.float32),
+        hexp=z(topk * inter, mx.float32), y_routed=z(hidden, mx.float32), sg=z(inter),
+        su=z(inter), sh=z(inter), shared=z(hidden), moe_out=z(hidden), hout=z(hc * hidden),
+        dummy=z(D), dummy_idx=mx.full((1,), -1, mx.int32),
+    )
+    mx.eval(*scratch_arrays.values())
+    mx.synchronize()
+    S = {k: T.add(v) for k, v in scratch_arrays.items()}
+
+    cb = plan_mod.ConstBlob()
+    ioff_off, _ = cb.add("2i", offset, 0)
+    pl = plan_mod.Planner(_RT, T, cb, S)
+    items = plan_mod.plan_block(pl, blk, "hin", "ring", "hout", ioff_off,
+                                topk, rscale, limit)
+    _RT.commit(items, T.ptrs, cb.bytes(), wait=True)
+
+    got = np.array(scratch_arrays["hout"].astype(mx.float32))
+    exp = np.array(h_ref.reshape(-1).astype(mx.float32))
+    diff = np.abs(got - exp)
+    # ~26 chained bf16 kernels with HC summing residual streams (intermediates
+    # reach ~1.4), so accumulated bf16 rounding is a few % of the peak — the
+    # per-HALF tests (< 2e-2 / 3e-2) are the tight numerical proof; this test
+    # proves the full-block ASSEMBLY. A wiring bug shows as a uniform ~0.7
+    # (seen and fixed during bring-up), not this localized tail.
+    assert diff.max() < 0.15, diff.max()
+    assert np.median(diff) < 2e-2, np.median(diff)
+
+
 def test_native_qmv_into_attn_core_chain():
     """A MIXED chained plan: a LIBRARY qmv (wq_b: qr -> q_raw) feeds a CUSTOM
     kernel (attn_core) through an intermediate buffer, in one command buffer.

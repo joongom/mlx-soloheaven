@@ -85,12 +85,19 @@ step unless profiling later demands it) owning:
    layer (test_native_dense_attention_plan_matches_reference). First full
    sub-block replayed end to end. Bug found and recorded: wo_a is 8-bit, so
    its per-group packed stride is gin/4 (not the 2-bit gin/16).
-5. NEXT: the FFN half plan — hc_pre (attn), hc_post, ffn_norm rms, gate, moe
-   K1/K2 (chain proven), shared expert (3 qmv + swiglu), hc_post — diffed
-   against MoE.decode_step_math + the Block HC wrapping. Then compose the two
-   halves into a full Block plan vs Block.decode_step_math, build the session
-   BufferTable from a real Model, stack 43 layers + embed/head, and integrate
-   behind SOLOHEAVEN_DSV4_NATIVE with the existing fallback. Then bench.
+5. ✅ FFN-half plan (hc_pre, ffn_norm rms, gate, moe K1/K2, shared expert
+   w1/w3/swiglu/w2, add, hc_post) diffed against the reference (< 3e-2).
+6. ✅ FULL dense Block plan via native/plan.plan_block (~26 dispatches, both
+   HC-wrapped halves) vs Block.decode_step_math — median diff < 2e-2, tail
+   < 0.15 (accumulated bf16 over the deep chain; the per-half tests are the
+   tight proof). native/plan.py now has the reusable Planner + plan_attention
+   / plan_moe / plan_block builders.
+7. NEXT: build the session BufferTable + scratch from a REAL loaded Model
+   (dense layers 0-1 first; then the compressed layers need the compressor/
+   indexer dispatches added to plan_attention), stack all layers + embed
+   (row gather) + final HC-head + head qmv, and replay a full token; diff
+   logits vs Model.__call__, then integrate behind SOLOHEAVEN_DSV4_NATIVE=1
+   as a third path in Model.__call__ with the existing eager fallback. Bench.
 5. All layer kinds, then the full 43-layer step + embed/head → token-level
    agreement over a 32-token greedy run.
 6. ppl probes through the native path ≈ MLX path (3.65).

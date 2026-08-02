@@ -1,0 +1,206 @@
+"""Per-layer decode PLAN assembly for the replay runtime.
+
+Turns a Block + scratch buffers into the native dispatch sequence the C encode
+loop replays. Every builder here mirrors an individually diff-verified plan in
+tests/test_dsv4_native.py — this is wiring, not new compute. Dense layers only
+for now (ratio==0); compressed layers add the compressor/indexer dispatches.
+
+Buffer/dtype contracts (from the deployed build, all diff-tested):
+* quantized projections: 8-bit gs64, scales/biases bf16; routed experts 2-bit.
+* norms and gate.weight are bf16.
+* every projection K is %512, so affine_qmv_fast covers them.
+"""
+
+from __future__ import annotations
+
+import struct
+
+from mlx_soloheaven.native.kernels import BUFFER_SLOTS
+
+_QMV = "affine_qmv_fast_bfloat16_t_gs_64_b_8_batch_0"
+
+
+class ConstBlob:
+    """Accumulates plan-static setBytes data; returns (offset, length)."""
+
+    def __init__(self):
+        self._b = bytearray()
+
+    def add(self, fmt, *vals):
+        off = len(self._b)
+        self._b += struct.pack("<" + fmt, *vals)
+        return off, len(self._b) - off
+
+    def bytes(self):
+        return bytes(self._b)
+
+
+class Planner:
+    """Holds the runtime, table, const blob and scratch, and builds items."""
+
+    def __init__(self, rt, table, cb: ConstBlob, scratch: dict):
+        self.rt = rt
+        self.t = table
+        self.cb = cb
+        self.S = scratch  # name -> table slot (pre-registered scratch buffers)
+
+    def _pi(self, kernel, custom, bufs, bytes_, grid, group, barrier=True):
+        from mlx_soloheaven.native.runtime import plan_item
+        return plan_item(self.rt, kernel, custom, bufs, bytes_, grid, group, barrier)
+
+    def qmv(self, mod, x, y, K, N, w_off=0, s_off=0, b_off=0, xoff=0, yoff=0):
+        ko, _ = self.cb.add("ii", K, N)
+        return self._pi(
+            _QMV, False,
+            [(self.t.add(mod.weight), 0, w_off), (self.t.add(mod.scales), 1, s_off),
+             (self.t.add(mod.biases), 2, b_off), (self.S[x], 3, xoff), (self.S[y], 4, yoff)],
+            [(ko, 4, 5), (ko + 4, 4, 6)], (1, (N + 7) // 8, 1), (32, 2, 1))
+
+    def rms(self, w, x, y, d, eps):
+        o, _ = self.cb.add("if", d, eps)
+        r = BUFFER_SLOTS["dsv4_rms_k"]
+        return self._pi(
+            "dsv4_rms_k", True,
+            [(self.S[x], r["x"]), (self.t.add(w), r["w"]), (self.S[y], r["y"])],
+            [(o, 4, r["params"]), (o + 4, 4, r["feps"])], (1, 1, 1), (256, 1, 1))
+
+    def hc_pre(self, h, fn, scale, base, x, post, comb, hc, hidden, iters, eps, hc_eps):
+        p, _ = self.cb.add("2i", hc, hidden)
+        f, _ = self.cb.add("2f", eps, hc_eps)
+        i, _ = self.cb.add("i", iters)
+        k = BUFFER_SLOTS["dsv4_hc_pre_k"]
+        return self._pi(
+            "dsv4_hc_pre_k", True,
+            [(self.S[h], k["h"]), (self.t.add(fn), k["fn"]), (self.t.add(scale), k["scale"]),
+             (self.t.add(base), k["base"]), (self.S[x], k["y"]), (self.S[post], k["post"]),
+             (self.S[comb], k["comb"])],
+            [(p, 8, k["params"]), (f, 8, k["feps"]), (i, 4, k["iters"])],
+            (1, 1, 1), (256, 1, 1))
+
+    def hc_post(self, x, residual, post, comb, y, hc, hidden):
+        p, _ = self.cb.add("2i", hc, hidden)
+        k = BUFFER_SLOTS["dsv4_hc_post_k"]
+        return self._pi(
+            "dsv4_hc_post_k", True,
+            [(self.S[x], k["x"]), (self.S[residual], k["residual"]), (self.S[post], k["post"]),
+             (self.S[comb], k["comb"]), (self.S[y], k["y"])],
+            [(p, 8, k["params"])], (hc, 1, 1), (256, 1, 1))
+
+
+def plan_attention(pl: Planner, attn, xin: str, ring: str, out: str,
+                   ioff_off: int) -> list:
+    """Dense attention on scratch[xin] (the attn_norm output) -> scratch[out].
+    scratch must hold: xp0, qr, q_raw, xp1, kvn, acore, kv_roped, o_lora.
+    Weight offsets for grouped wo_a assume 8-bit (packed stride gin/4)."""
+    a = attn
+    H, D, g = a.n_heads, a.head_dim, a.n_groups
+    NHD, gin, o_lora, win = H * D, (H * D) // g, a.wo_a.weight.shape[1], a.window
+    hidden = a.wq_a.scales.shape[1] * a.wq_a.group_size
+    q_lora = a.wq_b.scales.shape[1] * a.wq_b.group_size
+    items = [
+        pl.qmv(a.wq_a, xin, "xp0", hidden, q_lora),
+        pl.rms(a.q_norm.weight, "xp0", "qr", q_lora, a.eps),
+        pl.qmv(a.wq_b, "qr", "q_raw", q_lora, NHD),
+        pl.qmv(a.wkv, xin, "xp1", hidden, D),
+        pl.rms(a.kv_norm.weight, "xp1", "kvn", D, a.eps),
+    ]
+    ac = BUFFER_SLOTS["dsv4_attn_core"]
+    po, _ = pl.cb.add("5i", D, a.rope_dim, win, 0, 1)
+    fo, _ = pl.cb.add("2f", a.scale, a.eps)
+    items.append(pl._pi(
+        "dsv4_attn_core", True,
+        [(pl.S["q_raw"], ac["q"]), (pl.S["kvn"], ac["kv"]), (pl.S[ring], ac["ring"]),
+         (pl.S["dummy"], ac["comp"]), (pl.S["dummy_idx"], ac["cidx"]),
+         (pl.t.add(a.attn_sink), ac["sink"]), (pl.t.add(a._freqs), ac["freqs"]),
+         (pl.S["acore"], ac["out"]), (pl.S["kv_roped"], ac["kv_out"])],
+        [(po, 20, ac["params"]), (fo, 8, ac["fscal"]), (ioff_off, 8, ac["ioff"])],
+        (H, 1, 1), (128, 1, 1)))
+    rs = BUFFER_SLOTS["dsv4_ring_store_k"]
+    rp, _ = pl.cb.add("ii", D, win)
+    items.append(pl._pi(
+        "dsv4_ring_store_k", True,
+        [(pl.S["kv_roped"], rs["src"]), (pl.S[ring], rs["ring"])],
+        [(rp, 8, rs["params"]), (ioff_off, 4, rs["ioff"])], (1, 1, 1), (256, 1, 1)))
+    for gi in range(g):
+        items.append(pl.qmv(
+            a.wo_a, "acore", "o_lora", gin, o_lora,
+            w_off=gi * o_lora * (gin // 4) * 4, s_off=gi * o_lora * (gin // 64) * 2,
+            b_off=gi * o_lora * (gin // 64) * 2, xoff=gi * gin * 2, yoff=gi * o_lora * 2))
+    items.append(pl.qmv(a.wo_b, "o_lora", out, g * o_lora, hidden))
+    return items
+
+
+def plan_moe(pl: Planner, ffn, xin: str, out: str, topk: int, rscale: float,
+             limit: float) -> list:
+    """Score-layer MoE on scratch[xin] -> scratch[out]. scratch must hold:
+    scores, idx, w, hexp, y_routed, sg, su, sh, shared."""
+    exp, sh = ffn.experts, ffn.shared_experts
+    n_exp = ffn.gate.weight.shape[0]
+    hidden = ffn.gate.weight.shape[1]
+    inter = exp.gate_proj.weight.shape[1]
+    items = []
+    gk = BUFFER_SLOTS["dsv4_gate_k"]
+    go, _ = pl.cb.add("iiif", n_exp, hidden, topk, rscale)
+    items.append(pl._pi(
+        "dsv4_gate_k", True,
+        [(pl.S[xin], gk["x"]), (pl.t.add(ffn.gate.weight), gk["weight"]),
+         (pl.t.add(ffn.gate.bias), gk["bias"]), (pl.S["scores"], gk["scores"]),
+         (pl.S["idx"], gk["out_idx"]), (pl.S["w"], gk["out_w"])],
+        [(go, 12, gk["params"]), (go + 12, 4, gk["feps"])], (1, 1, 1), (256, 1, 1)))
+    mo, _ = pl.cb.add("iii", topk, hidden, inter)
+    ml, _ = pl.cb.add("f", limit)
+    w1 = BUFFER_SLOTS["dsv4_moe_w13"]
+    items.append(pl._pi(
+        "dsv4_moe_w13", True,
+        [(pl.S[xin], w1["x"]), (pl.t.add(exp.gate_proj.weight), w1["gw"]),
+         (pl.t.add(exp.gate_proj.scales), w1["gs_"]), (pl.t.add(exp.gate_proj.biases), w1["gb"]),
+         (pl.t.add(exp.up_proj.weight), w1["uw"]), (pl.t.add(exp.up_proj.scales), w1["us"]),
+         (pl.t.add(exp.up_proj.biases), w1["ub"]), (pl.S["idx"], w1["idxs"]), (pl.S["hexp"], w1["h"])],
+        [(mo, 12, w1["params"]), (ml, 4, w1["feps"])], ((topk * inter + 7) // 8, 1, 1), (256, 1, 1)))
+    w2 = BUFFER_SLOTS["dsv4_moe_w2"]
+    items.append(pl._pi(
+        "dsv4_moe_w2", True,
+        [(pl.S["hexp"], w2["h"]), (pl.t.add(exp.down_proj.weight), w2["dw"]),
+         (pl.t.add(exp.down_proj.scales), w2["ds_"]), (pl.t.add(exp.down_proj.biases), w2["db"]),
+         (pl.S["idx"], w2["idxs"]), (pl.S["w"], w2["wts"]), (pl.S["y_routed"], w2["y"])],
+        [(mo, 12, w2["params"])], ((hidden + 7) // 8, 1, 1), (256, 1, 1)))
+    items.append(pl.qmv(sh.w1, xin, "sg", hidden, inter))
+    items.append(pl.qmv(sh.w3, xin, "su", hidden, inter))
+    sw = BUFFER_SLOTS["dsv4_swiglu_k"]
+    so, _ = pl.cb.add("if", inter, limit)
+    items.append(pl._pi(
+        "dsv4_swiglu_k", True,
+        [(pl.S["sg"], sw["gate"]), (pl.S["su"], sw["up"]), (pl.S["sh"], sw["out"])],
+        [(so, 4, sw["params"]), (so + 4, 4, sw["feps"])], (inter, 1, 1), (256, 1, 1)))
+    items.append(pl.qmv(sh.w2, "sh", "shared", inter, hidden))
+    ak = BUFFER_SLOTS["dsv4_add_k"]
+    ao, _ = pl.cb.add("i", hidden)
+    items.append(pl._pi(
+        "dsv4_add_k", True,
+        [(pl.S["y_routed"], ak["a"]), (pl.S["shared"], ak["b"]), (pl.S[out], ak["out"])],
+        [(ao, 4, ak["params"])], (hidden, 1, 1), (256, 1, 1)))
+    return items
+
+
+def plan_block(pl: Planner, blk, hin: str, ring: str, hout: str, ioff_off: int,
+               topk: int, rscale: float, limit: float) -> list:
+    """A full dense Block: hc_pre/attn_norm/attention/hc_post, then
+    hc_pre/ffn_norm/MoE/hc_post. scratch[hin] in, scratch[hout] out.
+    scratch also needs: hx, post, comb, xn, attn_out, h1, moe_out, plus all
+    the attention and MoE scratch names."""
+    hc = blk.hc
+    hidden = blk.attn.wq_a.scales.shape[1] * blk.attn.wq_a.group_size
+    items = []
+    items.append(pl.hc_pre(hin, blk.hc_attn_fn.reshape(-1), blk.hc_attn_scale,
+                           blk.hc_attn_base, "hx", "post", "comb", hc, hidden,
+                           blk.iters, blk.eps, blk.hc_eps))
+    items.append(pl.rms(blk.attn_norm.weight, "hx", "xn", hidden, blk.eps))
+    items += plan_attention(pl, blk.attn, "xn", ring, "attn_out", ioff_off)
+    items.append(pl.hc_post("attn_out", hin, "post", "comb", "h1", hc, hidden))
+    items.append(pl.hc_pre("h1", blk.hc_ffn_fn.reshape(-1), blk.hc_ffn_scale,
+                           blk.hc_ffn_base, "hx", "post", "comb", hc, hidden,
+                           blk.iters, blk.eps, blk.hc_eps))
+    items.append(pl.rms(blk.ffn_norm.weight, "hx", "xn", hidden, blk.eps))
+    items += plan_moe(pl, blk.ffn, "xn", "moe_out", topk, rscale, limit)
+    items.append(pl.hc_post("moe_out", "h1", "post", "comb", hout, hc, hidden))
+    return items

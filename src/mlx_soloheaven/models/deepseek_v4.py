@@ -2299,13 +2299,11 @@ _HC_PRE_SRC = """
     const int TG = 1024;  // single threadgroup; widest allowed (comp_step precedent)
     const int hcn = params[0];
     const int d = params[1];
-    const int mix = (2 + hcn) * hcn;
     const int hcd = hcn * d;
     const float rms_eps = feps[0];
     const float hc_eps = feps[1];
 
     threadgroup float red[32];  // TG/32 simdgroup partials
-    threadgroup float mtg[64];
     threadgroup float pc[64];      // pre[hc], post[hc], comb[hc*hc]
     threadgroup float rms_s[1];
 
@@ -2322,55 +2320,51 @@ _HC_PRE_SRC = """
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float rms = rms_s[0];
 
-    // mixes[] holds the raw fn.h dots from dsv4_hc_mix_k; apply rms here.
-    for (int r = tid; r < mix; r += TG) mtg[r] = float(mixes[r]) * rms;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Gates + Sinkhorn, PARALLEL over rows/cols. The previous version ran the
-    // whole thing on tid 0 — ~640 serial iterations on one GPU thread, the same
-    // pathology the gate top-k had. Each row/col op keeps its serial inner
-    // order, so results are BIT-identical to the single-thread version.
-    threadgroup float cbtg[64];
-    if (tid < (uint)hcn) {
-        pc[tid] = 1.0f / (1.0f + exp(-(mtg[tid] * scale[0] + base[tid]))) + hc_eps;
-        pc[hcn + tid] = 2.0f / (1.0f + exp(-(mtg[hcn + tid] * scale[1] + base[hcn + tid])));
-    }
-    if (tid < (uint)(hcn * hcn))
-        cbtg[tid] = mtg[2 * hcn + tid] * scale[2] + base[2 * hcn + tid];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid < (uint)hcn) {              // row softmax (+ hc_eps)
-        int r = tid;
-        float m = cbtg[r * hcn];
-        for (int c = 1; c < hcn; ++c) m = max(m, cbtg[r * hcn + c]);
-        float s = 0.0f;
-        for (int c = 0; c < hcn; ++c) { cbtg[r * hcn + c] = exp(cbtg[r * hcn + c] - m); s += cbtg[r * hcn + c]; }
-        for (int c = 0; c < hcn; ++c) cbtg[r * hcn + c] = cbtg[r * hcn + c] / s + hc_eps;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid < (uint)hcn) {              // first column normalize
-        int c = tid;
-        float s = 0.0f;
-        for (int r = 0; r < hcn; ++r) s += cbtg[r * hcn + c];
-        for (int r = 0; r < hcn; ++r) cbtg[r * hcn + c] /= (s + hc_eps);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int it = 0; it < iters[0] - 1; ++it) {
-        if (tid < (uint)hcn) {          // row normalize
-            int r = tid;
-            float s = 0.0f;
-            for (int c = 0; c < hcn; ++c) s += cbtg[r * hcn + c];
-            for (int c = 0; c < hcn; ++c) cbtg[r * hcn + c] /= (s + hc_eps);
+    // Gates + Sinkhorn on ONE simdgroup: lane l < hcn*hcn holds comb element
+    // (l/hcn, l%hcn); row/col sums are gathered lane-by-lane with simd_shuffle
+    // in the SAME serial order as the barriered version's inner loops, and
+    // every mul/add keeps its two-step shape, so results stay BIT-identical.
+    // The barriered version paid 2 threadgroup barriers per Sinkhorn iteration
+    // (~40 total, 20 iters) to sync a hcn x hcn matrix across a 1024-thread
+    // group; a simdgroup is implicitly synchronous, so this pays none.
+    if (tid < 32) {
+        int l = tid;
+        int r = l / hcn, c = l % hcn;
+        float cb = 0.0f;
+        if (l < hcn * hcn) {
+            float mt = float(mixes[2 * hcn + l]) * rms;
+            cb = mt * scale[2] + base[2 * hcn + l];
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid < (uint)hcn) {          // column normalize
-            int c = tid;
-            float s = 0.0f;
-            for (int r = 0; r < hcn; ++r) s += cbtg[r * hcn + c];
-            for (int r = 0; r < hcn; ++r) cbtg[r * hcn + c] /= (s + hc_eps);
+        float m = simd_shuffle(cb, r * hcn);                 // row softmax (+ hc_eps)
+        for (int k = 1; k < hcn; ++k) m = max(m, simd_shuffle(cb, r * hcn + k));
+        float e = exp(cb - m);
+        float s = 0.0f;
+        for (int k = 0; k < hcn; ++k) s += simd_shuffle(e, r * hcn + k);
+        cb = e / s + hc_eps;
+        s = 0.0f;                                            // first column normalize
+        for (int k = 0; k < hcn; ++k) s += simd_shuffle(cb, c + hcn * k);
+        cb /= (s + hc_eps);
+        for (int it = 0; it < iters[0] - 1; ++it) {
+            s = 0.0f;                                        // row normalize
+            for (int k = 0; k < hcn; ++k) s += simd_shuffle(cb, r * hcn + k);
+            cb /= (s + hc_eps);
+            s = 0.0f;                                        // column normalize
+            for (int k = 0; k < hcn; ++k) s += simd_shuffle(cb, c + hcn * k);
+            cb /= (s + hc_eps);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (l < hcn * hcn) {
+            pc[2 * hcn + l] = cb;
+            comb[l] = cb;
+        }
+        if (l < hcn) {
+            float mt0 = float(mixes[l]) * rms;
+            float mt1 = float(mixes[hcn + l]) * rms;
+            float pst = 2.0f / (1.0f + exp(-(mt1 * scale[1] + base[hcn + l])));
+            pc[l] = 1.0f / (1.0f + exp(-(mt0 * scale[0] + base[l]))) + hc_eps;
+            pc[hcn + l] = pst;
+            post[l] = pst;
+        }
     }
-    if (tid < (uint)(hcn * hcn)) pc[2 * hcn + tid] = cbtg[tid];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (int i = tid; i < d; i += TG) {
@@ -2378,8 +2372,6 @@ _HC_PRE_SRC = """
         for (int j = 0; j < hcn; ++j) a += pc[j] * float(h[j * d + i]);
         y[i] = T(a);
     }
-    for (int i = tid; i < hcn; ++i) post[i] = pc[hcn + i];
-    for (int i = tid; i < hcn * hcn; i += TG) comb[i] = pc[2 * hcn + i];
 """
 
 _HC_POST_SRC = """

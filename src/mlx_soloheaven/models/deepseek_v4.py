@@ -940,9 +940,16 @@ _ATTN_CORE_SRC = """
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // scores: window part (ring slots computed inline; slot==offset%WIN is
-    // the fresh token -> use kvr) then comp part
+    // the fresh token -> use kvr) then comp part.
+    // Only [jlo, jhi) can hold valid entries: window slots below jlo have
+    // qpos < 0, comp groups past NCOMP (plain) are masked. The window and
+    // comp regions are contiguous, so shrinking the loop bounds makes every
+    // pass O(context) instead of O(window capacity) — at short offsets that
+    // is a ~30x cut in serial work per thread.
     const int K = WIN + KC;
-    for (int j = tid; j < K; j += TG) {
+    const int jlo = (offset + 1 < WIN) ? (WIN - 1 - offset) : 0;
+    const int jhi = WIN + (PLAIN ? min(NCOMP, KC) : KC);
+    for (int j = jlo + (int)tid; j < jhi; j += TG) {
         float s = -INFINITY;
         if (j < WIN) {
             int qpos = offset - WIN + 1 + j;
@@ -970,7 +977,7 @@ _ATTN_CORE_SRC = """
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float lm = -INFINITY;
-    for (int j = tid; j < K; j += TG) lm = max(lm, sc[j]);
+    for (int j = jlo + (int)tid; j < jhi; j += TG) lm = max(lm, sc[j]);
     lm = simd_max(lm);
     if ((tid & 31u) == 0) red[tid / 32] = lm;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -982,7 +989,7 @@ _ATTN_CORE_SRC = """
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float m = red[0];
     float ls = 0.0f;
-    for (int j = tid; j < K; j += TG) {
+    for (int j = jlo + (int)tid; j < jhi; j += TG) {
         float p = exp(sc[j] - m);
         sc[j] = p;
         ls += p;
@@ -1002,7 +1009,7 @@ _ATTN_CORE_SRC = """
     for (int p = tid; p < D / 2; p += TG) {
         int i0 = 2 * p;
         float a0 = 0.0f, a1 = 0.0f;
-        for (int j = 0; j < K; ++j) {
+        for (int j = jlo; j < jhi; ++j) {
             float pj = sc[j];
             if (pj <= 0.0f) continue;
             if (j < WIN) {

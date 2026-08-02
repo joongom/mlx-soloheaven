@@ -1489,16 +1489,17 @@ class Attention(nn.Module):
         o = self.wo_a(o[..., None, :], groups).squeeze(-2)
         return self.wo_b(o.reshape(b, s, -1))
 
-    def _x_projections(self, x):
-        """All per-layer projections OF X as ONE matmul (decode path).
-
-        wq_a, wkv, the compressors' wkv/wgate and the indexer's weights_proj
-        all consume the same [1,1,4096] input; issuing them separately costs
-        up to 7 kernel dispatches per layer per token. Affine-quantized rows
-        are independent along the OUTPUT axis, so the loaded Q8 weights are
-        concatenated once (lazily, at first decode) and split after a single
-        quantized_matmul — no reconversion, identical numerics.
-        """
+    def _x_stack(self):
+        """The lazily-built stacked x-projection: every per-layer projection OF
+        X (wq_a, wkv, the compressors' wkv/wgate, the indexer's weights_proj)
+        concatenated along the output axis. Affine-quantized rows are
+        independent along that axis, so this is a pure concat — no
+        reconversion, identical numerics. Shared by the compiled decode path
+        (_x_projections) and the native replay plan (one qmv instead of up to
+        7 dispatches per layer)."""
+        st = getattr(self, "_xstack", None)
+        if st is not None:
+            return st
         mods = [self.wq_a, self.wkv]
         if self.ratio:
             mods += [self.compressor.wkv, self.compressor.wgate]
@@ -1508,24 +1509,32 @@ class Attention(nn.Module):
                     self.indexer.compressor.wkv,
                     self.indexer.compressor.wgate,
                 ]
-        st = getattr(self, "_xstack", None)
-        if st is None:
-            if isinstance(mods[0], nn.QuantizedLinear):
-                gs, bits = mods[0].group_size, mods[0].bits
-                assert all(m.group_size == gs and m.bits == bits for m in mods)
-                st = (
-                    "q",
-                    mx.concatenate([m.weight for m in mods], axis=0),
-                    mx.concatenate([m.scales for m in mods], axis=0),
-                    mx.concatenate([m.biases for m in mods], axis=0),
-                    gs,
-                    bits,
-                    [m.scales.shape[0] for m in mods],
-                )
-            else:
-                st = ("p", mx.concatenate([m.weight for m in mods], axis=0),
-                      [m.weight.shape[0] for m in mods])
-            self._xstack = st
+        if isinstance(mods[0], nn.QuantizedLinear):
+            gs, bits = mods[0].group_size, mods[0].bits
+            assert all(m.group_size == gs and m.bits == bits for m in mods)
+            st = (
+                "q",
+                mx.concatenate([m.weight for m in mods], axis=0),
+                mx.concatenate([m.scales for m in mods], axis=0),
+                mx.concatenate([m.biases for m in mods], axis=0),
+                gs,
+                bits,
+                [m.scales.shape[0] for m in mods],
+            )
+        else:
+            st = ("p", mx.concatenate([m.weight for m in mods], axis=0),
+                  [m.weight.shape[0] for m in mods])
+        # materialize now: the native replay registers these arrays in its
+        # buffer table via DLPack, which needs real buffers, and identity must
+        # stay stable across plan rebuilds (hence cached on the module).
+        mx.eval(*st[1:4] if st[0] == "q" else (st[1],))
+        self._xstack = st
+        return st
+
+    def _x_projections(self, x):
+        """All per-layer projections OF X as ONE matmul (decode path); see
+        _x_stack for the stacking contract."""
+        st = self._x_stack()
         if st[0] == "q":
             _, qw, sc, bs, gs, bits, sizes = st
             out = mx.quantized_matmul(

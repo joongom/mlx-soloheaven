@@ -787,7 +787,7 @@ def test_native_full_model_logits_match_reference():
     block_scratch = dict(
         hx=z(hidden), post=z(hc, mx.float32), comb=z(hc * hc, mx.float32), xn=z(hidden),
         hc_mixes=z((2 + hc) * hc, mx.float32),
-        xp0=z(512), qr=z(512), q_raw=z(hidden * 2 // 2 * 2), xp1=z(D), kvn=z(D),
+        xall=z(8192), xp0=z(512), qr=z(512), q_raw=z(hidden * 2 // 2 * 2), xp1=z(D), kvn=z(D),
         acore=z(2 * D), kv_roped=z(D), o_lora=z(2 * 512), attn_out=z(hidden), h1=z(hc * hidden),
         scores=z(8, mx.float32), idx=mx.zeros((topk,), mx.int32), w=z(topk, mx.float32),
         hexp=z(topk * 512, mx.float32), y_routed=z(hidden, mx.float32), sg=z(512), su=z(512),
@@ -903,7 +903,7 @@ def test_native_ratio4_attention_plan_matches_reference():
     cd, icd = coff * D, icoff * ihd
     scratch = dict(
         x=x.reshape(-1), ring=ring0.astype(mx.float32).astype(mx.bfloat16).reshape(-1),
-        xp0=z(q_lora), qr=z(q_lora), q_raw=z(NHD), xp1=z(D), kvn=z(D), acore=z(NHD),
+        xall=z(8192), xp0=z(q_lora), qr=z(q_lora), q_raw=z(NHD), xp1=z(D), kvn=z(D), acore=z(NHD),
         kv_roped=z(D), o_lora=z(g * o_lora), attn_out=z(hidden), cwkv=z(cd), cwgate=z(cd),
         kv_st=z(coff * ratio * cd, mx.float32), sc_st=ninf(coff * ratio * cd),
         kv_st2=z(coff * ratio * cd, mx.float32), sc_st2=z(coff * ratio * cd, mx.float32),
@@ -1096,7 +1096,7 @@ def test_native_compressed_attention_plan_matches_reference():
     cd = attn.compressor.coff * D
     scratch = dict(
         x=x.reshape(-1), ring=ring0.astype(mx.float32).astype(mx.bfloat16).reshape(-1),
-        xp0=z(q_lora), qr=z(q_lora), q_raw=z(NHD), xp1=z(D), kvn=z(D), acore=z(NHD),
+        xall=z(8192), xp0=z(q_lora), qr=z(q_lora), q_raw=z(NHD), xp1=z(D), kvn=z(D), acore=z(NHD),
         kv_roped=z(D), o_lora=z(g * o_lora), attn_out=z(hidden), cwkv=z(cd), cwgate=z(cd),
         kv_st=z(ratio * cd, mx.float32), sc_st=mx.full((ratio * cd,), -mx.inf, mx.float32),
         kv_st2=z(ratio * cd, mx.float32), sc_st2=z(ratio * cd, mx.float32),
@@ -1175,7 +1175,7 @@ def test_native_full_block_plan_matches_reference():
         hin=hval.reshape(-1), ring=ring0.astype(mx.float32).astype(mx.bfloat16).reshape(-1),
         hx=z(hidden), post=z(hc, mx.float32), comb=z(hc * hc, mx.float32), xn=z(hidden),
         hc_mixes=z((2 + hc) * hc, mx.float32),
-        xp0=z(q_lora), qr=z(q_lora), q_raw=z(NHD), xp1=z(D), kvn=z(D), acore=z(NHD),
+        xall=z(8192), xp0=z(q_lora), qr=z(q_lora), q_raw=z(NHD), xp1=z(D), kvn=z(D), acore=z(NHD),
         kv_roped=z(D), o_lora=z(g * o_lora), attn_out=z(hidden), h1=z(hc * hidden),
         scores=z(n_exp, mx.float32), idx=mx.zeros((topk,), mx.int32), w=z(topk, mx.float32),
         hexp=z(topk * inter, mx.float32), y_routed=z(hidden, mx.float32), sg=z(inter),
@@ -1337,7 +1337,7 @@ def test_native_dense_attention_plan_matches_reference():
 
     ring = (ring0.astype(mx.float32).astype(mx.bfloat16)).reshape(-1)
     scratch = dict(
-        x=x.reshape(-1), ring=ring, xp0=z(q_lora), qr=z(q_lora), q_raw=z(NHD),
+        x=x.reshape(-1), ring=ring, xall=z(8192), xp0=z(q_lora), qr=z(q_lora), q_raw=z(NHD),
         xp1=z(D), kvn=z(D), out=z(NHD), kv_roped=z(D), o_lora=z(g * o_lora),
         attn_out=z(hidden), dummy=z(D), dummy_idx=mx.full((1,), -1, dtype=mx.int32),
         sink=attn.attn_sink, freqs=attn._freqs, ioff=mx.array([offset, 0], dtype=mx.int32),

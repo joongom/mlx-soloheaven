@@ -56,12 +56,12 @@ class Planner:
              (self.t.add(mod.biases), 2, b_off), (self.S[x], 3, xoff), (self.S[y], 4, yoff)],
             [(ko, 4, 5), (ko + 4, 4, 6)], (1, (N + 7) // 8, 1), (32, 2, 1))
 
-    def rms(self, w, x, y, d, eps):
+    def rms(self, w, x, y, d, eps, xoff=0):
         o, _ = self.cb.add("if", d, eps)
         r = BUFFER_SLOTS["dsv4_rms_k"]
         return self._pi(
             "dsv4_rms_k", True,
-            [(self.S[x], r["x"]), (self.t.add(w), r["w"]), (self.S[y], r["y"])],
+            [(self.S[x], r["x"], xoff), (self.t.add(w), r["w"]), (self.S[y], r["y"])],
             [(o, 4, r["params"]), (o + 4, 4, r["feps"])], (1, 1, 1), (256, 1, 1))
 
     def hc_pre(self, h, fn, scale, base, x, post, comb, hc, hidden, iters, eps, hc_eps):
@@ -100,7 +100,8 @@ class Planner:
 
 
 def plan_compressor(pl: Planner, comp, freqs, kv_src: str, sc_src: str,
-                    cache: dict, ioff_off: int, n: int) -> list:
+                    cache: dict, ioff_off: int, n: int,
+                    kv_off: int = 0, sc_off: int = 0) -> list:
     """Compressor decode step (dsv4_comp_step). ``kv_src``/``sc_src`` are the
     scratch slots holding comp.wkv/comp.wgate outputs; ``cache`` names the
     per-layer state slots (kv_st, sc_st, kv_st2, sc_st2, buf, buf2, row).
@@ -115,7 +116,7 @@ def plan_compressor(pl: Planner, comp, freqs, kv_src: str, sc_src: str,
     row_off = n * d * 2  # bf16 buf row stride
     return [pl._pi(
         "dsv4_comp_step", True,
-        [(pl.S[kv_src], cs["kv_row"]), (pl.S[sc_src], cs["sc_row"]),
+        [(pl.S[kv_src], cs["kv_row"], kv_off), (pl.S[sc_src], cs["sc_row"], sc_off),
          (pl.S[cache["kv_st"]], cs["kv_st"]), (pl.S[cache["sc_st"]], cs["sc_st"]),
          (pl.t.add(comp.ape), cs["ape"]), (pl.t.add(comp.norm.weight), cs["nw"]),
          (pl.t.add(freqs), cs["freqs"]),
@@ -126,24 +127,23 @@ def plan_compressor(pl: Planner, comp, freqs, kv_src: str, sc_src: str,
 
 
 def plan_indexer(pl: Planner, idxr, freqs, xin: str, qr: str, idx_cache: dict,
-                 ioff_off: int, n: int, ncomp: int) -> list:
-    """DSA indexer: its own comp step + wq_b/weights_proj qmv + score/top-k ->
-    cidx (scratch['cidx']). idx_cache names the indexer's compressor state
-    slots (i_kv_st, i_sc_st, i_kv_st2, i_sc_st2, i_buf) and its scratch
-    (i_ckv, i_cwg, iq, iw). cidx indexes the MAIN compressor's groups (aligned
-    by position). ncomp = visible groups."""
+                 ioff_off: int, n: int, ncomp: int,
+                 iw_off: int, ickv_off: int, icwg_off: int) -> list:
+    """DSA indexer: comp step + wq_b qmv + score/top-k -> cidx
+    (scratch['cidx']). Its x-projections (weights_proj, its compressor's
+    wkv/wgate) arrive PRE-COMPUTED in scratch['xall'] at byte offsets
+    iw_off/ickv_off/icwg_off (the stacked x-projection — see plan_attention);
+    only wq_b (whose input is qr, not x) dispatches here. idx_cache names the
+    indexer's compressor state slots. cidx indexes the MAIN compressor's
+    groups (aligned by position). ncomp = visible groups."""
     hd, rd, n_h = idxr.head_dim, idxr.rope_dim, idxr.n_heads
-    hidden = idxr.weights_proj.scales.shape[1] * idxr.weights_proj.group_size
     q_lora = idxr.wq_b.scales.shape[1] * idxr.wq_b.group_size
-    cd = idxr.compressor.coff * hd
     items = [
-        pl.qmv(idxr.compressor.wkv, xin, "i_ckv", hidden, cd),
-        pl.qmv(idxr.compressor.wgate, xin, "i_cwg", hidden, cd),
-        pl.qmv(idxr.weights_proj, xin, "iw", hidden, n_h),
         pl.qmv(idxr.wq_b, qr, "iq", q_lora, n_h * hd),
     ]
-    items += plan_compressor(pl, idxr.compressor, freqs, "i_ckv", "i_cwg",
-                             idx_cache, ioff_off, n)
+    items += plan_compressor(pl, idxr.compressor, freqs, "xall", "xall",
+                             idx_cache, ioff_off, n,
+                             kv_off=ickv_off, sc_off=icwg_off)
     isk, itk = BUFFER_SLOTS["dsv4_idx_score_k"], BUFFER_SLOTS["dsv4_idx_topk_k"]
     cap = 256
     sp, _ = pl.cb.add("4i", n_h, hd, rd, cap)
@@ -152,7 +152,8 @@ def plan_indexer(pl: Planner, idxr, freqs, xin: str, qr: str, idx_cache: dict,
     items.append(pl._pi(
         "dsv4_idx_score_k", True,
         [(pl.S["iq"], isk["q"]), (pl.S[idx_cache["i_buf"]], isk["buf"]),
-         (pl.S["iw"], isk["w"]), (pl.t.add(freqs), isk["freqs"]), (pl.S["scores"], isk["scores"])],
+         (pl.S["xall"], isk["w"], iw_off), (pl.t.add(freqs), isk["freqs"]),
+         (pl.S["scores"], isk["scores"])],
         [(sp, 16, isk["params"]), (sf, 4, isk["fscal"]), (ioff_off, 8, isk["ioff"])],
         (cap, 1, 1), (256, 1, 1)))
     items.append(pl._pi(
@@ -169,31 +170,44 @@ def plan_attention(pl: Planner, attn, xin: str, ring: str, out: str,
     Dense (comp_cache is None) or plain-compressed (ratio-128: comp_cache
     names the compressor state slots, ncomp = visible compressed groups).
     Indexer (ratio-4) layers are not yet wired here."""
+    import types
+
     a = attn
     H, D, g = a.n_heads, a.head_dim, a.n_groups
     NHD, gin, o_lora, win = H * D, (H * D) // g, a.wo_a.weight.shape[1], a.window
     hidden = a.wq_a.scales.shape[1] * a.wq_a.group_size
     q_lora = a.wq_b.scales.shape[1] * a.wq_b.group_size
+    # ONE stacked qmv for every projection of x (wq_a, wkv, comp wkv/wgate,
+    # indexer weights_proj + its comp wkv/wgate) into scratch['xall'];
+    # consumers read their slice at a byte offset. Reuses the model's lazily
+    # concatenated _x_stack (identical numerics, stable array identity for the
+    # buffer table). Saves up to 6 dispatches/layer over separate qmv.
+    st = a._x_stack()
+    assert st[0] == "q", "native plan requires the quantized build"
+    _, sqw, ssc, sbs, _gs, _bits, sizes = st
+    shim = types.SimpleNamespace(weight=sqw, scales=ssc, biases=sbs)
+    offs, acc = [], 0
+    for sz in sizes:
+        offs.append(acc * 2)  # bf16 bytes
+        acc += sz
     items = [
-        pl.qmv(a.wq_a, xin, "xp0", hidden, q_lora),
-        pl.rms(a.q_norm.weight, "xp0", "qr", q_lora, a.eps),
+        pl.qmv(shim, xin, "xall", hidden, acc),
+        pl.rms(a.q_norm.weight, "xall", "qr", q_lora, a.eps, xoff=offs[0]),
         pl.qmv(a.wq_b, "qr", "q_raw", q_lora, NHD),
-        pl.qmv(a.wkv, xin, "xp1", hidden, D),
-        pl.rms(a.kv_norm.weight, "xp1", "kvn", D, a.eps),
+        pl.rms(a.kv_norm.weight, "xall", "kvn", D, a.eps, xoff=offs[1]),
     ]
     kc, plain = 0, 1
     comp_slot, cidx_slot = "dummy", "dummy_idx"
     if idx_cache is not None:               # ratio-4: indexer selects groups
         items += plan_indexer(pl, a.indexer, a._freqs, xin, "qr", idx_cache,
-                              ioff_off, n, ncomp)
+                              ioff_off, n, ncomp,
+                              iw_off=offs[4], ickv_off=offs[5], icwg_off=offs[6])
         cidx_slot = "cidx"
         plain = 0
     if comp_cache is not None:
-        cd = a.compressor.coff * D
-        items.append(pl.qmv(a.compressor.wkv, xin, "cwkv", hidden, cd))
-        items.append(pl.qmv(a.compressor.wgate, xin, "cwgate", hidden, cd))
-        items += plan_compressor(pl, a.compressor, a._freqs, "cwkv", "cwgate",
-                                 comp_cache, ioff_off, n)
+        items += plan_compressor(pl, a.compressor, a._freqs, "xall", "xall",
+                                 comp_cache, ioff_off, n,
+                                 kv_off=offs[2], sc_off=offs[3])
         comp_slot = comp_cache["buf"]
         # plain layers: kc = visible groups; indexer layers: kc = topk width.
         kc = a.indexer.topk if idx_cache is not None else ncomp

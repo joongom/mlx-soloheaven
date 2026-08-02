@@ -294,11 +294,13 @@ def plan_head(pl: Planner, model, hin: str, logits: str, hc: int, hidden: int,
 
 
 def plan_block(pl: Planner, blk, hin: str, ring: str, hout: str, ioff_off: int,
-               topk: int, rscale: float, limit: float) -> list:
-    """A full dense Block: hc_pre/attn_norm/attention/hc_post, then
-    hc_pre/ffn_norm/MoE/hc_post. scratch[hin] in, scratch[hout] out.
-    scratch also needs: hx, post, comb, xn, attn_out, h1, moe_out, plus all
-    the attention and MoE scratch names."""
+               topk: int, rscale: float, limit: float, comp_cache: dict | None = None,
+               idx_cache: dict | None = None, ncomp: int = 0, n: int = 0) -> list:
+    """A full Block: hc_pre/attn_norm/attention/hc_post, then
+    hc_pre/ffn_norm/MoE/hc_post. scratch[hin] in, scratch[hout] out. Dense when
+    comp_cache is None; plain-compressed (comp_cache) or ratio-4 (comp_cache +
+    idx_cache) otherwise — the driver passes the layer's cache slot names and
+    its current group count n."""
     hc = blk.hc
     hidden = blk.attn.wq_a.scales.shape[1] * blk.attn.wq_a.group_size
     items = []
@@ -306,7 +308,8 @@ def plan_block(pl: Planner, blk, hin: str, ring: str, hout: str, ioff_off: int,
                            blk.hc_attn_base, "hx", "post", "comb", hc, hidden,
                            blk.iters, blk.eps, blk.hc_eps))
     items.append(pl.rms(blk.attn_norm.weight, "hx", "xn", hidden, blk.eps))
-    items += plan_attention(pl, blk.attn, "xn", ring, "attn_out", ioff_off)
+    items += plan_attention(pl, blk.attn, "xn", ring, "attn_out", ioff_off,
+                            comp_cache=comp_cache, ncomp=ncomp, n=n, idx_cache=idx_cache)
     items.append(pl.hc_post("attn_out", hin, "post", "comb", "h1", hc, hidden))
     items.append(pl.hc_pre("h1", blk.hc_ffn_fn.reshape(-1), blk.hc_ffn_scale,
                            blk.hc_ffn_base, "hx", "post", "comb", hc, hidden,

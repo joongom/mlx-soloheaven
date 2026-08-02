@@ -113,10 +113,19 @@ step unless profiling later demands it) owning:
       STILL TODO: wire the indexer dispatches (its own comp step +
       wq_b/weights_proj qmv + these two kernels) into plan_attention for
       ratio-4, then diff a ratio-4 Block.
-   b. real-Model driver: a NativeDecoder holding the Runtime, a session
-      BufferTable built from the loaded model's weights + a DeepSeekV4Cache's
-      ring/compressor buffers, the scratch, and a prebuilt plan; per token
-      write (token, offset) into the uniform buffer and commit.
+   b. IN PROGRESS: NativeDecoder (native/decoder.py) — builds the session
+      buffer table (all weights + per-layer ring/compressor/indexer cache at
+      fixed capacity) + scratch, and per token re-encodes the full plan
+      (embed + N plan_blocks + head) with current offset/group-counts,
+      commits, returns logits. WORKS for a dense multi-layer model and for
+      single compressed layers (argmax matches, tight median). BUG (xfail
+      test_native_decoder_full_model_matches_reference): a ratio-128 layer in
+      a NON-FIRST position NaNs — the per-layer compressor cache double-buffer
+      orientation (_cache_dicts parity) or the h ping-pong is mis-wired across
+      layers. IMPORTANT FIX ALREADY IN: mx `arr[:] = ...` does NOT propagate
+      to a registered MTLBuffer (it allocates a new buffer); seed via
+      buffer_contents + memmove (set_ring). Next: isolate the ratio-128
+      non-first-layer NaN, then the real 88 GB model + bench.
    c. integrate as a third path in Model.__call__ behind
       SOLOHEAVEN_DSV4_NATIVE=1 (after the compiled path), eager fallback kept.
    d. bench decode tok/s vs the 12 tok/s compiled path; target >=25.

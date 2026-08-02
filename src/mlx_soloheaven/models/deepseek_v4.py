@@ -2110,7 +2110,39 @@ _EMBED_SRC = """
     float sc = float(scales[(uint)token * (hidden / 64) + tid / 64]);
     float bi = float(biases[(uint)token * (hidden / 64) + tid / 64]);
     float v = float((word >> (8 * (tid % 4))) & 0xFFu) * sc + bi;
-    for (int s = 0; s < hc; ++s) h[s * hidden + tid] = T(v);
+    for (int s = 0; s < hc; ++s) h[s * hidden + tid] = HCSTORE(v);
+"""
+
+#: RMS-norm reading an FP32 stream and emitting BOTH the bf16 vector the
+#: library qmv consumes and an fp32 copy. The fp32 copy exists for the MoE
+#: gate: expert selection is the decode path's only DISCRETE decision, and a
+#: bf16 last bit in its input flips near-tied experts (measured: one flipped
+#: expert of six moved a block's output by 5% — Stage 4c). Scoring on fp32
+#: makes the choice track the unquantized model instead of a rounding.
+_RMS32_SRC = """
+    uint tid = thread_position_in_threadgroup.x;
+    const int TG = 256;
+    const int d = params[0];
+    const float eps = feps[0];
+    threadgroup float red[8];
+    threadgroup float rn[1];
+    float acc = 0.0f;
+    for (int i = tid; i < d; i += TG) { float v = float(x[i]); acc += v * v; }
+    acc = simd_sum(acc);
+    if ((tid & 31u) == 0) red[tid / 32] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float t = 0.0f;
+        for (int i = 0; i < TG / 32; ++i) t += red[i];
+        rn[0] = rsqrt(t / d + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float r = rn[0];
+    for (int i = tid; i < d; i += TG) {
+        float v = float(x[i]) * r * float(w[i]);
+        y[i] = T(v);
+        y32[i] = v;
+    }
 """
 
 _HC_HEAD_SRC = """
@@ -2437,7 +2469,7 @@ _HC_PRE_SRC = """
     for (int i = tid; i < d; i += TG) {
         float a = 0.0f;
         for (int j = 0; j < hcn; ++j) a += pc[j] * float(h[j * d + i]);
-        y[i] = T(a);
+        y[i] = HCSTORE(a);
     }
 """
 
@@ -2460,10 +2492,10 @@ _HC_POST2_SRC = """
     const int lo = part * chunk;
     const int hi = min(lo + chunk, d);
     for (int i = lo + (int)tid; i < hi; i += TG) {
-        float xv = float(T(float(a[i]) + float(b[i])));
+        float xv = float(a[i]) + float(b[i]);
         float acc = post[hc_] * xv;
         for (int j = 0; j < hcn; ++j) acc += comb[hc_ * hcn + j] * float(residual[j * d + i]);
-        y[hc_ * d + i] = T(acc);
+        y[hc_ * d + i] = HCSTORE(acc);
     }
 """
 
@@ -2485,7 +2517,7 @@ _HC_POST_SRC = """
     for (int i = lo + (int)tid; i < hi; i += TG) {
         float a = post[hc_] * float(x[i]);
         for (int j = 0; j < hcn; ++j) a += comb[hc_ * hcn + j] * float(residual[j * d + i]);
-        y[hc_ * d + i] = T(a);
+        y[hc_ * d + i] = HCSTORE(a);
     }
 """
 
@@ -2497,17 +2529,23 @@ def _get_hc_kernels():
     if _hc_kernels is None:
         # NOTE: _HC_PRE_SRC now consumes precomputed raw mixes (fn.h dots from
         # _HC_MIX_SRC) — the twin's inputs must match the body's buffer names.
+        # HCSTORE: the HC residual streams are FP32 in the native replay path
+        # (Stage 4c) and bf16 here, and the kernel bodies are shared verbatim —
+        # so the store rounds only in this instantiation.
+        hdr = "#define HCSTORE(v) T(v)\n"
         pre = mx.fast.metal_kernel(
             name="dsv4_hc_pre_k",
             input_names=["h", "mixes", "scale", "base", "params", "feps", "iters"],
             output_names=["y", "post", "comb"],
             source=_HC_PRE_SRC,
+            header=hdr,
         )
         post = mx.fast.metal_kernel(
             name="dsv4_hc_post_k",
             input_names=["x", "residual", "post", "comb", "params"],
             output_names=["y"],
             source=_HC_POST_SRC,
+            header=hdr,
         )
         _hc_kernels = (pre, post)
     return _hc_kernels

@@ -56,6 +56,18 @@ class Planner:
              (self.t.add(mod.biases), 2, b_off), (self.S[x], 3, xoff), (self.S[y], 4, yoff)],
             [(ko, 4, 5), (ko + 4, 4, 6)], (1, (N + 7) // 8, 1), (32, 2, 1))
 
+    def rms32(self, w, x, y, y32, d, eps):
+        """RMS over an FP32 stream, emitting the bf16 vector the qmv consumes
+        AND an fp32 copy for the MoE gate (whose expert pick is the decode
+        path's only discrete decision — see _RMS32_SRC)."""
+        o, _ = self.cb.add("if", d, eps)
+        r = BUFFER_SLOTS["dsv4_rms32_k"]
+        return self._pi(
+            "dsv4_rms32_k", True,
+            [(self.S[x], r["x"]), (self.t.add(w), r["w"]), (self.S[y], r["y"]),
+             (self.S[y32], r["y32"])],
+            [(o, 4, r["params"]), (o + 4, 4, r["feps"])], (1, 1, 1), (256, 1, 1))
+
     def rms(self, w, x, y, d, eps, xoff=0):
         o, _ = self.cb.add("if", d, eps)
         r = BUFFER_SLOTS["dsv4_rms_k"]
@@ -270,7 +282,7 @@ def plan_moe(pl: Planner, ffn, xin: str, out: str, topk: int, rscale: float,
         gh = BUFFER_SLOTS["dsv4_gate_hash_k"]
         items.append(pl._pi(
             "dsv4_gate_hash_k", True,
-            [(pl.S[xin], gh["x"]), (pl.t.add(ffn.gate.weight), gh["weight"]),
+            [(pl.S["xn32"], gh["x"]), (pl.t.add(ffn.gate.weight), gh["weight"]),
              (pl.t.add(ffn.gate.tid2eid), gh["tid2eid"]),
              (pl.S["idx"], gh["out_idx"]), (pl.S["w"], gh["out_w"])],
             [(go, 12, gh["params"]), (go + 12, 4, gh["feps"]), (tok_off, 4, gh["ioff"])],
@@ -281,7 +293,7 @@ def plan_moe(pl: Planner, ffn, xin: str, out: str, topk: int, rscale: float,
         gs = BUFFER_SLOTS["dsv4_gate_score_k"]
         items.append(pl._pi(
             "dsv4_gate_score_k", True,
-            [(pl.S[xin], gs["x"]), (pl.t.add(ffn.gate.weight), gs["weight"]),
+            [(pl.S["xn32"], gs["x"]), (pl.t.add(ffn.gate.weight), gs["weight"]),
              (pl.S["scores"], gs["scores"])],
             [(go, 8, gs["params"])], (n_exp, 1, 1), (256, 1, 1)))
         gt = BUFFER_SLOTS["dsv4_gate_topk_k"]
@@ -373,14 +385,14 @@ def plan_block(pl: Planner, blk, hin: str, ring: str, hout: str, ioff_off: int,
     items += pl.hc_pre(hin, blk.hc_attn_fn.reshape(-1), blk.hc_attn_scale,
                        blk.hc_attn_base, "hx", "post", "comb", hc, hidden,
                        blk.iters, blk.eps, blk.hc_eps)
-    items.append(pl.rms(blk.attn_norm.weight, "hx", "xn", hidden, blk.eps))
+    items.append(pl.rms32(blk.attn_norm.weight, "hx", "xn", "xn32", hidden, blk.eps))
     items += plan_attention(pl, blk.attn, "xn", ring, "attn_out", ioff_off,
                             comp_cache=comp_cache, ncomp=ncomp, n=n, idx_cache=idx_cache)
     items.append(pl.hc_post("attn_out", hin, "post", "comb", "h1", hc, hidden))
     items += pl.hc_pre("h1", blk.hc_ffn_fn.reshape(-1), blk.hc_ffn_scale,
                        blk.hc_ffn_base, "hx", "post", "comb", hc, hidden,
                        blk.iters, blk.eps, blk.hc_eps)
-    items.append(pl.rms(blk.ffn_norm.weight, "hx", "xn", hidden, blk.eps))
+    items.append(pl.rms32(blk.ffn_norm.weight, "hx", "xn", "xn32", hidden, blk.eps))
     items += plan_moe(pl, blk.ffn, "xn", "moe_out", topk, rscale, limit, tok_off)
     items.append(pl.hc_post2("y_routed", "shared", "h1", "post", "comb", hout, hc, hidden))
     return items

@@ -78,32 +78,37 @@ _SPECS = {
     "dsv4_embed_k": (
         "_EMBED_SRC",
         [("weight", _U), ("scales", _B), ("biases", _B), ("params", _I),
-         ("ioff", _I), ("h", "device bfloat*")],
+         ("ioff", _I), ("h", "device float*")],
     ),
     "dsv4_hc_head_k": (
         "_HC_HEAD_SRC",
-        [("h", _B), ("fn", _F), ("scale", _F), ("base", _F), ("params", _I),
+        [("h", _F), ("fn", _F), ("scale", _F), ("base", _F), ("params", _I),
          ("feps", _F), ("y", "device bfloat*")],
     ),
     "dsv4_gate_k": (
         "_GATE_SRC",
-        [("x", _B), ("weight", _B), ("bias", _F), ("params", _I), ("feps", _F),
+        [("x", _F), ("weight", _B), ("bias", _F), ("params", _I), ("feps", _F),
          ("scores", "device float*"), ("out_idx", "device int*"),
          ("out_w", "device float*")],
     ),
     "dsv4_gate_hash_k": (
         "_GATE_HASH_SRC",
-        [("x", _B), ("weight", _B), ("tid2eid", _I), ("params", _I), ("feps", _F),
+        [("x", _F), ("weight", _B), ("tid2eid", _I), ("params", _I), ("feps", _F),
          ("ioff", _I), ("out_idx", "device int*"), ("out_w", "device float*")],
     ),
     "dsv4_gate_score_k": (
         "_GATE_SCORE_SRC",
-        [("x", _B), ("weight", _B), ("params", _I), ("scores", "device float*")],
+        [("x", _F), ("weight", _B), ("params", _I), ("scores", "device float*")],
     ),
     "dsv4_gate_topk_k": (
         "_GATE_TOPK_SRC",
         [("scores", _F), ("bias", _F), ("params", _I), ("feps", _F),
          ("out_idx", "device int*"), ("out_w", "device float*")],
+    ),
+    "dsv4_rms32_k": (
+        "_RMS32_SRC",
+        [("x", _F), ("w", _B), ("params", _I), ("feps", _F),
+         ("y", "device bfloat*"), ("y32", "device float*")],
     ),
     "dsv4_rms_k": (
         "_RMS_SRC",
@@ -112,23 +117,23 @@ _SPECS = {
     ),
     "dsv4_hc_mix_k": (
         "_HC_MIX_SRC",
-        [("h", _B), ("fn", _F), ("params", _I), ("mixes", "device float*")],
+        [("h", _F), ("fn", _F), ("params", _I), ("mixes", "device float*")],
     ),
     "dsv4_hc_pre_k": (
         "_HC_PRE_SRC",
-        [("h", _B), ("mixes", _F), ("scale", _F), ("base", _F), ("params", _I),
-         ("feps", _F), ("iters", _I), ("y", "device bfloat*"),
+        [("h", _F), ("mixes", _F), ("scale", _F), ("base", _F), ("params", _I),
+         ("feps", _F), ("iters", _I), ("y", "device float*"),
          ("post", "device float*"), ("comb", "device float*")],
     ),
     "dsv4_hc_post_k": (
         "_HC_POST_SRC",
-        [("x", _B), ("residual", _B), ("post", _F), ("comb", _F), ("params", _I),
-         ("y", "device bfloat*")],
+        [("x", _B), ("residual", _F), ("post", _F), ("comb", _F), ("params", _I),
+         ("y", "device float*")],
     ),
     "dsv4_hc_post2_k": (
         "_HC_POST2_SRC",
-        [("a", _F), ("b", _B), ("residual", _B), ("post", _F), ("comb", _F),
-         ("params", _I), ("y", "device bfloat*")],
+        [("a", _F), ("b", _B), ("residual", _F), ("post", _F), ("comb", _F),
+         ("params", _I), ("y", "device float*")],
     ),
     "dsv4_comp_step": (
         "_COMP_STEP_SRC",
@@ -157,6 +162,7 @@ def _wrap(name: str, body: str, bufs: list[tuple[str, str]]) -> str:
         f"kernel void {name}(\n"
         + ",\n".join(args)
         + ")\n{\n    typedef bfloat T;\n"
+        + "#define HCSTORE(v) (v)\n"   # HC streams are fp32 here (Stage 4c)
         + body
         + "\n}\n"
     )

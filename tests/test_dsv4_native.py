@@ -334,7 +334,7 @@ def test_native_gate_and_rms_match_reference():
 
     n_exp, dim, topk, rscale = 32, 256, 6, 1.5
     rng = np.random.default_rng(3)
-    x = mx.array(rng.standard_normal((dim,)).astype(np.float32)).astype(mx.bfloat16)
+    x = mx.array(rng.standard_normal((dim,)).astype(np.float32))
     weight = mx.array(rng.standard_normal((n_exp, dim)).astype(np.float32) * 0.1).astype(mx.bfloat16)
     bias = mx.array(rng.standard_normal(n_exp).astype(np.float32)).astype(mx.float32)
     scores_ref = sqrtsoftplus(x.astype(mx.float32)[None] @ weight.T.astype(mx.float32))
@@ -372,16 +372,17 @@ def test_native_gate_and_rms_match_reference():
     rw = dict(zip(np.array(iref)[0].tolist(), np.array(wref)[0].tolist()))
     assert all(abs(gw[k] - rw[k]) < 1e-3 for k in rw)
 
-    # rms
+    # rms — dsv4_rms_k reads a BF16 vector (the gate above reads the fp32 copy)
+    xb = x.astype(mx.bfloat16)
     w = mx.array(rng.standard_normal(dim).astype(np.float32)).astype(mx.bfloat16)
     y = mx.zeros((dim,), dtype=mx.bfloat16)
-    xf = x.astype(mx.float32)
+    xf = xb.astype(mx.float32)
     yr = (xf * mx.rsqrt((xf ** 2).mean() + 1e-6) * w.astype(mx.float32))
-    mx.eval(w, y, yr)
+    mx.eval(xb, w, y, yr)
     mx.synchronize()
     t2 = rt_mod.BufferTable()
     rs = BUFFER_SLOTS["dsv4_rms_k"]
-    r = {nm: t2.add(a) for nm, a in [("x", x), ("w", w), ("y", y)]}
+    r = {nm: t2.add(a) for nm, a in [("x", xb), ("w", w), ("y", y)]}
     const2 = struct.pack("<if", dim, 1e-6)
     it2 = rt_mod.plan_item(
         _RT, "dsv4_rms_k", True,
@@ -403,7 +404,8 @@ def test_native_gate_split_matches_reference():
 
     n_exp, dim, topk, rscale = 32, 256, 6, 1.5
     rng = np.random.default_rng(7)
-    x = mx.array(rng.standard_normal((dim,)).astype(np.float32)).astype(mx.bfloat16)
+    # fp32 x: the gate reads the fp32 copy the hc norm emits (Stage 4c)
+    x = mx.array(rng.standard_normal((dim,)).astype(np.float32))
     weight = mx.array(rng.standard_normal((n_exp, dim)).astype(np.float32) * 0.1).astype(mx.bfloat16)
     bias = mx.array(rng.standard_normal(n_exp).astype(np.float32)).astype(mx.float32)
     scores_ref = sqrtsoftplus(x.astype(mx.float32)[None] @ weight.T.astype(mx.float32))
@@ -452,7 +454,7 @@ def test_native_gate_hash_matches_reference():
     n_exp, dim, topk, rscale, vocab = 32, 256, 6, 1.5, 40
     rng = np.random.default_rng(11)
     token = 17
-    x = mx.array(rng.standard_normal((dim,)).astype(np.float32)).astype(mx.bfloat16)
+    x = mx.array(rng.standard_normal((dim,)).astype(np.float32))
     weight = mx.array(rng.standard_normal((n_exp, dim)).astype(np.float32) * 0.1).astype(mx.bfloat16)
     tid2eid = mx.array(rng.integers(0, n_exp, size=(vocab, topk)).astype(np.int32))
 
@@ -492,12 +494,12 @@ def test_native_hc_pre_matches_reference():
     from mlx_soloheaven.native.kernels import BUFFER_SLOTS
 
     hc, d, iters = 4, 256, 20
-    h = mx.random.normal((1, 1, hc, d)).astype(mx.bfloat16)
+    h = mx.random.normal((1, 1, hc, d))          # fp32 residual stream
     fn = mx.random.normal((24, hc * d)).astype(mx.float32)
     scale = mx.random.normal((3,)).astype(mx.float32)
     base = mx.random.normal((24,)).astype(mx.float32)
     yref, pref, cref = _hc_pre_math(h, fn, scale, base, hc, iters, 1e-6, 1e-6)
-    y = mx.zeros((d,), dtype=mx.bfloat16)
+    y = mx.zeros((d,), dtype=mx.float32)
     post = mx.zeros((hc,), dtype=mx.float32)
     comb = mx.zeros((hc * hc,), dtype=mx.float32)
     mx.eval(h, fn, scale, base, yref, pref, cref, y, post, comb)
@@ -785,16 +787,17 @@ def test_native_full_model_logits_match_reference():
         return a
 
     block_scratch = dict(
-        hx=z(hidden), post=z(hc, mx.float32), comb=z(hc * hc, mx.float32), xn=z(hidden),
+        hx=z(hidden, mx.float32), xn32=z(hidden, mx.float32),
+        post=z(hc, mx.float32), comb=z(hc * hc, mx.float32), xn=z(hidden),
         hc_mixes=z((2 + hc) * hc, mx.float32),
         xall=z(8192), xp0=z(512), qr=z(512), q_raw=z(hidden * 2 // 2 * 2), xp1=z(D), kvn=z(D),
-        acore=z(2 * D), kv_roped=z(D), o_lora=z(2 * 512), attn_out=z(hidden), h1=z(hc * hidden),
+        acore=z(2 * D), kv_roped=z(D), o_lora=z(2 * 512), attn_out=z(hidden), h1=z(hc * hidden, mx.float32),
         scores=z(8, mx.float32), idx=mx.zeros((topk,), mx.int32), w=z(topk, mx.float32),
         hexp=z(topk * 512, mx.float32), y_routed=z(hidden, mx.float32), sg=z(512), su=z(512),
         sh=z(512), shared=z(hidden), moe_out=z(hidden), dummy=z(D),
         dummy_idx=mx.full((1,), -1, mx.int32), headx=z(hidden), headn=z(hidden),
     )
-    ha, hb = z(hc * hidden), z(hc * hidden)
+    ha, hb = z(hc * hidden, mx.float32), z(hc * hidden, mx.float32)
     logits = z(vocab)  # bf16: the head qmv writes bfloat16
     rings = [mx.array(r).reshape(-1) for r in ring_snap]
     all_arrays = dict(block_scratch, ha=ha, hb=hb, logits=logits)
@@ -1172,14 +1175,17 @@ def test_native_full_block_plan_matches_reference():
         return a
 
     scratch_arrays = dict(
-        hin=hval.reshape(-1), ring=ring0.astype(mx.float32).astype(mx.bfloat16).reshape(-1),
-        hx=z(hidden), post=z(hc, mx.float32), comb=z(hc * hc, mx.float32), xn=z(hidden),
+        hin=hval.astype(mx.float32).reshape(-1),   # fp32 stream, bf16 values
+        ring=ring0.astype(mx.float32).astype(mx.bfloat16).reshape(-1),
+        hx=z(hidden, mx.float32), xn32=z(hidden, mx.float32),
+        post=z(hc, mx.float32), comb=z(hc * hc, mx.float32), xn=z(hidden),
         hc_mixes=z((2 + hc) * hc, mx.float32),
         xall=z(8192), xp0=z(q_lora), qr=z(q_lora), q_raw=z(NHD), xp1=z(D), kvn=z(D), acore=z(NHD),
-        kv_roped=z(D), o_lora=z(g * o_lora), attn_out=z(hidden), h1=z(hc * hidden),
+        kv_roped=z(D), o_lora=z(g * o_lora), attn_out=z(hidden), h1=z(hc * hidden, mx.float32),
         scores=z(n_exp, mx.float32), idx=mx.zeros((topk,), mx.int32), w=z(topk, mx.float32),
         hexp=z(topk * inter, mx.float32), y_routed=z(hidden, mx.float32), sg=z(inter),
-        su=z(inter), sh=z(inter), shared=z(hidden), moe_out=z(hidden), hout=z(hc * hidden),
+        su=z(inter), sh=z(inter), shared=z(hidden), moe_out=z(hidden),
+        hout=z(hc * hidden, mx.float32),
         dummy=z(D), dummy_idx=mx.full((1,), -1, mx.int32),
     )
     mx.eval(*scratch_arrays.values())
@@ -1478,7 +1484,12 @@ def test_native_ffn_half_plan_matches_reference():
     hc, hidden, inter = args.hc_mult, 512, args.moe_intermediate_size
     n_exp, topk, limit = args.n_routed_experts, args.num_experts_per_tok, args.swiglu_limit
     rng = np.random.default_rng(7)
-    h = mx.array(rng.standard_normal((1, 1, hc, hidden)).astype(np.float32) * 0.3).astype(mx.bfloat16)
+    # the reference path runs in bf16 (as the compiled decode does); the native
+    # scratch holds the SAME values in the fp32 HC stream, so any diff below is
+    # internal precision, not a different input.
+    h = mx.array(rng.standard_normal((1, 1, hc, hidden)).astype(np.float32) * 0.3
+                 ).astype(mx.bfloat16)
+    h32 = h.astype(mx.float32)
     input_ids = mx.array([[0]], dtype=mx.int32)
 
     # reference FFN half
@@ -1500,11 +1511,13 @@ def test_native_ffn_half_plan_matches_reference():
         return a
 
     scratch = dict(
-        h=h.reshape(-1), x=z(hidden), post=z(hc, mx.float32), comb=z(hc * hc, mx.float32),
-        xn=z(hidden), scores=z(n_exp, mx.float32), idx=mx.zeros((topk,), mx.int32),
+        h=h32.reshape(-1), x=z(hidden, mx.float32), post=z(hc, mx.float32),
+        comb=z(hc * hc, mx.float32),
+        xn=z(hidden), xn32=z(hidden, mx.float32),
+        scores=z(n_exp, mx.float32), idx=mx.zeros((topk,), mx.int32),
         w=z(topk, mx.float32), hexp=z(topk * inter, mx.float32), y_routed=z(hidden, mx.float32),
         sg=z(inter), su=z(inter), sh=z(inter), shared=z(hidden), moe_out=z(hidden),
-        hout=z(hc * hidden), residual=h.reshape(-1),
+        hout=z(hc * hidden, mx.float32), residual=h32.reshape(-1),
         hc_mixes=z((2 + hc) * hc, mx.float32),
     )
     mx.eval(*scratch.values())
@@ -1540,17 +1553,18 @@ def test_native_ffn_half_plan_matches_reference():
         (1, 1, 1), (1024, 1, 1)))
     # ffn_norm rms
     ro, _ = cb.add("if", hidden, blk.eps)
-    rk = BUFFER_SLOTS["dsv4_rms_k"]
+    rk = BUFFER_SLOTS["dsv4_rms32_k"]
     items.append(rt_mod.plan_item(
-        _RT, "dsv4_rms_k", True,
-        [(S["x"], rk["x"]), (T.add(blk.ffn_norm.weight), rk["w"]), (S["xn"], rk["y"])],
+        _RT, "dsv4_rms32_k", True,
+        [(S["x"], rk["x"]), (T.add(blk.ffn_norm.weight), rk["w"]), (S["xn"], rk["y"]),
+         (S["xn32"], rk["y32"])],
         [(ro, 4, rk["params"]), (ro + 4, 4, rk["feps"])], (1, 1, 1), (256, 1, 1)))
     # gate
     gk = BUFFER_SLOTS["dsv4_gate_k"]
     go, _ = cb.add("iiif", n_exp, hidden, topk, args.routed_scaling_factor)
     items.append(rt_mod.plan_item(
         _RT, "dsv4_gate_k", True,
-        [(S["xn"], gk["x"]), (T.add(blk.ffn.gate.weight), gk["weight"]),
+        [(S["xn32"], gk["x"]), (T.add(blk.ffn.gate.weight), gk["weight"]),
          (T.add(blk.ffn.gate.bias), gk["bias"]), (S["scores"], gk["scores"]),
          (S["idx"], gk["out_idx"]), (S["w"], gk["out_w"])],
         [(go, 12, gk["params"]), (go + 12, 4, gk["feps"])], (1, 1, 1), (256, 1, 1)))

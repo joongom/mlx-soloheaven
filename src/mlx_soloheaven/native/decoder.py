@@ -92,6 +92,14 @@ class NativeDecoder:
             # read them until those writes have landed.
             mx.synchronize()
 
+    def _visible(self, lay: dict) -> int:
+        """Compressed groups this token may attend to = completed groups plus
+        the one this token itself completes (the reference's post-step `cn`)."""
+        r = lay["ratio"]
+        if not r:
+            return 0
+        return lay["n"] + (1 if (self.offset + 1) % r == 0 else 0)
+
     @staticmethod
     def _round_cap(ctx: int, ratio_min: int = 4, growth: int = 256) -> int:
         need = ctx // ratio_min
@@ -117,7 +125,12 @@ class NativeDecoder:
         q_lora, inter, ihd, i_nh = (a.q_lora_rank, a.moe_intermediate_size,
                                     a.index_head_dim, a.index_n_heads)
         s = dict(
-            ha=self._z(hc * hidden), hb=self._z(hc * hidden), hx=self._z(hidden),
+            # HC residual streams + the hc-norm input stay FP32: they are the
+            # only buffers a decode step accumulates across all 43 layers, and
+            # the bf16 write per half (86/token) both loses signal and flips
+            # near-tied MoE experts downstream (Stage 4c).
+            ha=self._z(hc * hidden, mx.float32), hb=self._z(hc * hidden, mx.float32),
+            hx=self._z(hidden, mx.float32), xn32=self._z(hidden, mx.float32),
             post=self._z(hc, mx.float32), comb=self._z(hc * hc, mx.float32), xn=self._z(hidden),
             hc_mixes=self._z((2 + hc) * hc, mx.float32),
             # xall: the stacked x-projection output, sized for the widest layer
@@ -125,7 +138,7 @@ class NativeDecoder:
             xall=self._z(q_lora + D + 4 * D + i_nh + 4 * ihd),
             xp0=self._z(q_lora), qr=self._z(q_lora), q_raw=self._z(NHD), xp1=self._z(D),
             kvn=self._z(D), acore=self._z(NHD), kv_roped=self._z(D), o_lora=self._z(NHD),
-            attn_out=self._z(hidden), h1=self._z(hc * hidden), scores=self._z(self._cap, mx.float32),
+            attn_out=self._z(hidden), h1=self._z(hc * hidden, mx.float32), scores=self._z(self._cap, mx.float32),
             idx=mx.zeros((self.topk,), mx.int32), w=self._z(self.topk, mx.float32),
             hexp=self._z(self.topk * inter, mx.float32), y_routed=self._z(hidden, mx.float32),
             sg=self._z(inter), su=self._z(inter), sh=self._z(inter), shared=self._z(hidden),
@@ -233,12 +246,21 @@ class NativeDecoder:
         for i, blk in enumerate(self.model.layers):
             lay = self._layers[i]
             comp, idx = self._cache_dicts(lay)
-            lioff, _ = cb.add("2i", self.offset, lay["n"])
+            # ioff[1] is the VISIBLE compressed-group count. The reference
+            # attends to the compressor's POST-step count (`ncomp = cn` in
+            # Attention.decode_step_math), so on a completion token the group
+            # this very token finished is visible — native passing the
+            # pre-step count silently dropped the newest (most relevant)
+            # summary every ratio-th token. It varies per token, so it is
+            # patched in decode() alongside the offset; only the structural
+            # bound below is baked.
+            lioff, _ = cb.add("2i", self.offset, self._visible(lay))
             self._ioff_offs.append(lioff)
             items += P.plan_block(pl, blk, cur, lay["ring"], nxt, lioff,
                                   self.topk, self.rscale, self.limit,
                                   comp_cache=comp, idx_cache=idx,
-                                  ncomp=lay["n"], n=lay["n"], tok_off=tok_off)
+                                  ncomp=lay["n"] + (1 if lay["ratio"] else 0),
+                                  n=lay["n"], tok_off=tok_off)
             cur, nxt = nxt, cur
         # after N layers the result is in `cur`; head reads it
         items += P.plan_head(pl, self.model, cur, "logits", self.hc, self.hidden, self.vocab)
@@ -264,8 +286,9 @@ class NativeDecoder:
             self._plan_cache[0] = cached
         items, blob, tok_off, ioff_offs = cached
         struct.pack_into("<i", blob, tok_off, int(token))
-        for off in ioff_offs:
-            struct.pack_into("<i", blob, off, int(self.offset))
+        for off, lay in zip(ioff_offs, self._layers):
+            struct.pack_into("<2i", blob, off, int(self.offset),
+                             self._visible(lay))
         self.rt.commit(items, self.table.ptrs, bytes(blob), wait=True)
         for lay in self._layers:
             if lay["ratio"]:

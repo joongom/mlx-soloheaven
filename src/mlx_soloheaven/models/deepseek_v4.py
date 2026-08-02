@@ -908,7 +908,16 @@ _ATTN_CORE_SRC = """
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (h_ == 0) {
-        for (int i = tid; i < D; i += TG) kv_out[i] = T(kvr[i]);
+        // The roped KV row IS this token's ring entry, so store it here rather
+        // than paying a separate dispatch (dsv4_ring_store_k, 43/token). Safe:
+        // the window loop below never reads slot offset%WIN — qpos == offset
+        // takes kvr directly — so no threadgroup can see a half-written slot.
+        // RING_WRITE is a no-op in the mx.fast twin, whose `ring` is a const
+        // input; the native wrapper defines it as the actual store.
+        for (int i = tid; i < D; i += TG) {
+            kv_out[i] = T(kvr[i]);
+            RING_WRITE(offset % WIN, i, T(kvr[i]));
+        }
     }
 
     // q: load head h, parameterless RMS over D, rope the tail
@@ -1158,6 +1167,7 @@ def _get_attn_core_kernel():
                          "params", "fscal", "ioff"],
             output_names=["out", "kv_out"],
             source=_ATTN_CORE_SRC,
+            header="#define RING_WRITE(s, i, v) ((void)0)\n",
         )
     return _attn_core_kernel
 

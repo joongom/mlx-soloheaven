@@ -236,11 +236,8 @@ def plan_attention(pl: Planner, attn, xin: str, ring: str, out: str,
         (H, 1, 1), (512, 1, 1)))
     rs = BUFFER_SLOTS["dsv4_ring_store_k"]
     rp, _ = pl.cb.add("ii", D, win)
-    items.append(pl._pi(
-        "dsv4_ring_store_k", True,
-        [(pl.S["kv_roped"], rs["src"]), (pl.S[ring], rs["ring"])],
-        [(rp, 8, rs["params"]), (ioff_off, 4, rs["ioff"])], (1, 1, 1), (256, 1, 1)))
-    # o_groups grouped 8-bit qmv as ONE dispatch (was g separate library qmv):
+    # the ring write now happens inside attn_core (Stage 4h)
+        # o_groups grouped 8-bit qmv as ONE dispatch (was g separate library qmv):
     # out[gi*o_lora+j] = deq(wo_a[gi,j]) . acore[gi*gin:], one simdgroup/row.
     wa = BUFFER_SLOTS["dsv4_wo_a_k"]
     wo, _ = pl.cb.add("3i", g, gin, o_lora)

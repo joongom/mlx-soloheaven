@@ -38,7 +38,8 @@ _SPECS = {
     ),
     "dsv4_attn_core": (
         "_ATTN_CORE_SRC",
-        [("q", _B), ("kv", _B), ("ring", _B), ("comp", _B), ("cidx", _I),
+        [("q", _B), ("kv", _B), ("ring", "device bfloat*"), ("comp", _B),
+         ("cidx", _I),
          ("sink", _F), ("freqs", _F), ("params", _I), ("fscal", _F),
          ("ioff", _I), ("out", "device bfloat*"), ("kv_out", "device bfloat*")],
     ),
@@ -157,6 +158,9 @@ def _wrap(name: str, body: str, bufs: list[tuple[str, str]]) -> str:
         f"kernel void {name}(\n"
         + ",\n".join(args)
         + ")\n{\n    typedef bfloat T;\n"
+        # attn_core folds the ring write in (Stage 4h); the mx.fast twin
+        # defines this away because its `ring` is a const input.
+        + "#define RING_WRITE(s, i, v) ring[(s) * D + (i)] = (v)\n"
         + body
         + "\n}\n"
     )

@@ -2279,40 +2279,51 @@ _HC_PRE_SRC = """
     for (int r = tid; r < mix; r += TG) mtg[r] = float(mixes[r]) * rms;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (tid == 0) {
-        for (int j = 0; j < hcn; ++j)
-            pc[j] = 1.0f / (1.0f + exp(-(mtg[j] * scale[0] + base[j]))) + hc_eps;
-        for (int j = 0; j < hcn; ++j)
-            pc[hcn + j] = 2.0f / (1.0f + exp(-(mtg[hcn + j] * scale[1] + base[hcn + j])));
-        float cb[16];
-        for (int j = 0; j < hcn * hcn; ++j)
-            cb[j] = mtg[2 * hcn + j] * scale[2] + base[2 * hcn + j];
-        for (int r = 0; r < hcn; ++r) {
-            float m = cb[r * hcn];
-            for (int c = 1; c < hcn; ++c) m = max(m, cb[r * hcn + c]);
-            float s = 0.0f;
-            for (int c = 0; c < hcn; ++c) { cb[r * hcn + c] = exp(cb[r * hcn + c] - m); s += cb[r * hcn + c]; }
-            for (int c = 0; c < hcn; ++c) cb[r * hcn + c] = cb[r * hcn + c] / s + hc_eps;
-        }
-        for (int c = 0; c < hcn; ++c) {
-            float s = 0.0f;
-            for (int r = 0; r < hcn; ++r) s += cb[r * hcn + c];
-            for (int r = 0; r < hcn; ++r) cb[r * hcn + c] /= (s + hc_eps);
-        }
-        for (int it = 0; it < iters[0] - 1; ++it) {
-            for (int r = 0; r < hcn; ++r) {
-                float s = 0.0f;
-                for (int c = 0; c < hcn; ++c) s += cb[r * hcn + c];
-                for (int c = 0; c < hcn; ++c) cb[r * hcn + c] /= (s + hc_eps);
-            }
-            for (int c = 0; c < hcn; ++c) {
-                float s = 0.0f;
-                for (int r = 0; r < hcn; ++r) s += cb[r * hcn + c];
-                for (int r = 0; r < hcn; ++r) cb[r * hcn + c] /= (s + hc_eps);
-            }
-        }
-        for (int j = 0; j < hcn * hcn; ++j) pc[2 * hcn + j] = cb[j];
+    // Gates + Sinkhorn, PARALLEL over rows/cols. The previous version ran the
+    // whole thing on tid 0 — ~640 serial iterations on one GPU thread, the same
+    // pathology the gate top-k had. Each row/col op keeps its serial inner
+    // order, so results are BIT-identical to the single-thread version.
+    threadgroup float cbtg[64];
+    if (tid < (uint)hcn) {
+        pc[tid] = 1.0f / (1.0f + exp(-(mtg[tid] * scale[0] + base[tid]))) + hc_eps;
+        pc[hcn + tid] = 2.0f / (1.0f + exp(-(mtg[hcn + tid] * scale[1] + base[hcn + tid])));
     }
+    if (tid < (uint)(hcn * hcn))
+        cbtg[tid] = mtg[2 * hcn + tid] * scale[2] + base[2 * hcn + tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < (uint)hcn) {              // row softmax (+ hc_eps)
+        int r = tid;
+        float m = cbtg[r * hcn];
+        for (int c = 1; c < hcn; ++c) m = max(m, cbtg[r * hcn + c]);
+        float s = 0.0f;
+        for (int c = 0; c < hcn; ++c) { cbtg[r * hcn + c] = exp(cbtg[r * hcn + c] - m); s += cbtg[r * hcn + c]; }
+        for (int c = 0; c < hcn; ++c) cbtg[r * hcn + c] = cbtg[r * hcn + c] / s + hc_eps;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < (uint)hcn) {              // first column normalize
+        int c = tid;
+        float s = 0.0f;
+        for (int r = 0; r < hcn; ++r) s += cbtg[r * hcn + c];
+        for (int r = 0; r < hcn; ++r) cbtg[r * hcn + c] /= (s + hc_eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int it = 0; it < iters[0] - 1; ++it) {
+        if (tid < (uint)hcn) {          // row normalize
+            int r = tid;
+            float s = 0.0f;
+            for (int c = 0; c < hcn; ++c) s += cbtg[r * hcn + c];
+            for (int c = 0; c < hcn; ++c) cbtg[r * hcn + c] /= (s + hc_eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < (uint)hcn) {          // column normalize
+            int c = tid;
+            float s = 0.0f;
+            for (int r = 0; r < hcn; ++r) s += cbtg[r * hcn + c];
+            for (int r = 0; r < hcn; ++r) cbtg[r * hcn + c] /= (s + hc_eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid < (uint)(hcn * hcn)) pc[2 * hcn + tid] = cbtg[tid];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (int i = tid; i < d; i += TG) {

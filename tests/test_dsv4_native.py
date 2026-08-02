@@ -497,6 +497,43 @@ def test_native_moe_routed_chain_matches_mx_fast():
     assert np.abs(got - exp).max() < 2e-2, np.abs(got - exp).max()
 
 
+def test_native_ring_store_updates_one_slot_in_place():
+    """dsv4_ring_store_k writes the fresh KV into ring[offset % win] IN PLACE,
+    leaving every other slot untouched — the post-attention ring write of the
+    decode step. In-place is the point (ring is a session buffer), so this is
+    tested through the native path, not mx.fast."""
+    from mlx_soloheaven.native.kernels import BUFFER_SLOTS
+
+    D, win, offset = 64, 8, 20
+    slot = offset % win
+    rng = np.random.default_rng(2)
+    ring = mx.array(rng.standard_normal((win, D)).astype(np.float32)).astype(mx.bfloat16)
+    src = mx.array(rng.standard_normal(D).astype(np.float32)).astype(mx.bfloat16)
+    before = np.array(ring.astype(mx.float32))
+    mx.eval(ring, src)
+    mx.synchronize()
+
+    rt_mod.load_custom_kernels(_RT)
+    table = rt_mod.BufferTable()
+    rs = BUFFER_SLOTS["dsv4_ring_store_k"]
+    s_src, s_ring = table.add(src), table.add(ring.reshape(-1))
+    const = struct.pack("<iii", D, win, offset)
+    it = rt_mod.plan_item(
+        _RT, "dsv4_ring_store_k", True,
+        [(s_src, rs["src"]), (s_ring, rs["ring"])],
+        [(0, 8, rs["params"]), (8, 4, rs["ioff"])],
+        (1, 1, 1), (256, 1, 1),
+    )
+    _RT.commit([it], table.ptrs, const, wait=True)
+
+    after = np.array(ring.astype(mx.float32))
+    # the target slot now equals src; every other slot is unchanged
+    assert np.abs(after[slot] - np.array(src.astype(mx.float32))).max() < 1e-3
+    for i in range(win):
+        if i != slot:
+            assert np.array_equal(after[i], before[i]), f"slot {i} changed"
+
+
 def test_native_qmv_into_attn_core_chain():
     """A MIXED chained plan: a LIBRARY qmv (wq_b: qr -> q_raw) feeds a CUSTOM
     kernel (attn_core) through an intermediate buffer, in one command buffer.

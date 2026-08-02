@@ -42,6 +42,10 @@ _SPECS = {
          ("sink", _F), ("freqs", _F), ("params", _I), ("fscal", _F),
          ("ioff", _I), ("out", "device bfloat*"), ("kv_out", "device bfloat*")],
     ),
+    "dsv4_ring_store_k": (
+        "_RING_STORE_SRC",
+        [("src", _B), ("params", _I), ("ioff", _I), ("ring", "device bfloat*")],
+    ),
     "dsv4_gate_k": (
         "_GATE_SRC",
         [("x", _B), ("weight", _B), ("bias", _F), ("params", _I), ("feps", _F),

@@ -1818,6 +1818,32 @@ _RMS_SRC = """
     for (int i = tid; i < d; i += TG) y[i] = T(float(x[i]) * r * float(w[i]));
 """
 
+_RING_STORE_SRC = """
+    // ring[(offset % win) * D + i] = src[i]  — the post-attention KV write.
+    uint tid = thread_position_in_threadgroup.x;
+    const int TG = 256;
+    const int D = params[0];
+    const int win = params[1];
+    const int slot = ioff[0] % win;
+    for (int i = tid; i < D; i += TG) ring[slot * D + i] = src[i];
+"""
+
+_misc_kernels = None
+
+
+def _get_misc_kernels():
+    global _misc_kernels
+    if _misc_kernels is None:
+        store = mx.fast.metal_kernel(
+            name="dsv4_ring_store_k",
+            input_names=["src", "params", "ioff"],
+            output_names=["ring"],
+            source=_RING_STORE_SRC,
+        )
+        _misc_kernels = (store,)
+    return _misc_kernels
+
+
 _gate_kernels = None
 
 

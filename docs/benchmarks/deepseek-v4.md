@@ -7,11 +7,17 @@ see the 0.53 tok/s entry below for why that rule exists.
 
 ## STATUS (2026-08-02, latest first)
 
-**Native replay decode: 36.9 ms / 27.1 tok/s, quality ppl 3.6516** (ko 6.52
-/ en 4.05 / code 1.46) — 2.0x the compiled path (74.3 ms), whose ppl on the
-same harness is 3.649. **The 27 tok/s goal is MET**; ds4 on this machine is
-27.34 tok/s (36.6 ms), so this is parity within 0.3 ms. Opt-in via
-`SOLOHEAVEN_NATIVE_DECODE=1`.
+**Native replay decode: 36.9 ms / 27.1 tok/s at a short prompt, quality ppl
+3.6516** (ko 6.52 / en 4.05 / code 1.46) — 2.0x the compiled path (74.3 ms),
+whose ppl on the same harness is 3.649. **The 27 tok/s goal is MET**; ds4 on
+this machine is 27.34 tok/s (36.6 ms), so this is parity within 0.3 ms.
+Opt-in via `SOLOHEAVEN_NATIVE_DECODE=1`.
+
+**Quote the context length with any decode number here.** Serving lives at
+thousands of tokens, and the numbers move: 43.4 ms at 1k, 52.7 ms at 2k,
+54.3 ms at 4k (compiled: 81 / 87 / 87). Native stays 1.6-1.9x ahead across
+that range — but only since Stage 4m, which found a 7x long-context
+regression that every short-prompt benchmark in this file had missed.
 
 Open work, in priority order:
 
@@ -1227,6 +1233,51 @@ it was noticing that a *serial prologue* forced a *shape*. Any kernel here
 that must reduce over its whole input before it can start is paying the
 same 1/64 tax. dsv4_hc_head_k (0.66 ms, one dispatch) has exactly that
 structure and is untouched.
+
+### Stage 4m — the long-context cliff: one kernel, 532x (2026-08-03)
+
+Reported from serving: a session that was fine multi-turn "suddenly" ran at
+**3 tok/s**. The log showed no fallback and no error, and a dead-constant
+382 ms/token over 900 tokens — too steady for paging or thermals.
+
+**Every decode number in this file before today was taken at an 8-token
+prompt.** Measuring the curve instead:
+
+| context | compiled | native (before) | native (after) |
+|---|---|---|---|
+| 256 | 78.1 ms | 40.4 | **40.5** |
+| 1024 | 81.0 ms | 43.8 | **43.4** |
+| 2048 | 87.0 ms | **380.2** | **52.7** |
+| 4096 | 87.2 ms | **381.2** | **54.3** |
+
+A cliff, not a curve, and native-only — the compiled path degrades gently
+across the same range, so it was ours, not the architecture. Per-kernel
+profiling at 1k vs 2.5k context named it in one run: `sh_dsv4_idx_topk_k`
+**0.63 -> 335.03 ms, x532**, with the other twenty kernels between x0.9 and
+x1.4.
+
+Cause: `index_topk` is 512 and the ratio-4 compressed group count is
+`offset/4`, so at 2048 tokens the indexer stops being able to select
+"everything" and takes its real top-k branch — a single-thread selection
+sort over the whole CAPACITY, O(cap*topk) = 8192*512 = 4.2M serial
+iterations per layer per token, with a `bool taken[1024]` scratch indexed to
+cap. 627 ms per dispatch at the deployed shape. The kernel comment said "a
+parallel rewrite is a follow-up if long contexts make this hot"; it was.
+
+Fixed with a threadgroup-wide threshold search (order-preserving float->uint
+key, 32 exact halvings, one parallel emit pass, deterministic tie top-up).
+
+**Two lessons, both general:**
+* **Benchmark the regime you serve.** An 8-token prompt exercised only the
+  fast path of a kernel that has two. Every headline number in this file was
+  honest and irrelevant to the failure. The decode table above is now part
+  of the reproduce steps.
+* **Correctness tests cannot see this class of bug.** The old kernel passed
+  the indexer test — it was *correct*, just 10,000x too slow, and the test
+  ran cap=6/topk=3 so it never reached the branch at scale. The new test
+  runs the deployed shape and carries a **time budget** (3 ms/dispatch; the
+  old code fails it at 627 ms). Where a kernel has a size-dependent
+  algorithm, assert the cost, not only the answer.
 
 ## 3. Reproduce
 

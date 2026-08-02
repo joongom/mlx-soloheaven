@@ -221,7 +221,7 @@ def plan_attention(pl: Planner, attn, xin: str, ring: str, out: str,
          (pl.t.add(a.attn_sink), ac["sink"]), (pl.t.add(a._freqs), ac["freqs"]),
          (pl.S["acore"], ac["out"]), (pl.S["kv_roped"], ac["kv_out"])],
         [(po, 20, ac["params"]), (fo, 8, ac["fscal"]), (ioff_off, 8, ac["ioff"])],
-        (H, 1, 1), (128, 1, 1)))
+        (H, 1, 1), (256, 1, 1)))
     rs = BUFFER_SLOTS["dsv4_ring_store_k"]
     rp, _ = pl.cb.add("ii", D, win)
     items.append(pl._pi(

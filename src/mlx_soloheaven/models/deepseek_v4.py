@@ -871,7 +871,8 @@ _ATTN_CORE_SRC = """
     // grid: one threadgroup (128 threads) per head; head h.
     uint h_ = threadgroup_position_in_grid.x;
     uint tid = thread_position_in_threadgroup.x;
-    const int TG = 128;
+    const int TG = 256;   // 64 heads x 128 = 8K threads underfilled the chip;
+                          // 512 exceeds this kernel's maxTotalThreadsPerThreadgroup
     const int D = params[0];        // head_dim (512)
     const int RD = params[1];       // rope dim (64)
     const int WIN = params[2];      // sliding window
@@ -1577,8 +1578,8 @@ class Attention(nn.Module):
                 mx.stack([offset.astype(mx.int32), ncomp.astype(mx.int32)]),
             ],
             template=[("T", q_raw.dtype)],
-            grid=(h * 128, 1, 1),
-            threadgroup=(128, 1, 1),
+            grid=(h * 256, 1, 1),
+            threadgroup=(256, 1, 1),
             output_shapes=[(h * d,), (d,)],
             output_dtypes=[q_raw.dtype, ring.dtype],
         )

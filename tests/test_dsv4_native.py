@@ -279,8 +279,8 @@ def test_native_attn_core_matches_mx_fast():
         inputs=[q.reshape(-1), kv.reshape(-1), ring.reshape(-1), comp.reshape(-1),
                 cidx.reshape(-1), sink, freqs, params, fscal, ioff],
         template=[("T", mx.bfloat16)],
-        grid=(H * 128, 1, 1),
-        threadgroup=(128, 1, 1),
+        grid=(H * 256, 1, 1),
+        threadgroup=(256, 1, 1),
         output_shapes=[(H * D,), (D,)],
         output_dtypes=[mx.bfloat16, mx.bfloat16],
     )
@@ -311,7 +311,7 @@ def test_native_attn_core_matches_mx_fast():
     it.bytes_off[1], it.bytes_len[1], it.bytes_slot[1] = 20, 8, smap["fscal"]
     it.bytes_off[2], it.bytes_len[2], it.bytes_slot[2] = 28, 8, smap["ioff"]
     it.grid[:] = [H, 1, 1]
-    it.group[:] = [128, 1, 1]
+    it.group[:] = [256, 1, 1]  # must match the kernel's compile-time TG
 
     const = struct.pack("<5i2f2i", D, RD, WIN, KC, 1, D ** -0.5, 1e-6, offset, ncomp)
     _RT.commit([it], table.ptrs, const, wait=True)
@@ -1238,7 +1238,7 @@ def test_native_qmv_into_attn_core_chain():
         inputs=[q_ref.reshape(-1), kv.reshape(-1), ring.reshape(-1),
                 dummy.reshape(-1), didx.reshape(-1), sink, freqs, params_a, fscal, ioff],
         template=[("T", mx.bfloat16)],
-        grid=(H * 128, 1, 1), threadgroup=(128, 1, 1),
+        grid=(H * 256, 1, 1), threadgroup=(256, 1, 1),
         output_shapes=[(NHD,), (D,)], output_dtypes=[mx.bfloat16, mx.bfloat16],
     )
 
@@ -1269,7 +1269,7 @@ def test_native_qmv_into_attn_core_chain():
          (s["dummy"], ac["comp"]), (s["didx"], ac["cidx"]), (s["sink"], ac["sink"]),
          (s["freqs"], ac["freqs"]), (s["out"], ac["out"]), (s["kvo"], ac["kv_out"])],
         [(8, 20, ac["params"]), (28, 8, ac["fscal"]), (36, 8, ac["ioff"])],
-        (H, 1, 1), (128, 1, 1),
+        (H, 1, 1), (256, 1, 1),
     )
     _RT.commit([qmv_item, core], table.ptrs, const, wait=True)
 
@@ -1383,7 +1383,7 @@ def test_native_dense_attention_plan_matches_reference():
          (S["dummy"], ac["comp"]), (S["dummy_idx"], ac["cidx"]), (S["sink"], ac["sink"]),
          (S["freqs"], ac["freqs"]), (S["out"], ac["out"]), (S["kv_roped"], ac["kv_out"])],
         [(po, 20, ac["params"]), (fo, 8, ac["fscal"]), (ioff_off, 8, ac["ioff"])],
-        (H, 1, 1), (128, 1, 1)))
+        (H, 1, 1), (256, 1, 1)))
 
     rs = BUFFER_SLOTS["dsv4_ring_store_k"]
     rpo, _ = cb.add("ii", D, win)

@@ -1830,32 +1830,55 @@ _GATE_TOPK_SRC = """
     const int topk = params[2];
     const float route_scale = feps[0];
 
-    // Stage scores+bias into threadgroup memory in parallel FIRST — the serial
-    // top-k below then never touches device memory. Reading device memory from
-    // the selection loop cost ~0.29 ms/dispatch (topk*n_exp = 1536 dependent
-    // device reads from a single thread); staged it is microseconds.
-    threadgroup float sc[512];
-    threadgroup float bs[512];
-    for (int e = tid; e < n_exp; e += TG) { sc[e] = scores[e]; bs[e] = bias[e]; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid != 0) return;
-    float wsum = 0.0f;
-    bool taken[512];
-    for (int e = 0; e < n_exp; ++e) taken[e] = false;
-    for (int k = 0; k < topk; ++k) {
-        int best = -1;
-        float bestv = -INFINITY;
-        for (int e = 0; e < n_exp; ++e) {
-            if (taken[e]) continue;
-            float v = sc[e] + bs[e];
-            if (v > bestv) { bestv = v; best = e; }
-        }
-        taken[best] = true;
-        out_idx[k] = best;
-        out_w[k] = sc[best];
-        wsum += sc[best];
+    // THREADGROUP-PARALLEL top-k: topk rounds of a cooperative argmax over the
+    // biased scores. A single-thread selection loop (even over staged
+    // threadgroup memory) cost ~0.27 ms/dispatch — one GPU thread running
+    // topk*n_exp serial iterations is the bottleneck itself, not the memory.
+    // Ties pick the lowest expert index (strict > in the reduction), matching
+    // the serial scan's order.
+    threadgroup float sc[512];      // unbiased scores (weights come from these)
+    threadgroup float sb[512];      // biased scores; -inf once taken
+    threadgroup float bv[256];
+    threadgroup int bi[256];
+    threadgroup float wsel[64];
+    threadgroup int isel[64];
+    for (int e = tid; e < n_exp; e += TG) {
+        float s = scores[e];
+        sc[e] = s;
+        sb[e] = s + bias[e];
     }
-    for (int k = 0; k < topk; ++k) out_w[k] = out_w[k] / wsum * route_scale;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int k = 0; k < topk; ++k) {
+        float mv = -INFINITY;
+        int mi = -1;
+        for (int e = tid; e < n_exp; e += TG) {
+            if (sb[e] > mv) { mv = sb[e]; mi = e; }
+        }
+        bv[tid] = mv;
+        bi[tid] = mi;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int s = TG / 2; s > 0; s >>= 1) {
+            if ((int)tid < s && bv[tid + s] > bv[tid]) {
+                bv[tid] = bv[tid + s];
+                bi[tid] = bi[tid + s];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0) {
+            isel[k] = bi[0];
+            wsel[k] = sc[bi[0]];
+            sb[bi[0]] = -INFINITY;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        float wsum = 0.0f;
+        for (int k = 0; k < topk; ++k) wsum += wsel[k];
+        for (int k = 0; k < topk; ++k) {
+            out_idx[k] = isel[k];
+            out_w[k] = wsel[k] / wsum * route_scale;
+        }
+    }
 """
 
 # Hash-routing gate (the first `num_hash_layers` layers): the topk experts come

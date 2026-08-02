@@ -587,6 +587,65 @@ class Compressor(nn.Module):
                 )
             )
 
+    def decode_step_math(
+        self,
+        x: mx.array,
+        kv_state: mx.array,
+        score_state: mx.array,
+        buf: mx.array,
+        n: mx.array,
+        offset: mx.array,
+        freqs: mx.array,
+    ) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+        """BRANCHLESS single-token compressor step for the compiled decode
+        path. ``offset``/``n`` are traced int32 scalars, so nothing here may
+        branch on their VALUES in Python — group completion is a ``where``
+        mask, and the output row is always written (with the OLD value when
+        the group is incomplete). This keeps one trace valid for every token;
+        a Python branch on offset would retrace per position.
+
+        Returns (kv_state, score_state, buf, new_n), all functionally updated.
+        """
+        ratio, d = self.ratio, self.head_dim
+        off_base = ratio if self.overlap else 0
+        filled = offset % ratio
+        kv1 = self.wkv(x).astype(mx.float32)[:, 0]
+        sc1 = self.wgate(x).astype(mx.float32)[:, 0] + mx.take(self.ape, filled, axis=0)
+        slot = off_base + filled
+        kv_state[:, slot] = kv1
+        score_state[:, slot] = sc1
+        complete = ((offset + 1) % ratio) == 0
+        if self.overlap:
+            ks = mx.concatenate(
+                [kv_state[:, :ratio, :d], kv_state[:, ratio:, d:]], axis=1
+            )
+            ss = mx.concatenate(
+                [score_state[:, :ratio, :d], score_state[:, ratio:, d:]], axis=1
+            )
+            pooled = (ks * mx.softmax(ss, axis=1)).sum(axis=1, keepdims=True)
+            kv_state = mx.concatenate(
+                [mx.where(complete, kv_state[:, ratio:], kv_state[:, :ratio]),
+                 kv_state[:, ratio:]],
+                axis=1,
+            )
+            score_state = mx.concatenate(
+                [mx.where(complete, score_state[:, ratio:], score_state[:, :ratio]),
+                 score_state[:, ratio:]],
+                axis=1,
+            )
+        else:
+            pooled = (kv_state * mx.softmax(score_state, axis=1)).sum(
+                axis=1, keepdims=True
+            )
+        g = self.norm(pooled.astype(x.dtype))
+        gpos = ((offset + 1) // ratio - 1).reshape(1)
+        cos, sin = rope_cos_sin(freqs * ratio, gpos)
+        tail = apply_interleaved_rope(g[..., -self.rope_dim :], cos, sin)
+        g = mx.concatenate([g[..., : -self.rope_dim], tail], axis=-1)
+        old = mx.take(buf, n, axis=1)
+        buf[:, n] = mx.where(complete, g[:, 0], old)
+        return kv_state, score_state, buf, n + complete.astype(n.dtype)
+
     def _pool_state(self, state: CompressorState) -> mx.array:
         """Pool the completed group held in ``state`` into one slot and (for
         overlap) shift the current group into the previous-group region."""
@@ -673,6 +732,32 @@ class Indexer(nn.Module):
         k = min(self.topk, g)
         idxs = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k].astype(mx.int32)
         return mx.where(idxs >= visible, MASKED_INDEX, idxs)
+
+    def decode_step_math(self, x, qr, kv_state, score_state, buf, n, offset, freqs):
+        """Branchless single-token DSA step for the compiled decode path.
+        Scores the FULL capacity buffer (invisible slots masked) so the trace
+        is capacity-keyed, not group-count-keyed."""
+        kv_state, score_state, buf, n2 = self.compressor.decode_step_math(
+            x, kv_state, score_state, buf, n, offset, freqs
+        )
+        rd = self.rope_dim
+        q = self.wq_b(qr).reshape(1, 1, self.n_heads, self.head_dim)
+        cos, sin = rope_cos_sin(freqs, offset.reshape(1))
+        tail = apply_interleaved_rope(q[..., -rd:], cos[:, None], sin[:, None])
+        q = mx.concatenate([q[..., :-rd], tail], axis=-1)
+        w = self.weights_proj(x).astype(mx.float32) * (
+            self.head_dim**-0.5 * self.n_heads**-0.5
+        )
+        cap = buf.shape[1]
+        scores = mx.einsum(
+            "bshd,bgd->bshg", q.astype(mx.float32), buf.astype(mx.float32)
+        )
+        scores = (mx.maximum(scores, 0) * w[..., None]).sum(axis=2)  # [1,1,cap]
+        scores = mx.where(mx.arange(cap) >= n2, -mx.inf, scores)
+        k = min(self.topk, cap)
+        idxs = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k].astype(mx.int32)
+        idxs = mx.where(idxs >= n2, MASKED_INDEX, idxs)
+        return idxs, kv_state, score_state, buf, n2
 
 
 # --- fused decode attention (Metal) ----------------------------------------
@@ -863,6 +948,93 @@ def sparse_attend(
     return _sparse_attend_eager(q, parts, attn_sink, scale)
 
 
+# --- whole-layer compiled decode (spec: decode-speed path 2) ----------------
+#
+# One mx.compile'd function per (layer, cache-capacity signature) covering the
+# ENTIRE decode step — HC pre, attention with cache updates, MoE, HC post —
+# so a token costs ~43 compiled-graph dispatches instead of thousands of eager
+# ones. State is threaded FUNCTIONALLY: cache arrays go in, updated arrays
+# come out, and the Python side commits them after all layers succeed. The
+# traced `offset`/`n` scalars keep one trace valid for every token; traces are
+# keyed only by the compressed-cache capacities (which step in 256-group
+# increments). Kill switch: SOLOHEAVEN_DSV4_COMPILE=0.
+
+
+_COMPILED_DECODE_BROKEN = False
+
+
+def _COMPILED_DECODE_ENABLED() -> bool:
+    return (
+        not _COMPILED_DECODE_BROKEN
+        and os.environ.get("SOLOHEAVEN_DSV4_COMPILE", "1") != "0"
+    )
+
+
+@functools.lru_cache(maxsize=4096)
+def _scalar_i32(v: int) -> mx.array:
+    return mx.array(v, dtype=mx.int32)
+
+
+def _ensure_comp_capacity(cs: CompressorState, comp: "Compressor", dtype) -> None:
+    """Decode-side capacity management, kept OUTSIDE the compiled function:
+    make sure the buffers exist and the output row `n` is writable. Growth
+    changes the buffer shape, which is exactly what re-keys the trace."""
+    if cs.kv_state is None:
+        cs.reset(1, comp.ratio, comp.coff, comp.head_dim)
+    if cs.cache is None:
+        cs.cache = mx.zeros((1, CompressorState.GROWTH, comp.head_dim), dtype=dtype)
+    elif cs.n >= cs.cache.shape[1]:
+        cs.cache = mx.concatenate(
+            [cs.cache,
+             mx.zeros((1, CompressorState.GROWTH, comp.head_dim), dtype=cs.cache.dtype)],
+            axis=1,
+        )
+
+
+def _pack_decode_state(c: DeepSeekV4Cache, layer) -> tuple:
+    attn = layer.attn
+    if c.ring is None:  # decode at offset>0 without prefill: restored state
+        c.ring = mx.zeros((1, attn.window, attn.head_dim), dtype=mx.bfloat16)
+    arrays = [c.ring]
+    if c.comp is not None:
+        _ensure_comp_capacity(c.comp, attn.compressor, c.ring.dtype)
+        arrays += [c.comp.kv_state, c.comp.score_state, c.comp.cache,
+                   _scalar_i32(c.comp.n)]
+    if c.idx is not None:
+        _ensure_comp_capacity(c.idx, attn.indexer.compressor, c.ring.dtype)
+        arrays += [c.idx.kv_state, c.idx.score_state, c.idx.cache,
+                   _scalar_i32(c.idx.n)]
+    return tuple(arrays)
+
+
+def _unpack_decode_state(
+    c: DeepSeekV4Cache, outs: tuple, start: int, ratio: int
+) -> None:
+    """Commit a layer's functionally-updated state. The python-side group
+    counts advance WITHOUT reading the traced n back (that would force a
+    device sync per layer): completion is derivable from the python offset —
+    a group closes exactly when (start+1) % ratio == 0. The indexer's
+    compressor shares the schedule (indexer layers are ratio 4)."""
+    c.ring = outs[0]
+    completed = 1 if (start + 1) % ratio == 0 else 0
+    i = 1
+    for cs in (c.comp, c.idx):
+        if cs is None:
+            continue
+        cs.kv_state, cs.score_state, cs.cache = outs[i], outs[i + 1], outs[i + 2]
+        cs.n += completed
+        i += 4  # outs[i+3] is the traced n — intentionally unread
+
+
+def _decode_window_indices_scalar(win: int, offset: mx.array) -> mx.array:
+    """[1, 1, win] indices into concat([ring, kv1]) for one query at
+    ``offset`` — the scalar-offset form of continuation_window_indices."""
+    qpos = offset - win + 1 + mx.arange(win)
+    slot = mx.maximum(qpos, 0) % win
+    idx = mx.where(qpos >= offset, win + (qpos - offset), slot)
+    return mx.where(qpos < 0, MASKED_INDEX, idx).astype(mx.int32)[None, None]
+
+
 def _sparse_attend_eager(
     q: mx.array,
     parts: list[tuple[mx.array, mx.array]],
@@ -1012,6 +1184,67 @@ class Attention(nn.Module):
         o = self.wo_a(o[..., None, :], groups).squeeze(-2)
         return self.wo_b(o.reshape(b, s, -1))
 
+    def decode_step_math(self, x, ring, state_arrays, offset):
+        """Branchless single-token attention for the compiled decode path.
+
+        ``state_arrays``: () for dense layers, (ckv, csc, cbuf, cn) for
+        plain-compressed, plus (ikv, isc, ibuf, in_) for indexer layers.
+        Returns (out, new_ring, *new_state_arrays). Same math as __call__'s
+        continuation branch, with offset as a traced scalar.
+        """
+        rd, win = self.rope_dim, self.window
+        pos = offset.reshape(1)
+        cos, sin = rope_cos_sin(self._freqs, pos)
+
+        qr = self.q_norm(self.wq_a(x))
+        q = self.wq_b(qr).reshape(1, 1, self.n_heads, self.head_dim)
+        qf = q.astype(mx.float32)
+        q = (qf * mx.rsqrt(qf.square().mean(-1, keepdims=True) + self.eps)).astype(q.dtype)
+        q_tail = apply_interleaved_rope(q[..., -rd:], cos[:, None], sin[:, None])
+        q = mx.concatenate([q[..., :-rd], q_tail], axis=-1)
+
+        kv = self.kv_norm(self.wkv(x))
+        kv_tail = apply_interleaved_rope(kv[..., -rd:], cos, sin)
+        kv = mx.concatenate([kv[..., :-rd], kv_tail], axis=-1)
+
+        buffer = mx.concatenate([ring, kv], axis=1)
+        parts = [(buffer, _decode_window_indices_scalar(win, offset))]
+        new_state: tuple = ()
+        if self.ratio:
+            if "indexer" in self:
+                ckv, csc, cbuf, cn, ikv, isc, ibuf, in_ = state_arrays
+                cidx, ikv, isc, ibuf, in_ = self.indexer.decode_step_math(
+                    x, qr, ikv, isc, ibuf, in_, offset, self._freqs
+                )
+            else:
+                ckv, csc, cbuf, cn = state_arrays
+            ckv, csc, cbuf, cn = self.compressor.decode_step_math(
+                x, ckv, csc, cbuf, cn, offset, self._freqs
+            )
+            if "indexer" not in self:
+                cap = cbuf.shape[1]
+                base = mx.arange(cap, dtype=mx.int32)[None, None]
+                cidx = mx.where(base >= cn, MASKED_INDEX, base)
+                new_state = (ckv, csc, cbuf, cn)
+            else:
+                new_state = (ckv, csc, cbuf, cn, ikv, isc, ibuf, in_)
+            parts.append((cbuf, cidx))
+
+        new_ring = ring
+        new_ring[:, offset % win] = kv[:, 0]
+
+        o = sparse_attend(q, parts, self.attn_sink, self.scale)
+        o_tail = apply_interleaved_rope(
+            o[..., -rd:], cos[:, None], sin[:, None], inverse=True
+        )
+        o = mx.concatenate([o[..., :-rd], o_tail], axis=-1)
+        o = o.reshape(1, 1, self.n_groups, -1)
+        groups = mx.broadcast_to(
+            mx.arange(self.n_groups)[None, None], (1, 1, self.n_groups)
+        )
+        o = self.wo_a(o[..., None, :], groups).squeeze(-2)
+        return (self.wo_b(o.reshape(1, 1, -1)), new_ring, *new_state)
+
 
 class ClippedSwiGLU:
     """Two-arg activation for SwitchGLU: called as ``activation(up, gate)``."""
@@ -1121,6 +1354,26 @@ def _hc_mixes(h: mx.array, fn: mx.array, eps: float) -> tuple[mx.array, mx.array
     return flat, (flat @ fn.T) * r
 
 
+def _hc_pre_math(h, fn, scale, base, hc, iters, hc_eps, rms_eps):
+    """Raw hc_pre: mixes + Sinkhorn + pre-reduction. Shared by the eagerly
+    compiled wrapper below and the whole-layer compiled decode step (which
+    must inline it — nesting compiled functions is not worth the risk)."""
+    b, s, hcd, d = h.shape
+    flat = h.reshape(b, s, hcd * d).astype(mx.float32)
+    r = mx.rsqrt(flat.square().mean(-1, keepdims=True) + rms_eps)
+    mixes = (flat @ fn.T) * r
+    pre, post, comb = hc_split_sinkhorn(mixes, scale, base, hc, iters, hc_eps)
+    y = (pre[..., None] * flat.reshape(h.shape)).sum(axis=2)
+    return y.astype(h.dtype), post, comb
+
+
+def _hc_post_math(x, residual, post, comb):
+    y = post[..., None] * x[..., None, :] + mx.einsum(
+        "bsjk,bsjd->bskd", comb, residual.astype(mx.float32)
+    )
+    return y.astype(x.dtype)
+
+
 @functools.lru_cache(maxsize=None)
 def _compiled_hc_pre(hc: int, iters: int, hc_eps: float, rms_eps: float):
     """Fused hc_pre: mixes + the 20-iteration Sinkhorn + the pre-reduction.
@@ -1186,6 +1439,40 @@ class Block(nn.Module):
     def _post(x, residual, post, comb):
         return _compiled_hc_post()(x, residual, post, comb)
 
+    def decode_step_math(self, h, input_ids, offset, ring, *state_arrays):
+        """The whole layer for one decoded token, as a pure function — the
+        body that gets mx.compile'd. HC math is inlined raw (the eager path's
+        separately-compiled HC wrappers must not nest inside this trace)."""
+        residual = h
+        x, post, comb = _hc_pre_math(
+            h, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
+            self.hc, self.iters, self.hc_eps, self.eps,
+        )
+        x = self.attn_norm(x)
+        x, new_ring, *new_state = self.attn.decode_step_math(
+            x, ring, state_arrays, offset
+        )
+        h = _hc_post_math(x, residual, post, comb)
+
+        residual = h
+        x, post, comb = _hc_pre_math(
+            h, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
+            self.hc, self.iters, self.hc_eps, self.eps,
+        )
+        x = self.ffn(self.ffn_norm(x), input_ids)
+        h = _hc_post_math(x, residual, post, comb)
+        return (h, new_ring, *new_state)
+
+    def compiled_step(self):
+        """Compiled decode step. mx.compile re-traces by input shape, which
+        here only changes when a compressed cache crosses a 256-group capacity
+        boundary; offset/n travel as traced scalars and never key the trace."""
+        fn = getattr(self, "_step_fn", None)
+        if fn is None:
+            fn = mx.compile(self.decode_step_math)
+            self._step_fn = fn
+        return fn
+
     def __call__(self, h: mx.array, input_ids: mx.array, cache) -> mx.array:
         residual = h
         x, post, comb = self._pre(h, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
@@ -1233,10 +1520,56 @@ class Model(nn.Module):
     def __call__(self, inputs: mx.array, cache=None) -> mx.array:
         if cache is None:
             cache = self.make_cache()
+        if (
+            _COMPILED_DECODE_ENABLED()
+            and inputs.shape[0] == 1
+            and inputs.shape[1] == 1
+            and cache[0].offset > 0
+        ):
+            try:
+                return self._decode_compiled(inputs, cache)
+            except Exception:  # noqa: BLE001 — fall back to the eager path once
+                global _COMPILED_DECODE_BROKEN
+                if not _COMPILED_DECODE_BROKEN:
+                    _COMPILED_DECODE_BROKEN = True
+                    import logging
+
+                    logging.getLogger(__name__).exception(
+                        "[deepseek_v4] compiled decode failed — eager fallback"
+                    )
         h = self.embed(inputs)
         h = mx.broadcast_to(h[:, :, None, :], (*h.shape[:2], self.hc, h.shape[-1]))
         for layer, c in zip(self.layers, cache):
             h = layer(h, inputs, c)
+        flat, mixes = _hc_mixes(h, self.hc_head_fn, self.eps)
+        pre = mx.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.hc_eps
+        x = (pre[..., None] * flat.reshape(h.shape)).sum(axis=2).astype(h.dtype)
+        return self.head(self.norm(x))
+
+    def _decode_compiled(self, inputs: mx.array, cache) -> mx.array:
+        """One decoded token through the per-layer compiled steps.
+
+        State is committed only after EVERY layer's function has been built
+        and called (all lazily functional), so a trace failure anywhere falls
+        back to the eager path with the caches untouched.
+        """
+        start = cache[0].offset
+        offset = _scalar_i32(start)
+        h = self.embed(inputs)
+        h = mx.broadcast_to(h[:, :, None, :], (*h.shape[:2], self.hc, h.shape[-1]))
+
+        staged = []
+        for layer, c in zip(self.layers, cache):
+            arrays = _pack_decode_state(c, layer)
+            outs = layer.compiled_step()(h, inputs, offset, *arrays)
+            h = outs[0]
+            staged.append((c, outs[1:], layer.attn.ratio))
+        # commit (python bookkeeping stays eval-free: completion is derivable
+        # from the PYTHON offset, so n never forces a device sync)
+        for c, outs, ratio in staged:
+            _unpack_decode_state(c, outs, start, ratio or 1)
+            c.offset = start + 1
+
         flat, mixes = _hc_mixes(h, self.hc_head_fn, self.eps)
         pre = mx.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.hc_eps
         x = (pre[..., None] * flat.reshape(h.shape)).sum(axis=2).astype(h.dtype)

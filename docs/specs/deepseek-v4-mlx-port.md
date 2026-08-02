@@ -309,11 +309,23 @@ across ~5k ops/token. Paths, in effort order:
    compressed cache at CAPACITY (it grows in 256-group steps) — that makes
    decode shapes stable, which makes the remaining decode ops
    mx.compile-able without retrace churn.
-2. Restructure layer caches to functional state (no setitem) so the whole
-   per-layer decode step compiles — the MLX approximation of ds4's resident
-   graph. Big surgery; the shapes are already fixed except the compressed
-   cache, so it is feasible. Est. reach: ~20+ tok/s. **This is where the
-   real jump lives** — see the kernel outcome below.
+2. ~~Whole-layer mx.compile~~ DONE (2026-08-02) — and the estimate was
+   WRONG. The full functional-state restructure landed (branchless
+   offset-scalar decode steps, capacity-keyed traces, staged commit with a
+   safe eager fallback; all consistency tests pass THROUGH the compiled
+   path) and decode did not move: 85.3 ms/token, 43/43 layers compiled, no
+   fallback. Measured lesson: mx.compile removes python graph-build and
+   fuses ELEMENTWISE chains, but every matmul/gather/scatter still
+   dispatches as its own Metal kernel — MLX has no analog of ds4's
+   command-buffer replay, so the dispatch tax lives below compile's reach.
+   The path stays in (correctness-neutral, tests exercise it, and the
+   functional state threading is the foundation for 2b) behind
+   SOLOHEAVEN_DSV4_COMPILE.
+   2b. The lever that remains is KERNEL COUNT, not graph shape: stack the
+   per-layer x-projections (wq_a, wkv, compressor wkv/wgate, indexer
+   weights_proj — all take the same [1,1,4096] x) into ONE quantized matmul
+   and split the output (~5 fewer kernels x 43 layers per token), and roll
+   the compressor step into a custom kernel like the attention one.
 3. ~~A fused sparse-attention Metal kernel~~ DONE (2026-08-02), with an
    honest outcome: `dsv4_sparse_decode` (one dispatch per layer, online
    softmax + sink, both parts walked in-kernel, differential-tested against

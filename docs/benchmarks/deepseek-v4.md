@@ -190,6 +190,31 @@ exist — ds4 runs its whole step in 36 ms. Every kernel built in Stage 1
 (attention core, MoE pair, compressor step) is exactly what the external
 loop encodes, so none of this work is lost.
 
+### Campaign Stage 3a — replay-loop preconditions ALL PROVEN (2026-08-02)
+
+`src/mlx_soloheaven/native/dsv4_replay_spike.py` (pure ctypes/objc, run it):
+
+1. `mx.array.__dlpack_device__() == (8, 0)` — kDLMetal; the capsule's data
+   pointer IS the live `id<MTLBuffer>` (verified: `[buf contents]` reads the
+   array's actual values; class AGXG13XFamilyBuffer).
+2. `mlx.metallib` loads via `newLibraryWithURL:`; the fully specialized
+   entries exist for OUR quantizations (`affine_qmv_fast_bfloat16_t_gs_64_b_8_batch_0`,
+   `..._b_2`, `gather_qmv_*`, steel gemm) and qmv needs NO function constants.
+3. Dispatch spec extracted from mlx v0.32.0 `quantized.cpp`: buffers
+   0=w 1=scales 2=biases 3=x 4=y, bytes 5=K 6=N (int32), threadgroups
+   (1, ceil(N/8), 1) x (32, 2, 1); `qmv_fast` requires N%8==0 && K%512==0.
+4. External command buffer dispatching that kernel on MLX-owned DLPack
+   buffers returns **max abs diff 0.0** vs `mx.quantized_matmul` (bf16
+   scales — T-typed kernels need scales/biases in T; fp32 scales feed NaN).
+5. `mx.synchronize()` before external submission is the ordering contract.
+
+With Stage 2's session-stable cache buffers, everything the Stage 3b
+runtime needs is now demonstrated: encode the whole 43-layer step once
+against fixed MLX-owned buffers (library kernels for matmuls + our custom
+kernels for attention/MoE/compressor), then per token write (token_id,
+offset) into a small uniform buffer and re-commit the prebuilt command
+buffer(s). The per-op floor that caps MLX at ~87 ms does not exist there.
+
 Standing conclusions:
 * Per-launch overhead is ~4 µs (39 ms / ~10k launches) — the remaining ~1k
   launches cost ~3 ms. The 85 ms is a SUM of medium inefficiencies, not one

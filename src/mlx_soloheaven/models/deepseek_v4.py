@@ -1358,6 +1358,171 @@ class Gate(nn.Module):
         return route(scores, self.topk, self.route_scale, self.bias)
 
 
+# --- fused batch-1 MoE kernels (decode) -------------------------------------
+#
+# gather_qmm at batch 1 measured 14 ms/token against ~3 ms of pure bandwidth
+# (docs/benchmarks/deepseek-v4.md). These two kernels do the routed-expert
+# FFN for ONE token with full-chip parallelism: K1 grids (expert x inner-row)
+# simdgroups computing gate/up dots + clipped SwiGLU into h; K2 grids output
+# dims reducing down_proj against h across the active experts, applying the
+# routing weights. 2-bit affine unpack (16 values per uint32, one 64-group
+# per word) happens in-register. Quantized builds only (bits=2, gs=64).
+
+_MOE_K1_SRC = """
+    // one simdgroup per (expert_slot, inner_row): gate & up dots + swiglu
+    uint sg_global = threadgroup_position_in_grid.x * 8 + simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    const int n_act = params[0];
+    const int d_model = params[1];
+    const int d_inner = params[2];
+    const float limit = feps[0];
+    uint e_slot = sg_global / (uint)d_inner;
+    uint row = sg_global % (uint)d_inner;
+    if (e_slot >= (uint)n_act) return;
+    int e = idxs[e_slot];
+    if (e < 0) { if (lane == 0) h[e_slot * d_inner + row] = 0.0f; return; }
+
+    const int words = d_model / 16;          // packed uint32 per row
+    const uint gbase = ((uint)e * (uint)d_inner + row) * (uint)words;
+    const int wpg = 64 / 16;                  // words per quant group
+    const uint sbase = ((uint)e * (uint)d_inner + row) * (uint)(d_model / 64);
+
+    float acc_g = 0.0f;
+    float acc_u = 0.0f;
+    for (int w = lane; w < words; w += 32) {
+        uint pg = gw[gbase + w];
+        uint pu = uw[gbase + w];
+        float sg_ = float(gs_[sbase + w / wpg]);
+        float bg = float(gb[sbase + w / wpg]);
+        float su = float(us[sbase + w / wpg]);
+        float bu = float(ub[sbase + w / wpg]);
+        int base = w * 16;
+        for (int j = 0; j < 16; ++j) {
+            float xv = float(x[base + j]);
+            acc_g += (float((pg >> (2 * j)) & 3u) * sg_ + bg) * xv;
+            acc_u += (float((pu >> (2 * j)) & 3u) * su + bu) * xv;
+        }
+    }
+    acc_g = simd_sum(acc_g);
+    acc_u = simd_sum(acc_u);
+    if (lane == 0) {
+        if (limit > 0.0f) {
+            acc_u = clamp(acc_u, -limit, limit);
+            acc_g = min(acc_g, limit);
+        }
+        h[e_slot * d_inner + row] = (acc_g / (1.0f + exp(-acc_g))) * acc_u;
+    }
+"""
+
+_MOE_K2_SRC = """
+    // one simdgroup per OUTPUT dim: sum over active experts of w_e * (down_e[d] . h[e])
+    uint sg_global = threadgroup_position_in_grid.x * 8 + simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    const int n_act = params[0];
+    const int d_model = params[1];
+    const int d_inner = params[2];
+    if (sg_global >= (uint)d_model) return;
+    const int words = d_inner / 16;
+    const int wpg = 64 / 16;
+    float acc = 0.0f;
+    for (int s = 0; s < n_act; ++s) {
+        int e = idxs[s];
+        if (e < 0) continue;
+        float we = wts[s];
+        const uint base = ((uint)e * (uint)d_model + sg_global) * (uint)words;
+        const uint sbase = ((uint)e * (uint)d_model + sg_global) * (uint)(d_inner / 64);
+        float a = 0.0f;
+        for (int w = lane; w < words; w += 32) {
+            uint p = dw[base + w];
+            float sc = float(ds_[sbase + w / wpg]);
+            float bi = float(db[sbase + w / wpg]);
+            int hb = s * d_inner + w * 16;
+            for (int j = 0; j < 16; ++j)
+                a += (float((p >> (2 * j)) & 3u) * sc + bi) * h[hb + j];
+        }
+        acc += we * a;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) y[sg_global] = acc;
+"""
+
+_moe_kernels = None
+
+
+def _get_moe_kernels():
+    global _moe_kernels
+    if _moe_kernels is None:
+        k1 = mx.fast.metal_kernel(
+            name="dsv4_moe_w13",
+            input_names=["x", "gw", "gs_", "gb", "uw", "us", "ub", "idxs", "params", "feps"],
+            output_names=["h"],
+            source=_MOE_K1_SRC,
+        )
+        k2 = mx.fast.metal_kernel(
+            name="dsv4_moe_w2",
+            input_names=["h", "dw", "ds_", "db", "idxs", "wts", "params"],
+            output_names=["y"],
+            source=_MOE_K2_SRC,
+        )
+        _moe_kernels = (k1, k2)
+    return _moe_kernels
+
+
+@functools.lru_cache(maxsize=16)
+def _moe_params(n_act: int, d_model: int, d_inner: int, limit: float):
+    return (
+        mx.array([n_act, d_model, d_inner], dtype=mx.int32),
+        mx.array([limit], dtype=mx.float32),
+    )
+
+
+def _moe_kernel_usable(glu) -> bool:
+    from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+
+    return (
+        os.environ.get("SOLOHEAVEN_DSV4_METAL", "1") != "0"
+        and mx.metal.is_available()
+        and isinstance(glu.gate_proj, QuantizedSwitchLinear)
+        and glu.gate_proj.bits == 2
+        and glu.gate_proj.group_size == 64
+        and glu.gate_proj.input_dims % 64 == 0
+        and glu.down_proj.input_dims % 64 == 0
+    )
+
+
+def _moe_routed_kernel(glu, x, indices, weights, limit: float) -> mx.array:
+    """Routed-expert output for one token via the fused kernels.
+    ``x`` [1,1,D]; ``indices`` [1,1,K] int32; ``weights`` [1,1,K]. Returns
+    [1,1,D] fp32."""
+    k1, k2 = _get_moe_kernels()
+    d_model = glu.gate_proj.input_dims
+    d_inner = glu.gate_proj.output_dims
+    n_act = indices.size
+    params, feps = _moe_params(n_act, d_model, d_inner, limit)
+    idxs = indices.reshape(-1).astype(mx.int32)
+    tg = 256
+    sgs1 = n_act * d_inner
+    (h,) = k1(
+        inputs=[x.reshape(-1), glu.gate_proj.weight, glu.gate_proj.scales,
+                glu.gate_proj.biases, glu.up_proj.weight, glu.up_proj.scales,
+                glu.up_proj.biases, idxs, params, feps],
+        grid=(((sgs1 + 7) // 8) * tg, 1, 1),
+        threadgroup=(tg, 1, 1),
+        output_shapes=[(n_act * d_inner,)],
+        output_dtypes=[mx.float32],
+    )
+    (y,) = k2(
+        inputs=[h, glu.down_proj.weight, glu.down_proj.scales,
+                glu.down_proj.biases, idxs, weights.reshape(-1).astype(mx.float32),
+                params],
+        grid=(((d_model + 7) // 8) * tg, 1, 1),
+        threadgroup=(tg, 1, 1),
+        output_shapes=[(d_model,)],
+        output_dtypes=[mx.float32],
+    )
+    return y.reshape(1, 1, d_model)
+
+
 class MoE(nn.Module):
     def __init__(self, args: "ModelArgs", layer_id: int):
         super().__init__()
@@ -1377,6 +1542,20 @@ class MoE(nn.Module):
         weights, indices = self.gate(x, input_ids)
         routed = self.experts(x, indices).astype(mx.float32)
         y = (routed * weights[..., None]).sum(axis=-2)
+        return (y + self.shared_experts(x).astype(mx.float32)).astype(x.dtype)
+
+    def decode_step_math(self, x: mx.array, input_ids: mx.array) -> mx.array:
+        """Single-token MoE for the compiled decode path: fused batch-1
+        kernels for the routed experts on quantized builds; identical eager
+        math (the canonical, differential-tested reference) otherwise."""
+        weights, indices = self.gate(x, input_ids)
+        if _moe_kernel_usable(self.experts):
+            y = _moe_routed_kernel(
+                self.experts, x, indices, weights, self.shared_experts.limit
+            )
+        else:
+            routed = self.experts(x, indices).astype(mx.float32)
+            y = (routed * weights[..., None]).sum(axis=-2)
         return (y + self.shared_experts(x).astype(mx.float32)).astype(x.dtype)
 
 
@@ -1515,7 +1694,7 @@ class Block(nn.Module):
             h, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
             self.hc, self.iters, self.hc_eps, self.eps,
         )
-        x = self.ffn(self.ffn_norm(x), input_ids)
+        x = self.ffn.decode_step_math(self.ffn_norm(x), input_ids)
         h = _hc_post_math(x, residual, post, comb)
         return (h, new_ring, *new_state)
 

@@ -207,6 +207,51 @@ def test_metal_decode_kernel_matches_eager(two_parts, masked):
     assert np.allclose(got, ref, atol=1e-5), np.abs(got - ref).max()
 
 
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Metal not available")
+def test_moe_kernel_matches_dequantized_reference():
+    """The fused batch-1 MoE kernels must reproduce the dequantized eager
+    computation on a REAL 2-bit/gs64 quantized SwitchGLU — including the
+    clipped-SwiGLU asymmetry, routing weights, and a masked (-1) slot."""
+    import mlx.nn as nn
+    from mlx_lm.models.switch_layers import SwitchGLU
+
+    from mlx_soloheaven.models.deepseek_v4 import (
+        ClippedSwiGLU,
+        _moe_kernel_usable,
+        _moe_routed_kernel,
+        clipped_swiglu,
+    )
+
+    d, inner, n_exp, limit = 128, 192, 8, 10.0
+    glu = SwitchGLU(d, inner, n_exp, activation=ClippedSwiGLU(limit), bias=False)
+    nn.quantize(glu, group_size=64, bits=2)
+    assert _moe_kernel_usable(glu)
+
+    rng = np.random.default_rng(6)
+    x = mx.array(rng.standard_normal((1, 1, d)).astype(np.float32)).astype(mx.bfloat16)
+    idxs = mx.array([[[3, 5, 0, -1]]], dtype=mx.int32)  # incl. masked slot
+    wts = mx.array([[[0.5, 0.3, 0.2, 0.4]]], dtype=mx.float32)
+
+    got = np.array(_moe_routed_kernel(glu, x, idxs, wts, limit))
+
+    def deq(m):
+        return mx.dequantize(m.weight, m.scales, m.biases, group_size=64, bits=2)
+
+    xf = mx.array(np.array(x.astype(mx.float32)))
+    ref = mx.zeros((d,))
+    for s in range(4):
+        e = int(np.array(idxs)[0, 0, s])
+        if e < 0:
+            continue
+        g = (xf.reshape(-1) @ deq(glu.gate_proj)[e].T).astype(mx.float32)
+        u = (xf.reshape(-1) @ deq(glu.up_proj)[e].T).astype(mx.float32)
+        h = clipped_swiglu(g, u, limit)
+        ref = ref + float(np.array(wts)[0, 0, s]) * (h @ deq(glu.down_proj)[e].T)
+    assert np.allclose(got.ravel(), np.array(ref), atol=2e-2, rtol=2e-2), (
+        np.abs(got.ravel() - np.array(ref)).max()
+    )
+
+
 # --- rope ------------------------------------------------------------------
 
 

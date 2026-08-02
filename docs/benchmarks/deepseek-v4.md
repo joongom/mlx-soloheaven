@@ -122,6 +122,50 @@ and instantiable with MTLFunctionConstantValues. Path A (reuse MLX's
 compiled kernels from our own encoder) is viable at the naming level;
 argument layouts to be read from the matching-version .metal sources (MIT).
 
+### Campaign Stage 1a — fused batch-1 MoE kernels (2026-08-02)
+
+`dsv4_moe_w13`/`dsv4_moe_w2`: routed-expert FFN as two dispatches/layer,
+2-bit unpack in-register, full-chip grids (expert x row / output dim),
+differential-tested against `mx.dequantize` reference incl. masked slots.
+
+Result: **90.3 ms/token — no wall-time change** (89.0 baseline on 0.32).
+Third substitution in a row (whole-layer compile, stacked projections, MoE
+kernels) that is correctness-clean but does not move end-to-end time, while
+component DELETION does (MoE ablation: -14 ms). Interpretation shifted to:
+the decode is bounded by the length of the dependent kernel CHAIN (per-
+boundary latency), not by any component's compute or bandwidth. Kernel kept:
+it is the Stage 3 MoE kernel (external loop needs it regardless).
+
+### The validated cost model (2026-08-02) — read this before optimizing
+
+Two decisive measurements:
+
+1. **Dual-stream test**: two independent decode chains in one eval take
+   1.99x one chain (90.9 → 180.7 ms/pair). The GPU is BUSY, not idle —
+   latency-bound hypothesis refuted (refutation #4). Corollary: concurrent
+   sessions/speculative batches are nearly free in throughput terms only if
+   the chain shortens; a second stream costs full price.
+2. **Kernel micro-bench** (synthetic, no model load — iterate in seconds):
+   our MoE kernels 0.30 ms/layer ≈ gather_qmm 0.25 ≈ both ~6x off the
+   library qmv on identical bytes (0.047 ms). And take+qmv variants LOSE
+   (0.68 ms) because they add ops: 10 ops x ~60 µs each.
+
+**The model that fits every experiment so far**: each op in the dependent
+chain costs ~50 µs of GPU time regardless of its size (setup + memory
+round-trip dominates at [1,1,*] shapes); a token is ~1,800 ops ≈ 90 ms.
+Substituting equal-op implementations changes nothing; deleting ops helps
+linearly; adding ops hurts linearly. HC fusion (+25 ms for ~10k removed),
+MoE kernel (±0 for net -6 ops), stacking (±0 for -190 tiny-share ops... at
+~4-6 µs their share was ~1 ms), attention kernel (+3.6 ms for ~24 removed
+x 43) are all consistent within factor-2.
+
+**Therefore the campaign lever is CHAIN OP COUNT.** Priority by removable
+ops per token: attention pre/post glue (rope x3, parameterless q-norm,
+concats, casts ~20/layer x 43 -> absorb into the attention kernel),
+compressor step non-matmul math (~12 x 61 calls -> one small-state kernel),
+HC sinkhorn tail (keep the [24,16384] GEMV in the library, fuse the rest),
+cast/astype hygiene across the step.
+
 Standing conclusions:
 * Per-launch overhead is ~4 µs (39 ms / ~10k launches) — the remaining ~1k
   launches cost ~3 ms. The 85 ms is a SUM of medium inefficiencies, not one

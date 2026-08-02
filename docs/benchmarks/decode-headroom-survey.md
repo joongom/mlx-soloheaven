@@ -58,6 +58,51 @@ is DeepSeek's noaux_tc plus hash routing), a Qwen plan builder, and a
 preallocating adapter for mlx-lm's `KVCache`, which grows in 256-token chunks
 and would hit exactly the address-stability bug that broke V4 multi-turn.
 
+## The Qwen MoE kernel swap: REFUTED (2026-08-03)
+
+Ran the experiment proposed above on Qwen3.6-35B-A3B. The gate accepts the
+model (`_moe_kernel_usable` True — experts are 8-bit/gs64, 2048->512, 256
+experts, top_k 8) and `_moe_routed_kernel` reproduces
+`(switch_mlp(x, inds) * scores).sum(-2)` on real weights: worst relative error
+**7e-3** across six layers, i.e. bf16-level agreement, not bit-identity.
+
+**Speed: 16.94 -> 16.33 ms/token. 1.04x.** Control re-measure 16.92 (0.1%
+drift), so this is not noise — it is simply not a win.
+
+Ablation says why. Stubbing one component at a time out of a 16.95 ms token:
+
+| component | cost | share |
+|---|---:|---:|
+| MoE block, total | 8.78 ms | 51.8% |
+| — routed experts | 4.56 ms | 27% |
+| — gate routing math | 2.44 ms | 14% |
+| — shared expert | 1.40 ms | 8% |
+| GatedDeltaNet (30 of 40 layers) | 5.28 ms | 31.2% |
+| full attention (10 layers) | 1.36 ms | 8.0% |
+
+The kernels replaced the 4.56 ms piece and did it in ~3.95 ms — 13% better,
+not the multiple V4 got. V4's experts are 2-bit with a 2048-wide inner
+dimension against hidden 4096; Qwen's are 8-bit, inner 512, hidden 2048. The
+same kernel on a much smaller, wider-precision expert is close to what MLX's
+gather_qmm already achieves.
+
+**The structural difference from V4.** V4 had one dominant, replaceable
+sink — the HC/Sinkhorn path was 39 ms of a 112 ms token. Qwen's overhead is
+spread: 2.4 ms of gate routing (softmax + argpartition + take_along_axis +
+normalize over 256 experts, ~6 MLX ops x 40 layers) and 5.3 ms of
+GatedDeltaNet recurrence. Fusing the gate the way V4 does buys at most 2.4 ms
+(1.17x) and GatedDeltaNet is a large new kernel. There is no single lever here.
+
+Note this also weakens the 3.72x headroom figure for THIS model: 30 of its 40
+layers are linear attention carrying recurrent state, so "active weight bytes"
+understates what the step actually moves. Treat the MoE-vs-dense split above
+as the reliable finding and this model's exact multiple as soft.
+
+Kept as a negative result rather than reverted: `_moe_kernel_usable` and the
+packing-derived kernels are correct and marginally faster on this shape, so
+they stay available — but nothing in mlx-lm's Qwen path is wired to them, and
+on this evidence it should not be.
+
 ## Caveats on these numbers
 
 * 800 GB/s is the nominal figure, not a measured STREAM number for this

@@ -545,3 +545,49 @@ def test_parameter_tree_matches_real_checkpoint():
     assert not extra, f"model has tensors absent from checkpoint: {extra[:8]}"
     bad = {k: (ours[k], expected[k]) for k in expected if ours[k] != expected[k]}
     assert not bad, f"shape mismatches: {dict(list(bad.items())[:8])}"
+
+
+@pytest.mark.parametrize("bits", [2, 4, 8])
+def test_moe_kernel_matches_dequantized_reference_at_any_supported_width(bits):
+    """The fused MoE kernels derive their packing from the weights, so the
+    gate must admit every width they can read — not just the 2-bit one the
+    DeepSeek-V4 converter happens to emit. This is what would let another
+    model's 8-bit experts use them."""
+    import mlx.nn as nn
+    from mlx_lm.models.switch_layers import SwitchGLU
+
+    from mlx_soloheaven.models.deepseek_v4 import (
+        ClippedSwiGLU,
+        _moe_kernel_usable,
+        _moe_routed_kernel,
+        clipped_swiglu,
+    )
+
+    d, inner, n_exp, limit = 128, 192, 8, 10.0
+    glu = SwitchGLU(d, inner, n_exp, activation=ClippedSwiGLU(limit), bias=False)
+    nn.quantize(glu, group_size=64, bits=bits)
+    assert _moe_kernel_usable(glu), f"{bits}-bit experts rejected by the gate"
+
+    rng = np.random.default_rng(6)
+    x = mx.array(rng.standard_normal((1, 1, d)).astype(np.float32)).astype(mx.bfloat16)
+    idxs = mx.array([[[3, 5, 0, -1]]], dtype=mx.int32)
+    wts = mx.array([[[0.5, 0.3, 0.2, 0.4]]], dtype=mx.float32)
+
+    got = np.array(_moe_routed_kernel(glu, x, idxs, wts, limit))
+    ref = mx.zeros((d,), dtype=mx.float32)
+    for slot in range(idxs.shape[-1]):
+        e = int(idxs[0, 0, slot])
+        if e < 0:
+            continue
+        g = mx.dequantize(glu.gate_proj.weight[e], glu.gate_proj.scales[e],
+                          glu.gate_proj.biases[e], group_size=64, bits=bits)
+        u = mx.dequantize(glu.up_proj.weight[e], glu.up_proj.scales[e],
+                          glu.up_proj.biases[e], group_size=64, bits=bits)
+        dn = mx.dequantize(glu.down_proj.weight[e], glu.down_proj.scales[e],
+                           glu.down_proj.biases[e], group_size=64, bits=bits)
+        xf = x.reshape(-1).astype(mx.float32)
+        h = clipped_swiglu((g @ xf).astype(mx.float32),
+                           (u @ xf).astype(mx.float32), limit)
+        ref = ref + float(wts[0, 0, slot]) * (dn @ h.astype(mx.float32))
+    mx.eval(ref)
+    assert np.abs(got.reshape(-1) - np.array(ref)).max() < 2e-2

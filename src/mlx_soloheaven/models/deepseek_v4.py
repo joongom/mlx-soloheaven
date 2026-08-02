@@ -2953,16 +2953,33 @@ def _moe_params(n_act: int, d_model: int, d_inner: int, limit: float):
 
 
 def _moe_kernel_usable(glu) -> bool:
+    """Can the fused batch-1 routed-expert kernels serve this SwitchGLU?
+
+    The bit width used to be pinned at 2 here, matching constants that no
+    longer exist in the kernel bodies — they derive their packing from the
+    weights now (QuantSpec), so the gate follows the same supported set. The
+    remaining conditions are what the INDEXING needs: one recipe across the
+    three projections, dimensions that divide the scale group, and an output
+    vector the moe_w2 tile covers exactly.
+    """
     from mlx_lm.models.switch_layers import QuantizedSwitchLinear
 
+    if os.environ.get("SOLOHEAVEN_METAL_KERNELS", "1") == "0":
+        return False
+    if not mx.metal.is_available():
+        return False
+    projs = (glu.gate_proj, glu.up_proj, glu.down_proj)
+    if not all(isinstance(p, QuantizedSwitchLinear) for p in projs):
+        return False
+    recipes = {(p.bits, p.group_size) for p in projs}
+    if len(recipes) != 1:
+        return False
+    bits, gs = recipes.pop()
     return (
-        os.environ.get("SOLOHEAVEN_METAL_KERNELS", "1") != "0"
-        and mx.metal.is_available()
-        and isinstance(glu.gate_proj, QuantizedSwitchLinear)
-        and glu.gate_proj.bits == 2
-        and glu.gate_proj.group_size == 64
-        and glu.gate_proj.input_dims % 64 == 0
-        and glu.down_proj.input_dims % 64 == 0
+        bits in QuantSpec.SUPPORTED_BITS
+        and gs in QuantSpec.SUPPORTED_GROUP_SIZES
+        and glu.gate_proj.input_dims % gs == 0
+        and glu.down_proj.input_dims % gs == 0
         # moe_w2 emits _W2_ROWS output dims per simdgroup, so the tile must
         # divide the output vector exactly
         and glu.down_proj.output_dims % _W2_ROWS == 0

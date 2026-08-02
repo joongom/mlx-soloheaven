@@ -600,6 +600,43 @@ Remaining to 40 ms: -13.4. Next: the same bisection on moe_w13/w2 (12.7 ms
 measured vs ~1.8 ms of 2-bit expert-weight bandwidth — 14% efficiency, the
 biggest unexplained gap left).
 
+### Stage 3l — moe bisected: staging was the enemy; 49.3 ms / 20.3 tok/s (2026-08-02)
+
+Three probe rounds on the real model (probe_moe*.py in the session
+scratchpad; one ~2-min load each), then the fix. Additive decomposition of
+moe FULL (isolated ms, K1/K2): dispatch+staging floor 1.6/2.3, weight loads
+1.5/~0, 2-bit unpack ALU 1.2/0.9, staged-x threadgroup reads 2.0/2.5.
+Refuted along the way (recorded so nobody retries them):
+
+* float4 vector reads of staged x: NO change — the cost is not load
+  instruction count;
+* uint4 (128-bit) weight loads: K1 got WORSE (6.6 -> 7.1);
+* bf16 threadgroup staging (16 KB -> 8 KB): -1.0 — pointed at residency.
+
+Winner: **no staging at all**. x (8 KB) and h (48 KB) are L2-hot across
+every threadgroup; K1's 16 KB xs[] had capped residency at 2 TGs/core and
+K2 serialized behind 2 barriers per active expert. Reading straight from
+device is bit-exact (the stage only moved the bf16->float convert) and
+measured w13 6.7 -> 5.2, w2 6.3 -> 4.9 isolated. Commit is the perf commit
+preceding this entry. Bench (wired, 96% free, bench12):
+
+| | ms/token | tok/s |
+|---|---|---|
+| before (Stage 3k) | 53.4 | 18.7 |
+| after moe no-staging | **49.3** | **20.3** (1.55x vs 76.6 compiled) |
+
+Session cumulative 611 -> 49.3 (12.4x). The no-barrier diagnostic now
+exactly equals the barriered run — blanket barriers cost ~0; overlap is
+NOT a remaining lever.
+
+Profile after (bench12, isolated ms): qmv 11.25/280 · moe w13+w2 10.10/86 ·
+hc_pre 5.18/86 · comp_step 4.70/62 · wo_a 4.04/43 · hc_mix 3.20/86 ·
+rms 2.77/173 · attn_core 1.74/43 · hc_post 1.64/86 · gate 2.21/80.
+Remaining to 40 ms: -9.3. Next queued: hc_pre Sinkhorn on simd shuffles
+(the 20 iterations cost ~40 threadgroup barriers on a 4x4 matrix; shuffle
+gather keeps the serial add order, so it stays bit-identical), then
+hc_mix widening, shared-expert qmv trio fusion, moe unpack LUT.
+
 ## 3. Reproduce
 
 ```bash

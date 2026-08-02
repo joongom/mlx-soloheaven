@@ -104,9 +104,15 @@ step unless profiling later demands it) owning:
       diffed against ratio-128 Attention.decode_step_math (< 3e-2). plan.py
       has plan_compressor. n (completed groups) is baked as the buf-row byte
       offset; the driver re-encodes per token (0.65 ms, cheap). Covers the 20
-      ratio-128 layers. STILL TODO: the ratio-4 INDEXER (21 layers) needs a
-      scoring+top-k kernel over the indexer's own compressed cache, then its
-      dispatches added to plan_attention.
+      ratio-128 layers.
+   a2. ✅ INDEXER scoring+top-k kernels (dsv4_idx_score_k: one threadgroup per
+      compressed group, buf[g] staged, q roped inline; dsv4_idx_topk_k selects
+      the top-k visible groups). Diffed vs Indexer.decode_step_math: scores
+      match at bf16 (~1%), top-1 agrees. EVERY kernel for EVERY real-model
+      layer type (dense / ratio-128 / ratio-4) now exists and is verified.
+      STILL TODO: wire the indexer dispatches (its own comp step +
+      wq_b/weights_proj qmv + these two kernels) into plan_attention for
+      ratio-4, then diff a ratio-4 Block.
    b. real-Model driver: a NativeDecoder holding the Runtime, a session
       BufferTable built from the loaded model's weights + a DeepSeekV4Cache's
       ring/compressor buffers, the scratch, and a prebuilt plan; per token

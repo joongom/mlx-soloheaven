@@ -1818,6 +1818,106 @@ _RMS_SRC = """
     for (int i = tid; i < d; i += TG) y[i] = T(float(x[i]) * r * float(w[i]));
 """
 
+# DSA indexer scoring: score[g] = sum_h relu(q_roped[h] . buf[g]) * w[h] over
+# n_idx_heads, then top-k over the visible groups. Split into a per-group score
+# kernel (grid = cap threadgroups, buf[g] staged; q read from device and roped
+# inline) and a tiny top-k kernel, so neither needs to stage the full q
+# (n_idx_heads*idx_head_dim can be 32 KB). Follows Indexer.decode_step_math.
+_IDX_SCORE_SRC = """
+    uint g = threadgroup_position_in_grid.x;   // group index
+    uint tid = thread_position_in_threadgroup.x;
+    uint sg = tid / 32, lane = tid % 32;
+    const int TG = 256;
+    const int n_h = params[0];
+    const int hd = params[1];       // idx_head_dim
+    const int rd = params[2];       // rope_dim
+    const int cap = params[3];
+    const int n2 = ioff[1];
+    const int offset = ioff[0];
+    const float wscale = fscal[0];
+    if ((int)g >= cap) return;
+
+    threadgroup float bg[128];      // buf[g]
+    threadgroup float cs[64];       // cos/sin for the rope tail
+    threadgroup float red[8];
+    for (int i = tid; i < hd; i += TG) bg[i] = float(buf[g * hd + i]);
+    for (int p = tid; p < rd / 2; p += TG) {
+        float ang = float(offset) * float(freqs[p]);
+        cs[2 * p] = cos(ang); cs[2 * p + 1] = sin(ang);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if ((int)g >= n2) { if (tid == 0) scores[g] = -INFINITY; return; }
+
+    float acc = 0.0f;
+    for (int h = sg; h < n_h; h += TG / 32) {
+        float d = 0.0f;
+        for (int i = lane; i < hd; i += 32) {
+            float qv = float(q[h * hd + i]);
+            if (i >= hd - rd) {                 // rope the tail pairwise
+                int pr = (i - (hd - rd)) / 2;
+                bool hi = ((i - (hd - rd)) & 1) == 1;
+                int i0 = hd - rd + 2 * pr;
+                float e = float(q[h * hd + i0]), o = float(q[h * hd + i0 + 1]);
+                float c = cs[2 * pr], s = cs[2 * pr + 1];
+                qv = hi ? (e * s + o * c) : (e * c - o * s);
+            }
+            d += qv * bg[i];
+        }
+        d = simd_sum(d);
+        if (lane == 0) acc += max(d, 0.0f) * float(w[h]) * wscale;
+    }
+    if (lane == 0) red[sg] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float t = 0.0f;
+        for (int i = 0; i < TG / 32; ++i) t += red[i];
+        scores[g] = t;
+    }
+"""
+
+_IDX_TOPK_SRC = """
+    // top-k over scores[cap]; masked (< n2) already -inf. Emit indices, -1 for
+    // slots beyond n2 (matching Indexer.decode_step_math's mask).
+    uint tid = thread_position_in_threadgroup.x;
+    const int cap = params[0];
+    const int topk = params[1];
+    const int n2 = ioff[1];
+    if (tid != 0) return;
+    bool taken[1024];
+    for (int i = 0; i < cap; ++i) taken[i] = false;
+    for (int k = 0; k < topk; ++k) {
+        int best = -1; float bv = -INFINITY;
+        for (int i = 0; i < cap; ++i) {
+            if (taken[i]) continue;
+            if (scores[i] > bv) { bv = scores[i]; best = i; }
+        }
+        if (best < 0 || best >= n2) { out_idx[k] = -1; }
+        else { taken[best] = true; out_idx[k] = best; }
+    }
+"""
+
+_idx_kernels = None
+
+
+def _get_idx_kernels():
+    global _idx_kernels
+    if _idx_kernels is None:
+        score = mx.fast.metal_kernel(
+            name="dsv4_idx_score_k",
+            input_names=["q", "buf", "w", "freqs", "params", "fscal", "ioff"],
+            output_names=["scores"],
+            source=_IDX_SCORE_SRC,
+        )
+        topk = mx.fast.metal_kernel(
+            name="dsv4_idx_topk_k",
+            input_names=["scores", "params", "ioff"],
+            output_names=["out_idx"],
+            source=_IDX_TOPK_SRC,
+        )
+        _idx_kernels = (score, topk)
+    return _idx_kernels
+
+
 _EMBED_SRC = """
     // dequantize embed row token_id (8-bit gs64) and replicate into hc streams:
     // h[s*hidden + i] = dequant(weight[token][i]) for every stream s.

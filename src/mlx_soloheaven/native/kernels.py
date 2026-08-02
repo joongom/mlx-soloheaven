@@ -55,6 +55,15 @@ _SPECS = {
         "_ADD_SRC",
         [("a", _F), ("b", _B), ("params", _I), ("out", "device bfloat*")],
     ),
+    "dsv4_idx_score_k": (
+        "_IDX_SCORE_SRC",
+        [("q", _B), ("buf", _B), ("w", _B), ("freqs", _F), ("params", _I),
+         ("fscal", _F), ("ioff", _I), ("scores", "device float*")],
+    ),
+    "dsv4_idx_topk_k": (
+        "_IDX_TOPK_SRC",
+        [("scores", _F), ("params", _I), ("ioff", _I), ("out_idx", "device int*")],
+    ),
     "dsv4_embed_k": (
         "_EMBED_SRC",
         [("weight", _U), ("scales", _B), ("biases", _B), ("params", _I),

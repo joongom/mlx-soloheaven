@@ -1875,3 +1875,96 @@ def test_native_decode_grows_compressed_cache_instead_of_writing_past_it(monkeyp
     lg2 = model(mx.array([[17, 19, 23]], dtype=mx.int32), cache)
     mx.eval(lg2)
     check("second prefill")
+
+
+def test_native_idx_topk_selects_true_topk_at_deployed_scale():
+    """REGRESSION — the long-context decode cliff, 2026-08-02.
+
+    Past index_topk*ratio tokens the indexer stops selecting "everything" and
+    has to do a real top-k. That branch was a single-thread selection sort over
+    the whole CAPACITY — O(cap*topk) = 8192*512 = 4.2M serial iterations per
+    layer per token — and its `bool taken[1024]` scratch overran once cap grew
+    past 1024. Decode fell from 43.8 to 380 ms/token at a 2048-token context
+    while every other kernel stayed flat.
+
+    The tiny existing indexer test (cap=6, topk=3) exercises the branch but not
+    the scale, and passed throughout. This one runs the DEPLOYED shape and
+    checks the selected SET against mx.argpartition — order inside the set is
+    free (attn_core softmaxes over all of it), except out_idx[0], which stays
+    the argmax by contract.
+    """
+    from mlx_soloheaven.native.kernels import BUFFER_SLOTS
+
+    cap, topk, n2 = 8192, 512, 640           # n2 > topk, cap >> n2
+    rt_mod.load_custom_kernels(_RT)
+
+    def run(scores_np):
+        scores = mx.array(scores_np, dtype=mx.float32)
+        oi = mx.full((topk,), -7, dtype=mx.int32)
+        mx.eval(scores, oi)
+        mx.synchronize()
+        table = rt_mod.BufferTable()
+        s = {"scores": table.add(scores), "oi": table.add(oi)}
+        k = BUFFER_SLOTS["sh_dsv4_idx_topk_k"]
+        cb = ConstBlob()
+        po, _ = cb.add("2i", cap, topk)
+        io, _ = cb.add("2i", 0, n2)          # ioff = (offset, visible count)
+        it = rt_mod.plan_item(
+            _RT, "sh_dsv4_idx_topk_k", True,
+            [(s["scores"], k["scores"]), (s["oi"], k["out_idx"])],
+            [(po, 8, k["params"]), (io, 8, k["ioff"])], (1, 1, 1), (256, 1, 1))
+        _RT.commit([it], table.ptrs, cb.bytes(), wait=True)
+        mx.synchronize()
+        return np.array(oi), np.array(scores)
+
+    # distinct scores: the selection is unambiguous
+    rng = np.random.default_rng(17)
+    sc = np.full(cap, -np.inf, dtype=np.float32)
+    sc[:n2] = rng.permutation(n2).astype(np.float32) * 0.5 - 100.0
+    got, scores = run(sc)
+
+    assert (got >= 0).all() and (got < n2).all(), got[got < 0][:5]
+    assert len(set(got.tolist())) == topk, "duplicate slots selected"
+    exp = set(np.argsort(-sc[:n2], kind="stable")[:topk].tolist())
+    assert set(got.tolist()) == exp, len(set(got.tolist()) ^ exp)
+    assert int(got[0]) == int(np.argmax(sc[:n2]))
+
+    # ties straddling the threshold: still exactly topk distinct indices, and
+    # every selected score is >= every unselected one
+    sc2 = np.full(cap, -np.inf, dtype=np.float32)
+    sc2[:n2] = (rng.integers(0, 4, size=n2) * 1.0).astype(np.float32)
+    got2, _ = run(sc2)
+    assert len(set(got2.tolist())) == topk, "ties produced duplicate slots"
+    assert (got2 >= 0).all() and (got2 < n2).all()
+    chosen = sc2[got2]
+    rest = np.delete(sc2[:n2], got2)
+    assert chosen.min() >= rest.max(), (chosen.min(), rest.max())
+
+    # A TIME budget, because correctness alone cannot see this bug: the old
+    # single-thread selection sort passed every assertion above and still cost
+    # ~16 ms per dispatch (x21 layers x every token). The rewrite is ~100x
+    # under this bound; the old code is several times over it.
+    import time
+
+    scores = mx.array(sc, dtype=mx.float32)
+    oi = mx.zeros((topk,), dtype=mx.int32)
+    mx.eval(scores, oi)
+    mx.synchronize()
+    table = rt_mod.BufferTable()
+    sl = {"scores": table.add(scores), "oi": table.add(oi)}
+    k = BUFFER_SLOTS["sh_dsv4_idx_topk_k"]
+    cb = ConstBlob()
+    po, _ = cb.add("2i", cap, topk)
+    io, _ = cb.add("2i", 0, n2)
+    it = rt_mod.plan_item(
+        _RT, "sh_dsv4_idx_topk_k", True,
+        [(sl["scores"], k["scores"]), (sl["oi"], k["out_idx"])],
+        [(po, 8, k["params"]), (io, 8, k["ioff"])], (1, 1, 1), (256, 1, 1))
+    blob = cb.bytes()
+    for _ in range(3):
+        _RT.commit([it], table.ptrs, blob, wait=True)
+    t0 = time.perf_counter()
+    for _ in range(20):
+        _RT.commit([it], table.ptrs, blob, wait=True)
+    ms = (time.perf_counter() - t0) / 20 * 1e3
+    assert ms < 3.0, f"idx_topk at the deployed shape took {ms:.2f} ms/dispatch"

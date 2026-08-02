@@ -2099,7 +2099,8 @@ _IDX_TOPK_SRC = """
     // selected group indices (order is irrelevant — attn_core softmaxes over the
     // whole set), -1 for slots past the valid count (matching the reference mask).
     uint tid = thread_position_in_threadgroup.x;
-    const int cap = params[0];
+    const int cap = params[0];   // scratch capacity; the scan is bounded by n2
+    (void)cap;
     const int topk = params[1];
     const int n2 = ioff[1];
     // Common case (context shorter than index_topk groups): every valid group is
@@ -2110,20 +2111,62 @@ _IDX_TOPK_SRC = """
         for (int k = tid; k < topk; k += 256) out_idx[k] = (k < n2) ? k : -1;
         return;
     }
-    // Rare case (n2 > topk, i.e. > index_topk completed groups): true top-k.
-    // out_idx[0] is the argmax (the indexer test asserts this); a parallel
-    // rewrite is a follow-up if long contexts make this hot.
-    if (tid != 0) return;
-    bool taken[1024];
-    for (int i = 0; i < cap; ++i) taken[i] = false;
-    for (int k = 0; k < topk; ++k) {
-        int best = -1; float bv = -INFINITY;
-        for (int i = 0; i < cap; ++i) {
-            if (taken[i]) continue;
-            if (scores[i] > bv) { bv = scores[i]; best = i; }
+    // n2 > topk (context past index_topk*ratio tokens): a real selection.
+    //
+    // This used to be a single-thread selection sort over the whole CAPACITY:
+    // O(cap*topk) = 8192*512 = 4.2M serial iterations per layer per token, and
+    // `bool taken[cap]` overran its 1024-entry declaration once cap grew past
+    // that. It cost 335 of the 380 ms/token this path spent at a 2.5k context
+    // while every other kernel stayed flat (Stage 4m). Now: a threshold search
+    // on an order-preserving integer key, which the whole threadgroup shares.
+    threadgroup int red[8];              // TG/32 simdgroup partials
+    threadgroup atomic_int cnt;
+
+    // Largest key with count(key >= lo) >= topk — i.e. the key of the topk-th
+    // largest score. sh_order_key is monotonic in the float, so 32 halvings of
+    // the uint range land on it EXACTLY: no tolerance, no iteration budget.
+    uint lo = 0u, hi = 0xFFFFFFFFu;
+    while (lo < hi) {
+        uint span = hi - lo;             // (hi-lo+1)/2 would overflow at full range
+        uint mid = lo + (span >> 1) + (span & 1u);
+        int c = 0;
+        for (int i = tid; i < n2; i += 256)
+            if (sh_order_key(scores[i]) >= mid) ++c;
+        c = simd_sum(c);
+        if ((tid & 31u) == 0) red[tid / 32] = c;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        int tot = 0;
+        for (int j = 0; j < 8; ++j) tot += red[j];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // lo/hi are identical in every thread, so the loop stays uniform and
+        // the barriers above are reached by all of them.
+        if (tot >= topk) lo = mid; else hi = mid - 1u;
+    }
+
+    if (tid == 0) atomic_store_explicit(&cnt, 0, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Strictly-above-threshold groups: fewer than topk of them by construction
+    // (count(>= lo+1) < topk), and their order within the set does not matter —
+    // attn_core softmaxes over the whole selection.
+    for (int i = tid; i < n2; i += 256)
+        if (sh_order_key(scores[i]) > lo) {
+            int slot = atomic_fetch_add_explicit(&cnt, 1, memory_order_relaxed);
+            if (slot < topk) out_idx[slot] = i;
         }
-        if (best < 0 || best >= n2) { out_idx[k] = -1; }
-        else { taken[best] = true; out_idx[k] = best; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        // Top up from the tie group AT the threshold, lowest index first, so
+        // the selected SET is deterministic even when scores collide.
+        int c = atomic_load_explicit(&cnt, memory_order_relaxed);
+        for (int i = 0; i < n2 && c < topk; ++i)
+            if (sh_order_key(scores[i]) == lo) out_idx[c++] = i;
+        // out_idx[0] stays the argmax (the indexer test asserts it).
+        int bp = 0;
+        for (int k = 1; k < topk; ++k) {
+            int a = out_idx[k], b = out_idx[bp];
+            if (scores[a] > scores[b] || (scores[a] == scores[b] && a < b)) bp = k;
+        }
+        if (bp) { int t = out_idx[0]; out_idx[0] = out_idx[bp]; out_idx[bp] = t; }
     }
 """
 
@@ -2144,6 +2187,7 @@ def _get_idx_kernels():
             input_names=["scores", "params", "ioff"],
             output_names=["out_idx"],
             source=_IDX_TOPK_SRC,
+            header=_KERNEL_DEFINES,
         )
         _idx_kernels = (score, topk)
     return _idx_kernels
@@ -2688,6 +2732,13 @@ _HC_PRE_SPLIT = 8
 _KERNEL_DEFINES = (
     f"#define W2_ROWS {_W2_ROWS}\n"
     f"#define HC_PRE_SPLIT {_HC_PRE_SPLIT}\n"
+    # Order-preserving float -> uint: a < b  <=>  key(a) < key(b), so a binary
+    # search over the uint range is a binary search over the float values and
+    # terminates exactly. Used by the indexer's top-k threshold search.
+    "static inline uint sh_order_key(float f) {\n"
+    "    uint u = as_type<uint>(f);\n"
+    "    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);\n"
+    "}\n"
 )
 _W2_ROWS_HEADER = _KERNEL_DEFINES
 

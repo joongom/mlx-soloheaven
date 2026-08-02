@@ -228,11 +228,16 @@ def plan_attention(pl: Planner, attn, xin: str, ring: str, out: str,
         "dsv4_ring_store_k", True,
         [(pl.S["kv_roped"], rs["src"]), (pl.S[ring], rs["ring"])],
         [(rp, 8, rs["params"]), (ioff_off, 4, rs["ioff"])], (1, 1, 1), (256, 1, 1)))
-    for gi in range(g):
-        items.append(pl.qmv(
-            a.wo_a, "acore", "o_lora", gin, o_lora,
-            w_off=gi * o_lora * (gin // 4) * 4, s_off=gi * o_lora * (gin // 64) * 2,
-            b_off=gi * o_lora * (gin // 64) * 2, xoff=gi * gin * 2, yoff=gi * o_lora * 2))
+    # o_groups grouped 8-bit qmv as ONE dispatch (was g separate library qmv):
+    # out[gi*o_lora+j] = deq(wo_a[gi,j]) . acore[gi*gin:], one simdgroup/row.
+    wa = BUFFER_SLOTS["dsv4_wo_a_k"]
+    wo, _ = pl.cb.add("3i", g, gin, o_lora)
+    items.append(pl._pi(
+        "dsv4_wo_a_k", True,
+        [(pl.S["acore"], wa["x"]), (pl.t.add(a.wo_a.weight), wa["weight"]),
+         (pl.t.add(a.wo_a.scales), wa["scales"]), (pl.t.add(a.wo_a.biases), wa["biases"]),
+         (pl.S["o_lora"], wa["out"])],
+        [(wo, 12, wa["params"])], ((g * o_lora + 7) // 8, 1, 1), (256, 1, 1)))
     items.append(pl.qmv(a.wo_b, "o_lora", out, g * o_lora, hidden))
     return items
 

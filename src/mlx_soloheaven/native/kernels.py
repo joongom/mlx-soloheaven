@@ -46,6 +46,11 @@ _SPECS = {
         "_RING_STORE_SRC",
         [("src", _B), ("params", _I), ("ioff", _I), ("ring", "device bfloat*")],
     ),
+    "dsv4_wo_a_k": (
+        "_WO_A_SRC",
+        [("x", _B), ("weight", _U), ("scales", _B), ("biases", _B),
+         ("params", _I), ("out", "device bfloat*")],
+    ),
     "dsv4_swiglu_k": (
         "_SWIGLU_SRC",
         [("gate", _B), ("up", _B), ("params", _I), ("feps", _F),

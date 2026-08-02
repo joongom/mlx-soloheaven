@@ -2138,6 +2138,42 @@ _ADD_SRC = """
     out[tid] = T(float(a[tid]) + float(b[tid]));
 """
 
+_WO_A_SRC = """
+    // Grouped 8-bit affine qmv for the o_groups low-rank O projection:
+    //   out[gi*o_lora + j] = sum_i deq(w[gi, j, i]) * x[gi*gin + i]
+    // replacing the o_groups (8) separate library qmv dispatches with ONE.
+    // One simdgroup per output row (gi, j); weight is uint32-packed 8-bit gs64
+    // (4 values/word, one scale+bias per 64 = 16 words), affine w = q*sc + bi.
+    uint sg_id = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint row = threadgroup_position_in_grid.x * 8 + sg_id;
+    const int g = params[0];
+    const int gin = params[1];
+    const int o_lora = params[2];
+    uint gi = row / o_lora;
+    if (gi >= (uint)g) return;
+    uint j = row % o_lora;
+    const int words = gin / 4;
+    const uint wbase = ((uint)gi * o_lora + j) * words;
+    const uint sbase = ((uint)gi * o_lora + j) * (gin / 64);
+    const uint xbase = gi * gin;
+    float a = 0.0f;
+    for (int w = lane; w < words; w += 32) {
+        uint p = weight[wbase + w];
+        float sc = float(scales[sbase + w / 16]);
+        float bi = float(biases[sbase + w / 16]);
+        float aw = 0.0f, sw = 0.0f;
+        for (int k = 0; k < 4; ++k) {
+            float xk = float(x[xbase + w * 4 + k]);
+            aw += float((p >> (8 * k)) & 0xFFu) * xk;
+            sw += xk;
+        }
+        a += aw * sc + sw * bi;
+    }
+    a = simd_sum(a);
+    if (lane == 0) out[row] = T(a);
+"""
+
 _RING_STORE_SRC = """
     // ring[(offset % win) * D + i] = src[i]  — the post-attention KV write.
     uint tid = thread_position_in_threadgroup.x;

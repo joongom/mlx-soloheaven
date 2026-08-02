@@ -97,11 +97,16 @@ step unless profiling later demands it) owning:
    head qmv — and its logits' ARGMAX matches Model.__call__ (median logit
    diff < 5e-2). plan.py has plan_embed / plan_head / plan_block. Bug caught:
    embed 8-bit row stride is hidden/4 (not the 2-bit hidden/16).
-8. NEXT (only DENSE-model wiring remains for a bench; compressed layers add
-   the compressor/indexer dispatches to plan_attention):
-   a. compressed-layer plan: extend plan_attention with the compressor step
-      (dsv4_comp_step) + indexer for ratio-4, wiring the per-layer compressor
-      cache buffers; diff a compressed Block.
+8. IN PROGRESS:
+   a. ✅ PLAIN-compressed (ratio-128) plan: plan_attention now takes a
+      comp_cache and emits comp.wkv/wgate qmv + dsv4_comp_step over the
+      double-buffered state, then attn_core with the compressed buffer —
+      diffed against ratio-128 Attention.decode_step_math (< 3e-2). plan.py
+      has plan_compressor. n (completed groups) is baked as the buf-row byte
+      offset; the driver re-encodes per token (0.65 ms, cheap). Covers the 20
+      ratio-128 layers. STILL TODO: the ratio-4 INDEXER (21 layers) needs a
+      scoring+top-k kernel over the indexer's own compressed cache, then its
+      dispatches added to plan_attention.
    b. real-Model driver: a NativeDecoder holding the Runtime, a session
       BufferTable built from the loaded model's weights + a DeepSeekV4Cache's
       ring/compressor buffers, the scratch, and a prebuilt plan; per token

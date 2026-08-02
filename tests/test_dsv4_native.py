@@ -724,6 +724,103 @@ def test_native_full_model_logits_match_reference():
     assert np.median(np.abs(got - exp)) < 5e-2, np.median(np.abs(got - exp))
 
 
+def test_native_compressed_attention_plan_matches_reference():
+    """LADDER STEP 8a: a ratio-128 (plain-compressed) attention as a native
+    plan — the compressor step (comp.wkv/wgate qmv + dsv4_comp_step over its
+    state buffers) added to the dense path — diffed against the ratio-128
+    Attention.decode_step_math. At offset < ratio the compressed buffer is
+    empty (kc=0), so this isolates the compressor STATE ACCUMULATION wiring;
+    the attention output must still match exactly."""
+    import mlx.nn as nn
+
+    from mlx_soloheaven.models.deepseek_v4 import Attention, ModelArgs
+    from mlx_soloheaven.native import plan as plan_mod
+
+    cfg = dict(model_type="deepseek_v4", hidden_size=512, num_attention_heads=2,
+               head_dim=512, qk_rope_head_dim=64, q_lora_rank=512, o_lora_rank=512,
+               o_groups=2, sliding_window=8, compress_ratios=[128],
+               compress_rope_theta=160000, rope_theta=10000, num_hidden_layers=1,
+               rms_norm_eps=1e-6)
+    args = ModelArgs.from_dict(cfg)
+    attn = Attention(args, 0)
+    nn.quantize(attn, group_size=64, bits=8,
+                class_predicate=lambda p, m: hasattr(m, "to_quantized") and "norm" not in p)
+    for nm in ("wq_a", "wq_b", "wkv", "wo_b", "wo_a"):
+        m = getattr(attn, nm)
+        m.scales, m.biases = m.scales.astype(mx.bfloat16), m.biases.astype(mx.bfloat16)
+    for c in ("wkv", "wgate"):
+        m = getattr(attn.compressor, c)
+        m.scales, m.biases = m.scales.astype(mx.bfloat16), m.biases.astype(mx.bfloat16)
+    for nm in ("q_norm", "kv_norm"):
+        getattr(attn, nm).weight = getattr(attn, nm).weight.astype(mx.bfloat16)
+    attn.compressor.norm.weight = attn.compressor.norm.weight.astype(mx.bfloat16)
+
+    H, D, g = attn.n_heads, attn.head_dim, attn.n_groups
+    ratio, win, hidden = attn.ratio, attn.window, 512
+    q_lora, NHD, o_lora = 512, H * D, args.o_lora_rank
+    offset, n = 4, 0  # offset < ratio -> no completed group, empty comp buffer
+
+    rng = np.random.default_rng(12)
+    x = mx.array(rng.standard_normal((1, 1, hidden)).astype(np.float32) * 0.3).astype(mx.bfloat16)
+    ring0 = mx.array(rng.standard_normal((1, win, D)).astype(np.float32) * 0.1).astype(mx.bfloat16)
+
+    # reference: a DeepSeekV4Cache-style compressor state
+    from mlx_soloheaven.models.deepseek_v4 import CompressorState
+    st = CompressorState()
+    st.reset(1, ratio, attn.compressor.coff, D)
+    ck, csc, cbuf, cn = attn.compressor.decode_step_math(
+        (attn.compressor.wkv(x), attn.compressor.wgate(x)), x.dtype,
+        st.kv_state, st.score_state,
+        mx.zeros((1, 256, D), dtype=mx.bfloat16), mx.array(n, dtype=mx.int32),
+        mx.array(offset, dtype=mx.int32), attn._freqs)
+    mx.eval(ck, csc, cbuf, cn)
+    # now run the full attention reference with fresh state (it re-does the
+    # compressor internally); compare the ATTENTION output.
+    ring_ref = ring0.astype(mx.float32).astype(mx.bfloat16)
+    st2 = CompressorState()
+    st2.reset(1, ratio, attn.compressor.coff, D)
+    attn.compressor  # ensure built
+    out_ref, *_ = attn.decode_step_math(
+        x, ring_ref, (st2.kv_state, st2.score_state,
+                      mx.zeros((1, 256, D), dtype=mx.bfloat16), mx.array(n, dtype=mx.int32)),
+        mx.array(offset, dtype=mx.int32))
+    mx.eval(out_ref)
+    mx.synchronize()
+
+    rt_mod.load_custom_kernels(_RT)
+    T = rt_mod.BufferTable()
+
+    def z(nn_, dt=mx.bfloat16):
+        a = mx.zeros((nn_,), dtype=dt)
+        mx.eval(a)
+        return a
+
+    cd = attn.compressor.coff * D
+    scratch = dict(
+        x=x.reshape(-1), ring=ring0.astype(mx.float32).astype(mx.bfloat16).reshape(-1),
+        xp0=z(q_lora), qr=z(q_lora), q_raw=z(NHD), xp1=z(D), kvn=z(D), acore=z(NHD),
+        kv_roped=z(D), o_lora=z(g * o_lora), attn_out=z(hidden), cwkv=z(cd), cwgate=z(cd),
+        kv_st=z(ratio * cd, mx.float32), sc_st=mx.full((ratio * cd,), -mx.inf, mx.float32),
+        kv_st2=z(ratio * cd, mx.float32), sc_st2=z(ratio * cd, mx.float32),
+        buf=z(256 * D), dummy=z(D), dummy_idx=mx.full((1,), -1, mx.int32),
+    )
+    mx.eval(*scratch.values())
+    mx.synchronize()
+    S = {k: T.add(v) for k, v in scratch.items()}
+    cb = plan_mod.ConstBlob()
+    ioff_off, _ = cb.add("2i", offset, 0)
+    pl = plan_mod.Planner(_RT, T, cb, S)
+    comp_cache = dict(kv_st="kv_st", sc_st="sc_st", kv_st2="kv_st2",
+                      sc_st2="sc_st2", buf="buf")
+    items = plan_mod.plan_attention(pl, attn, "x", "ring", "attn_out", ioff_off,
+                                    comp_cache=comp_cache, ncomp=0, n=n)
+    _RT.commit(items, T.ptrs, cb.bytes(), wait=True)
+
+    got = np.array(scratch["attn_out"].astype(mx.float32))
+    exp = np.array(out_ref.reshape(-1).astype(mx.float32))
+    assert np.abs(got - exp).max() < 3e-2, np.abs(got - exp).max()
+
+
 def test_native_full_block_plan_matches_reference():
     """LADDER STEP 6: the WHOLE dense Block as one native plan (both HC-wrapped
     halves, ~26 dispatches, one command buffer) via native/plan.plan_block,

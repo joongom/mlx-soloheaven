@@ -87,11 +87,39 @@ class Planner:
             [(p, 8, k["params"])], (hc, 1, 1), (256, 1, 1))
 
 
+def plan_compressor(pl: Planner, comp, freqs, kv_src: str, sc_src: str,
+                    cache: dict, ioff_off: int, n: int) -> list:
+    """Compressor decode step (dsv4_comp_step). ``kv_src``/``sc_src`` are the
+    scratch slots holding comp.wkv/comp.wgate outputs; ``cache`` names the
+    per-layer state slots (kv_st, sc_st, kv_st2, sc_st2, buf, buf2, row).
+    ``n`` (Python) is the completed-group count so the buf write lands at row
+    n; the driver re-encodes per token (cheap: 0.65 ms/1500), so baking n as a
+    static byte offset is fine. Reads OLD state, writes NEW state (double
+    buffered to avoid an in-place hazard)."""
+    cs = BUFFER_SLOTS["dsv4_comp_step"]
+    d, ratio, coff = comp.head_dim, comp.ratio, comp.coff
+    po, _ = pl.cb.add("4i", ratio, d, coff, comp.rope_dim)
+    fo, _ = pl.cb.add("f", 1e-6)
+    row_off = n * d * 2  # bf16 buf row stride
+    return [pl._pi(
+        "dsv4_comp_step", True,
+        [(pl.S[kv_src], cs["kv_row"]), (pl.S[sc_src], cs["sc_row"]),
+         (pl.S[cache["kv_st"]], cs["kv_st"]), (pl.S[cache["sc_st"]], cs["sc_st"]),
+         (pl.t.add(comp.ape), cs["ape"]), (pl.t.add(comp.norm.weight), cs["nw"]),
+         (pl.t.add(freqs), cs["freqs"]),
+         (pl.S[cache["kv_st2"]], cs["kv_out"]), (pl.S[cache["sc_st2"]], cs["sc_out"]),
+         (pl.S[cache["buf"]], cs["row_out"], row_off), (pl.S[cache["buf"]], cs["old_row"], row_off)],
+        [(po, 16, cs["params"]), (fo, 4, cs["feps"]), (ioff_off, 4, cs["ioff"])],
+        (1, 1, 1), (256, 1, 1))]
+
+
 def plan_attention(pl: Planner, attn, xin: str, ring: str, out: str,
-                   ioff_off: int) -> list:
-    """Dense attention on scratch[xin] (the attn_norm output) -> scratch[out].
-    scratch must hold: xp0, qr, q_raw, xp1, kvn, acore, kv_roped, o_lora.
-    Weight offsets for grouped wo_a assume 8-bit (packed stride gin/4)."""
+                   ioff_off: int, comp_cache: dict | None = None, ncomp: int = 0,
+                   n: int = 0) -> list:
+    """Attention on scratch[xin] (the attn_norm output) -> scratch[out].
+    Dense (comp_cache is None) or plain-compressed (ratio-128: comp_cache
+    names the compressor state slots, ncomp = visible compressed groups).
+    Indexer (ratio-4) layers are not yet wired here."""
     a = attn
     H, D, g = a.n_heads, a.head_dim, a.n_groups
     NHD, gin, o_lora, win = H * D, (H * D) // g, a.wo_a.weight.shape[1], a.window
@@ -104,13 +132,23 @@ def plan_attention(pl: Planner, attn, xin: str, ring: str, out: str,
         pl.qmv(a.wkv, xin, "xp1", hidden, D),
         pl.rms(a.kv_norm.weight, "xp1", "kvn", D, a.eps),
     ]
+    kc, plain = 0, 1
+    comp_slot = "dummy"
+    if comp_cache is not None:
+        cd = a.compressor.coff * D
+        items.append(pl.qmv(a.compressor.wkv, xin, "cwkv", hidden, cd))
+        items.append(pl.qmv(a.compressor.wgate, xin, "cwgate", hidden, cd))
+        items += plan_compressor(pl, a.compressor, a._freqs, "cwkv", "cwgate",
+                                 comp_cache, ioff_off, n)
+        comp_slot = comp_cache["buf"]
+        kc = ncomp  # visible compressed groups (buf rows)
     ac = BUFFER_SLOTS["dsv4_attn_core"]
-    po, _ = pl.cb.add("5i", D, a.rope_dim, win, 0, 1)
+    po, _ = pl.cb.add("5i", D, a.rope_dim, win, kc, plain)
     fo, _ = pl.cb.add("2f", a.scale, a.eps)
     items.append(pl._pi(
         "dsv4_attn_core", True,
         [(pl.S["q_raw"], ac["q"]), (pl.S["kvn"], ac["kv"]), (pl.S[ring], ac["ring"]),
-         (pl.S["dummy"], ac["comp"]), (pl.S["dummy_idx"], ac["cidx"]),
+         (pl.S[comp_slot], ac["comp"]), (pl.S["dummy_idx"], ac["cidx"]),
          (pl.t.add(a.attn_sink), ac["sink"]), (pl.t.add(a._freqs), ac["freqs"]),
          (pl.S["acore"], ac["out"]), (pl.S["kv_roped"], ac["kv_out"])],
         [(po, 20, ac["params"]), (fo, 8, ac["fscal"]), (ioff_off, 8, ac["ioff"])],

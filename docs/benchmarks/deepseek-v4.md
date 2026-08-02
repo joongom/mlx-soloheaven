@@ -792,6 +792,44 @@ determinism, mini second turn), `pplnative` / `ppldec` (teacher-forced ppl
 through the native / compiled DECODE step — decode-vs-decode is the fair
 native gate; batch ppl differs by prefill-vs-decode semantics).
 
+### Stage 4b — native decode quality gap: no localized bug; path-inherent divergence (2026-08-02)
+
+Decode-vs-decode teacher-forced ppl on the shipped build: compiled 3.65
+(ko 6.58 / en 3.98 / code 1.46) vs **native 4.13 (ko 7.05 / en 4.01 /
+code 1.97)** — +13% ALL, concentrated on peaked distributions. The
+investigation, so the next person doesn't redo it:
+
+* Real bug found and FIXED on the way (commit e7d9026): the decoder gave
+  every layer ONE shared [offset, ncomp] blob with ncomp=0 — the whole
+  compressed region and the indexer's n2 were masked on the replay path
+  above offset 128. Per-layer blobs now bake each layer's n.
+* Per-position nll: the deficit clusters on the FIRST native-scored peaked
+  token and recurring knife-edge positions; per-layer state diff shows
+  smooth ~1e-2 divergence at L0 amplifying through the 43-layer HC ladder
+  (no localized break).
+* Component microscopes on the real model at offset=1: attention half
+  CLEAN (attn_out 0.4% of magnitude; qr/q_raw/kvn/kv_roped at 1e-3),
+  dense block clean (0.047); compressed-layer blocks 4x worse (0.18) via
+  legitimate amplification of ~0.008 input diffs through the 2-bit MoE's
+  sharp nonlinearities. (Trap for future probes: cwkv/cwgate/i_ckv/i_cwg/
+  iw scratch are LEGACY-UNUSED — the plan reads xall by byte offset;
+  comparing those buffers gives false smoking guns.)
+* REFUTED: restoring the reference path's bf16 rounding points at the
+  fusion seams (q rms/rope, roped kv, attn out, pooled group, sg/su) made
+  ppl WORSE (4.13 -> 4.37) — reverted (3a943e2). The gap is not missing
+  rounding; it is the compounding cost of a numerically different (often
+  higher-precision) kernel path, and matching the library kernels'
+  summation orders would reinstate the serial-loop latency pathologies.
+* Generation A/B (greedy, smoke prompts): the delta IS user-visible in
+  Korean — a corrupted multibyte token in a greeting, one repetitive
+  degeneration — while English/factual outputs stay comparable.
+
+Serving guidance recorded: SOLOHEAVEN_DSV4_NATIVE=1 is a SPEED mode
+(25.7 tok/s, 1.85x) with a measured quality delta vs the compiled path
+(13.5 tok/s, ppl 3.65). Closing the gap is future work (candidate: fp32
+hc streams end-to-end, which could pass the compiled path's quality
+rather than chase it).
+
 ## 3. Reproduce
 
 ```bash

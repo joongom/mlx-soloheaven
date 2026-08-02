@@ -890,54 +890,47 @@ paths, where being "more precise" than MLX is not the same as agreeing
 with it. Note which paths already agree bit-for-bit: everything still on
 the library qmv.
 
-**RESOLVED by layer bisection** (probe_bisect.py — one load walks all 43
-block boundaries; at offset 1 with zero caches, prefix commits are
-idempotent, so the native plan can be committed in growing prefixes and
-compared against the reference chain step by step):
+**RESOLVED — it was a real bug: hc_post read the HC mixing matrix
+TRANSPOSED.** The reference is `einsum("bsjk,bsjd->bskd", comb, residual)`:
+the SOURCE stream is comb's first axis, the OUTPUT stream its second. Both
+native hc_post kernels summed `comb[k*hcn + j]` instead of
+`comb[j*hcn + k]`. Fixed; native decode ppl **4.44 -> 3.651 against the
+compiled path's 3.649** (Korean 6.52 vs 6.58 — native slightly BETTER), and
+the long-context logit error vs the eager batch matches exactly (P=200:
+1.375 both).
 
-| layer | block-out rel. error |
-|---|---|
-| L0 | 6.13% |
-| L1 | 13.9% |
-| L5 / L14 / L21 | 9.3% / 2.9% / 9.2% |
-| L28 / L35 / L42 | 12.5% / 70% / 85% |
+Two layers of camouflage hid it:
 
-L0 is the whole story. Its input differs from the reference's by exactly
-**one bf16 ULP** (the native path hands the embed row over in fp32; the
-reference materializes it as bf16 — `dsv4_embed_k` itself is clean, 1 ULP,
-streams identical), and its output is off by **6.13%**. That is a ~20x
-amplification of a rounding difference IN ONE BLOCK, and it compounds over
-43 of them.
+1. **Every 2x2 doubly-stochastic matrix is symmetric.** All native test
+   configs use hc_mult=2, so a transposed mixing matrix is numerically
+   invisible there. The shipped model is hc_mult=4. A regression test with
+   a deliberately non-symmetric comb at hc=4 now exists.
+2. **The compiled decode calls `_hc_post_math` (the einsum), not the shared
+   mx.fast twin**, so only the replay path carried the bug — which is
+   exactly why compiled measured 3.65 and native 4.44.
 
-So the model is extraordinarily ill-conditioned with respect to rounding
-(2-bit experts + Hyper-Connections with a 20-iteration Sinkhorn), and that
-settles the question the three precision experiments were circling:
+How it was finally localized (the method to reuse): seed ONE block with an
+input identical to the reference's and walk its intermediates in order.
+hx/post/comb came out exact, xn/qr/q_raw/kvn/attn_out within 1 ULP, and
+h1 off by 14.5% — every input right, the output wrong, so the mixing step
+was the only candidate left.
 
-* **Being more precise than the reference does not help** — it is a
-  different trajectory, and every trajectory that is not the reference's
-  lands at ~4.4 ppl. That is why fp32 streams, fp32 projections and fp32
-  output paths each measured flat.
-* **Only bit-exactness with the reference's arithmetic can close the gap.**
-  The compiled path reaches 3.65 because it IS the reference's ops in the
-  reference's order (its logits track the eager batch at 98.8% argmax);
-  the native replay reaches 4.4 because its kernels are individually
-  correct to 1-3 ULP but not identical.
+**Correction of record.** Earlier entries in this stage concluded that the
+gap was inherent — that the model amplifies rounding ~20x per block and
+only bit-exactness with MLX's kernels could close it. That was WRONG, and
+the way it went wrong is worth keeping: three precision experiments in a
+row measured flat, which should have falsified the precision hypothesis
+instead of being explained away by an amplification story built on a
+probe whose two sides had different input dtypes. The decisive counter-
+example was available the whole time and came from the user: **ds4 is a
+fully independent implementation with its own kernels and it is accurate**,
+so "different kernels cost quality" could not be true. When measurements
+keep refuting a hypothesis, suspect the hypothesis.
 
-Consequence for the design: a replay runtime can only match this model's
-quality if it replays the reference's ops, rounding point for rounding
-point — which means using MLX's own kernels for every op that has one
-(gather_qmm for the routed experts, library qmv for wo_a/sh13/the stacked
-projection, mx.fast.rms_norm's exact reduction) and keeping bf16 exactly
-where the reference keeps it. The custom fused kernels that bought the
-speed (Stages 3d-3r) are precisely what costs the quality. Note the two
-already-shared kernels — attn_core and the MoE pair, which the compiled
-path also runs via mx.fast — are NOT part of the problem: they are
-bit-identical between the paths by construction.
-
-Next session starts here: revert the fp32 activation chain (it is
-counterproductive under this finding), then swap the native-only quantized
-kernels back to MLX's one at a time, measuring ppl after each, to find the
-subset that restores 3.65 at the least speed cost.
+Kept from the detour: the two other real bugs (per-layer ioff/ncomp, the
+post-step visible group count) and `dsv4_qmv8_k` (unused by the plan). The
+fp32 activation chain was reverted — with the actual bug fixed it buys
+nothing and costs bandwidth.
 
 ## 3. Reproduce
 

@@ -2582,25 +2582,6 @@ def _get_hc_kernels():
 # routing weights. 2-bit affine unpack (16 values per uint32, one 64-group
 # per word) happens in-register. Quantized builds only (bits=2, gs=64).
 
-#: 2-bit unpack table: byte -> its four 2-bit values, low pair first. The
-#: scalar form (16 shifts + 16 masks + 16 int->float per packed word, twice in
-#: w13) was the dominant integer chain in the two slowest custom kernels; this
-#: replaces it with four constant-cache loads per word. 4 KiB, read by every
-#: thread — the case Metal's constant address space exists for.
-#:
-#: The four float4 lanes are read back in j = 4*byte + k order, so the
-#: accumulation sequence is unchanged from j = 0..15 and the quantized dot is
-#: bit-identical. Do NOT collapse the inner loop into dot(float4, float4): that
-#: licenses a different reduction tree and the twin/native builds would drift.
-_Q2_LUT_HEADER = (
-    "constant float4 sh_q2_lut[256] = {\n"
-    + ",\n".join(
-        "float4(" + ", ".join(f"{(v >> bit) & 3}.0f" for bit in (0, 2, 4, 6)) + ")"
-        for v in range(256)
-    )
-    + "\n};\n"
-)
-
 _MOE_K1_SRC = """
     // one simdgroup per (expert_slot, inner_row); x read straight from
     // device — it is 8 KB and L2-hot across all threadgroups. Staging it in
@@ -2637,19 +2618,12 @@ _MOE_K1_SRC = """
         float buv = float(ub[sbase + g_]);
         const device bfloat* xv = x + w * 16;
         float ag = 0.0f, au = 0.0f, sx = 0.0f;
-        // four 2-bit values per byte, j = 4*byte + k — same order as the
-        // scalar shift/mask chain this replaces, so bit-identical.
-        for (int byte_ = 0; byte_ < 4; ++byte_) {
-            float4 qg = sh_q2_lut[(pg >> (8 * byte_)) & 0xFFu];
-            float4 qu = sh_q2_lut[(pu >> (8 * byte_)) & 0xFFu];
-            const device bfloat* xb = xv + byte_ * 4;
-            #pragma unroll
-            for (int k = 0; k < 4; ++k) {
-                float xj = float(xb[k]);
-                ag += qg[k] * xj;
-                au += qu[k] * xj;
-                sx += xj;
-            }
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            float xj = float(xv[j]);
+            ag += float((pg >> (2 * j)) & 3u) * xj;
+            au += float((pu >> (2 * j)) & 3u) * xj;
+            sx += xj;
         }
         acc_g += ag * sgv + sx * bgv;
         acc_u += au * suv + sx * buv;
@@ -2697,15 +2671,11 @@ _MOE_K2_SRC = """
             bi = float(db[sbase + g_]);
             const device float* hv = hs + w * 16;
             float aw = 0.0f, sw = 0.0f;
-            for (int byte_ = 0; byte_ < 4; ++byte_) {
-                float4 q = sh_q2_lut[(p >> (8 * byte_)) & 0xFFu];
-                const device float* hb = hv + byte_ * 4;
-                #pragma unroll
-                for (int k = 0; k < 4; ++k) {
-                    float hj = hb[k];
-                    aw += q[k] * hj;
-                    sw += hj;
-                }
+            #pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                float hj = hv[j];
+                aw += float((p >> (2 * j)) & 3u) * hj;
+                sw += hj;
             }
             a += aw * sc + sw * bi;
         }
@@ -2728,14 +2698,12 @@ def _get_moe_kernels():
             input_names=["x", "gw", "gs_", "gb", "uw", "us", "ub", "idxs", "params", "feps"],
             output_names=["h"],
             source=_MOE_K1_SRC,
-            header=_Q2_LUT_HEADER,
         )
         k2 = mx.fast.metal_kernel(
             name="sh_dsv4_moe_w2",
             input_names=["h", "dw", "ds_", "db", "idxs", "wts", "params"],
             output_names=["y"],
             source=_MOE_K2_SRC,
-            header=_Q2_LUT_HEADER,
         )
         _moe_kernels = (k1, k2)
     return _moe_kernels

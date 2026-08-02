@@ -22,6 +22,7 @@ instead of saying "model type not supported", which is a worse error.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -931,6 +932,42 @@ def _hc_mixes(h: mx.array, fn: mx.array, eps: float) -> tuple[mx.array, mx.array
     return flat, (flat @ fn.T) * r
 
 
+@functools.lru_cache(maxsize=None)
+def _compiled_hc_pre(hc: int, iters: int, hc_eps: float, rms_eps: float):
+    """Fused hc_pre: mixes + the 20-iteration Sinkhorn + the pre-reduction.
+
+    Eager, this is ~130 tiny kernel launches per call and it runs 86 times per
+    decoded token (2 per layer x 43); measured at 39 ms/token of pure launch
+    overhead — 35% of decode — for arithmetic on 4x4 matrices. The function is
+    pure (no cache mutation), so mx.compile is safe; it re-traces per input
+    shape, which in serving is just decode [1,1,...] plus a handful of prefill
+    chunk sizes. Cached per (hc, iters, eps) so tiny test configs and the real
+    config coexist.
+    """
+
+    def f(h, fn, scale, base):
+        b, s, hcd, d = h.shape
+        flat = h.reshape(b, s, hcd * d).astype(mx.float32)
+        r = mx.rsqrt(flat.square().mean(-1, keepdims=True) + rms_eps)
+        mixes = (flat @ fn.T) * r
+        pre, post, comb = hc_split_sinkhorn(mixes, scale, base, hc, iters, hc_eps)
+        y = (pre[..., None] * flat.reshape(h.shape)).sum(axis=2)
+        return y.astype(h.dtype), post, comb
+
+    return mx.compile(f)
+
+
+@functools.lru_cache(maxsize=None)
+def _compiled_hc_post():
+    def f(x, residual, post, comb):
+        y = post[..., None] * x[..., None, :] + mx.einsum(
+            "bsjk,bsjd->bskd", comb, residual.astype(mx.float32)
+        )
+        return y.astype(x.dtype)
+
+    return mx.compile(f)
+
+
 class Block(nn.Module):
     def __init__(self, args: "ModelArgs", layer_id: int):
         super().__init__()
@@ -952,19 +989,13 @@ class Block(nn.Module):
         self.hc_ffn_scale = mx.zeros((3,), dtype=mx.float32)
 
     def _pre(self, h, fn, scale, base):
-        flat, mixes = _hc_mixes(h, fn, self.eps)
-        pre, post, comb = hc_split_sinkhorn(
-            mixes, scale, base, self.hc, self.iters, self.hc_eps
+        return _compiled_hc_pre(self.hc, self.iters, self.hc_eps, self.eps)(
+            h, fn, scale, base
         )
-        y = (pre[..., None] * flat.reshape(h.shape)).sum(axis=2)
-        return y.astype(h.dtype), post, comb
 
     @staticmethod
     def _post(x, residual, post, comb):
-        y = post[..., None] * x[..., None, :] + mx.einsum(
-            "bsjk,bsjd->bskd", comb, residual.astype(mx.float32)
-        )
-        return y.astype(x.dtype)
+        return _compiled_hc_post()(x, residual, post, comb)
 
     def __call__(self, h: mx.array, input_ids: mx.array, cache) -> mx.array:
         residual = h

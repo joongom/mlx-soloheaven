@@ -378,6 +378,43 @@ library `qmv` and keep only the sinkhorn/top-k tail custom. Native is still 2.4x
 the compiled 84 ms, and 25 tok/s (40 ms) still needs fewer dispatches (fusion),
 but the pathological floor is gone.
 
+### Stage 3e — single-threadgroup kernels parallelized: native OVERTAKES compiled (2026-08-02)
+
+Three fixes in the same shape ("one threadgroup / one thread cannot hide latency
+or run serial loops — give the chip the whole grid"), each verified by diff test
+then measured on the real model (`bench 24`, wired, `--force`):
+
+| step | native ms/tok | tok/s | what changed |
+|---|---|---|---|
+| after idx_topk fix | 199-201 | 5.0 | (previous entry) |
+| + gate split (score per-expert grid + tiny top-k) | 141.7 | 7.1 | gate 70.4 → 12.7 ms |
+| + hc_pre split (`dsv4_hc_mix_k` grid=24 rows) + topk staging | 90.2 | 11.1 | hc_pre 72 → 16.3 ms |
+| + PARALLEL argmax rounds in gate top-k | **80.2** | **12.5** | gate_topk 10.8 → 1.26 ms |
+
+**Native now beats the compiled path (80.2 vs 84.5 ms, 1.05x)** — the replay
+premise is redeemed after the kernel fixes; cumulative 611 → 80.2 = 7.6x.
+
+Negative result worth keeping: STAGING the gate top-k's reads into threadgroup
+memory barely helped (11.7 → 10.8 ms) — the cost was ONE GPU thread executing
+topk×n_exp serial iterations, not where it read from. Parallel argmax rounds
+(256-thread cooperative reduction per selected expert) fixed it (→ 1.26 ms).
+Single-thread serial loops on GPU are ~100x slower than they look.
+
+Current profile (80.2 ms; isolated-group times, sum ≈ 91 inflated by per-group
+commit overhead):
+
+| kernel | count | ms | lever |
+|---|---|---|---|
+| library qmv | 812 | 19.8 | dispatch COUNT: reuse the model's `_xstack` (7→1 x-projections/layer, −188), grouped-wo_a kernel (8→1, −301) |
+| dsv4_attn_core | 43 | 16.3 | 64 threadgroups underfill; split score/value or widen grid |
+| dsv4_hc_pre_k (tail) | 86 | 13.0 | serial sinkhorn on tid0 + launch; modest |
+| dsv4_comp_step | 62 | 11.4 | single threadgroup; grid over d |
+| moe w13+w2 | 86 | 12.5 | already full-chip; near bandwidth |
+
+Target ≥25 tok/s = ≤40 ms: needs roughly qmv-count (−7) + attn_core (−8) +
+comp_step (−6) + hc_pre tail (−5) + misc, i.e. most of the table — grind, but
+every step so far landed where the profile pointed.
+
 ## 3. Reproduce
 
 ```bash

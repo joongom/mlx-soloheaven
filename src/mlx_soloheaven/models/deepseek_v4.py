@@ -2650,25 +2650,27 @@ _MOE_K2_SRC = """
         float we = wts[s];
         const uint base = ((uint)e * (uint)d_model + dim) * (uint)words;
         const uint sbase = ((uint)e * (uint)d_model + dim) * (uint)(d_inner / 64);
-        float a = 0.0f, sh = 0.0f, gacc = 0.0f;
-        int cur_g = -1;
-        float sc = 0.0f, bi = 0.0f;
-        for (int w = lane; w < words; w += 32) {
-            uint p = dw[base + w];
-            uint g_ = w / wpg;
-            sc = float(ds_[sbase + g_]);
-            bi = float(db[sbase + g_]);
-            const device float* hv = hs + w * 16;
+        // per-GROUP loop (see the note in _MOE_K1_SRC): one scale/bias load
+        // per 64 values instead of one per word.
+        float a = 0.0f;
+        const int n_groups = d_inner / 64;
+        for (int g = lane; g < n_groups; g += 32) {
+            float sc = float(ds_[sbase + g]);
+            float bi = float(db[sbase + g]);
             float aw = 0.0f, sw = 0.0f;
             #pragma unroll
-            for (int j = 0; j < 16; ++j) {
-                float hj = hv[j];
-                aw += float((p >> (2 * j)) & 3u) * hj;
-                sw += hj;
+            for (int q = 0; q < 4; ++q) {
+                uint p = dw[base + g * wpg + q];
+                const device float* hv = hs + (g * wpg + q) * 16;
+                #pragma unroll
+                for (int j = 0; j < 16; ++j) {
+                    float hj = hv[j];
+                    aw += float((p >> (2 * j)) & 3u) * hj;
+                    sw += hj;
+                }
             }
             a += aw * sc + sw * bi;
         }
-        (void)cur_g; (void)gacc; (void)sh;
         acc += we * a;
     }
     if (dim >= (uint)d_model) return;

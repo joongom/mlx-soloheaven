@@ -1266,20 +1266,34 @@ def _scalar_i32(v: int) -> mx.array:
     return mx.array(v, dtype=mx.int32)
 
 
+@functools.lru_cache(maxsize=8)
+def _comp_target_capacity(ratio: int) -> int:
+    """Campaign Stage 2: preallocate compressed caches to the max-context
+    capacity so decode buffers keep ONE address and ONE shape for a whole
+    session — the precondition for command-buffer replay (and it removes
+    the 256-group trace re-keying as a side effect). Default 32K context
+    costs ~220 MB across all layers; override via env for longer sessions.
+    """
+    max_ctx = int(os.environ.get("SOLOHEAVEN_DSV4_MAX_CONTEXT", "32768"))
+    g = CompressorState.GROWTH
+    return max(g, ((max_ctx // ratio + g - 1) // g) * g)
+
+
 def _ensure_comp_capacity(cs: CompressorState, comp: "Compressor", dtype) -> None:
     """Decode-side capacity management, kept OUTSIDE the compiled function:
-    make sure the buffers exist and the output row `n` is writable. Growth
-    changes the buffer shape, which is exactly what re-keys the trace."""
+    make sure the buffers exist at the SESSION-STABLE capacity (see
+    _comp_target_capacity); growth beyond it stays possible but re-keys the
+    trace and breaks replay for that session."""
     if cs.kv_state is None:
         cs.reset(1, comp.ratio, comp.coff, comp.head_dim)
+    target = _comp_target_capacity(comp.ratio)
     if cs.cache is None:
-        cs.cache = mx.zeros((1, CompressorState.GROWTH, comp.head_dim), dtype=dtype)
+        cs.cache = mx.zeros((1, target, comp.head_dim), dtype=dtype)
     elif cs.n >= cs.cache.shape[1]:
-        cs.cache = mx.concatenate(
-            [cs.cache,
-             mx.zeros((1, CompressorState.GROWTH, comp.head_dim), dtype=cs.cache.dtype)],
-            axis=1,
-        )
+        new_cap = max(target, cs.n + CompressorState.GROWTH)
+        grown = mx.zeros((1, new_cap, comp.head_dim), dtype=cs.cache.dtype)
+        grown[:, : cs.n] = cs.cache[:, : cs.n]
+        cs.cache = grown
 
 
 def _pack_decode_state(c: DeepSeekV4Cache, layer) -> tuple:

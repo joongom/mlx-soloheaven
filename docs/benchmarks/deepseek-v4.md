@@ -533,6 +533,29 @@ Profile after (bench9, isolated-group ms): qmv 11.10 / attn_core 9.88 /
 hc_pre 7.45 / moe w13+w2 12.65 / comp_step 4.93 / wo_a 3.82 / hc_mix 3.30 /
 hc_post 3.14 / rms 2.75.
 
+### Stage 3j — hc_pre TG 1024 + hc_post d-split: -4.2 ms, prediction MET (2026-08-02)
+
+Commit 8d2e4d5. hc_pre single-threadgroup widened 256 -> 1024 (red[8] ->
+red[32], all dispatch sites moved — Stage 3g checklist); hc_post grid split
+from hcn (4) threadgroups to hcn x NSPLIT(8) d-slices. Method: same bench,
+wired, 96% free, bench10.
+
+| | ms/token | tok/s |
+|---|---|---|
+| before (Stage 3i) | 60.8 | 16.4 |
+| after hc widening | **56.6** | **17.7** (1.44x vs 81.4 compiled) |
+
+Isolated: hc_pre 7.45 -> 5.34 (-2.1), hc_post 3.14 -> 1.13 (-2.0); wall
+-4.2 ms ~= the isolated sum — the first change this session where the
+prediction landed exactly. Session cumulative: 611 -> 56.6 ms (10.8x).
+
+Profile after (bench10, isolated-group ms): qmv 11.39/280 · attn_core
+10.19/43 · moe w13+w2 12.72/86 · hc_pre 5.34/86 · comp_step 4.89/62 ·
+wo_a 3.51/43 · hc_mix 3.25/86 · rms 2.81/173 · gate 2.49/80 · hc_post 1.13/86.
+Remaining to 40 ms: -16.6. Next: attn_core early-return bisection (the
+~230 us/dispatch is still unexplained — Stage 3i), then comp_step/hc_pre
+single-TG tails, then moe/qmv bandwidth efficiency.
+
 ## 3. Reproduce
 
 ```bash

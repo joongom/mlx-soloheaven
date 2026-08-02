@@ -113,9 +113,46 @@ def plan_compressor(pl: Planner, comp, freqs, kv_src: str, sc_src: str,
         (1, 1, 1), (256, 1, 1))]
 
 
+def plan_indexer(pl: Planner, idxr, freqs, xin: str, qr: str, idx_cache: dict,
+                 ioff_off: int, n: int, ncomp: int) -> list:
+    """DSA indexer: its own comp step + wq_b/weights_proj qmv + score/top-k ->
+    cidx (scratch['cidx']). idx_cache names the indexer's compressor state
+    slots (i_kv_st, i_sc_st, i_kv_st2, i_sc_st2, i_buf) and its scratch
+    (i_ckv, i_cwg, iq, iw). cidx indexes the MAIN compressor's groups (aligned
+    by position). ncomp = visible groups."""
+    hd, rd, n_h = idxr.head_dim, idxr.rope_dim, idxr.n_heads
+    hidden = idxr.weights_proj.scales.shape[1] * idxr.weights_proj.group_size
+    q_lora = idxr.wq_b.scales.shape[1] * idxr.wq_b.group_size
+    cd = idxr.compressor.coff * hd
+    items = [
+        pl.qmv(idxr.compressor.wkv, xin, "i_ckv", hidden, cd),
+        pl.qmv(idxr.compressor.wgate, xin, "i_cwg", hidden, cd),
+        pl.qmv(idxr.weights_proj, xin, "iw", hidden, n_h),
+        pl.qmv(idxr.wq_b, qr, "iq", q_lora, n_h * hd),
+    ]
+    items += plan_compressor(pl, idxr.compressor, freqs, "i_ckv", "i_cwg",
+                             idx_cache, ioff_off, n)
+    isk, itk = BUFFER_SLOTS["dsv4_idx_score_k"], BUFFER_SLOTS["dsv4_idx_topk_k"]
+    cap = 256
+    sp, _ = pl.cb.add("4i", n_h, hd, rd, cap)
+    sf, _ = pl.cb.add("f", hd ** -0.5 * n_h ** -0.5)
+    tp, _ = pl.cb.add("2i", cap, idxr.topk)
+    items.append(pl._pi(
+        "dsv4_idx_score_k", True,
+        [(pl.S["iq"], isk["q"]), (pl.S[idx_cache["i_buf"]], isk["buf"]),
+         (pl.S["iw"], isk["w"]), (pl.t.add(freqs), isk["freqs"]), (pl.S["scores"], isk["scores"])],
+        [(sp, 16, isk["params"]), (sf, 4, isk["fscal"]), (ioff_off, 8, isk["ioff"])],
+        (cap, 1, 1), (256, 1, 1)))
+    items.append(pl._pi(
+        "dsv4_idx_topk_k", True,
+        [(pl.S["scores"], itk["scores"]), (pl.S["cidx"], itk["out_idx"])],
+        [(tp, 8, itk["params"]), (ioff_off, 8, itk["ioff"])], (1, 1, 1), (256, 1, 1)))
+    return items
+
+
 def plan_attention(pl: Planner, attn, xin: str, ring: str, out: str,
                    ioff_off: int, comp_cache: dict | None = None, ncomp: int = 0,
-                   n: int = 0) -> list:
+                   n: int = 0, idx_cache: dict | None = None) -> list:
     """Attention on scratch[xin] (the attn_norm output) -> scratch[out].
     Dense (comp_cache is None) or plain-compressed (ratio-128: comp_cache
     names the compressor state slots, ncomp = visible compressed groups).
@@ -133,7 +170,12 @@ def plan_attention(pl: Planner, attn, xin: str, ring: str, out: str,
         pl.rms(a.kv_norm.weight, "xp1", "kvn", D, a.eps),
     ]
     kc, plain = 0, 1
-    comp_slot = "dummy"
+    comp_slot, cidx_slot = "dummy", "dummy_idx"
+    if idx_cache is not None:               # ratio-4: indexer selects groups
+        items += plan_indexer(pl, a.indexer, a._freqs, xin, "qr", idx_cache,
+                              ioff_off, n, ncomp)
+        cidx_slot = "cidx"
+        plain = 0
     if comp_cache is not None:
         cd = a.compressor.coff * D
         items.append(pl.qmv(a.compressor.wkv, xin, "cwkv", hidden, cd))
@@ -141,14 +183,15 @@ def plan_attention(pl: Planner, attn, xin: str, ring: str, out: str,
         items += plan_compressor(pl, a.compressor, a._freqs, "cwkv", "cwgate",
                                  comp_cache, ioff_off, n)
         comp_slot = comp_cache["buf"]
-        kc = ncomp  # visible compressed groups (buf rows)
+        # plain layers: kc = visible groups; indexer layers: kc = topk width.
+        kc = a.indexer.topk if idx_cache is not None else ncomp
     ac = BUFFER_SLOTS["dsv4_attn_core"]
     po, _ = pl.cb.add("5i", D, a.rope_dim, win, kc, plain)
     fo, _ = pl.cb.add("2f", a.scale, a.eps)
     items.append(pl._pi(
         "dsv4_attn_core", True,
         [(pl.S["q_raw"], ac["q"]), (pl.S["kvn"], ac["kv"]), (pl.S[ring], ac["ring"]),
-         (pl.S[comp_slot], ac["comp"]), (pl.S["dummy_idx"], ac["cidx"]),
+         (pl.S[comp_slot], ac["comp"]), (pl.S[cidx_slot], ac["cidx"]),
          (pl.t.add(a.attn_sink), ac["sink"]), (pl.t.add(a._freqs), ac["freqs"]),
          (pl.S["acore"], ac["out"]), (pl.S["kv_roped"], ac["kv_out"])],
         [(po, 20, ac["params"]), (fo, 8, ac["fscal"]), (ioff_off, 8, ac["ioff"])],

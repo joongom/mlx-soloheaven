@@ -724,6 +724,112 @@ def test_native_full_model_logits_match_reference():
     assert np.median(np.abs(got - exp)) < 5e-2, np.median(np.abs(got - exp))
 
 
+def test_native_ratio4_attention_plan_matches_reference():
+    """LADDER STEP 8a3: a ratio-4 (indexer) attention as a native plan — the
+    indexer's own comp step + wq_b/weights_proj qmv + score/top-k, then the
+    main compressor step, then attn_core with the indexer-selected groups —
+    diffed against ratio-4 Attention.decode_step_math. At offset < ratio both
+    compressed buffers are empty, so this isolates the FULL indexer+compressor
+    wiring while the attention output must still match exactly."""
+    import mlx.nn as nn
+
+    from mlx_soloheaven.models.deepseek_v4 import (
+        Attention,
+        CompressorState,
+        ModelArgs,
+    )
+    from mlx_soloheaven.native import plan as plan_mod
+
+    cfg = dict(model_type="deepseek_v4", hidden_size=512, num_attention_heads=2,
+               head_dim=512, qk_rope_head_dim=64, q_lora_rank=512, o_lora_rank=512,
+               o_groups=2, sliding_window=8, compress_ratios=[4],
+               compress_rope_theta=160000, rope_theta=10000, num_hidden_layers=1,
+               rms_norm_eps=1e-6, index_head_dim=128, index_n_heads=2, index_topk=4)
+    mx.random.seed(15)  # deterministic module init regardless of suite order
+    args = ModelArgs.from_dict(cfg)
+    attn = Attention(args, 0)
+    nn.quantize(attn, group_size=64, bits=8,
+                class_predicate=lambda p, m: hasattr(m, "to_quantized") and "norm" not in p)
+    qmods = ["wq_a", "wq_b", "wkv", "wo_b", "wo_a"]
+    for m in [getattr(attn, nm) for nm in qmods] + [
+            attn.compressor.wkv, attn.compressor.wgate,
+            attn.indexer.wq_b, attn.indexer.weights_proj,
+            attn.indexer.compressor.wkv, attn.indexer.compressor.wgate]:
+        m.scales, m.biases = m.scales.astype(mx.bfloat16), m.biases.astype(mx.bfloat16)
+    for nm in ("q_norm", "kv_norm"):
+        getattr(attn, nm).weight = getattr(attn, nm).weight.astype(mx.bfloat16)
+    attn.compressor.norm.weight = attn.compressor.norm.weight.astype(mx.bfloat16)
+    attn.indexer.compressor.norm.weight = attn.indexer.compressor.norm.weight.astype(mx.bfloat16)
+
+    H, D, g = attn.n_heads, attn.head_dim, attn.n_groups
+    ratio, win, hidden = attn.ratio, attn.window, 512
+    q_lora, NHD, o_lora = 512, H * D, args.o_lora_rank
+    ihd, coff = attn.indexer.head_dim, attn.compressor.coff
+    icoff = attn.indexer.compressor.coff
+    offset, n = 2, 0
+
+    rng = np.random.default_rng(15)
+    x = mx.array(rng.standard_normal((1, 1, hidden)).astype(np.float32) * 0.3).astype(mx.bfloat16)
+    ring0 = mx.array(rng.standard_normal((1, win, D)).astype(np.float32) * 0.1).astype(mx.bfloat16)
+
+    def fresh_state():
+        cs, ics = CompressorState(), CompressorState()
+        cs.reset(1, ratio, coff, D)
+        ics.reset(1, ratio, icoff, ihd)
+        return (cs.kv_state, cs.score_state, mx.zeros((1, 256, D), mx.bfloat16),
+                mx.array(n, mx.int32), ics.kv_state, ics.score_state,
+                mx.zeros((1, 256, ihd), mx.bfloat16), mx.array(n, mx.int32))
+
+    out_ref, *_ = attn.decode_step_math(
+        x, ring0.astype(mx.float32).astype(mx.bfloat16), fresh_state(),
+        mx.array(offset, dtype=mx.int32))
+    mx.eval(out_ref)
+    mx.synchronize()
+
+    rt_mod.load_custom_kernels(_RT)
+    T = rt_mod.BufferTable()
+
+    def z(nn_, dt=mx.bfloat16):
+        aa = mx.zeros((nn_,), dtype=dt)
+        mx.eval(aa)
+        return aa
+
+    def ninf(nn_):
+        aa = mx.full((nn_,), -mx.inf, mx.float32)
+        mx.eval(aa)
+        return aa
+
+    cd, icd = coff * D, icoff * ihd
+    scratch = dict(
+        x=x.reshape(-1), ring=ring0.astype(mx.float32).astype(mx.bfloat16).reshape(-1),
+        xp0=z(q_lora), qr=z(q_lora), q_raw=z(NHD), xp1=z(D), kvn=z(D), acore=z(NHD),
+        kv_roped=z(D), o_lora=z(g * o_lora), attn_out=z(hidden), cwkv=z(cd), cwgate=z(cd),
+        kv_st=z(ratio * cd, mx.float32), sc_st=ninf(ratio * cd), kv_st2=z(ratio * cd, mx.float32),
+        sc_st2=z(ratio * cd, mx.float32), buf=z(256 * D),
+        i_ckv=z(icd), i_cwg=z(icd), iw=z(attn.indexer.n_heads), iq=z(attn.indexer.n_heads * ihd),
+        i_kv_st=z(ratio * icd, mx.float32), i_sc_st=ninf(ratio * icd),
+        i_kv_st2=z(ratio * icd, mx.float32), i_sc_st2=z(ratio * icd, mx.float32),
+        i_buf=z(256 * ihd), scores=z(256, mx.float32), cidx=mx.zeros((attn.indexer.topk,), mx.int32),
+        dummy=z(D), dummy_idx=mx.full((1,), -1, mx.int32),
+    )
+    mx.eval(*scratch.values())
+    mx.synchronize()
+    S = {k: T.add(v) for k, v in scratch.items()}
+    cb = plan_mod.ConstBlob()
+    ioff_off, _ = cb.add("2i", offset, 0)
+    pl = plan_mod.Planner(_RT, T, cb, S)
+    comp_cache = dict(kv_st="kv_st", sc_st="sc_st", kv_st2="kv_st2", sc_st2="sc_st2", buf="buf")
+    idx_cache = dict(kv_st="i_kv_st", sc_st="i_sc_st", kv_st2="i_kv_st2",
+                     sc_st2="i_sc_st2", buf="i_buf", i_buf="i_buf")
+    items = plan_mod.plan_attention(pl, attn, "x", "ring", "attn_out", ioff_off,
+                                    comp_cache=comp_cache, ncomp=0, n=n, idx_cache=idx_cache)
+    _RT.commit(items, T.ptrs, cb.bytes(), wait=True)
+
+    got = np.array(scratch["attn_out"].astype(mx.float32))
+    exp = np.array(out_ref.reshape(-1).astype(mx.float32))
+    assert np.abs(got - exp).max() < 3e-2, np.abs(got - exp).max()
+
+
 def test_native_indexer_kernels_match_reference():
     """LADDER STEP 8b: the DSA indexer's scoring + top-k (the gating piece for
     the 21 ratio-4 layers) via the C loop, vs Indexer.decode_step_math's
@@ -927,6 +1033,7 @@ def test_native_full_block_plan_matches_reference():
                num_hash_layers=0, hc_mult=2, hc_sinkhorn_iters=5, swiglu_limit=10.0,
                compress_ratios=[0], rope_theta=10000, num_hidden_layers=1,
                rms_norm_eps=1e-6, hc_eps=1e-6)
+    mx.random.seed(22)
     args = ModelArgs.from_dict(cfg)
     blk = Block(args, 0)
     for nm in ("hc_attn_fn", "hc_ffn_fn"):
@@ -1255,6 +1362,7 @@ def test_native_ffn_half_plan_matches_reference():
                num_hash_layers=0, hc_mult=2, hc_sinkhorn_iters=5, swiglu_limit=10.0,
                compress_ratios=[0], rope_theta=10000, num_hidden_layers=1,
                rms_norm_eps=1e-6, hc_eps=1e-6)
+    mx.random.seed(21)
     args = ModelArgs.from_dict(cfg)
     blk = Block(args, 0)
     blk.hc_ffn_fn = mx.random.normal(blk.hc_ffn_fn.shape) * 0.1

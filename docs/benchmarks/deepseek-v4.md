@@ -242,6 +242,50 @@ Standing conclusions:
   0.32 DLPack zero-copy for an external ds4-style decode loop (weeks, the
   only mapped road to parity). Details in the spec.
 
+### Stage 3b ladder steps 8b–8c — full native decoder CORRECT + the dispatch floor (2026-08-02)
+
+The `NativeDecoder` now replays a full multi-layer decode (dense + ratio-128 +
+ratio-4) as one command buffer and is **bit-for-bit deterministic** and correct
+(argmax in the compiled reference's top-3 when that reference is self-consistent;
+the per-layer-type plan tests are the tight proof). Getting here surfaced two
+out-of-bounds bugs — found with **`MTL_SHADER_VALIDATION=1`**, the tool that
+cracked a nasty in-suite-only Heisenbug (full write-up:
+`docs/benchmarks/deepseek-v4-native-debugging.md`):
+* **Compressor state under-allocation (real, native-path bug).** `dsv4_comp_step`
+  indexes the state as `[coff*ratio, coff*head_dim]` (`CompressorState.reset`),
+  but `decoder.py`/tests allocated `ratio*cd` — missing the `coff` row factor, so
+  every ratio-4 (`coff==2`) layer read/wrote one group past the end into adjacent
+  buffers (allocation-dependent garbage). Fixed to `coff*ratio*cd`. Only the
+  native runtime under-allocated; the compiled/eager model path (which sizes via
+  `CompressorState.reset`) was always correct.
+* **qmv `N%8` (test-config artifact).** `affine_qmv_fast_..._batch_0` needs
+  `N%8==0`; `weights_proj` has `N=index_n_heads`, and the tests used `2`. The real
+  model uses `64`, so this never affected production; tests now use `8`.
+
+The residual full-model-test flake was traced to the model's **`mx.compile`'d
+decode reference being non-deterministic under pytest memory pressure**
+(`ref_self_max` up to ~2.0 on identical inputs), NOT the native path
+(`nat_self_max==0` always). Open question for the server: is the compiled decode
+non-deterministic in production too? (weights were confirmed identical).
+
+**Plan cache (`decoder.py`).** The per-token plan build was ~10.8 ms of Python
+(1306 `_PlanItem` structs). The dispatch list depends only on each layer's
+completed-group count `n` and the compressor parity `par`; token id and offset
+are the only per-token-varying values and live at fixed const-blob offsets
+(patched in place). Caching by `(n, par)` and rebuilding only when `n` advances
+makes most tokens a byte-patch. Verified bit-identical to a per-token rebuild
+over 12 tokens (par flips + n increments).
+
+**The dispatch floor (measured, tiny 43-layer model, hidden=256).** Per token:
+Python plan build ~11 ms (now cached away), C encode **0.52 ms**, GPU replay of
+1306 dispatches **~26 ms**. Barriers are **free**: same plan with all barriers vs
+none timed 25.88 vs 26.03 ms — the 26 ms is the GPU command processor launching
+1306 dispatches, ~20 µs each, NOT barrier serialization. So on the real model the
+lever for ≥25 tok/s is **dispatch count** (kernel fusion — e.g. the 8 grouped
+`wo_a` qmv → 1), not barriers or Python. Tiny-model µs/dispatch does not predict
+the real model (whose large kernels are compute-dominated); a real-model number
+is required — run `validate_deepseek_v4.py bench`.
+
 ## 3. Reproduce
 
 ```bash
@@ -251,13 +295,10 @@ DSV4_MODEL=~/.lmstudio/models/mlx-soloheaven/DeepSeek-V4-Flash-0731-MLX-2bit-sea
 # ds4 side (from ~/workspace/numenore/ds4; --raw is required for comparisons)
 ./ds4 --raw -p "PROMPT" --dump-logits ref.json -n 1 --temp 0
 ./ds4 -p "PROMPT" -n 64 --temp 0                   # prints prefill/generation t/s
-# decode bench pattern (wired! nothing else loaded!)
-python - <<'PY'
-import mlx.core as mx, time
-mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
-# load via validate_deepseek_v4.load(), prefill ~10 tokens, time 24+ greedy
-# decode steps with mx.eval per token, discard the first 4-6 (traces/JIT)
-PY
+# decode throughput — compiled path vs native replay runtime, tok/s each
+# (loads the 88 GB weights; close everything else first — needs ~100 GiB free)
+DSV4_MODEL=~/.lmstudio/models/mlx-soloheaven/DeepSeek-V4-Flash-0731-MLX-2bit-search \
+  .venv/bin/python validate_deepseek_v4.py bench 64
 ```
 
 Rules this ledger follows are in `docs/DOCUMENTATION.md`.

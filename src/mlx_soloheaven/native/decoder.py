@@ -14,6 +14,8 @@ that runs them on a real model. Opt-in via SOLOHEAVEN_DSV4_NATIVE=1.
 
 from __future__ import annotations
 
+import struct
+
 import mlx.core as mx
 
 from mlx_soloheaven.native import plan as P
@@ -33,6 +35,19 @@ class NativeDecoder:
         self.n_layers = a.num_hidden_layers
         self._cap = self._round_cap(max_context)
         self.offset = 0
+        # Plan cache: the built dispatch list depends only on each layer's
+        # completed-group count `n` (baked buffer row offsets) and the
+        # compressor double-buffer parity `par` (which state buffer is
+        # read/written). The token id and running offset are the ONLY
+        # per-token-varying values, and both live at fixed positions in the
+        # const blob (setBytes) — patched in place per token. `n` advances at
+        # most every ratio tokens; `par` flips every token but has 2 states.
+        # So we keep <=2 built plans for the current n and rebuild only when n
+        # advances, turning the ~10 ms/token Python plan build into a patch.
+        self._plan_cache: dict = {}
+        self._plan_n: tuple | None = None
+        self._tok_off = 0
+        self._ioff_off = 0
 
         self.table = rt.BufferTable()
         self.S: dict[str, int] = {}
@@ -90,19 +105,26 @@ class NativeDecoder:
         self._reg(p + "ring", self._z(self.win * D))
         lay = {"ratio": ratio, "n": 0, "par": 0, "ring": p + "ring"}
         if ratio:
+            # Compressor state is [coff*ratio, coff*head_dim] = [rows, cd]
+            # (CompressorState.reset), so the buffer is rows*cd. The dsv4_comp_step
+            # kernel indexes rows = coff*ratio rows; sizing at ratio*cd (missing
+            # the coff row factor) under-allocates the ratio-4 (coff=2) state and
+            # the kernel reads/writes 1 group past the end into adjacent buffers.
             coff, cd = (2, 2 * D) if ratio == 4 else (1, D)
-            self._reg(p + "kv_a", self._z(ratio * cd, mx.float32))
-            self._reg(p + "sc_a", self._ninf(ratio * cd))
-            self._reg(p + "kv_b", self._z(ratio * cd, mx.float32))
-            self._reg(p + "sc_b", self._z(ratio * cd, mx.float32))
+            st = coff * ratio * cd
+            self._reg(p + "kv_a", self._z(st, mx.float32))
+            self._reg(p + "sc_a", self._ninf(st))
+            self._reg(p + "kv_b", self._z(st, mx.float32))
+            self._reg(p + "sc_b", self._z(st, mx.float32))
             self._reg(p + "buf", self._z(self._cap * D))
             lay["comp"] = p
             if ratio == 4:
-                icd = 2 * ihd
-                self._reg(p + "ikv_a", self._z(ratio * icd, mx.float32))
-                self._reg(p + "isc_a", self._ninf(ratio * icd))
-                self._reg(p + "ikv_b", self._z(ratio * icd, mx.float32))
-                self._reg(p + "isc_b", self._z(ratio * icd, mx.float32))
+                icoff, icd = 2, 2 * ihd
+                ist = icoff * ratio * icd
+                self._reg(p + "ikv_a", self._z(ist, mx.float32))
+                self._reg(p + "isc_a", self._ninf(ist))
+                self._reg(p + "ikv_b", self._z(ist, mx.float32))
+                self._reg(p + "isc_b", self._z(ist, mx.float32))
                 self._reg(p + "ibuf", self._z(self._cap * ihd))
                 lay["idx"] = p
         return lay
@@ -128,6 +150,7 @@ class NativeDecoder:
         pl = P.Planner(self.rt, self.table, cb, self.S)
         tok_off, _ = cb.add("i", token)
         ioff_off, _ = cb.add("2i", self.offset, 0)
+        self._tok_off, self._ioff_off = tok_off, ioff_off
         items = P.plan_embed(pl, self.model.embed, "ha", self.hc, self.hidden, tok_off)
         cur, nxt = "ha", "hb"
         for i, blk in enumerate(self.model.layers):
@@ -146,9 +169,21 @@ class NativeDecoder:
     def decode(self, token: int) -> mx.array:
         """Replay one decode step for `token` at the current offset; returns
         the logits (bf16 [vocab]). Advances offset + per-layer state."""
-        cb = P.ConstBlob()
-        items = self._build_plan(cb, int(token))
-        self.rt.commit(items, self.table.ptrs, cb.bytes(), wait=True)
+        n_tuple = tuple(lay["n"] for lay in self._layers)
+        if n_tuple != self._plan_n:
+            self._plan_cache.clear()   # `n`-baked buffer offsets changed
+            self._plan_n = n_tuple
+        par_key = tuple(lay["par"] for lay in self._layers)
+        cached = self._plan_cache.get(par_key)
+        if cached is None:
+            cb = P.ConstBlob()
+            items = self._build_plan(cb, int(token))
+            cached = (items, bytearray(cb.bytes()), self._tok_off, self._ioff_off)
+            self._plan_cache[par_key] = cached
+        items, blob, tok_off, ioff_off = cached
+        struct.pack_into("<i", blob, tok_off, int(token))
+        struct.pack_into("<i", blob, ioff_off, int(self.offset))
+        self.rt.commit(items, self.table.ptrs, bytes(blob), wait=True)
         for lay in self._layers:
             if lay["ratio"]:
                 if (self.offset + 1) % lay["ratio"] == 0:

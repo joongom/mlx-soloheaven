@@ -11,6 +11,8 @@ Subcommands:
   agree DS4LP.json "PROMPT"    teacher-forced top-1 agreement over a ds4
                             `--dump-logprobs` continuation — the number to rank
                             two builds on
+  bench [n_tokens]          decode throughput: mx.compile'd path vs the native
+                            Metal replay runtime (NativeDecoder), tok/s each
 
 Point at a specific build with DSV4_MODEL=/path/to/build.
 
@@ -229,6 +231,67 @@ def cmd_agree(ds4_logprobs: str, prompt: str) -> None:
     print(f"ours in ds4 top-5: {in5}/{n}  ({in5 / n:.0%})")
 
 
+def cmd_bench(n_tokens: int = 64, prefill: int = 8) -> None:
+    """Decode-throughput benchmark: the mx.compile'd path vs the external
+    Metal replay runtime (NativeDecoder), on the REAL model. Reports tok/s for
+    each. Run yourself (loads the 88 GB weights): `python validate_deepseek_v4.py
+    bench [n_tokens] [prefill]`. Needs ~100 GiB reclaimable (or --force)."""
+    import time
+
+    import mlx.core as mx
+
+    model, tokenizer = load()
+    ids = tokenizer.encode("The quick brown fox jumps over the lazy dog. "
+                           "In a distant land,", add_special_tokens=False)[:prefill]
+
+    def timed(fn, warmup=4):
+        for _ in range(warmup):
+            fn()
+        mx.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(n_tokens):
+            fn()
+        mx.synchronize()
+        return n_tokens / (time.perf_counter() - t0)
+
+    # --- compiled path ---
+    cache = model.make_cache()
+    logits = model(mx.array([ids]), cache)
+    mx.eval(logits)
+    mx.synchronize()
+    tok = logits[0, -1].argmax().reshape(1, 1)
+
+    def step_compiled():
+        nonlocal tok
+        tok = model(tok, cache)[0, -1].argmax().reshape(1, 1)
+        mx.eval(tok)
+
+    tps_compiled = timed(step_compiled)
+    print(f"compiled decode:  {tps_compiled:5.1f} tok/s  ({1e3 / tps_compiled:.1f} ms/token)")
+
+    # --- native replay path ---
+    from mlx_soloheaven.native.decoder import NativeDecoder
+
+    dec = NativeDecoder(model, max_context=int(os.environ.get(
+        "SOLOHEAVEN_DSV4_MAX_CONTEXT", "8192")))
+    dec.offset = len(ids)
+    for i, c in enumerate(cache):
+        if getattr(c, "ring", None) is not None:
+            dec.set_ring(i, c.ring)
+    seed_tok = int(logits[0, -1].argmax())
+
+    def step_native():
+        nonlocal seed_tok
+        lg = dec.decode(seed_tok)
+        mx.eval(lg)
+        seed_tok = int(lg.argmax())
+
+    tps_native = timed(step_native)
+    print(f"native  decode:   {tps_native:5.1f} tok/s  ({1e3 / tps_native:.1f} ms/token)")
+    print(f"speedup:          {tps_native / tps_compiled:.2f}x  "
+          f"(target >=25 tok/s: {'MET' if tps_native >= 25 else 'not yet'})")
+
+
 def cmd_compare(ours_path: str, ds4_path: str) -> None:
     import numpy as np
 
@@ -256,5 +319,8 @@ if __name__ == "__main__":
         cmd_agree(sys.argv[2], sys.argv[3])
     elif cmd == "compare":
         cmd_compare(sys.argv[2], sys.argv[3])
+    elif cmd == "bench":
+        n = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 64
+        cmd_bench(n_tokens=n)
     else:
         raise SystemExit(__doc__)

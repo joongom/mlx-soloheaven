@@ -942,37 +942,41 @@ _ATTN_CORE_SRC = """
     // scores: window part (ring slots computed inline; slot==offset%WIN is
     // the fresh token -> use kvr) then comp part.
     // Only [jlo, jhi) can hold valid entries: window slots below jlo have
-    // qpos < 0, comp groups past NCOMP (plain) are masked. The window and
-    // comp regions are contiguous, so shrinking the loop bounds makes every
-    // pass O(context) instead of O(window capacity) — at short offsets that
-    // is a ~30x cut in serial work per thread.
+    // qpos < 0, and BOTH comp modes expose a contiguous valid prefix of
+    // min(NCOMP, KC) groups (plain masks past NCOMP; idx_topk emits its
+    // winners as a -1-padded prefix and NCOMP is the n2 it saw). The window
+    // and comp regions are contiguous, so the loops run O(context) instead
+    // of O(window capacity).
+    // One SIMDGROUP per slot, lanes split the D dims: a single thread
+    // serially walking a 512-dim row exposes full DRAM latency per element
+    // (~138 us/dispatch, Stage 3k bisection); 32 coalesced lanes + simd_sum
+    // hide it.
     const int K = WIN + KC;
     const int jlo = (offset + 1 < WIN) ? (WIN - 1 - offset) : 0;
-    const int jhi = WIN + (PLAIN ? min(NCOMP, KC) : KC);
-    for (int j = jlo + (int)tid; j < jhi; j += TG) {
+    const int jhi = WIN + min(NCOMP, KC);
+    uint sg_ = simdgroup_index_in_threadgroup;
+    uint lane_ = thread_index_in_simdgroup;
+    for (int j = jlo + (int)sg_; j < jhi; j += TG / 32) {
         float s = -INFINITY;
         if (j < WIN) {
             int qpos = offset - WIN + 1 + j;
-            if (qpos >= 0) {
-                float a = 0.0f;
-                if (qpos == offset) {
-                    for (int i = 0; i < D; ++i) a += qh[i] * kvr[i];
-                } else {
-                    int slot = qpos % WIN;
-                    for (int i = 0; i < D; ++i) a += qh[i] * float(ring[slot * D + i]);
-                }
-                s = a * scale;
+            float a = 0.0f;
+            if (qpos == offset) {
+                for (int i = lane_; i < D; i += 32) a += qh[i] * kvr[i];
+            } else {
+                int slot = qpos % WIN;
+                for (int i = lane_; i < D; i += 32) a += qh[i] * float(ring[slot * D + i]);
             }
+            s = simd_sum(a) * scale;
         } else {
-            int jc = j - WIN;
-            int idx = PLAIN ? (jc < NCOMP ? jc : -1) : cidx[jc];
+            int idx = PLAIN ? (j - WIN) : cidx[j - WIN];
             if (idx >= 0) {
                 float a = 0.0f;
-                for (int i = 0; i < D; ++i) a += qh[i] * float(comp[idx * D + i]);
-                s = a * scale;
+                for (int i = lane_; i < D; i += 32) a += qh[i] * float(comp[idx * D + i]);
+                s = simd_sum(a) * scale;
             }
         }
-        sc[j] = s;
+        if (lane_ == 0) sc[j] = s;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 

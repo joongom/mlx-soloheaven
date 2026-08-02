@@ -932,6 +932,29 @@ post-step visible group count) and `dsv4_qmv8_k` (unused by the plan). The
 fp32 activation chain was reverted — with the actual bug fixed it buys
 nothing and costs bandwidth.
 
+### Stage 4f — the corrected native path: quality MET, 41.2 ms / 24.3 tok/s (2026-08-02)
+
+With the transposed-comb fix and both compressed-region fixes in, on the
+shipped build:
+
+| | ppl ALL | ko | en | code | ms/token | tok/s |
+|---|---|---|---|---|---|---|
+| compiled | 3.649 | 6.58 | 3.98 | 1.46 | 76.5 | 13.1 |
+| **native** | **3.651** | **6.52** | 4.05 | 1.46 | **41.2** | **24.3** |
+
+Quality is equal within noise (Korean slightly better), and the
+long-context logit error against the eager batch now matches the compiled
+path exactly (P=200: 1.375 both) — the native replay is a faithful decode,
+1.86x faster.
+
+**Read the earlier speed numbers with this correction**: Stage 3r's
+38.9 ms / 25.7 tok/s was measured while `ncomp` was pinned to 0, i.e. while
+attn_core skipped the entire compressed region on every layer. Attending to
+it is real work, and 41.2 ms is the honest cost of the correct computation.
+Every Stage 3 number from 3a through 3r carries that same discount; the
+relative gains within the campaign stand, the absolute floor is ~2 ms
+higher.
+
 ## 3. Reproduce
 
 ```bash

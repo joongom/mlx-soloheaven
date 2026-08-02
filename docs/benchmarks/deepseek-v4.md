@@ -435,6 +435,28 @@ score/value or widen the grid), comp_step 11.8 (single threadgroup; grid over
 d), moe 13.4 (near bandwidth), hc_pre 7.4. Target 40 ms needs roughly
 attn_core + comp_step + qmv-count together.
 
+### Stage 3g — threadgroup widening: 62.6 ms, 16.0 tok/s (2026-08-02)
+
+The next three bottlenecks all fell to the same lever (widen the underfilled
+threadgroup, ALL dispatch sites moved together):
+
+| step | native ms/tok | tok/s | what changed |
+|---|---|---|---|
+| attn_core TG 128 -> 256 -> 512 | 69.0 | 14.5 | attn_core 16.3 -> 9.5 ms |
+| comp_step TG 256 -> 1024 (+wsum[32]) | **62.6** | **16.0 (1.26x)** | comp_step 11.3 -> <6 ms |
+
+Trap recorded: bumping a kernel's compile-time TG while ANY dispatch site still
+launches the old thread count leaves the simdgroup-partial array (red[]/wsum[])
+partially unwritten -> NaN. The first 512 attempt NaN'd from exactly this (a
+test's hand-built _PlanItem and the mx.fast twin's dispatch weren't moved);
+PSO maxTotalThreadsPerThreadgroup is 1024, not the limit. Check `pipeline
+maxTotalThreadsPerThreadgroup` and grep EVERY dispatch site before widening.
+
+Cumulative: 611 -> 62.6 ms = 9.8x. Remaining (62.6 ms): qmv 16.9 (624 —
+grouped wo_a 8->1 is the count lever, -301 dispatches), moe 12.4 (near
+bandwidth), attn_core 9.6, hc_pre 7.4, hc_post/mix/rms ~9. Target 40 ms:
+needs the wo_a count cut plus one more of attn_core/hc tail.
+
 ## 3. Reproduce
 
 ```bash

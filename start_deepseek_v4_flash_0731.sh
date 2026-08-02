@@ -51,6 +51,5 @@ mlx-soloheaven \
   --temperature 0.8 \
   --top-p 0.95 \
   --thinking-budget 4096 \
-  --no-thinking \
   --repetition-penalty 1.05 \
   "$@"

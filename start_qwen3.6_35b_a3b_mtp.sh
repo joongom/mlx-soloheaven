@@ -77,13 +77,14 @@ DRAFT_ARGS=(--draft-model "$DRAFT_PATH" --draft-block-size 1)
 # --thinking-budget/--repetition-penalty: anti-loop safety net (overridable via "$@")
 mlx-soloheaven \
   --model "$MODEL_PATH" \
-  --memory-budget-gb 30 \
+  --memory-budget-gb 20 \
   "${DRAFT_ARGS[@]}" \
   --gpu-keepalive \
   --prefill-step-size 2048 \
   --temperature 0.6 \
   --top-k 20 \
   --top-p 0.95 \
+  --no-thinking \
   --thinking-budget 4096 \
   --repetition-penalty 1.1 \
   "$@"

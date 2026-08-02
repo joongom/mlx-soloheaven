@@ -44,7 +44,7 @@
 # NOTE: the LM Studio hub path (~/.lmstudio/hub/models/qwen/qwen3.6-27b) is
 # a catalog stub with no weights; the runnable MLX weights are the path below.
 MODEL_PATH="$HOME/.lmstudio/models/lmstudio-community/Qwen3.6-27B-MLX-8bit"
-DRAFT_PATH="${DRAFT_PATH:-$HOME/.lmstudio/models/mlx-community/Qwen3.6-27B-MTP-bf16}"
+DRAFT_PATH="${DRAFT_PATH:-$HOME/.lmstudio/models/mlx-community/Qwen3.6-27B-MTP-4bit}"
 
 cd "$(dirname "$0")"
 source .venv/bin/activate
@@ -86,5 +86,6 @@ mlx-soloheaven \
   --top-k 20 \
   --top-p 0.95 \
   --thinking-budget 4096 \
+  --no-thinking \
   --repetition-penalty 1.1 \
   "$@"

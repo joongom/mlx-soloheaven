@@ -113,19 +113,21 @@ step unless profiling later demands it) owning:
       STILL TODO: wire the indexer dispatches (its own comp step +
       wq_b/weights_proj qmv + these two kernels) into plan_attention for
       ratio-4, then diff a ratio-4 Block.
-   b. IN PROGRESS: NativeDecoder (native/decoder.py) — builds the session
+   b. ✅ DONE: NativeDecoder (native/decoder.py) — builds the session
       buffer table (all weights + per-layer ring/compressor/indexer cache at
       fixed capacity) + scratch, and per token re-encodes the full plan
       (embed + N plan_blocks + head) with current offset/group-counts,
-      commits, returns logits. WORKS for a dense multi-layer model and for
-      single compressed layers (argmax matches, tight median). BUG (xfail
-      test_native_decoder_full_model_matches_reference): a ratio-128 layer in
-      a NON-FIRST position NaNs — the per-layer compressor cache double-buffer
-      orientation (_cache_dicts parity) or the h ping-pong is mis-wired across
-      layers. IMPORTANT FIX ALREADY IN: mx `arr[:] = ...` does NOT propagate
-      to a registered MTLBuffer (it allocates a new buffer); seed via
-      buffer_contents + memmove (set_ring). Next: isolate the ratio-128
-      non-first-layer NaN, then the real 88 GB model + bench.
+      commits, returns logits. A FULL multi-layer model with ALL THREE layer
+      types (dense + ratio-128 + ratio-4) replays as one command buffer and
+      its logits' argmax lands in the reference top-3
+      (test_native_decoder_full_model_matches_reference — no longer xfail).
+      The earlier ratio-128-non-first NaN was a TEST-SETUP omission
+      (gate.weight, a bare Gate parameter, was left fp32 by apply_to_modules
+      while the kernel reads it bf16 — the deployed converter writes it bf16),
+      NOT a driver bug: the double-buffer parity and h ping-pong were correct.
+      IMPORTANT FIX ALREADY IN: mx `arr[:] = ...` does NOT propagate to a
+      registered MTLBuffer (it allocates a new buffer); seed via
+      buffer_contents + memmove (set_ring). Next: the real 88 GB model + bench.
    c. integrate as a third path in Model.__call__ behind
       SOLOHEAVEN_DSV4_NATIVE=1 (after the compiled path), eager fallback kept.
    d. bench decode tok/s vs the 12 tok/s compiled path; target >=25.

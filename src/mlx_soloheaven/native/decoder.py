@@ -9,7 +9,7 @@ so per-token-varying buffer offsets need no dynamic in-kernel indexing.
 
 Correctness of the plan builders is verified in tests/test_dsv4_native.py
 (per-layer-type plans + full dense-model logits). This class is the wiring
-that runs them on a real model. Opt-in via SOLOHEAVEN_DSV4_NATIVE=1.
+that runs them on a real model. Opt-in via SOLOHEAVEN_NATIVE_DECODE=1.
 """
 
 from __future__ import annotations

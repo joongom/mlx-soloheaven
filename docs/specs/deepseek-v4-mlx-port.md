@@ -12,7 +12,7 @@ continuation positions: top-1 27/32, ours-in-ds4-top5 31/32.
 15.7x the first native measurement (611 ms). Full campaign, per-stage
 methods, and the refuted attempts: `docs/benchmarks/deepseek-v4.md`
 Stages 3a-3r. NOT yet wired into serving: the native path still needs a
-ppl run through the native decoder, the SOLOHEAVEN_DSV4_NATIVE=1 opt-in
+ppl run through the native decoder, the SOLOHEAVEN_NATIVE_DECODE=1 opt-in
 with eager fallback, and a multi-turn server check (native/README ladder).
 
 Generation quality was broken (Korean corrupted at the token level) until the
@@ -328,7 +328,7 @@ across ~5k ops/token. Paths, in effort order:
    command-buffer replay, so the dispatch tax lives below compile's reach.
    The path stays in (correctness-neutral, tests exercise it, and the
    functional state threading is the foundation for 2b) behind
-   SOLOHEAVEN_DSV4_COMPILE.
+   SOLOHEAVEN_COMPILE_DECODE.
    2b. ~~Stacked x-projections~~ DONE (2026-08-02) — also no change
    (86.1 ms/token; loaded Q8 weights concatenated along the output axis at
    first decode, one quantized_matmul + split, identical numerics, tests
@@ -385,7 +385,7 @@ across ~5k ops/token. Paths, in effort order:
    10.7, because the ablation removed compute+dispatch while the kernel
    still pays call preparation. Lesson recorded: single-op fusion picks off
    a few ms each; the spread dispatch tax needs (2), not more of (3).
-   Eager path stays canonical (`SOLOHEAVEN_DSV4_METAL=0` to disable).
+   Eager path stays canonical (`SOLOHEAVEN_METAL_KERNELS=0` to disable).
 
 ## Sequence
 

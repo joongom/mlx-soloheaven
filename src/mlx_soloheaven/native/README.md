@@ -144,7 +144,7 @@ step unless profiling later demands it) owning:
       `par`; the token id and offset are patched into the const blob in place,
       so most tokens skip the rebuild entirely.
    c. integrate as a third path in Model.__call__ behind
-      SOLOHEAVEN_DSV4_NATIVE=1 (after the compiled path), eager fallback kept.
+      SOLOHEAVEN_NATIVE_DECODE=1 (after the compiled path), eager fallback kept.
    d. bench decode tok/s vs the 12 tok/s compiled path; target >=25.
       Harness ready: `python validate_deepseek_v4.py bench [n_tokens]` times
       the compiled path vs the NativeDecoder on the REAL model and prints tok/s
@@ -154,7 +154,7 @@ step unless profiling later demands it) owning:
    agreement over a 32-token greedy run.
 6. ppl probes through the native path ≈ MLX path (3.65).
 7. serving integration: third path in `Model.__call__` behind
-   `SOLOHEAVEN_DSV4_NATIVE=1`, fallback preserved; multi-turn HIT check.
+   `SOLOHEAVEN_NATIVE_DECODE=1`, fallback preserved; multi-turn HIT check.
 8. bench: target ≤40 ms/token (≥25 tok/s).
 
 ## Chained-plan contracts (learned building the first 2-item plan)
@@ -175,7 +175,7 @@ step unless profiling later demands it) owning:
 * scales/biases must be bf16 (T-typed kernels) — our build already is.
 * qmv_fast needs N%8==0 && K%512==0 — all our shapes qualify except the
   stacked x-proj (4160 rows: 4160%8==0 ✓, K=4096 ✓ fine).
-* Cache growth past SOLOHEAVEN_DSV4_MAX_CONTEXT re-allocates buffers →
+* Cache growth past SOLOHEAVEN_NATIVE_MAX_CONTEXT re-allocates buffers →
   runtime must detect (buffer identity check) and re-build the plan.
 * Everything stays MLX-resident: the runtime borrows buffers, never owns
   weights; session save/restore and the engine contract are untouched.

@@ -279,7 +279,7 @@ def cmd_bench(n_tokens: int = 64, prefill: int = 8) -> None:
     # --- native replay path ---
     from mlx_soloheaven.native.decoder import NativeDecoder
 
-    cap = int(os.environ.get("SOLOHEAVEN_DSV4_MAX_CONTEXT", "8192"))
+    cap = int(os.environ.get("SOLOHEAVEN_NATIVE_MAX_CONTEXT", "8192"))
 
     def native_tps(barriers: bool) -> float:
         dec = NativeDecoder(model, max_context=cap, barriers=barriers)
@@ -338,7 +338,7 @@ def cmd_compare(ours_path: str, ds4_path: str) -> None:
 
 def cmd_ppl_native(path: str = "native") -> None:
     """Teacher-forced perplexity THROUGH A DECODE PATH — the quality gate for
-    serving with SOLOHEAVEN_DSV4_NATIVE=1. Same probes and metric as cmd_ppl:
+    serving with SOLOHEAVEN_NATIVE_DECODE=1. Same probes and metric as cmd_ppl:
     position 0 is scored from the (eager) one-token prefill logits, every
     later position from a decode step fed the true token. ``path`` "native"
     (borrow-mode replay) or "compiled" (the mx.compile'd step — the fair

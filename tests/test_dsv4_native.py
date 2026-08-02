@@ -1838,8 +1838,8 @@ def test_native_decode_grows_compressed_cache_instead_of_writing_past_it(monkeyp
     from mlx_soloheaven.models.deepseek_v4 import CompressorState
 
     monkeypatch.setattr(CompressorState, "GROWTH", 4)
-    monkeypatch.setenv("SOLOHEAVEN_DSV4_MAX_CONTEXT", "16")
-    monkeypatch.setenv("SOLOHEAVEN_DSV4_NATIVE", "1")
+    monkeypatch.setenv("SOLOHEAVEN_NATIVE_MAX_CONTEXT", "16")
+    monkeypatch.setenv("SOLOHEAVEN_NATIVE_DECODE", "1")
     monkeypatch.setattr(v4, "_NATIVE_DECODE_BROKEN", False)
 
     model = _tiny_dsv4_model()

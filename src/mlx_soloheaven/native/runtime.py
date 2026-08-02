@@ -7,7 +7,7 @@ README.md). Everything here is proven working by the Stage 3a spike; this
 is that spike, generalized and made reusable.
 
 Nothing in this module is imported by the serving path unless
-SOLOHEAVEN_DSV4_NATIVE=1 selects it — it is inert otherwise.
+SOLOHEAVEN_NATIVE_DECODE=1 selects it — it is inert otherwise.
 """
 
 from __future__ import annotations

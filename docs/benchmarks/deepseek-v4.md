@@ -11,7 +11,7 @@ see the 0.53 tok/s entry below for why that rule exists.
 / en 4.05 / code 1.46) — 2.0x the compiled path (74.3 ms), whose ppl on the
 same harness is 3.649. **The 27 tok/s goal is MET**; ds4 on this machine is
 27.34 tok/s (36.6 ms), so this is parity within 0.3 ms. Opt-in via
-`SOLOHEAVEN_DSV4_NATIVE=1`.
+`SOLOHEAVEN_NATIVE_DECODE=1`.
 
 Open work, in priority order:
 
@@ -775,7 +775,7 @@ Paths beyond 25 tok/s, if wanted (in expected-value order): hc_pre rms
 fusion (-1.0, designed), moe unpack ALU LUT (~-1), wo_a load widening
 (~-1?), gate score+topk merge (~-0.5). Still OPEN before serving defaults
 to the native path: ppl through the native decoder (quality gate), the
-SOLOHEAVEN_DSV4_NATIVE=1 integration with eager fallback, and a multi-turn
+SOLOHEAVEN_NATIVE_DECODE=1 integration with eager fallback, and a multi-turn
 server check — the native/README ladder items.
 
 ### Stage 4a — serving stability: native path quality-equivalent; WEIGHTS REGRESSED ON DISK ⚠️ (2026-08-02)
@@ -853,7 +853,7 @@ investigation, so the next person doesn't redo it:
   Korean — a corrupted multibyte token in a greeting, one repetitive
   degeneration — while English/factual outputs stay comparable.
 
-Serving guidance recorded: SOLOHEAVEN_DSV4_NATIVE=1 is a SPEED mode
+Serving guidance recorded: SOLOHEAVEN_NATIVE_DECODE=1 is a SPEED mode
 (25.7 tok/s, 1.85x) with a measured quality delta vs the compiled path
 (13.5 tok/s, ppl 3.65). Closing the gap is future work (candidate: fp32
 hc streams end-to-end, which could pass the compiled path's quality
@@ -989,7 +989,7 @@ higher.
 Reported from a real server session (`data/soloheaven.db`, session
 bae406cda41343af): turn 1 answered normally, turn 2 printed EOS-looking
 text without stopping and no assistant message was recorded. Reproduction
-attempts at the MODEL level, all with SOLOHEAVEN_DSV4_NATIVE=1 — none
+attempts at the MODEL level, all with SOLOHEAVEN_NATIVE_DECODE=1 — none
 reproduce it:
 
 | harness | result |
@@ -1043,7 +1043,7 @@ what "feels like" a long run.**
 Fixed with two independent guards (`_ensure_comp_capacity` reaches the
 session target eagerly; `NativeDecoder.overflowing()` forces a rebind
 over a grown cache when a session outruns
-`SOLOHEAVEN_DSV4_MAX_CONTEXT`), plus a scaled-down regression test
+`SOLOHEAVEN_NATIVE_MAX_CONTEXT`), plus a scaled-down regression test
 (`GROWTH=4`, 16-token max context) that fails on the pre-fix code.
 
 Side effect to watch: compressed caches now reach their full 32K-context

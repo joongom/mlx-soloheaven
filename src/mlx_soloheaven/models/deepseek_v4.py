@@ -1248,7 +1248,7 @@ def _sparse_attend_decode_metal(
 
 
 def _decode_kernel_usable(q: mx.array, parts) -> bool:
-    if os.environ.get("SOLOHEAVEN_DSV4_METAL", "1") == "0":
+    if os.environ.get("SOLOHEAVEN_METAL_KERNELS", "1") == "0":
         return False
     if not mx.metal.is_available():
         return False
@@ -1280,7 +1280,7 @@ def sparse_attend(
 # come out, and the Python side commits them after all layers succeed. The
 # traced `offset`/`n` scalars keep one trace valid for every token; traces are
 # keyed only by the compressed-cache capacities (which step in 256-group
-# increments). Kill switch: SOLOHEAVEN_DSV4_COMPILE=0.
+# increments). Kill switch: SOLOHEAVEN_COMPILE_DECODE=0.
 
 
 _COMPILED_DECODE_BROKEN = False
@@ -1289,7 +1289,7 @@ _COMPILED_DECODE_BROKEN = False
 def _COMPILED_DECODE_ENABLED() -> bool:
     return (
         not _COMPILED_DECODE_BROKEN
-        and os.environ.get("SOLOHEAVEN_DSV4_COMPILE", "1") != "0"
+        and os.environ.get("SOLOHEAVEN_COMPILE_DECODE", "1") != "0"
     )
 
 
@@ -1302,7 +1302,7 @@ _NATIVE_DECODE_BROKEN = False
 def _NATIVE_DECODE_ENABLED() -> bool:
     return (
         not _NATIVE_DECODE_BROKEN
-        and os.environ.get("SOLOHEAVEN_DSV4_NATIVE", "0") == "1"
+        and os.environ.get("SOLOHEAVEN_NATIVE_DECODE", "0") == "1"
     )
 
 
@@ -1319,7 +1319,7 @@ def _comp_target_capacity(ratio: int) -> int:
     the 256-group trace re-keying as a side effect). Default 32K context
     costs ~220 MB across all layers; override via env for longer sessions.
     """
-    max_ctx = int(os.environ.get("SOLOHEAVEN_DSV4_MAX_CONTEXT", "32768"))
+    max_ctx = int(os.environ.get("SOLOHEAVEN_NATIVE_MAX_CONTEXT", "32768"))
     g = CompressorState.GROWTH
     return max(g, ((max_ctx // ratio + g - 1) // g) * g)
 
@@ -1642,7 +1642,7 @@ class Attention(nn.Module):
 
     def _attn_core_usable(self, kc: int, q_dtype, ring_dtype) -> bool:
         return (
-            os.environ.get("SOLOHEAVEN_DSV4_METAL", "1") != "0"
+            os.environ.get("SOLOHEAVEN_METAL_KERNELS", "1") != "0"
             and mx.metal.is_available()
             and self.head_dim <= 512
             and self.window + kc <= 2176
@@ -2809,7 +2809,7 @@ def _moe_kernel_usable(glu) -> bool:
     from mlx_lm.models.switch_layers import QuantizedSwitchLinear
 
     return (
-        os.environ.get("SOLOHEAVEN_DSV4_METAL", "1") != "0"
+        os.environ.get("SOLOHEAVEN_METAL_KERNELS", "1") != "0"
         and mx.metal.is_available()
         and isinstance(glu.gate_proj, QuantizedSwitchLinear)
         and glu.gate_proj.bits == 2
@@ -3149,7 +3149,7 @@ class Model(nn.Module):
         dec = getattr(self, "_native_dec", None)
         if self._native_stale(dec, cache):
             mx.synchronize()  # cache arrays were written on MLX's queue
-            max_ctx = int(os.environ.get("SOLOHEAVEN_DSV4_MAX_CONTEXT", "32768"))
+            max_ctx = int(os.environ.get("SOLOHEAVEN_NATIVE_MAX_CONTEXT", "32768"))
             dec = _nd.NativeDecoder(
                 self, max_context=max_ctx, cache=cache,
                 runtime=_nd.shared_runtime(),

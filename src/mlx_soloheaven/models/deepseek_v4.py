@@ -2439,20 +2439,17 @@ def _get_hc_kernels():
 # per word) happens in-register. Quantized builds only (bits=2, gs=64).
 
 _MOE_K1_SRC = """
-    // one simdgroup per (expert_slot, inner_row); x staged in threadgroup
+    // one simdgroup per (expert_slot, inner_row); x read straight from
+    // device — it is 8 KB and L2-hot across all threadgroups. Staging it in
+    // 16 KB of threadgroup memory capped residency at 2 TGs/core and cost a
+    // barrier; removing the stage measured -1.6 ms/token (Stage 3l probe).
     uint sg_id = simdgroup_index_in_threadgroup;
     uint sg_global = threadgroup_position_in_grid.x * 8 + sg_id;
     uint lane = thread_index_in_simdgroup;
-    uint tid = thread_position_in_threadgroup.x;
-    const int TG = 256;
     const int n_act = params[0];
     const int d_model = params[1];
     const int d_inner = params[2];
     const float limit = feps[0];
-
-    threadgroup float xs[4096];
-    for (int i = tid; i < d_model; i += TG) xs[i] = float(x[i]);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     uint e_slot = sg_global / (uint)d_inner;
     uint row = sg_global % (uint)d_inner;
@@ -2475,11 +2472,11 @@ _MOE_K1_SRC = """
         float bgv = float(gb[sbase + g_]);
         float suv = float(us[sbase + g_]);
         float buv = float(ub[sbase + g_]);
-        threadgroup const float* xv = xs + w * 16;
+        const device bfloat* xv = x + w * 16;
         float ag = 0.0f, au = 0.0f, sx = 0.0f;
         #pragma unroll
         for (int j = 0; j < 16; ++j) {
-            float xj = xv[j];
+            float xj = float(xv[j]);
             ag += float((pg >> (2 * j)) & 3u) * xj;
             au += float((pu >> (2 * j)) & 3u) * xj;
             sx += xj;
@@ -2499,11 +2496,12 @@ _MOE_K1_SRC = """
 """
 
 _MOE_K2_SRC = """
-    // threadgroup covers 8 output dims; h staged per active expert
+    // threadgroup covers 8 output dims; h read straight from device — the
+    // active experts' h is ~48 KB and L2-hot across all threadgroups.
+    // Staging each expert into threadgroup memory serialized the TG behind
+    // 2 barriers per expert; removing it measured -1.6 ms/token (Stage 3l).
     uint sg_id = simdgroup_index_in_threadgroup;
     uint lane = thread_index_in_simdgroup;
-    uint tid = thread_position_in_threadgroup.x;
-    const int TG = 256;
     uint dim = threadgroup_position_in_grid.x * 8 + sg_id;
     const int n_act = params[0];
     const int d_model = params[1];
@@ -2511,17 +2509,11 @@ _MOE_K2_SRC = """
     const int words = d_inner / 16;
     const int wpg = 4;
 
-    threadgroup float hs[2048];
-
     float acc = 0.0f;
     for (int s = 0; s < n_act; ++s) {
         int e = idxs[s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (e >= 0) {
-            for (int i = tid; i < d_inner; i += TG) hs[i] = h[s * d_inner + i];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (e < 0 || dim >= (uint)d_model) continue;
+        const device float* hs = h + s * d_inner;
         float we = wts[s];
         const uint base = ((uint)e * (uint)d_model + dim) * (uint)words;
         const uint sbase = ((uint)e * (uint)d_model + dim) * (uint)(d_inner / 64);
@@ -2533,7 +2525,7 @@ _MOE_K2_SRC = """
             uint g_ = w / wpg;
             sc = float(ds_[sbase + g_]);
             bi = float(db[sbase + g_]);
-            threadgroup const float* hv = hs + w * 16;
+            const device float* hv = hs + w * 16;
             float aw = 0.0f, sw = 0.0f;
             #pragma unroll
             for (int j = 0; j < 16; ++j) {

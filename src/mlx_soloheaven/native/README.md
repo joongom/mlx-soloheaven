@@ -7,6 +7,10 @@ that caps in-MLX decode at ~87 ms/token. Target ≥25 tok/s (≤40 ms).
 Every precondition is proven by `dsv4_replay_spike.py` (run it) and
 recorded in `docs/benchmarks/deepseek-v4.md` §Stage 3a.
 
+Debugging war-story (a real ratio-4 compressor-state OOB found via
+`MTL_SHADER_VALIDATION`, plus why the full-model test was flaky):
+`docs/benchmarks/deepseek-v4-native-debugging.md`.
+
 ## Architecture
 
 One Python module (`runtime.py`, ctypes/objc like the spike — no C build
@@ -127,10 +131,25 @@ step unless profiling later demands it) owning:
       NOT a driver bug: the double-buffer parity and h ping-pong were correct.
       IMPORTANT FIX ALREADY IN: mx `arr[:] = ...` does NOT propagate to a
       registered MTLBuffer (it allocates a new buffer); seed via
-      buffer_contents + memmove (set_ring). Next: the real 88 GB model + bench.
+      buffer_contents + memmove (set_ring).
+      CRITICAL BUG FIXED (found via MTL_SHADER_VALIDATION): the ratio-4
+      compressor state was allocated `ratio*cd` but the dsv4_comp_step kernel
+      indexes `rows*cd = coff*ratio*cd`; for coff==2 the state was half-sized
+      and every token read/wrote 1 group OOB into adjacent buffers (a real
+      correctness bug on 21 of the 43 layers, not just a test flake). Now
+      allocates `coff*ratio*cd`. Full story + method:
+      docs/benchmarks/deepseek-v4-native-debugging.md.
+      PERF: per-token plan build (~10 ms Python) is now cached — it depends
+      only on each layer's completed-group count `n` and the compressor parity
+      `par`; the token id and offset are patched into the const blob in place,
+      so most tokens skip the rebuild entirely.
    c. integrate as a third path in Model.__call__ behind
       SOLOHEAVEN_DSV4_NATIVE=1 (after the compiled path), eager fallback kept.
    d. bench decode tok/s vs the 12 tok/s compiled path; target >=25.
+      Harness ready: `python validate_deepseek_v4.py bench [n_tokens]` times
+      the compiled path vs the NativeDecoder on the REAL model and prints tok/s
+      + whether >=25 is met. NOT yet run on the 88 GB build (needs a clean
+      ~100 GiB and no other residents — see the memory caveats in CLAUDE.md).
 5. All layer kinds, then the full 43-layer step + embed/head → token-level
    agreement over a 32-token greedy run.
 6. ppl probes through the native path ≈ MLX path (3.65).

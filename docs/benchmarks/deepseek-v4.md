@@ -302,17 +302,33 @@ wired at load, 111 GiB reclaimable, nothing else resident, prefill 8 tokens):
 runtime is **7.3x slower** than the path it was meant to beat. Prediction failed;
 recorded so we do not repeat the reasoning.
 
-Why (analysis, not yet profiled on the real model):
-* The one-command-buffer plan puts a `memoryBarrierWithScope:Buffers` before
-  **every** dispatch → the ~1500 dispatches run **fully serialized**, so the GPU
-  never overlaps independent work (grouped `wo_a`, shared-expert `w1/w3`, the
-  MoE experts). MLX's scheduler overlaps and pipelines those, which is most of
-  its 84 ms. 611 ms ≈ 1500 × ~0.4 ms of serialized launch+compute.
-* The tiny-model "barriers are free / 20 µs per dispatch" number did NOT
-  transfer: on real (compute-heavy) kernels the serialization penalty dominates,
-  exactly the caveat noted in the previous entry.
-* The custom MoE/attn kernels may also be slower than MLX's steel/gather_qmm;
-  unquantified until a per-kernel real-model profile.
+Why — barriers RULED OUT (measured, same load, `bench_barrier.py`):
+
+| native variant | ms/token |
+|---|---|
+| WITH a buffer barrier before every dispatch | 611.1 |
+| with ALL barriers forced off (`plan_item barrier=False`) | 610.1 |
+
+**1.00x** — the blanket barriers cost nothing; the earlier tiny-model "barriers
+are free" result DID transfer. So the 611 ms is the **serial sum of ~1500
+dispatches' launch+compute latency**, ~0.4 ms each. That is ~8x MLX's own
+~50 µs/op floor (the compiled path is at its floor: ~1800 ops × ~47 µs ≈ 84 ms).
+
+The gap is therefore NOT barriers and NOT the CPU encode (0.52 ms). Two survivors:
+* **No overlap.** A `computeCommandEncoder` is serial-dispatch; forcing barriers
+  off does not enable concurrency (that needs `MTLDispatchTypeConcurrent`), so
+  every dispatch pays its full launch latency in series. MLX keeps the GPU fed by
+  streaming many small command buffers with `async_eval` (CPU queues ahead).
+* **Slower custom kernels.** attn_core/comp_step/hc/gate use small grids
+  (e.g. attn_core = one threadgroup per head = 64) that underfill the chip on the
+  real dims, vs MLX's steel/gather_qmm. The MoE micro-bench had them ~on par, but
+  the others are unprofiled on real dims.
+
+Both point the same way as the validated cost model (§ above): the floor is
+per-DISPATCH, so the only real lever is **dispatch count** — ~1500 is already
+MLX-parity, and even at MLX's 50 µs/op that is ~75-90 ms (≈12 tok/s), NOT 40 ms
+(25 tok/s). Reaching 25 tok/s needs ds4-scale FUSION (≪1000 dispatches), not an
+external loop over the same op granularity.
 
 (This run first crashed before timing: the real model's first `num_hash_layers`
 (3) route experts by `tid2eid[token]` with no gate bias, which `plan_moe` didn't
@@ -320,13 +336,14 @@ handle. Fixed by adding `dsv4_gate_hash_k` — the native path is now correct on
 every real layer type, which is why the throughput number above could be taken.)
 
 Bottom line: the ≥25 tok/s goal is **NOT met** via the replay path as designed
-(worse than the 12 tok/s compiled baseline). A rethink is required — remove the
-blanket barriers (dependency-aware, so the GPU can overlap), fuse to cut dispatch
-count, or abandon the external loop. Correctness of the native path stands (it is
-bit-deterministic and matches the reference); this is purely a throughput verdict.
-Next diagnostic BEFORE more replay work: a per-kernel real-model profile to split
-"blanket-barrier serialization" from "our kernels slower than MLX's" — the two
-candidate causes, currently unquantified.
+(1.6 tok/s, worse than the 12 tok/s compiled baseline), and the barrier ablation
+shows tinkering with the encoder won't fix it. The replay loop was premised on
+the per-op floor being CPU-side and removable; the cost model already found it is
+GPU-side, and this real-model number confirms it. **The external loop over the
+same ~1500-op granularity cannot beat the compiled path** — the only lever is
+dispatch-count reduction (fusion), which is a ds4-scale rewrite. Correctness of
+the native path stands (bit-deterministic, matches the reference); this is purely
+a throughput verdict. Decision point for the campaign, recorded for the user.
 
 ## 3. Reproduce
 

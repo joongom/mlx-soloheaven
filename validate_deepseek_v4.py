@@ -240,6 +240,8 @@ def cmd_bench(n_tokens: int = 64, prefill: int = 8) -> None:
 
     import mlx.core as mx
 
+    # keep the 88 GB of weights GPU-resident, else decode pages every token
+    mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
     model, tokenizer = load()
     ids = tokenizer.encode("The quick brown fox jumps over the lazy dog. "
                            "In a distant land,", add_special_tokens=False)[:prefill]

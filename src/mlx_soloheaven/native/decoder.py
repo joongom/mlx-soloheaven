@@ -88,6 +88,7 @@ class NativeDecoder:
         s = dict(
             ha=self._z(hc * hidden), hb=self._z(hc * hidden), hx=self._z(hidden),
             post=self._z(hc, mx.float32), comb=self._z(hc * hc, mx.float32), xn=self._z(hidden),
+            hc_mixes=self._z((2 + hc) * hc, mx.float32),
             xp0=self._z(q_lora), qr=self._z(q_lora), q_raw=self._z(NHD), xp1=self._z(D),
             kvn=self._z(D), acore=self._z(NHD), kv_roped=self._z(D), o_lora=self._z(NHD),
             attn_out=self._z(hidden), h1=self._z(hc * hidden), scores=self._z(self._cap, mx.float32),

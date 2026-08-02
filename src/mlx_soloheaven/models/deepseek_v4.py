@@ -1825,9 +1825,19 @@ _GATE_SCORE_SRC = """
 
 _GATE_TOPK_SRC = """
     uint tid = thread_position_in_threadgroup.x;
+    const int TG = 256;
     const int n_exp = params[0];
     const int topk = params[2];
     const float route_scale = feps[0];
+
+    // Stage scores+bias into threadgroup memory in parallel FIRST — the serial
+    // top-k below then never touches device memory. Reading device memory from
+    // the selection loop cost ~0.29 ms/dispatch (topk*n_exp = 1536 dependent
+    // device reads from a single thread); staged it is microseconds.
+    threadgroup float sc[512];
+    threadgroup float bs[512];
+    for (int e = tid; e < n_exp; e += TG) { sc[e] = scores[e]; bs[e] = bias[e]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid != 0) return;
     float wsum = 0.0f;
     bool taken[512];
@@ -1837,13 +1847,13 @@ _GATE_TOPK_SRC = """
         float bestv = -INFINITY;
         for (int e = 0; e < n_exp; ++e) {
             if (taken[e]) continue;
-            float v = scores[e] + bias[e];
+            float v = sc[e] + bs[e];
             if (v > bestv) { bestv = v; best = e; }
         }
         taken[best] = true;
         out_idx[k] = best;
-        out_w[k] = scores[best];
-        wsum += scores[best];
+        out_w[k] = sc[best];
+        wsum += sc[best];
     }
     for (int k = 0; k < topk; ++k) out_w[k] = out_w[k] / wsum * route_scale;
 """
@@ -2179,6 +2189,32 @@ def _get_gate_kernels():
 # right shape. Exposed for the native runtime and diff-tested against
 # _hc_pre_math / _hc_post_math.
 
+_HC_MIX_SRC = """
+    // One threadgroup per mix row: the raw dot fn[r] . h, reduced over the whole
+    // threadgroup. This is the HC input mixing GEMV — ~1.5 MB of fn read that
+    // starved a single threadgroup in the fused hc_pre (it was 50%+ of decode);
+    // splitting it out to (mix) threadgroups lets the chip hide the memory
+    // latency. rms and everything downstream stay in dsv4_hc_pre_k, which just
+    // reads these raw dots.
+    uint tid = thread_position_in_threadgroup.x;
+    const int TG = 256;
+    const int hcn = params[0];
+    const int d = params[1];
+    const int hcd = hcn * d;
+    uint r = threadgroup_position_in_grid.x;
+    threadgroup float red[8];
+    float a = 0.0f;
+    for (int i = tid; i < hcd; i += TG) a += float(fn[r * hcd + i]) * float(h[i]);
+    a = simd_sum(a);
+    if ((tid & 31u) == 0) red[tid / 32] = a;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float t = 0.0f;
+        for (int i = 0; i < TG / 32; ++i) t += red[i];
+        mixes[r] = t;
+    }
+"""
+
 _HC_PRE_SRC = """
     uint tid = thread_position_in_threadgroup.x;
     const int TG = 256;
@@ -2190,7 +2226,7 @@ _HC_PRE_SRC = """
     const float hc_eps = feps[1];
 
     threadgroup float red[8];
-    threadgroup float mixes[64];
+    threadgroup float mtg[64];
     threadgroup float pc[64];      // pre[hc], post[hc], comb[hc*hc]
     threadgroup float rms_s[1];
 
@@ -2207,22 +2243,18 @@ _HC_PRE_SRC = """
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float rms = rms_s[0];
 
-    for (int r = tid / 32; r < mix; r += TG / 32) {
-        float a = 0.0f;
-        for (int i = tid % 32; i < hcd; i += 32) a += float(fn[r * hcd + i]) * float(h[i]);
-        a = simd_sum(a);
-        if ((tid & 31u) == 0) mixes[r] = a * rms;
-    }
+    // mixes[] holds the raw fn.h dots from dsv4_hc_mix_k; apply rms here.
+    for (int r = tid; r < mix; r += TG) mtg[r] = float(mixes[r]) * rms;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (tid == 0) {
         for (int j = 0; j < hcn; ++j)
-            pc[j] = 1.0f / (1.0f + exp(-(mixes[j] * scale[0] + base[j]))) + hc_eps;
+            pc[j] = 1.0f / (1.0f + exp(-(mtg[j] * scale[0] + base[j]))) + hc_eps;
         for (int j = 0; j < hcn; ++j)
-            pc[hcn + j] = 2.0f / (1.0f + exp(-(mixes[hcn + j] * scale[1] + base[hcn + j])));
+            pc[hcn + j] = 2.0f / (1.0f + exp(-(mtg[hcn + j] * scale[1] + base[hcn + j])));
         float cb[16];
         for (int j = 0; j < hcn * hcn; ++j)
-            cb[j] = mixes[2 * hcn + j] * scale[2] + base[2 * hcn + j];
+            cb[j] = mtg[2 * hcn + j] * scale[2] + base[2 * hcn + j];
         for (int r = 0; r < hcn; ++r) {
             float m = cb[r * hcn];
             for (int c = 1; c < hcn; ++c) m = max(m, cb[r * hcn + c]);
@@ -2280,9 +2312,11 @@ _hc_kernels = None
 def _get_hc_kernels():
     global _hc_kernels
     if _hc_kernels is None:
+        # NOTE: _HC_PRE_SRC now consumes precomputed raw mixes (fn.h dots from
+        # _HC_MIX_SRC) — the twin's inputs must match the body's buffer names.
         pre = mx.fast.metal_kernel(
             name="dsv4_hc_pre_k",
-            input_names=["h", "fn", "scale", "base", "params", "feps", "iters"],
+            input_names=["h", "mixes", "scale", "base", "params", "feps", "iters"],
             output_names=["y", "post", "comb"],
             source=_HC_PRE_SRC,
         )

@@ -65,17 +65,29 @@ class Planner:
             [(o, 4, r["params"]), (o + 4, 4, r["feps"])], (1, 1, 1), (256, 1, 1))
 
     def hc_pre(self, h, fn, scale, base, x, post, comb, hc, hidden, iters, eps, hc_eps):
+        # Two dispatches: dsv4_hc_mix_k parallelizes the ~1.5 MB fn.h GEMV over
+        # (mix) threadgroups into the shared `hc_mixes` scratch, then hc_pre reads
+        # those raw dots and does rms/sinkhorn/gates/output in one threadgroup.
         p, _ = self.cb.add("2i", hc, hidden)
         f, _ = self.cb.add("2f", eps, hc_eps)
         i, _ = self.cb.add("i", iters)
+        mix = (2 + hc) * hc
+        mk = BUFFER_SLOTS["dsv4_hc_mix_k"]
         k = BUFFER_SLOTS["dsv4_hc_pre_k"]
-        return self._pi(
-            "dsv4_hc_pre_k", True,
-            [(self.S[h], k["h"]), (self.t.add(fn), k["fn"]), (self.t.add(scale), k["scale"]),
-             (self.t.add(base), k["base"]), (self.S[x], k["y"]), (self.S[post], k["post"]),
-             (self.S[comb], k["comb"])],
-            [(p, 8, k["params"]), (f, 8, k["feps"]), (i, 4, k["iters"])],
-            (1, 1, 1), (256, 1, 1))
+        return [
+            self._pi(
+                "dsv4_hc_mix_k", True,
+                [(self.S[h], mk["h"]), (self.t.add(fn), mk["fn"]),
+                 (self.S["hc_mixes"], mk["mixes"])],
+                [(p, 8, mk["params"])], (mix, 1, 1), (256, 1, 1)),
+            self._pi(
+                "dsv4_hc_pre_k", True,
+                [(self.S[h], k["h"]), (self.S["hc_mixes"], k["mixes"]),
+                 (self.t.add(scale), k["scale"]), (self.t.add(base), k["base"]),
+                 (self.S[x], k["y"]), (self.S[post], k["post"]), (self.S[comb], k["comb"])],
+                [(p, 8, k["params"]), (f, 8, k["feps"]), (i, 4, k["iters"])],
+                (1, 1, 1), (256, 1, 1)),
+        ]
 
     def hc_post(self, x, residual, post, comb, y, hc, hidden):
         p, _ = self.cb.add("2i", hc, hidden)
@@ -324,16 +336,16 @@ def plan_block(pl: Planner, blk, hin: str, ring: str, hout: str, ioff_off: int,
     hc = blk.hc
     hidden = blk.attn.wq_a.scales.shape[1] * blk.attn.wq_a.group_size
     items = []
-    items.append(pl.hc_pre(hin, blk.hc_attn_fn.reshape(-1), blk.hc_attn_scale,
-                           blk.hc_attn_base, "hx", "post", "comb", hc, hidden,
-                           blk.iters, blk.eps, blk.hc_eps))
+    items += pl.hc_pre(hin, blk.hc_attn_fn.reshape(-1), blk.hc_attn_scale,
+                       blk.hc_attn_base, "hx", "post", "comb", hc, hidden,
+                       blk.iters, blk.eps, blk.hc_eps)
     items.append(pl.rms(blk.attn_norm.weight, "hx", "xn", hidden, blk.eps))
     items += plan_attention(pl, blk.attn, "xn", ring, "attn_out", ioff_off,
                             comp_cache=comp_cache, ncomp=ncomp, n=n, idx_cache=idx_cache)
     items.append(pl.hc_post("attn_out", hin, "post", "comb", "h1", hc, hidden))
-    items.append(pl.hc_pre("h1", blk.hc_ffn_fn.reshape(-1), blk.hc_ffn_scale,
-                           blk.hc_ffn_base, "hx", "post", "comb", hc, hidden,
-                           blk.iters, blk.eps, blk.hc_eps))
+    items += pl.hc_pre("h1", blk.hc_ffn_fn.reshape(-1), blk.hc_ffn_scale,
+                       blk.hc_ffn_base, "hx", "post", "comb", hc, hidden,
+                       blk.iters, blk.eps, blk.hc_eps)
     items.append(pl.rms(blk.ffn_norm.weight, "hx", "xn", hidden, blk.eps))
     items += plan_moe(pl, blk.ffn, "xn", "moe_out", topk, rscale, limit, tok_off)
     items.append(pl.hc_post("moe_out", "h1", "post", "comb", hout, hc, hidden))

@@ -99,9 +99,13 @@ _SPECS = {
         [("x", _B), ("w", _B), ("params", _I), ("feps", _F),
          ("y", "device bfloat*")],
     ),
+    "dsv4_hc_mix_k": (
+        "_HC_MIX_SRC",
+        [("h", _B), ("fn", _F), ("params", _I), ("mixes", "device float*")],
+    ),
     "dsv4_hc_pre_k": (
         "_HC_PRE_SRC",
-        [("h", _B), ("fn", _F), ("scale", _F), ("base", _F), ("params", _I),
+        [("h", _B), ("mixes", _F), ("scale", _F), ("base", _F), ("params", _I),
          ("feps", _F), ("iters", _I), ("y", "device bfloat*"),
          ("post", "device float*"), ("comb", "device float*")],
     ),

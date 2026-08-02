@@ -276,6 +276,46 @@ MoE activates ~6/256 experts per token, so mmap-backed streaming is plausible
 (it is what ds4's `--ssd-streaming` does), but it needs MLX to keep weights
 file-backed and unwired, which is unverified.
 
+## Decode speed: where the 2.4x vs ds4 actually is (measured 2026-08-02)
+
+Same machine, same prompt, greedy. ds4 measured (not felt): **27.3 tok/s**
+decode, 34.8 tok/s prefill. Ours: **12.1 tok/s** decode (82.4 ms/token,
+wired, after the HC fusion), **80.9 tok/s prefill** — 2.3x FASTER than ds4.
+
+That prefill inversion is the diagnosis. Our kernels and arithmetic are fine
+when dispatch is amortized over a 256-token chunk; per-token dispatch is the
+tax. ds4's log says why it doesn't pay it: `using GPU graph generation` — it
+replays ONE GPU-resident graph per token (plus a fused sparse-attention
+kernel), zero per-op dispatch. We rebuild and dispatch thousands of Metal
+commands per token.
+
+Decode breakdown (ablation, ms/token out of 82.4):
+
+| component | ms | note |
+|---|---|---|
+| CPU graph build | 11.0 | python + node construction; overlapped by async_eval in serving |
+| routed MoE | 14.0 | gather_qmm x3 per layer; mostly genuine memory reads |
+| attention gather/softmax | 10.7 | multi-part gathers + fp32 einsums |
+| compressors | 5.4 | state machine, many tiny setitems |
+| rope | 3.3 | |
+| HC path | ~14 | was 39 before mx.compile fusion (8.9 -> 12.1 tok/s) |
+| remaining (quantized matmuls + dispatch gaps) | ~38 | |
+
+The HC fusion already demonstrated the lever: 39 ms of launch overhead
+compressed to ~14 by mx.compile. The rest of the dispatch tax is spread
+across ~5k ops/token. Paths, in effort order:
+
+1. Pad the Indexer's top-k to a fixed `index_topk` width and gather the
+   compressed cache at CAPACITY (it grows in 256-group steps) — that makes
+   decode shapes stable, which makes `sparse_attend` and the rope helpers
+   mx.compile-able without retrace churn. Est. reach: ~15-16 tok/s.
+2. Restructure layer caches to functional state (no setitem) so the whole
+   per-layer decode step compiles — the MLX approximation of ds4's resident
+   graph. Big surgery; the shapes are already fixed except the compressed
+   cache, so it is feasible. Est. reach: ~20+ tok/s.
+3. A fused sparse-attention Metal kernel via mx.fast.metal_kernel, like
+   ds4's. Largest single win after (2), largest effort.
+
 ## Sequence
 
 1. `ModelArgs` for V4 + weight-name mapping, from the real `config.json`

@@ -56,12 +56,16 @@ step unless profiling later demands it) owning:
    custom kernel (kernels.metal, explicit signature, C-loop dispatch) ==
    the mx.fast version. Every runtime primitive the loop needs now has a
    passing test.
-3. NEXT: port the remaining kernel bodies into kernels.metal with explicit
-   signatures (attention core, MoE K1, compressor step, HC sinkhorn tail,
-   gate/indexer top-k) — each diffed against its mx.fast twin the same way
-   dsv4_moe_w2 is. This is mechanical: the bodies are frozen and tested.
-4. Build the per-layer plan + session BufferTable from a real Model, replay
-   ONE dense layer → logits diff vs the MLX compiled step (bf16 ~1e-2).
+3. ✅ (mostly) native/kernels.py GENERATES the kernel source from the model's
+   frozen body strings + explicit signatures — single source of truth, no
+   drift possible. All four compute kernels (moe_w13, moe_w2, attn_core,
+   comp_step) compile; moe_w13, moe_w2 and the big branch-heavy attn_core are
+   diffed against their mx.fast twins and match. Remaining for a full layer:
+   the x-projection split, wq_b, wo_a/wo_b (all library qmv), the shared
+   expert, HC pre/post (mixes via library gemv + a small sinkhorn kernel),
+   the gate (scores + top-k) and the indexer — mechanical, same pattern.
+4. NEXT: build the per-layer plan + session BufferTable from a real Model,
+   replay ONE dense layer → logits diff vs the MLX compiled step (bf16 ~1e-2).
 5. All layer kinds, then the full 43-layer step + embed/head → token-level
    agreement over a 32-token greedy run.
 6. ppl probes through the native path ≈ MLX path (3.65).

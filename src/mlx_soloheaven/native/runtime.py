@@ -245,9 +245,11 @@ def register_quantized_linear(table: BufferTable, qlin) -> tuple[int, int, int]:
 
 
 def load_custom_kernels(rt: Runtime) -> None:
-    """Compile native/kernels.metal into the runtime's custom library."""
-    with open(os.path.join(_HERE, "kernels.metal")) as f:
-        rt.load_custom_source(f.read())
+    """Compile the generated kernel source (single source of truth: the bodies
+    come from models/deepseek_v4.py — see native/kernels.py)."""
+    from mlx_soloheaven.native.kernels import build_source
+
+    rt.load_custom_source(build_source())
 
 
 def plan_qmv(rt: Runtime, buf_ids: tuple, K: int, N: int,

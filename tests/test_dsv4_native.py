@@ -187,6 +187,128 @@ def test_native_moe_w2_kernel_matches_mx_fast():
     assert np.abs(got - exp).max() < 1e-3, np.abs(got - exp).max()
 
 
+def test_native_moe_w13_kernel_matches_mx_fast():
+    """dsv4_moe_w13 (gate/up + clipped SwiGLU) native == mx.fast twin."""
+    from mlx_soloheaven.models.deepseek_v4 import _get_moe_kernels
+
+    n_act, d_model, d_inner, E, limit = 4, 256, 192, 8, 10.0
+    gw_w = mx.random.normal((E, d_inner, d_model)).astype(mx.bfloat16)
+    gqw, gsc, gbi = mx.quantize(gw_w, group_size=64, bits=2)
+    uw_w = mx.random.normal((E, d_inner, d_model)).astype(mx.bfloat16)
+    uqw, usc, ubi = mx.quantize(uw_w, group_size=64, bits=2)
+    x = mx.random.normal((d_model,)).astype(mx.bfloat16)
+    idxs = mx.array([3, 5, 0, -1], dtype=mx.int32)
+
+    k1, _ = _get_moe_kernels()
+    params = mx.array([n_act, d_model, d_inner], dtype=mx.int32)
+    feps = mx.array([limit], dtype=mx.float32)
+    (ref,) = k1(
+        inputs=[x, gqw, gsc, gbi, uqw, usc, ubi, idxs, params, feps],
+        grid=((((n_act * d_inner) + 7) // 8) * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(n_act * d_inner,)],
+        output_dtypes=[mx.float32],
+    )
+    h = mx.zeros((n_act * d_inner,), dtype=mx.float32)
+    mx.eval(gqw, gsc, gbi, uqw, usc, ubi, x, idxs, ref, h)
+    mx.synchronize()
+
+    rt_mod.load_custom_kernels(_RT)
+    table = rt_mod.BufferTable()
+    ins = [x, gqw, gsc, gbi, uqw, usc, ubi, idxs]
+    slots = [table.add(a) for a in ins]
+    h_slot = table.add(h)
+
+    it = rt_mod._PlanItem()
+    it.pso = _RT.pipeline("dsv4_moe_w13", custom=True)
+    it.n_bufs = len(ins) + 1
+    for i, s in enumerate(slots):
+        it.buf_ids[i], it.buf_slots[i], it.buf_offs[i] = s, i, 0
+    it.buf_ids[len(ins)], it.buf_slots[len(ins)], it.buf_offs[len(ins)] = h_slot, 10, 0
+    it.n_bytes = 2
+    it.bytes_off[0], it.bytes_len[0], it.bytes_slot[0] = 0, 12, 8   # params (3 int)
+    it.bytes_off[1], it.bytes_len[1], it.bytes_slot[1] = 12, 4, 9   # feps (1 float)
+    it.grid[:] = [(((n_act * d_inner) + 7) // 8), 1, 1]
+    it.group[:] = [256, 1, 1]
+
+    const = struct.pack("<iiif", n_act, d_model, d_inner, limit)
+    _RT.commit([it], table.ptrs, const, wait=True)
+    assert np.abs(np.array(h) - np.array(ref)).max() < 1e-3
+
+
+def test_native_attn_core_matches_mx_fast():
+    """dsv4_attn_core native (explicit signature, C-loop dispatch) == the
+    mx.fast twin, on a plain-compressed decode shape. This is the largest and
+    most branch-heavy kernel; matching it validates the generated-signature
+    path for the whole family."""
+    from mlx_soloheaven.native.kernels import BUFFER_SLOTS
+
+    H, D, RD, WIN = 4, 64, 16, 8
+    KC = 6  # comp part width (plain path)
+    rng = np.random.default_rng(9)
+    q = mx.array(rng.standard_normal((1, 1, H, D)).astype(np.float32)).astype(mx.bfloat16)
+    kv = mx.array(rng.standard_normal((1, 1, D)).astype(np.float32)).astype(mx.bfloat16)
+    ring = mx.array(rng.standard_normal((1, WIN, D)).astype(np.float32)).astype(mx.bfloat16)
+    comp = mx.array(rng.standard_normal((1, KC, D)).astype(np.float32)).astype(mx.bfloat16)
+    cidx = mx.zeros((1, 1, 1), dtype=mx.int32)  # PLAIN -> unread dummy
+    sink = mx.array(rng.standard_normal(H).astype(np.float32))
+    freqs = mx.array((1.0 / (10000.0 ** (np.arange(0, RD, 2) / RD))).astype(np.float32))
+    offset, ncomp = 20, 3
+    params = mx.array([D, RD, WIN, KC, 1], dtype=mx.int32)     # plain=1
+    fscal = mx.array([D ** -0.5, 1e-6], dtype=mx.float32)
+    ioff = mx.array([offset, ncomp], dtype=mx.int32)
+
+    from mlx_soloheaven.models.deepseek_v4 import _get_attn_core_kernel
+
+    out_ref, kv_ref = _get_attn_core_kernel()(
+        inputs=[q.reshape(-1), kv.reshape(-1), ring.reshape(-1), comp.reshape(-1),
+                cidx.reshape(-1), sink, freqs, params, fscal, ioff],
+        template=[("T", mx.bfloat16)],
+        grid=(H * 128, 1, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(H * D,), (D,)],
+        output_dtypes=[mx.bfloat16, mx.bfloat16],
+    )
+    out = mx.zeros((H * D,), dtype=mx.bfloat16)
+    kvo = mx.zeros((D,), dtype=mx.bfloat16)
+    mx.eval(q, kv, ring, comp, cidx, sink, freqs, out_ref, kv_ref, out, kvo)
+    mx.synchronize()
+
+    rt_mod.load_custom_kernels(_RT)
+    table = rt_mod.BufferTable()
+    named = dict(
+        q=q.reshape(-1), kv=kv.reshape(-1), ring=ring.reshape(-1),
+        comp=comp.reshape(-1), cidx=cidx.reshape(-1), sink=sink, freqs=freqs,
+        out=out, kv_out=kvo,
+    )
+    slots = {nm: table.add(a) for nm, a in named.items()}
+    smap = BUFFER_SLOTS["dsv4_attn_core"]
+
+    it = rt_mod._PlanItem()
+    it.pso = _RT.pipeline("dsv4_attn_core", custom=True)
+    buf_items = list(slots.items())
+    it.n_bufs = len(buf_items)
+    for i, (nm, s) in enumerate(buf_items):
+        it.buf_ids[i], it.buf_slots[i], it.buf_offs[i] = s, smap[nm], 0
+    # params(int x5) at slot smap['params'], fscal(float x2), ioff(int x2)
+    it.n_bytes = 3
+    it.bytes_off[0], it.bytes_len[0], it.bytes_slot[0] = 0, 20, smap["params"]
+    it.bytes_off[1], it.bytes_len[1], it.bytes_slot[1] = 20, 8, smap["fscal"]
+    it.bytes_off[2], it.bytes_len[2], it.bytes_slot[2] = 28, 8, smap["ioff"]
+    it.grid[:] = [H, 1, 1]
+    it.group[:] = [128, 1, 1]
+
+    const = struct.pack("<5i2f2i", D, RD, WIN, KC, 1, D ** -0.5, 1e-6, offset, ncomp)
+    _RT.commit([it], table.ptrs, const, wait=True)
+
+    a = np.array(out.astype(mx.float32))
+    b = np.array(out_ref.astype(mx.float32))
+    assert np.abs(a - b).max() < 1e-2, np.abs(a - b).max()
+    ka = np.array(kvo.astype(mx.float32))
+    kb = np.array(kv_ref.astype(mx.float32))
+    assert np.abs(ka - kb).max() < 1e-2, np.abs(ka - kb).max()
+
+
 def test_c_encode_cost_is_in_budget():
     """CPU-side encode+commit of a 1500-dispatch plan (wait=False, so GPU
     time is excluded — this is the per-token CPU cost that must fit in the

@@ -2680,7 +2680,7 @@ _MOE_K1_SRC = """
 _W2_ROWS = 4
 
 #: Threadgroups dsv4_hc_pre_k splits the output dim over (see the kernel body).
-_HC_PRE_SPLIT = 4
+_HC_PRE_SPLIT = 8
 
 #: Compile-time constants the shared kernel bodies read. The bodies are built
 #: twice — once into the native replay library, once per mx.fast twin — so both

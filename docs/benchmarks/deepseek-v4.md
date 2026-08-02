@@ -1017,6 +1017,26 @@ Naming note: kernels are `sh_dsv4_*` as of this stage — `sh` for this
 project, `dsv4` for the architecture. Nothing is copied from ds4; it is
 consulted as a numerical oracle only.
 
+### Stage 4i — moe per-group scale loads: REGRESSION, reverted (2026-08-02)
+
+Hypothesis: the moe kernels' word-wise loop re-reads the four per-64-value
+scale/bias entries for each of a group's 4 words, so 8 bytes of scale
+traffic ride along with every 8 bytes of weights — doubling the traffic a
+bandwidth-bound kernel pays. Restructured both moe_w13 and moe_w2 to
+iterate whole quant GROUPS per lane (one scale/bias load per 64 values).
+
+**Measured WORSE**: 39.0 -> 39.4 ms; moe_w2 4.73 -> 5.25, moe_w13
+4.77 -> 4.83. Reverted (84e603d).
+
+Reading: the compiler was already hoisting those loads — they are loop
+invariant across an unrolled group — so the restructure bought no traffic
+and cost scheduling freedom and registers with the extra nested loop.
+Lesson for this kernel family: **do not hand-hoist what the Metal compiler
+can see is invariant; measure the traffic before assuming it is real.**
+The moe gap to its bandwidth bound (~4x) is therefore NOT redundant scale
+loads. Remaining suspects there: the 16-way shift/mask/convert chain per
+word (ALU) and the per-simdgroup activation re-reads.
+
 ## 3. Reproduce
 
 ```bash

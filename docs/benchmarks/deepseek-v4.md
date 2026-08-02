@@ -955,6 +955,36 @@ Every Stage 3 number from 3a through 3r carries that same discount; the
 relative gains within the campaign stand, the absolute floor is ~2 ms
 higher.
 
+### Stage 4g — multi-turn server failure: four hypotheses eliminated (2026-08-02)
+
+Reported from a real server session (`data/soloheaven.db`, session
+bae406cda41343af): turn 1 answered normally, turn 2 printed EOS-looking
+text without stopping and no assistant message was recorded. Reproduction
+attempts at the MODEL level, all with SOLOHEAVEN_DSV4_NATIVE=1 — none
+reproduce it:
+
+| harness | result |
+|---|---|
+| 3 turns, chat template, greedy, 31 tok/turn | native == compiled, coherent |
+| same + `cache.state` snapshots between turns (the prefix-reuse store, to test in-place-write vs lazy-copy aliasing) | coherent |
+| 400-token single-turn generation crossing the ring wrap (offset 128) and the ratio-128 group completion, checked at offsets 128/129/200/300/400 | coherent to offset 417 |
+| chat-template greedy, token-id level | native and compiled emit IDENTICAL ids |
+
+Also verified: the engine's stop set is correct (`_collect_eos_ids` -> {1}),
+`decode([1])` is the EOS string, and only ids 0/1 contain "sentence" (so a
+lookalike token is not the cause).
+
+What that leaves — everything the model-level harnesses do NOT exercise:
+the engine layer. Namely sampling (the session ran temperature 0.6 with
+top_p/repetition_penalty, every probe here is greedy — note a repetition
+penalty applied to the EOS id suppresses stopping by construction), the
+thinking-budget routing, and the engine's own prefix-reuse/cold-fill
+machinery. Next session: reproduce through `MLXEngine.generate_stream`
+with the session's exact sampling settings, not through `Model.__call__`.
+
+Until then SOLOHEAVEN_DSV4_NATIVE=1 is single-turn only; the compiled path
+is unaffected.
+
 ## 3. Reproduce
 
 ```bash

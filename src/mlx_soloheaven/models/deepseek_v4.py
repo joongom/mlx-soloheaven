@@ -2736,6 +2736,17 @@ _MOE_K2_SRC = """
             #pragma unroll
             for (int r = 0; r < W2_ROWS; ++r) p[r] = dw[base + r * words + w];
             uint g_ = w / wpg;
+            // scale/bias into named locals BEFORE the inner loop, exactly as
+            // the one-row original did. Reading them inline in the `a[r] +=`
+            // expression instead lets the compiler contract that FMA chain
+            // differently: same algebra, ~4e-5 different output, which over 43
+            // layers moved native ppl 3.651 -> 3.672 (Stage 4k). Keep the shape.
+            float sc[W2_ROWS], bi[W2_ROWS];
+            #pragma unroll
+            for (int r = 0; r < W2_ROWS; ++r) {
+                sc[r] = float(ds_[sbase + r * meta + g_]);
+                bi[r] = float(db[sbase + r * meta + g_]);
+            }
             const device float* hv = hs + w * 16;
             float aw[W2_ROWS];
             #pragma unroll
@@ -2750,9 +2761,7 @@ _MOE_K2_SRC = """
                 sw += hj;
             }
             #pragma unroll
-            for (int r = 0; r < W2_ROWS; ++r)
-                a[r] += aw[r] * float(ds_[sbase + r * meta + g_])
-                      + sw * float(db[sbase + r * meta + g_]);
+            for (int r = 0; r < W2_ROWS; ++r) a[r] += aw[r] * sc[r] + sw * bi[r];
         }
         #pragma unroll
         for (int r = 0; r < W2_ROWS; ++r) acc[r] += we * a[r];

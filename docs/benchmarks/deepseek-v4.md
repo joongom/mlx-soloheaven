@@ -19,12 +19,12 @@ Open work, in priority order:
    are already REFUTED and must not be retried: uint4/float4 vector loads,
    threadgroup staging of activations, dispatch-count fusion beyond what is
    done, threadgroup widening beyond current, and hand-hoisting the moe
-   scale/bias loads (Stage 4i — the compiler already does it). The next
-   three candidates come from an external kernel review (Stage 4j): a
-   256-entry `float4` LUT for the 2-bit unpack, and two-output-rows-per-
-   SIMD-group tiling in `wo_a` and `moe_w2`. All three cut ALU/activation
-   traffic rather than weight traffic, which is what "4x off bandwidth"
-   predicts is spendable.
+   scale/bias loads (Stage 4i — the compiler already does it), and a
+   constant-space LUT for the 2-bit unpack (Stage 4j — lane-divergent
+   constant reads cost 2x the whole kernel; that one also refuted "the
+   unpack ALU chain is the moe bottleneck"). Untried: two-output-rows-per-
+   SIMD-group tiling in `wo_a` and `moe_w2`, which halves ACTIVATION
+   re-reads rather than weight traffic or ALU.
 2. Server multi-turn smoke as an acceptance gate — **the native-path
    multi-turn crash is FIXED (Stage 4g, commit 49d90d7) but the fix has
    not yet been confirmed on the running server.**
@@ -1100,6 +1100,49 @@ can see is invariant; measure the traffic before assuming it is real.**
 The moe gap to its bandwidth bound (~4x) is therefore NOT redundant scale
 loads. Remaining suspects there: the 16-way shift/mask/convert chain per
 word (ALU) and the per-simdgroup activation re-reads.
+
+### Stage 4j — 2-bit unpack via a constant LUT: BIG REGRESSION, reverted (2026-08-02)
+
+Top-ranked suggestion of an external kernel review (codex, gpt-5.6-sol at
+xhigh, given the per-kernel timings and the refuted list). Hypothesis: the
+16 shifts + 16 masks + 16 int->float per packed word — done twice in w13 —
+is the dominant integer chain in the two slowest custom kernels; replace it
+with a 256-entry `constant float4 sh_q2_lut[]` mapping a byte to its four
+2-bit values. 4 KiB, read by every thread, "the case Metal's constant
+address space exists for". Predicted **-1.0 to -1.4 ms**.
+
+**Measured MUCH worse: 39.0 -> 48.2 ms/token.**
+
+| kernel (isolated) | before | LUT | after revert |
+|---|---|---|---|
+| sh_dsv4_moe_w2 | 4.73 | **10.16** | 4.65 |
+| sh_dsv4_moe_w13 | 4.77 | **8.43** | 4.79 |
+| whole native decode | 39.0 | 48.2 | 38.7 |
+
+The post-revert column is the control and it matters: the compiled path's
+number wandered 73 -> 85 -> 75 ms across these three runs, so the compiled
+figure cannot arbitrate anything. The **isolated per-kernel times** are the
+reliable instrument, and they restore exactly.
+
+Reading: a `constant`-space table is broadcast-optimized — one address per
+cycle for the whole SIMD-group. Here the 32 lanes index 32 unrelated bytes,
+so every access serializes into up to 32 constant-cache reads, and that
+costs far more than the ALU chain it removed. The review named divergence
+as "the risk" but priced it at a 20% haircut; it was worth **2x the whole
+kernel**. Generalized lesson, and it is not moe-specific: **on this chip a
+lane-divergent table lookup is not a cheaper multiply — do not trade ALU
+for a shared-table load in any of these kernels.**
+
+Also refuted by the same measurement: the standing suspicion (end of Stage
+4i) that the unpack ALU chain is what keeps moe ~4x off its bandwidth
+bound. Removing that chain made things worse, so the chain is not the
+binding constraint — it is overlapping with memory latency that stays
+whatever we do. Remaining untested suspect there: per-simdgroup activation
+re-reads (candidates 2 and 3 of the review).
+
+Verified bit-identity before benchmarking (probe_lut_bitexact.py: 0/512
+elements differ over 6 active experts), so this is a pure speed result —
+the LUT was correct, just slow.
 
 ## 3. Reproduce
 

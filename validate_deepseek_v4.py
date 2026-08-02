@@ -331,18 +331,22 @@ def cmd_compare(ours_path: str, ds4_path: str) -> None:
     print(f"KL(ds4 || ours): {kl:.4f}")
 
 
-def cmd_ppl_native() -> None:
-    """Teacher-forced perplexity THROUGH THE NATIVE DECODE PATH — the quality
-    gate for serving with SOLOHEAVEN_DSV4_NATIVE=1. Same probes and metric as
-    cmd_ppl: position 0 is scored from the (eager) one-token prefill logits,
-    every later position from a borrow-mode native decode step fed the true
-    token. Run: `python validate_deepseek_v4.py pplnative [--force]`."""
+def cmd_ppl_native(path: str = "native") -> None:
+    """Teacher-forced perplexity THROUGH A DECODE PATH — the quality gate for
+    serving with SOLOHEAVEN_DSV4_NATIVE=1. Same probes and metric as cmd_ppl:
+    position 0 is scored from the (eager) one-token prefill logits, every
+    later position from a decode step fed the true token. ``path`` "native"
+    (borrow-mode replay) or "compiled" (the mx.compile'd step — the fair
+    decode-vs-decode baseline; the BATCH cmd_ppl differs from any decode by
+    prefill-vs-decode semantics, not by backend).
+    Run: `python validate_deepseek_v4.py pplnative|ppldec [--force]`."""
     import math
 
     import mlx.core as mx
 
     mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
     model, tokenizer = load()
+    step_fn = model._decode_native if path == "native" else model._decode_compiled
     total_nll = total_n = 0.0
     for name, text in PPL_TEXTS.items():
         ids = tokenizer.encode(text, add_special_tokens=False)
@@ -351,7 +355,8 @@ def cmd_ppl_native() -> None:
         mx.eval(lg)
         steps = [lg[0, -1].astype(mx.float32)]
         for t in range(1, len(ids) - 1):
-            lgt = model._decode_native(mx.array([[ids[t]]]), cache)
+            lgt = step_fn(mx.array([[ids[t]]]), cache)
+            mx.eval(lgt)
             steps.append(lgt.reshape(-1).astype(mx.float32))
         nll_sum = 0.0
         for t, lgv in enumerate(steps):
@@ -472,6 +477,8 @@ if __name__ == "__main__":
     elif cmd == "nativecheck":
         cmd_nativecheck()
     elif cmd == "pplnative":
-        cmd_ppl_native()
+        cmd_ppl_native("native")
+    elif cmd == "ppldec":
+        cmd_ppl_native("compiled")
     else:
         raise SystemExit(__doc__)

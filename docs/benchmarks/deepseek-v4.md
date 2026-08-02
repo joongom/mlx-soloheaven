@@ -749,6 +749,41 @@ to the native path: ppl through the native decoder (quality gate), the
 SOLOHEAVEN_DSV4_NATIVE=1 integration with eager fallback, and a multi-turn
 server check — the native/README ladder items.
 
+### Stage 4a — serving stability: native path quality-equivalent; WEIGHTS REGRESSED ON DISK ⚠️ (2026-08-02)
+
+Borrow-mode serving integration (commit 7efcda7) validated on the real
+model. The investigation chain and its traps, in order:
+
+1. `nativecheck` (prefill 200, greedy 24): native determinism **0.0**,
+   coherent-LOOKING output; compiled looked like garbage. **Trap**: on
+   repetitive synthetic text, greedy coherence is a mirage — the
+   locally-pattern-matching path can LOOK right while being wrong.
+2. Teacher-forced step logits vs the eager batch reference: native was the
+   one drifting (P=60 max|d| 9.4 -> P=200 19.3 with an argmax flip);
+   compiled CONVERGED to eager with P (6.2 -> 0.8). Lesson: judge paths on
+   logits against an independent reference, never on greedy text.
+3. Per-layer state diff after ONE step from identical prefill state
+   (prefill determinism 0.0): NO localized break — L0 ring differs by
+   0.016 and the difference amplifies smoothly to ~3 by L42. bf16 chain
+   divergence between two valid kernel orders, not a seeding bug.
+4. Verdict by teacher-forced ppl on identical probes and weights:
+   batch 7.11 / compiled-decode 6.98 / **native-decode 6.96** (ALL) —
+   the native path is quality-EQUIVALENT. Gate PASSED.
+
+**Separate finding, blocking serving**: the model directory
+`...-2bit-search` was rewritten 2026-08-02 01:43 (after the ledger's §1.1
+measurement) and now scores ko 17.80 / en 9.17 / code 1.54 / ALL 7.11 —
+numerically the MIN/MAX (pre-fix) build's row (17.91/9.01/1.55/7.11), not
+the shipped search build (6.60/4.12/1.46/3.69). The error-searched weights
+appear to have been overwritten by a converter run. Every speed number in
+this ledger is unaffected (quantization scales do not change kernel
+timing); quality-sensitive serving needs the search build reconverted.
+
+New validate subcommands: `nativecheck` (seeded-session agreement,
+determinism, mini second turn), `pplnative` / `ppldec` (teacher-forced ppl
+through the native / compiled DECODE step — decode-vs-decode is the fair
+native gate; batch ppl differs by prefill-vs-decode semantics).
+
 ## 3. Reproduce
 
 ```bash

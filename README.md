@@ -17,6 +17,7 @@ SoloHeaven turns your Mac into a personal AI server with sub-second response tim
 - **Thinking budget control** — Configurable token limit for reasoning models, with per-request override
 - **Prompt Lookup Decoding (PLD)** — Optional draft-model-free speculative decoding for prompt-echo-heavy workloads (+37% on copy tasks)
 - **Speculative decoding (MTP)** — Gemma 4 multi-token-prediction drafter via mlx-vlm (`--backend mlx-vlm --draft-model`); ~2x decode, byte-identical output, with sliding-window wrap fixes
+- **Native replay decode (DeepSeek-V4)** — Encodes the whole 43-layer decode step once and replays it, borrowing the session's own KV arrays zero-copy: **2.0x decode (37.0 ms, 27.0 tok/s) at equal perplexity**, opt-in via `SOLOHEAVEN_NATIVE_DECODE=1` and self-disabling on any build its kernels cannot read
 - **Separate-process engine (default)** — Generation runs in a child process on its main thread for ~+30% tok/s at temp>0 (the FastAPI parent holds no MLX); switch off with `--engine-mode inprocess`
 - **Structured output (`response_format`)** — OpenAI-compatible JSON mode and JSON Schema constraints via logits-level FSM masking (100% schema adherence, no prompt engineering)
 - **Prefill chunk tuning** — Configurable `prefill_step_size` for 1.3-1.5x long-prompt speedup
@@ -70,7 +71,7 @@ support through mlx-vlm. (`--backend mlx-lm` forces the mlx-lm path;
 | **GPT-OSS** (`gpt_oss`, e.g. 20B/120B) | mlx-lm | Standard `KVCache` mix | **Harmony format** (family `harmony`): `<\|start\|>`/`<\|channel\|>`/`<\|message\|>` channel framing. The server parses the channels — `analysis` → `reasoning_content`, `final` → `content`, `commentary to=functions.*` → OpenAI `tool_calls` — so raw markers never leak into `content`. Thinking-budget forcing is disabled (the analysis→final transition is multi-token; no single close token exists). Natural stops record `<\|return\|>`/`<\|call\|>`; the HIT-splice reconciles them against the template's `<\|end\|>` history rendering (see suffix reconciliation below). |
 | **MiniMax** | mlx-lm | Standard `KVCache` | ChatML. |
 | **EXAONE-4.5** (`exaone4_5`, 33B) | mlx-lm via our shim (`models/exaone4_5.py`) | `RotatingKVCache` (48 sliding, window 4096) + `KVCache` (16 NoPE full-attn) | Convert first with `convert_exaone4_5.py` (output loads on stock mlx-lm as `exaone4`). ChatML-EXAONE dialect (`<\|user\|>`/`<\|endofturn\|>`). |
-| **DeepSeek-V4-Flash** (`deepseek_v4`, 284B MoE) | mlx-lm via our shim (`models/deepseek_v4.py` — full from-scratch port) | `DeepSeekV4Cache` per layer: 128-slot sliding ring + learned-pooling compressed KV (append-only) | MLA (one 512-wide KV latent), DSA indexer, hash routing, Hyper-Connections, fused Metal decode attention. Family `deepseek` (`<｜User｜>`/`<｜Assistant｜>`, eos closes assistant turns only). Append-only prefix reuse works; cache not trimmable → branch/PLD cold-fill. See conversion below. |
+| **DeepSeek-V4-Flash** (`deepseek_v4`, 284B MoE) | mlx-lm via our shim (`models/deepseek_v4.py` — full from-scratch port) | `DeepSeekV4Cache` per layer: 128-slot sliding ring + learned-pooling compressed KV (append-only) | MLA (one 512-wide KV latent), DSA indexer, hash routing, Hyper-Connections, fused Metal decode attention. Family `deepseek` (`<｜User｜>`/`<｜Assistant｜>`, eos closes assistant turns only). Append-only prefix reuse works; cache not trimmable → branch/PLD cold-fill. **Opt-in native replay decode runtime — 2.0x, 27 tok/s** (see below). See conversion below. |
 
 ### DeepSeek-V4-Flash: build the weights first
 
@@ -97,6 +98,45 @@ Weights are ~88 GiB resident — close other model servers first. The full
 story (why 2-bit min/max scales corrupt Korean, the ds4 oracle methodology,
 the decode-speed analysis) is in
 [`docs/specs/deepseek-v4-mlx-port.md`](docs/specs/deepseek-v4-mlx-port.md).
+
+### DeepSeek-V4-Flash: native replay decode (opt-in, 2.0x)
+
+MLX re-encodes every operation of every token. V4's decode is ~1500 small
+dispatches, so that encoding — not the arithmetic — set the pace. The native
+runtime encodes the whole 43-layer step ONCE per weight-layout signature and
+replays it, patching only the token id and offset per step. Weights and the
+session's own KV arrays are registered zero-copy (DLPack → `MTLBuffer`), so
+every native write IS a cache write and the session machinery, prefix reuse
+included, keeps working untouched.
+
+```bash
+SOLOHEAVEN_NATIVE_DECODE=1 ./start_deepseek_v4_flash_0731.sh
+```
+
+Measured on an M1 Ultra (128 GiB, wired, one model resident):
+
+| context | compiled path | native | |
+|---|---|---|---|
+| short prompt | 74.3 ms | **37.0 ms / 27.0 tok/s** | 2.0x |
+| 1k tokens | 81.0 ms | 43.4 ms | 1.9x |
+| 4k tokens | 87.2 ms | 54.3 ms | 1.6x |
+
+Quality is the gate, not an afterthought: teacher-forced perplexity through
+the native path is **3.6516** against the compiled path's 3.649 (ko 6.52 /
+en 4.05 / code 1.46) — equal within noise, and every kernel change is diffed
+against the code it replaces before it is measured for speed.
+
+It is **opt-in and self-disabling**. The runtime is architecture-specific
+(`deepseek_v4` only — the plan replays V4's MLA + compressor + DSA indexer +
+Hyper-Connections), and it derives the weight PACKING from the model rather
+than assuming one: 2/4/8-bit at group size 32/64/128, bf16 scales, one recipe
+per weight class. Anything else raises inside the decoder's constructor and
+falls back to the compiled path, because a mismatched packing would otherwise
+be read at the right addresses with the wrong stride and return plausible
+garbage.
+
+Numbers, method, machine state and every refuted optimization are in
+[`docs/benchmarks/deepseek-v4.md`](docs/benchmarks/deepseek-v4.md).
 
 **Note on mxfp4/mxfp8 quantization**: MLX currently has kernel inefficiencies for
 MoE matmul under mxfp4/mxfp8 modes (see [mlx issue #3402](https://github.com/ml-explore/mlx/issues/3402)).
@@ -1432,6 +1472,16 @@ src/mlx_soloheaven/
 │   ├── errors.py         # Canonical {message,type,code} error envelope + 429/503 helpers
 │   ├── gate_stream.py    # SlotStreamingResponse: holds the inference lease until post-stream commit, then releases
 │   └── schemas.py        # Pydantic request/response models
+├── models/             # Architectures mlx-lm does not ship, registered into its namespace
+│   ├── __init__.py     # register_extra_architectures(): model_type -> our module
+│   ├── exaone4_5.py    # EXAONE-4.5 shim (convert with convert_exaone4_5.py)
+│   └── deepseek_v4.py  # DeepSeek-V4 from-scratch port + every custom Metal kernel body
+├── native/             # Command-buffer replay decode runtime (opt-in, deepseek_v4 only)
+│   ├── encoder.m       # C/ObjC encode loop, built on demand into libdsv4enc.dylib
+│   ├── runtime.py      # Metal device/queue/pipelines, DLPack -> MTLBuffer, commit
+│   ├── kernels.py      # Generates the kernel library from the model's frozen bodies
+│   ├── plan.py         # Per-layer dispatch plan (the bodies' single call site)
+│   └── decoder.py      # NativeDecoder: borrows the session cache, patches token/offset
 ├── cache/
 │   └── manager.py      # Budget-based LRU cache manager
 ├── storage/
@@ -1442,6 +1492,34 @@ src/mlx_soloheaven/
     ├── style.css       # Dark theme, responsive design
     └── app.js          # Client-side logic (~500 lines)
 ```
+
+## Documentation
+
+Performance and correctness claims in this repo are expected to carry a
+measurement. `docs/DOCUMENTATION.md` states the rules: every number is
+recorded with its method and machine state at the moment it was taken,
+refuted ideas are kept with the prediction that failed, and each spec opens
+with a Status block saying what is done, broken, or next. Several of the
+negative results below have since saved days of re-derivation.
+
+| document | what it holds |
+|---|---|
+| [`docs/DOCUMENTATION.md`](docs/DOCUMENTATION.md) | the rules the rest of these follow |
+| [`docs/specs/deepseek-v4-mlx-port.md`](docs/specs/deepseek-v4-mlx-port.md) | the V4 port: design, quantization ceiling, oracle methodology, decisions |
+| [`docs/benchmarks/deepseek-v4.md`](docs/benchmarks/deepseek-v4.md) | every V4 measurement, the native-runtime campaign, and the optimizations that LOST |
+| [`docs/benchmarks/deepseek-v4-native-debugging.md`](docs/benchmarks/deepseek-v4-native-debugging.md) | the numerical hunt behind the native path |
+| [`docs/benchmarks/decode-headroom-survey.md`](docs/benchmarks/decode-headroom-survey.md) | how far each served model sits from its bandwidth floor — which is what decides whether kernel work can pay at all |
+| [`docs/benchmarks/qwen3.6-27b.md`](docs/benchmarks/qwen3.6-27b.md) | Qwen3.6-27B multi-turn to 11k tokens, and why MTP does not pay on it |
+
+Two results worth reading before optimizing anything here:
+
+* **Benchmark the regime you serve.** Every V4 decode number was taken at an
+  8-token prompt, which exercised only the fast path of a kernel that has
+  two. Long-context decode was 7x slower than reported until that was found.
+* **Where kernel work pays is decided by the bandwidth floor.** The dense
+  models served here sit within 1.4-1.6x of theirs — already bandwidth jobs,
+  nothing for an execution-side rewrite to take. V4 sat at 5.9x, which is why
+  its campaign was worth running.
 
 ## Future Directions
 

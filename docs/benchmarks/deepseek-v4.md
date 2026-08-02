@@ -7,27 +7,29 @@ see the 0.53 tok/s entry below for why that rule exists.
 
 ## STATUS (2026-08-02, latest first)
 
-**Native replay decode: 39.0 ms / 25.6 tok/s, quality 3.651 ppl vs the
-compiled path's 3.649** (Korean 6.52 vs 6.58 — native slightly better).
-1.88x the compiled path. Opt-in via `SOLOHEAVEN_DSV4_NATIVE=1`.
+**Native replay decode: 36.9 ms / 27.1 tok/s, quality ppl 3.6516** (ko 6.52
+/ en 4.05 / code 1.46) — 2.0x the compiled path (74.3 ms), whose ppl on the
+same harness is 3.649. **The 27 tok/s goal is MET**; ds4 on this machine is
+27.34 tok/s (36.6 ms), so this is parity within 0.3 ms. Opt-in via
+`SOLOHEAVEN_DSV4_NATIVE=1`.
 
 Open work, in priority order:
 
-1. **Goal: beat ds4's 27 tok/s (37.0 ms) — needs -2.0 ms.** Dispatch
-   folding is spent (Stage 4h). The gap lives in kernels that are far from
-   their bandwidth bound: moe ~4x off, wo_a ~2x off. Five perf hypotheses
-   are already REFUTED and must not be retried: uint4/float4 vector loads,
-   threadgroup staging of activations, dispatch-count fusion beyond what is
-   done, threadgroup widening beyond current, and hand-hoisting the moe
-   scale/bias loads (Stage 4i — the compiler already does it), and a
-   constant-space LUT for the 2-bit unpack (Stage 4j — lane-divergent
-   constant reads cost 2x the whole kernel; that one also refuted "the
-   unpack ALU chain is the moe bottleneck"). Untried: two-output-rows-per-
-   SIMD-group tiling in `wo_a` and `moe_w2`, which halves ACTIVATION
-   re-reads rather than weight traffic or ALU.
-2. Server multi-turn smoke as an acceptance gate — **the native-path
-   multi-turn crash is FIXED (Stage 4g, commit 49d90d7) but the fix has
-   not yet been confirmed on the running server.**
+1. **Server multi-turn smoke as an acceptance gate.** The native-path
+   multi-turn crash is FIXED (Stage 4g, commit 49d90d7 — a compressed-cache
+   buffer overrun, NOT sampling) but has not yet been confirmed on a
+   running server.
+2. Further decode speed, if wanted. Nine hypotheses are REFUTED and must
+   not be retried: uint4/float4 vector loads; threadgroup staging of
+   activations; dispatch-count fusion beyond what is done; threadgroup
+   widening; hand-hoisting the moe scale/bias loads (Stage 4i); a
+   constant-space LUT for the 2-bit unpack (Stage 4j — cost 2x the kernel,
+   and refuted "the unpack ALU chain is the moe bottleneck"); and row
+   tiling in `moe_w13` and `wo_a` (Stage 4k — it pays only where the
+   activation stream dominates the weight stream). What remains is the
+   library qmv at 9.0 ms over 194 dispatches, and any kernel whose serial
+   prologue forces a single-threadgroup shape (Stage 4l names
+   `sh_dsv4_hc_head_k` as the last one).
 
 Machine rule that still bites: never load the 94.5 GB model while another
 copy is up (server or a bench) — check `memory_pressure` first.
@@ -1143,6 +1145,88 @@ re-reads (candidates 2 and 3 of the review).
 Verified bit-identity before benchmarking (probe_lut_bitexact.py: 0/512
 elements differ over 6 active experts), so this is a pure speed result —
 the LUT was correct, just slow.
+
+### Stage 4k — activation-vs-weight tiling: moe_w2 wins, the others lose (2026-08-02)
+
+Suggestion 2 and 3 of the external review: compute several output rows per
+simdgroup so the rows SHARE the activation they reduce against. Measured on
+all three custom qmv-shaped kernels, one at a time:
+
+| kernel | 1 row | 2 rows | 4 rows | act : weight per row |
+|---|---|---|---|---|
+| **sh_dsv4_moe_w2** | 4.65 | **3.07** | **2.93** | 57 KB : 3.5 KB |
+| sh_dsv4_moe_w13 | 4.80 | 4.90 | — | 8 KB : 2 KB (x2 streams) |
+| sh_dsv4_wo_a_k | 3.45 | 3.73 | — | 8 KB : 4 KB |
+
+**The rule is the activation:weight ratio of ONE output row, not the
+kernel.** Tiling divides the activation stream and multiplies the live
+weight streams; it pays only where the activation dominates. moe_w2's rows
+each re-read all active experts' h (~57 KB) against 3.5 KB of packed
+weights, so it wins twice; w13 already carries two weight streams (gate and
+up) so a pair needs four, and wo_a's activation is a mere 8 KB. Both losers
+are reverted with the numbers left in their kernel comments.
+
+Decode: 38.7 -> 37.4 ms/token.
+
+**And a method failure worth more than the numbers.** The tiled body was
+written with indexed arrays so the tile width could be one constant, which
+moved the scale/bias loads into the accumulate expression:
+
+```
+-  sc = float(ds_[...]); ...   a  += aw   * sc  + sw * bi;
++                              a[r] += aw[r] * float(ds_[...]) + sw * float(db[...]);
+```
+
+Same algebra; the compiler contracts that FMA chain differently. ~4e-5 on
+the block output, and over 43 layers native ppl went 3.651 -> 3.672 — caught
+only by the quality gate, three commits later, after four real-model runs to
+bisect it. The probes that had "proved" bit-identity compared the new body
+at 4 rows against the new body at 1 row, and against its own mx.fast twin.
+Both agreed perfectly. **They never compared the new body against the OLD
+one.** Restoring the named-local shape brought back exact equality at every
+tile width and cost no speed.
+
+Two rules from this, both cheap to follow:
+* **Bit-identity is a claim about the code being REPLACED.** Compare
+  against that, not against a variant of the replacement.
+* A diff test whose grid over-launches (as the moe_w2 one does: it uses the
+  1-row grid formula at 256 wide, and the `dim >= d_model` guard absorbs
+  the excess) cannot see a grid that is too SMALL. It passed unchanged
+  through every tile width here.
+
+The compiled-path control was what made the bisect tractable: `ppldec`
+reproduced 3.649 exactly while `pplnative` did not, which pinned the drift
+to the native side within one run.
+
+### Stage 4l — hc_pre was single-threadgroup because of its own rms (2026-08-02)
+
+hc_pre opened by reducing sum(h^2) over ALL of h, so nothing else could
+proceed and the whole kernel had to be one threadgroup — roughly 1/64 of
+this chip's bandwidth, which is why it spent 33 us/dispatch moving 72 KB.
+
+dsv4_hc_mix_k already streams every element of h for its own dot products,
+so threadgroup 0 there now reduces sum(h^2) alongside, into one extra
+`mixes` slot. hc_pre reads it and splits the remaining per-output reduction
+over HC_PRE_SPLIT threadgroups; the gates and the 20-iteration Sinkhorn are
+recomputed per part (16 floats of simdgroup-local work, cheaper than another
+dispatch and its barrier) and only part 0 publishes post/comb.
+
+| | hc_pre (isolated) | decode |
+|---|---|---|
+| single threadgroup | 2.83 | 37.4 |
+| 4 threadgroups | 2.20 | 36.9 |
+| 8 threadgroups | 2.21 | 36.7 |
+
+4 and 8 are the same kernel time — it is no longer bandwidth-starved at
+either — so 8 is kept on the end-to-end number only. Bit-identity verified
+against the pre-split kernels at deployed sizes (hc=4, d=4096: y, post and
+comb all 0 differing elements), this time against the OLD code per Stage 4k.
+
+**Generalize before moving on:** the fix was not "make the kernel faster",
+it was noticing that a *serial prologue* forced a *shape*. Any kernel here
+that must reduce over its whole input before it can start is paying the
+same 1/64 tax. dsv4_hc_head_k (0.66 ms, one dispatch) has exactly that
+structure and is untouched.
 
 ## 3. Reproduce
 

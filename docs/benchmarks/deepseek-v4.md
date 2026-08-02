@@ -215,6 +215,20 @@ kernels for attention/MoE/compressor), then per token write (token_id,
 offset) into a small uniform buffer and re-commit the prebuilt command
 buffer(s). The per-op floor that caps MLX at ~87 ms does not exist there.
 
+### Stage 3b ladder step 1 — the replay loop is numerically viable
+
+Chained dependent dispatches of a small qmv in a RAW external command
+buffer: **13-15 µs/kernel** (vs the ~40-70 µs MLX-layer floor — the replay
+loop saves ~4x per op). Projection: a ~600-800-kernel step x 13 µs + ~25-30
+ms of genuine compute ≈ **35-45 ms/token ≈ 22-28 tok/s** — the target is
+inside the envelope, consistent with ds4's 36 ms.
+
+Encode-cost decision: python-ctypes re-encoding costs 16.6 ms per 1500
+dispatches (11 µs each of FFI overhead) — OUT. The runtime needs either a
+~100-line C dylib encode loop (~1 ms) or MTLIndirectCommandBuffer (note:
+ICB compute has no setBytes — per-token scalars must live in a small
+uniform buffer either way, which the design already specifies).
+
 Standing conclusions:
 * Per-launch overhead is ~4 µs (39 ms / ~10k launches) — the remaining ~1k
   launches cost ~3 ms. The 85 ms is a SUM of medium inefficiencies, not one

@@ -19,15 +19,15 @@ Open work, in priority order:
    are already REFUTED and must not be retried: uint4/float4 vector loads,
    threadgroup staging of activations, dispatch-count fusion beyond what is
    done, threadgroup widening beyond current, and hand-hoisting the moe
-   scale/bias loads (Stage 4i — the compiler already does it).
-2. **Multi-turn on the server is BROKEN with the native path** (Stage 4g).
-   Single turn is fine. NOT reproducible at the model level — four
-   harnesses (3-turn, state snapshots, 400-token generation, token-id
-   comparison) all pass — so reproduce through `MLXEngine.generate_stream`
-   with the session's real sampling (temperature 0.6, top_p,
-   repetition_penalty; note a repetition penalty on the EOS id suppresses
-   stopping by construction), not through `Model.__call__`.
-3. Server multi-turn smoke as an acceptance gate once (2) is fixed.
+   scale/bias loads (Stage 4i — the compiler already does it). The next
+   three candidates come from an external kernel review (Stage 4j): a
+   256-entry `float4` LUT for the 2-bit unpack, and two-output-rows-per-
+   SIMD-group tiling in `wo_a` and `moe_w2`. All three cut ALU/activation
+   traffic rather than weight traffic, which is what "4x off bandwidth"
+   predicts is spendable.
+2. Server multi-turn smoke as an acceptance gate — **the native-path
+   multi-turn crash is FIXED (Stage 4g, commit 49d90d7) but the fix has
+   not yet been confirmed on the running server.**
 
 Machine rule that still bites: never load the 94.5 GB model while another
 copy is up (server or a bench) — check `memory_pressure` first.
@@ -1009,8 +1009,45 @@ thinking-budget routing, and the engine's own prefix-reuse/cold-fill
 machinery. Next session: reproduce through `MLXEngine.generate_stream`
 with the session's exact sampling settings, not through `Model.__call__`.
 
-Until then SOLOHEAVEN_DSV4_NATIVE=1 is single-turn only; the compiled path
-is unaffected.
+**SOLVED — it was none of those. Compressed-cache buffer overrun**
+(commit 49d90d7). The server log of the second reproduction carried the
+real error, which the model-level probes had no way to surface:
+
+```
+2026-08-02 22:30:39  HIT | reusing 1099 cached tokens + 11 suffix tokens
+deepseek_v4.py:401  new[:, :self.n] = self.cache[:, :self.n]
+ValueError: [broadcast_shapes] Shapes (1,256,128) and (1,274,128)
+```
+
+274 groups in a 256-slot indexer cache. In borrow mode the native decoder
+registers the compressed buffers **by address** and afterwards only
+advances the python-side group count, so capacity is settled once, at
+decoder build — while `_ensure_comp_capacity` grew a buffer only once it
+was ALREADY full, and so never lifted the 256 slots that
+`CompressorState.append` had rounded a short first prefill to. The
+compiled path re-checks every step and survives; the native path wrote
+~18 groups past the end of the allocation, corrupting whatever MLX had
+placed next in the heap. Hence the ordering: garbage tokens partway
+through a LONG turn, then a 500 on the NEXT prefill.
+
+Why every model-level harness missed it: the boundary is 256 groups. At
+ratio 4 that is 1024 decoded tokens in ONE turn — the 3-turn probe ran
+31 tokens per turn and the long probe 400. The user's turn 2 ran ~860
+tokens on top of a 238-token prefix. **Lesson for the ledger: a probe
+that does not cross the buffer-growth boundary is not a probe of buffer
+growth; size probes by the state transitions they must cross, not by
+what "feels like" a long run.**
+
+Fixed with two independent guards (`_ensure_comp_capacity` reaches the
+session target eagerly; `NativeDecoder.overflowing()` forces a rebind
+over a grown cache when a session outruns
+`SOLOHEAVEN_DSV4_MAX_CONTEXT`), plus a scaled-down regression test
+(`GROWTH=4`, 16-token max context) that fails on the pre-fix code.
+
+Side effect to watch: compressed caches now reach their full 32K-context
+capacity (~85 MB across all layers, bf16) at the first decode step
+instead of creeping there — which is what the Stage-2 design intended,
+and it also removes the compiled path's periodic trace re-keying.
 
 ### Stage 4h — dispatch folding after the correctness work (2026-08-02)
 

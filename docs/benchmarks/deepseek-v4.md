@@ -501,6 +501,38 @@ commit overhead):
 So the real 40 ms levers are the big kernels' compute: moe (13, near bandwidth —
 hard), attn_core (10), hc_pre (7). The easy pathological-kernel wins are spent.
 
+### Stage 3i — attn_core loops bounded to O(context): small win, model of cost REFUTED ⚠️ (2026-08-02)
+
+Commit aad0054. Every attn_core pass iterated the full slot capacity
+K = WIN + KC regardless of context; the loops now run [jlo, jhi) with
+jlo = max(0, WIN-1-offset), jhi = WIN + (PLAIN ? min(NCOMP, KC) : KC).
+Method: `validate_deepseek_v4.py bench` (64 tok, prefill 8), wired, 96% free
+before load, bench9.
+
+| | ms/token | tok/s |
+|---|---|---|
+| before (Stage 3h) | 62.6 | 16.0 |
+| after loop bounding | **60.8** | **16.4** (1.36x vs 82.9 compiled) |
+
+**Prediction FAILED in the interesting direction.** Expected ~-7 ms (ratio-128
+layers drop from 2176 to ~72 slots at bench offsets; config: sliding_window=128,
+index_topk=512); measured -1.8 ms wall and attn_core isolated 9.97 -> 9.88 (flat).
+The arithmetic explains it in hindsight: a skipped slot (sc[j] <= 0 branch) costs
+a few cycles, so 2176-slot sweeps were only ~7 µs/dispatch of the ~230 µs
+observed. **The O(K) serial loops were never the attn_core cost.** The ~230
+µs/dispatch remains unexplained — candidates: exposed memory latency on the
+scattered ring/comp rows, barrier stalls (12/dispatch x 64 TGs), or
+per-dispatch scheduling in the isolated-profile method itself (this run's
+isolated sum 67.1 > wall 60.8, so the profiler overstates per-group cost —
+treat isolated numbers as ranking, not absolute). Next probe: early-return
+bisection variants of attn_core on the real model to localize the 230 µs.
+Change kept: strictly less work, correct (native tests diff-verify;
+full suite 1396), and it matters at prefill-heavy offsets.
+
+Profile after (bench9, isolated-group ms): qmv 11.10 / attn_core 9.88 /
+hc_pre 7.45 / moe w13+w2 12.65 / comp_step 4.93 / wo_a 3.82 / hc_mix 3.30 /
+hc_post 3.14 / rms 2.75.
+
 ## 3. Reproduce
 
 ```bash

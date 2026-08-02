@@ -344,6 +344,31 @@ across ~5k ops/token. Paths, in effort order:
    ds4 parity (36 ms) additionally needs its command-buffer-replay runtime
    model, which MLX does not expose — that is an upstream feature
    conversation, not something this repo can code around.
+
+### Upstream survey (2026-08-02, installed 0.31.2 vs latest 0.32.0)
+
+* **No Metal graph capture/replay exists or is planned.** The CUDA-side
+  proposals (mlx#2358, mlx#2359) were closed over address instability
+  ("the memory address of arrays almost always change"). And the Metal
+  backend ALREADY batches encoding into one command buffer per stream
+  (device.h `buffer_ops_`/`needs_commit()`) — consistent with our finding
+  that per-launch cost is ~µs, not the 85 ms.
+* 0.32.0 adds `qmv_wide` (mlx#3764): faster quantized matvec for batch
+  M=2-8 — useless for batch-1 decode, RELEVANT if a speculative/drafter
+  path ever lands for this model.
+* **Our gather_qmm batch-1 measurement (14 ms vs ~3 ms bandwidth) is not
+  reported upstream** — mlx#3402 covers mxfp4 MoE only. Filing it with our
+  numbers is the highest-leverage move for the largest single component.
+* Two OFFICIAL hybrid paths exist:
+  A. a C++ extension Primitive may encode MULTIPLE kernels inside one
+     `eval_gpu` (the public CommandEncoder API) — days of work, but our own
+     stacking/HC results say encoding overhead is small and parallelism is
+     easy to lose, so expectations must be modest;
+  B. 0.32's DLPack zero-copy Metal buffer sharing (mlx#3531) makes the
+     REAL hybrid officially possible: MLX owns weights/prefill, decode
+     runs in our own ds4-style replay loop against MLX-owned buffers.
+     Weeks of per-architecture kernel work; the only mapped road to
+     ds4-parity decode.
 3. ~~A fused sparse-attention Metal kernel~~ DONE (2026-08-02), with an
    honest outcome: `dsv4_sparse_decode` (one dispatch per layer, online
    softmax + sink, both parts walked in-kernel, differential-tested against

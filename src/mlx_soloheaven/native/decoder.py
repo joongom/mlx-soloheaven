@@ -79,7 +79,7 @@ class NativeDecoder:
         self._plan_cache: dict = {}
         self._plan_n: tuple | None = None
         self._tok_off = 0
-        self._ioff_off = 0
+        self._ioff_offs: list[int] = []
 
         self.table = rt.BufferTable()
         self.S: dict[str, int] = {}
@@ -219,14 +219,23 @@ class NativeDecoder:
     def _build_plan(self, cb: P.ConstBlob, token: int):
         pl = P.Planner(self.rt, self.table, cb, self.S)
         tok_off, _ = cb.add("i", token)
-        ioff_off, _ = cb.add("2i", self.offset, 0)
-        self._tok_off, self._ioff_off = tok_off, ioff_off
+        self._tok_off = tok_off
         items = P.plan_embed(pl, self.model.embed, "ha", self.hc, self.hidden, tok_off)
         cur, nxt = "ha", "hb"
+        # PER-LAYER ioff blobs: the kernels read [offset, ncomp] as one
+        # 8-byte constant, and ncomp (= the layer's completed-group count,
+        # plan-build constant) differs per layer. A single shared blob baked
+        # ncomp=0 for everyone, which silently masked the ENTIRE compressed
+        # region (and the indexer's n2) on the replay path — invisible below
+        # offset 128 where the ring covers everything. Only the offset half
+        # is per-token; decode() patches it into every blob.
+        self._ioff_offs = []
         for i, blk in enumerate(self.model.layers):
             lay = self._layers[i]
             comp, idx = self._cache_dicts(lay)
-            items += P.plan_block(pl, blk, cur, lay["ring"], nxt, ioff_off,
+            lioff, _ = cb.add("2i", self.offset, lay["n"])
+            self._ioff_offs.append(lioff)
+            items += P.plan_block(pl, blk, cur, lay["ring"], nxt, lioff,
                                   self.topk, self.rscale, self.limit,
                                   comp_cache=comp, idx_cache=idx,
                                   ncomp=lay["n"], n=lay["n"], tok_off=tok_off)
@@ -250,11 +259,13 @@ class NativeDecoder:
             if not self._barriers:
                 for it in items:
                     it.barrier = 0
-            cached = (items, bytearray(cb.bytes()), self._tok_off, self._ioff_off)
+            cached = (items, bytearray(cb.bytes()), self._tok_off,
+                      tuple(self._ioff_offs))
             self._plan_cache[0] = cached
-        items, blob, tok_off, ioff_off = cached
+        items, blob, tok_off, ioff_offs = cached
         struct.pack_into("<i", blob, tok_off, int(token))
-        struct.pack_into("<i", blob, ioff_off, int(self.offset))
+        for off in ioff_offs:
+            struct.pack_into("<i", blob, off, int(self.offset))
         self.rt.commit(items, self.table.ptrs, bytes(blob), wait=True)
         for lay in self._layers:
             if lay["ratio"]:

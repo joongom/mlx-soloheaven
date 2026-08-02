@@ -1914,12 +1914,24 @@ _IDX_SCORE_SRC = """
 """
 
 _IDX_TOPK_SRC = """
-    // top-k over scores[cap]; masked (< n2) already -inf. Emit indices, -1 for
-    // slots beyond n2 (matching Indexer.decode_step_math's mask).
+    // top-k over scores[cap]; scores at indices >= n2 are already -inf. Emit the
+    // selected group indices (order is irrelevant — attn_core softmaxes over the
+    // whole set), -1 for slots past the valid count (matching the reference mask).
     uint tid = thread_position_in_threadgroup.x;
     const int cap = params[0];
     const int topk = params[1];
     const int n2 = ioff[1];
+    // Common case (context shorter than index_topk groups): every valid group is
+    // selected, so emit 0..n2-1 directly across all threads. This skips the
+    // O(cap*topk) single-thread selection sort that otherwise dominates decode
+    // (~19 ms/layer at cap=256, topk=512 — see docs/benchmarks/deepseek-v4.md).
+    if (n2 <= topk) {
+        for (int k = tid; k < topk; k += 256) out_idx[k] = (k < n2) ? k : -1;
+        return;
+    }
+    // Rare case (n2 > topk, i.e. > index_topk completed groups): true top-k.
+    // out_idx[0] is the argmax (the indexer test asserts this); a parallel
+    // rewrite is a follow-up if long contexts make this hot.
     if (tid != 0) return;
     bool taken[1024];
     for (int i = 0; i < cap; ++i) taken[i] = false;

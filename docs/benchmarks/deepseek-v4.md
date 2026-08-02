@@ -5,6 +5,33 @@ Machine: Apple M1 Ultra, 128 GiB. All decode numbers: **wired working set**
 warm average (first 4-6 tokens excluded). Un-wired numbers are invalid —
 see the 0.53 tok/s entry below for why that rule exists.
 
+## STATUS (2026-08-02, latest first)
+
+**Native replay decode: 39.0 ms / 25.6 tok/s, quality 3.651 ppl vs the
+compiled path's 3.649** (Korean 6.52 vs 6.58 — native slightly better).
+1.88x the compiled path. Opt-in via `SOLOHEAVEN_DSV4_NATIVE=1`.
+
+Open work, in priority order:
+
+1. **Goal: beat ds4's 27 tok/s (37.0 ms) — needs -2.0 ms.** Dispatch
+   folding is spent (Stage 4h). The gap lives in kernels that are far from
+   their bandwidth bound: moe ~4x off, wo_a ~2x off. Five perf hypotheses
+   are already REFUTED and must not be retried: uint4/float4 vector loads,
+   threadgroup staging of activations, dispatch-count fusion beyond what is
+   done, threadgroup widening beyond current, and hand-hoisting the moe
+   scale/bias loads (Stage 4i — the compiler already does it).
+2. **Multi-turn on the server is BROKEN with the native path** (Stage 4g).
+   Single turn is fine. NOT reproducible at the model level — four
+   harnesses (3-turn, state snapshots, 400-token generation, token-id
+   comparison) all pass — so reproduce through `MLXEngine.generate_stream`
+   with the session's real sampling (temperature 0.6, top_p,
+   repetition_penalty; note a repetition penalty on the EOS id suppresses
+   stopping by construction), not through `Model.__call__`.
+3. Server multi-turn smoke as an acceptance gate once (2) is fixed.
+
+Machine rule that still bites: never load the 94.5 GB model while another
+copy is up (server or a bench) — check `memory_pressure` first.
+
 Companion narrative: `docs/specs/deepseek-v4-mlx-port.md` (design, evidence,
 decisions). This file is the raw numbers + how to reproduce them.
 

@@ -497,6 +497,79 @@ def test_native_moe_routed_chain_matches_mx_fast():
     assert np.abs(got - exp).max() < 2e-2, np.abs(got - exp).max()
 
 
+def test_native_qmv_into_attn_core_chain():
+    """A MIXED chained plan: a LIBRARY qmv (wq_b: qr -> q_raw) feeds a CUSTOM
+    kernel (attn_core) through an intermediate buffer, in one command buffer.
+    MoE proved custom->custom; this proves library->custom, the other pattern
+    a real layer needs. Diffed against the same two ops in mx."""
+    from mlx_soloheaven.models.deepseek_v4 import _get_attn_core_kernel
+    from mlx_soloheaven.native.kernels import BUFFER_SLOTS
+
+    H, D, RD, WIN, QLORA = 4, 64, 16, 8, 512  # K%512==0 for qmv_fast
+    NHD = H * D  # 256, %8==0 for qmv_fast
+    gs = 64
+    rng = np.random.default_rng(11)
+    qr = mx.array(rng.standard_normal((1, QLORA)).astype(np.float32)).astype(mx.bfloat16)
+    wqb_w = mx.array(rng.standard_normal((NHD, QLORA)).astype(np.float32) * 0.1).astype(mx.bfloat16)
+    wqb_q, wqb_s, wqb_b = mx.quantize(wqb_w, group_size=gs, bits=8)
+    kv = mx.array(rng.standard_normal((1, 1, D)).astype(np.float32)).astype(mx.bfloat16)
+    ring = mx.array(rng.standard_normal((1, WIN, D)).astype(np.float32)).astype(mx.bfloat16)
+    sink = mx.array(rng.standard_normal(H).astype(np.float32))
+    freqs = mx.array((1.0 / (10000.0 ** (np.arange(0, RD, 2) / RD))).astype(np.float32))
+    offset = 20
+
+    # reference: q_raw = qmv(qr, wqb) ; out = attn_core(q_raw, kv, ring, ...)
+    q_ref = mx.quantized_matmul(qr, wqb_q, wqb_s, wqb_b, transpose=True,
+                                group_size=gs, bits=8)
+    params_a = mx.array([D, RD, WIN, 0, 1], dtype=mx.int32)
+    fscal = mx.array([D ** -0.5, 1e-6], dtype=mx.float32)
+    ioff = mx.array([offset, 0], dtype=mx.int32)
+    dummy = mx.zeros((1, 1, D), dtype=mx.bfloat16)
+    didx = mx.full((1, 1, 1), -1, dtype=mx.int32)
+    out_ref, _ = _get_attn_core_kernel()(
+        inputs=[q_ref.reshape(-1), kv.reshape(-1), ring.reshape(-1),
+                dummy.reshape(-1), didx.reshape(-1), sink, freqs, params_a, fscal, ioff],
+        template=[("T", mx.bfloat16)],
+        grid=(H * 128, 1, 1), threadgroup=(128, 1, 1),
+        output_shapes=[(NHD,), (D,)], output_dtypes=[mx.bfloat16, mx.bfloat16],
+    )
+
+    q_raw = mx.zeros((NHD,), dtype=mx.bfloat16)
+    out = mx.zeros((NHD,), dtype=mx.bfloat16)
+    kvo = mx.zeros((D,), dtype=mx.bfloat16)
+    mx.eval(qr, wqb_q, wqb_s, wqb_b, kv, ring, sink, freqs, dummy, didx,
+            q_ref, out_ref, q_raw, out, kvo)
+    mx.synchronize()
+
+    rt_mod.load_custom_kernels(_RT)
+    table = rt_mod.BufferTable()
+    ac = BUFFER_SLOTS["dsv4_attn_core"]
+    s = {nm: table.add(a) for nm, a in [
+        ("qr", qr), ("wqb_q", wqb_q), ("wqb_s", wqb_s), ("wqb_b", wqb_b),
+        ("q_raw", q_raw), ("kv", kv.reshape(-1)), ("ring", ring.reshape(-1)),
+        ("dummy", dummy.reshape(-1)), ("didx", didx.reshape(-1)),
+        ("sink", sink), ("freqs", freqs), ("out", out), ("kvo", kvo)]}
+    const = struct.pack("<ii5i2f2i", QLORA, NHD, D, RD, WIN, 0, 1,
+                        D ** -0.5, 1e-6, offset, 0)
+
+    qmv_item = rt_mod.plan_qmv(
+        _RT, (s["wqb_q"], s["wqb_s"], s["wqb_b"], s["qr"], s["q_raw"]),
+        QLORA, NHD, 0, 4)
+    core = rt_mod.plan_item(
+        _RT, "dsv4_attn_core", True,
+        [(s["q_raw"], ac["q"]), (s["kv"], ac["kv"]), (s["ring"], ac["ring"]),
+         (s["dummy"], ac["comp"]), (s["didx"], ac["cidx"]), (s["sink"], ac["sink"]),
+         (s["freqs"], ac["freqs"]), (s["out"], ac["out"]), (s["kvo"], ac["kv_out"])],
+        [(8, 20, ac["params"]), (28, 8, ac["fscal"]), (36, 8, ac["ioff"])],
+        (H, 1, 1), (128, 1, 1),
+    )
+    _RT.commit([qmv_item, core], table.ptrs, const, wait=True)
+
+    a = np.array(out.astype(mx.float32))
+    b = np.array(out_ref.astype(mx.float32))
+    assert np.abs(a - b).max() < 1e-2, np.abs(a - b).max()
+
+
 def test_c_encode_cost_is_in_budget():
     """CPU-side encode+commit of a 1500-dispatch plan (wait=False, so GPU
     time is excluded — this is the per-token CPU cost that must fit in the

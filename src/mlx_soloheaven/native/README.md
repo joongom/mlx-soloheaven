@@ -70,10 +70,14 @@ step unless profiling later demands it) owning:
    shared expert is 3 qmv + a swiglu (reuse moe_w13-style or eager), grouped
    wo_a is 8 qmv (one per group) or gather_qmv. NOTHING custom remains
    unbuilt for a dense layer.
-4. NEXT: assemble the per-layer PLAN + session BufferTable from a real Model
-   and replay ONE dense layer → logits diff vs the MLX compiled step
-   (bf16 ~1e-2). This is now pure assembly — every dispatch it needs is a
-   proven kernel.
+   ✅ BOTH chaining patterns a layer uses are proven: custom->custom (MoE
+   K1->K2) and library->custom (wq_b qmv -> attn_core), each an intermediate
+   buffer across a barrier in one command buffer.
+4. NEXT: assemble the FULL dense-layer plan (rms, qmv wq_a/wkv/wq_b/wo_b,
+   grouped wo_a, attn_core, hc_pre/post, gate, moe K1/K2, shared expert) +
+   session BufferTable from a real Model, replay ONE dense layer → logits
+   diff vs the MLX compiled step (bf16 ~1e-2). Pure assembly: every kernel
+   AND every chaining pattern it needs is now individually proven.
 5. All layer kinds, then the full 43-layer step + embed/head → token-level
    agreement over a 32-token greedy run.
 6. ppl probes through the native path ≈ MLX path (3.65).

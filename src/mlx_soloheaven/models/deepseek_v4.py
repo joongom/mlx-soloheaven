@@ -896,19 +896,15 @@ _ATTN_CORE_SRC = """
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // roped kv row (computed redundantly per TG; 512 dims, trivial).
-    // T() rounds mirror the reference path's bf16 buffer between rope and
-    // attention — fused fp32 here would diverge from the compiled path by
-    // ~1e-2 per layer, which the 43-layer HC ladder amplifies into logit
-    // divergence (the Stage 4b ppl gap).
+    // roped kv row (computed redundantly per TG; 512 dims, trivial)
     for (int i = tid; i < D; i += TG) kvr[i] = float(kv[i]);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int p = tid; p < RD / 2; p += TG) {
         int i0 = D - RD + 2 * p;
         float c = cs[2 * p], s = cs[2 * p + 1];
         float e = kvr[i0], o = kvr[i0 + 1];
-        kvr[i0] = float(T(e * c - o * s));
-        kvr[i0 + 1] = float(T(e * s + o * c));
+        kvr[i0] = e * c - o * s;
+        kvr[i0 + 1] = e * s + o * c;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (h_ == 0) {
@@ -932,16 +928,14 @@ _ATTN_CORE_SRC = """
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float rn = red[0];
-    // T() rounds: the reference path materializes bf16 buffers after the
-    // q RMS and after the rope — keep those rounding points (Stage 4b).
-    for (int i = tid; i < D; i += TG) qh[i] = float(T(qh[i] * rn));
+    for (int i = tid; i < D; i += TG) qh[i] *= rn;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int p = tid; p < RD / 2; p += TG) {
         int i0 = D - RD + 2 * p;
         float c = cs[2 * p], s = cs[2 * p + 1];
         float e = qh[i0], o = qh[i0 + 1];
-        qh[i0] = float(T(e * c - o * s));
-        qh[i0 + 1] = float(T(e * s + o * c));
+        qh[i0] = e * c - o * s;
+        qh[i0 + 1] = e * s + o * c;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1036,10 +1030,8 @@ _ATTN_CORE_SRC = """
                 a1 += pj * float(comp[idx * D + i0 + 1]);
             }
         }
-        // T() round before the inverse rope: the reference path writes the
-        // attention output as bf16 and inverse-ropes THAT (Stage 4b).
-        a0 = float(T(a0 / denom));
-        a1 = float(T(a1 / denom));
+        a0 /= denom;
+        a1 /= denom;
         if (i0 >= D - RD) {                    // inverse rope (conjugate)
             int pr = (i0 - (D - RD)) / 2;
             float c = cs[2 * pr], s = cs[2 * pr + 1];
@@ -1109,9 +1101,7 @@ _COMP_STEP_SRC = """
                 m = mn;
             }
         }
-        // T() round: the reference norms the POOLED GROUP AS BF16
-        // (norm(pooled.astype(out_dtype)) in decode_step_math) — Stage 4b.
-        pooled[i] = float(T(acc / den));
+        pooled[i] = acc / den;
     }
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
 
@@ -1141,17 +1131,15 @@ _COMP_STEP_SRC = """
     float rn = wsum[0];
     int gpos = (offset + 1) / ratio - 1;
     for (int i = tid; i < d; i += TG) {
-        // T() rounds: the reference materializes the normed group as bf16
-        // and ropes THAT (Stage 4b).
-        float v = float(T(pooled[i] * rn * float(nw[i])));
+        float v = pooled[i] * rn * float(nw[i]);
         if (i >= d - RD) {
             int p2 = (i - (d - RD)) / 2;
             bool hi = ((i - (d - RD)) & 1) == 1;
             float ang = float(gpos) * float(freqs[p2]) * float(ratio);
             float c = cos(ang), s = sin(ang);
             int i0 = d - RD + 2 * p2;
-            float e = float(T(pooled[i0] * rn * float(nw[i0])));
-            float o = float(T(pooled[i0 + 1] * rn * float(nw[i0 + 1])));
+            float e = pooled[i0] * rn * float(nw[i0]);
+            float o = pooled[i0 + 1] * rn * float(nw[i0 + 1]);
             v = hi ? (e * s + o * c) : (e * c - o * s);
         }
         row_out[i] = T(complete ? v : float(old_row[i]));
@@ -2258,9 +2246,7 @@ _SH13_SRC = """
     a1 = simd_sum(a1);
     a3 = simd_sum(a3);
     if (lane == 0) {
-        // T() rounds mirror the sg/su bf16 buffers the unfused path had
-        // between the two qmv and the swiglu (Stage 4b).
-        float g = float(T(a1)), u = float(T(a3));
+        float g = a1, u = a3;
         if (limit > 0.0f) { u = clamp(u, -limit, limit); g = min(g, limit); }
         out[row] = T((g / (1.0f + exp(-g))) * u);
     }

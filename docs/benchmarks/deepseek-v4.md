@@ -556,6 +556,50 @@ Remaining to 40 ms: -16.6. Next: attn_core early-return bisection (the
 ~230 us/dispatch is still unexplained — Stage 3i), then comp_step/hc_pre
 single-TG tails, then moe/qmv bandwidth efficiency.
 
+### Stage 3k — attn_core bisected and fixed: 10.2 -> 1.6 ms isolated (2026-08-02)
+
+Commits: probe method + fix in the perf commit (see git log around this
+entry). New METHOD worth keeping: early-return bisection on the real model
+with ONE load — patch the kernel source string per variant and build a fresh
+NativeDecoder per variant (each compiles its own runtime), then read just
+that kernel's profile_kernels row. Probe results for attn_core (token=5,
+offset 13):
+
+| cut | cumulative ms | delta |
+|---|---|---|
+| P0 dispatch floor | 0.80 | — |
+| + kv rope / q RMS+rope | 0.86 | ~0 |
+| + scores loop | 6.78 | **+5.92** |
+| + softmax | 6.90 | +0.12 |
+| + values loop (FULL) | 10.31 | **+3.41** |
+
+Two causes, two fixes (one commit): (1) scores gave each valid slot to ONE
+thread walking a 512-dim row serially — a single thread's few outstanding
+loads expose full DRAM latency per element; now one SIMDGROUP per slot,
+lanes stride the dims, simd_sum reduces (the qmv access pattern). (2) traced
+(indexer) layers swept jhi = WIN+KC = 640 slots in every pass; idx_topk
+emits winners as a -1-padded contiguous prefix and ioff[1] is its n2, so
+both comp modes now bound jhi = WIN + min(NCOMP, KC). Bench (wired, 90%+
+free, bench11):
+
+| | ms/token | tok/s |
+|---|---|---|
+| before (Stage 3j) | 56.6 | 17.7 |
+| after attn_core fix | **53.4** | **18.7** (1.45x vs 77.5 compiled) |
+
+attn_core isolated 10.19 -> **1.59** ms. Session cumulative 611 -> 53.4
+(11.4x). Lesson recorded: when a kernel's cost defies its arithmetic,
+bisect it on the real model before optimizing — Stage 3i optimized the
+wrong loop property (trip count, actually ~free) where the real cost was
+one-thread-per-row latency exposure.
+
+Profile after (bench11, isolated ms): moe w13+w2 12.68/86 · qmv 11.42/280 ·
+hc_pre 5.27/86 · comp_step 5.12/62 · hc_mix 3.59/86 · wo_a 3.47/43 ·
+rms 2.70/173 · gate 2.37/80 · attn_core 1.59/43 · hc_post 1.15/86.
+Remaining to 40 ms: -13.4. Next: the same bisection on moe_w13/w2 (12.7 ms
+measured vs ~1.8 ms of 2-bit expert-weight bandwidth — 14% efficiency, the
+biggest unexplained gap left).
+
 ## 3. Reproduce
 
 ```bash

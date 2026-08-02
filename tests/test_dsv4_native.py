@@ -24,10 +24,17 @@ if not metal.is_available():
     pytest.skip("Metal not available", allow_module_level=True)
 
 try:
+    from mlx_soloheaven.models.deepseek_v4 import QuantSpec, _kernel_defines
     from mlx_soloheaven.native import runtime as rt_mod
     _RT = rt_mod.Runtime()
 except Exception as e:  # noqa: BLE001 — dylib/build/device issues -> skip
     pytest.skip(f"native runtime unavailable: {e}", allow_module_level=True)
+
+#: Every fixture in this file is quantized the way the converter deploys:
+#: dense 8-bit/gs64, routed experts 2-bit/gs64. The kernels are compiled for a
+#: specific packing, so the tests state theirs instead of inheriting a default.
+_TEST_DEFINES = _kernel_defines(QuantSpec(dense_bits=8, dense_gs=64,
+                                          exp_bits=2, exp_gs=64))
 
 
 class ConstBlob:
@@ -160,7 +167,7 @@ def test_native_moe_w2_kernel_matches_mx_fast():
     wts = mx.array([0.5, 0.3, 0.2, 0.4], dtype=mx.float32)
 
     # reference: the model's mx.fast K2
-    _, k2 = _get_moe_kernels()
+    _, k2 = _get_moe_kernels(2, 64)
     params = mx.array([n_act, d_model, d_inner], dtype=mx.int32)
     (ref,) = k2(
         inputs=[h.reshape(-1), dqw, dsc, dbi, idxs, wts, params],
@@ -174,7 +181,7 @@ def test_native_moe_w2_kernel_matches_mx_fast():
     mx.synchronize()
 
     load = rt_mod.load_custom_kernels
-    load(_RT)
+    load(_RT, _TEST_DEFINES)
     table = rt_mod.BufferTable()
     slots = [table.add(a) for a in (h.reshape(-1), dqw, dsc, dbi, idxs, wts, y)]
 
@@ -214,7 +221,7 @@ def test_native_moe_w13_kernel_matches_mx_fast():
     x = mx.random.normal((d_model,)).astype(mx.bfloat16)
     idxs = mx.array([3, 5, 0, -1], dtype=mx.int32)
 
-    k1, _ = _get_moe_kernels()
+    k1, _ = _get_moe_kernels(2, 64)
     params = mx.array([n_act, d_model, d_inner], dtype=mx.int32)
     feps = mx.array([limit], dtype=mx.float32)
     (ref,) = k1(
@@ -228,7 +235,7 @@ def test_native_moe_w13_kernel_matches_mx_fast():
     mx.eval(gqw, gsc, gbi, uqw, usc, ubi, x, idxs, ref, h)
     mx.synchronize()
 
-    rt_mod.load_custom_kernels(_RT)
+    rt_mod.load_custom_kernels(_RT, _TEST_DEFINES)
     table = rt_mod.BufferTable()
     ins = [x, gqw, gsc, gbi, uqw, usc, ubi, idxs]
     slots = [table.add(a) for a in ins]
@@ -289,7 +296,7 @@ def test_native_attn_core_matches_mx_fast():
     mx.eval(q, kv, ring, comp, cidx, sink, freqs, out_ref, kv_ref, out, kvo)
     mx.synchronize()
 
-    rt_mod.load_custom_kernels(_RT)
+    rt_mod.load_custom_kernels(_RT, _TEST_DEFINES)
     table = rt_mod.BufferTable()
     named = dict(
         q=q.reshape(-1), kv=kv.reshape(-1), ring=ring.reshape(-1),
@@ -343,7 +350,7 @@ def test_native_gate_and_rms_match_reference():
     order = np.argsort(-biased)
     assert biased[order[topk - 1]] - biased[order[topk]] > 1e-2, "seed hit a near-tie"
 
-    rt_mod.load_custom_kernels(_RT)
+    rt_mod.load_custom_kernels(_RT, _TEST_DEFINES)
     sc = mx.zeros((n_exp,), dtype=mx.float32)
     oi = mx.zeros((topk,), dtype=mx.int32)
     ow = mx.zeros((topk,), dtype=mx.float32)
@@ -412,7 +419,7 @@ def test_native_gate_split_matches_reference():
     order = np.argsort(-biased)
     assert biased[order[topk - 1]] - biased[order[topk]] > 1e-2, "seed hit a near-tie"
 
-    rt_mod.load_custom_kernels(_RT)
+    rt_mod.load_custom_kernels(_RT, _TEST_DEFINES)
     sc = mx.zeros((n_exp,), dtype=mx.float32)
     oi = mx.zeros((topk,), dtype=mx.int32)
     ow = mx.zeros((topk,), dtype=mx.float32)
@@ -461,7 +468,7 @@ def test_native_gate_hash_matches_reference():
     w_ref = scores[idx_ref]
     w_ref = w_ref / w_ref.sum() * rscale
 
-    rt_mod.load_custom_kernels(_RT)
+    rt_mod.load_custom_kernels(_RT, _TEST_DEFINES)
     oi = mx.zeros((topk,), dtype=mx.int32)
     ow = mx.zeros((topk,), dtype=mx.float32)
     mx.eval(x, weight, tid2eid, oi, ow)
@@ -503,7 +510,7 @@ def test_native_hc_pre_matches_reference():
     mx.eval(h, fn, scale, base, yref, pref, cref, y, post, comb)
     mx.synchronize()
 
-    rt_mod.load_custom_kernels(_RT)
+    rt_mod.load_custom_kernels(_RT, _TEST_DEFINES)
     table = rt_mod.BufferTable()
     mix = (2 + hc) * hc
     # +1 slot: hc_mix parks sum(h^2) there for hc_pre's rms
@@ -560,7 +567,7 @@ def test_native_hc_post_comb_orientation_hc4():
     mx.eval(x, res, post, comb, y)
     mx.synchronize()
 
-    rt_mod.load_custom_kernels(_RT)
+    rt_mod.load_custom_kernels(_RT, _TEST_DEFINES)
     T = rt_mod.BufferTable()
     k = BUFFER_SLOTS["sh_dsv4_hc_post_k"]
     s_ = {nm: T.add(a) for nm, a in [("x", x), ("residual", res.reshape(-1)),
@@ -612,7 +619,7 @@ def test_native_moe_routed_chain_matches_mx_fast():
     mx.eval(ref)
     mx.synchronize()
 
-    rt_mod.load_custom_kernels(_RT)
+    rt_mod.load_custom_kernels(_RT, _TEST_DEFINES)
     h = mx.zeros((n_act * d_inner,), dtype=mx.float32)
     y = mx.zeros((d_model,), dtype=mx.float32)
     idx1 = idxs.reshape(-1)
@@ -712,7 +719,7 @@ def test_native_ring_store_updates_one_slot_in_place():
     mx.eval(ring, src)
     mx.synchronize()
 
-    rt_mod.load_custom_kernels(_RT)
+    rt_mod.load_custom_kernels(_RT, _TEST_DEFINES)
     table = rt_mod.BufferTable()
     rs = BUFFER_SLOTS["sh_dsv4_ring_store_k"]
     s_src, s_ring = table.add(src), table.add(ring.reshape(-1))
@@ -823,7 +830,7 @@ def test_native_full_model_logits_match_reference():
     assert not v4._COMPILED_DECODE_BROKEN
 
     # native full-model plan
-    rt_mod.load_custom_kernels(_RT)
+    rt_mod.load_custom_kernels(_RT, _TEST_DEFINES)
     T = rt_mod.BufferTable()
 
     def z(n, dt=mx.bfloat16):
@@ -934,7 +941,7 @@ def test_native_ratio4_attention_plan_matches_reference():
     mx.eval(out_ref)
     mx.synchronize()
 
-    rt_mod.load_custom_kernels(_RT)
+    rt_mod.load_custom_kernels(_RT, _TEST_DEFINES)
     T = rt_mod.BufferTable()
 
     def z(nn_, dt=mx.bfloat16):
@@ -1027,7 +1034,7 @@ def test_native_indexer_kernels_match_reference():
     mx.eval(iref, sc, buf, qr, x)
     mx.synchronize()
 
-    rt_mod.load_custom_kernels(_RT)
+    rt_mod.load_custom_kernels(_RT, _TEST_DEFINES)
     q_raw = idx.wq_b(qr).reshape(-1)
     wraw = idx.weights_proj(x).reshape(-1)
     scores = mx.zeros((cap,), dtype=mx.float32)
@@ -1132,7 +1139,7 @@ def test_native_compressed_attention_plan_matches_reference():
     mx.eval(out_ref)
     mx.synchronize()
 
-    rt_mod.load_custom_kernels(_RT)
+    rt_mod.load_custom_kernels(_RT, _TEST_DEFINES)
     T = rt_mod.BufferTable()
 
     def z(nn_, dt=mx.bfloat16):
@@ -1210,7 +1217,7 @@ def test_native_full_block_plan_matches_reference():
     mx.eval(h_ref)
     mx.synchronize()
 
-    rt_mod.load_custom_kernels(_RT)
+    rt_mod.load_custom_kernels(_RT, _TEST_DEFINES)
     T = rt_mod.BufferTable()
 
     def z(n, dt=mx.bfloat16):
@@ -1296,7 +1303,7 @@ def test_native_qmv_into_attn_core_chain():
             q_ref, out_ref, q_raw, out, kvo)
     mx.synchronize()
 
-    rt_mod.load_custom_kernels(_RT)
+    rt_mod.load_custom_kernels(_RT, _TEST_DEFINES)
     table = rt_mod.BufferTable()
     ac = BUFFER_SLOTS["sh_dsv4_attn_core"]
     s = {nm: table.add(a) for nm, a in [
@@ -1373,7 +1380,7 @@ def test_native_dense_attention_plan_matches_reference():
     mx.eval(out_ref, ring_ref)
     mx.synchronize()
 
-    rt_mod.load_custom_kernels(_RT)
+    rt_mod.load_custom_kernels(_RT, _TEST_DEFINES)
     T = rt_mod.BufferTable()
 
     # scratch (session/per-token) buffers
@@ -1539,7 +1546,7 @@ def test_native_ffn_half_plan_matches_reference():
     mx.eval(h_ref)
     mx.synchronize()
 
-    rt_mod.load_custom_kernels(_RT)
+    rt_mod.load_custom_kernels(_RT, _TEST_DEFINES)
     T = rt_mod.BufferTable()
 
     def z(n, dt=mx.bfloat16):
@@ -1686,7 +1693,7 @@ def test_c_encode_cost_is_in_budget():
     assert best < 4e-3, f"CPU encode+commit of 1500 dispatches took {best*1e3:.1f} ms"
 
 
-def _tiny_dsv4_model(L=3, vocab=64):
+def _tiny_dsv4_model(L=3, vocab=64, exp_bits=2, dense_bits=8):
     """A 3-layer V4 covering all three layer kinds (dense + ratio-128 +
     ratio-4/indexer), quantized the way the converter deploys the real model.
     n_routed_experts == num_experts_per_tok so every expert is always selected
@@ -1728,10 +1735,10 @@ def _tiny_dsv4_model(L=3, vocab=64):
         if not hasattr(m, "to_quantized") or "norm" in p:
             return False
         if ".experts." in p and "shared" not in p:
-            return {"group_size": 64, "bits": 2}
-        return {"group_size": 64, "bits": 8}
+            return {"group_size": 64, "bits": exp_bits}
+        return {"group_size": 64, "bits": dense_bits}
 
-    nn.quantize(model, group_size=64, bits=8, class_predicate=pred)
+    nn.quantize(model, group_size=64, bits=dense_bits, class_predicate=pred)
 
     def cast(_n, c):
         if hasattr(c, "scales"):
@@ -1896,7 +1903,7 @@ def test_native_idx_topk_selects_true_topk_at_deployed_scale():
     from mlx_soloheaven.native.kernels import BUFFER_SLOTS
 
     cap, topk, n2 = 8192, 512, 640           # n2 > topk, cap >> n2
-    rt_mod.load_custom_kernels(_RT)
+    rt_mod.load_custom_kernels(_RT, _TEST_DEFINES)
 
     def run(scores_np):
         scores = mx.array(scores_np, dtype=mx.float32)
@@ -1968,3 +1975,138 @@ def test_native_idx_topk_selects_true_topk_at_deployed_scale():
         _RT.commit([it], table.ptrs, blob, wait=True)
     ms = (time.perf_counter() - t0) / 20 * 1e3
     assert ms < 3.0, f"idx_topk at the deployed shape took {ms:.2f} ms/dispatch"
+
+
+@pytest.mark.parametrize("exp_bits", [2, 4])
+def test_native_kernels_follow_the_models_bit_width(exp_bits, monkeypatch):
+    """The kernels index packed uint32 words by (bits, group_size), so those
+    must come from the MODEL, not from constants in the source. Same fixture
+    quantized two ways: the native path has to agree with the reference for
+    both, which it cannot do if a width is baked in.
+
+    2-bit is the deployed recipe; 4-bit packs 8 values per word instead of 16
+    and halves the words per scale group, so it exercises every derived
+    quantity (VPW, MASK, WPG, and the row strides built from them).
+    """
+    import mlx_soloheaven.models.deepseek_v4 as v4
+    from mlx_soloheaven.models.deepseek_v4 import QuantSpec
+
+    monkeypatch.setattr(v4, "_NATIVE_DECODE_BROKEN", False)
+    monkeypatch.setattr(v4, "_COMPILED_DECODE_BROKEN", False)
+    model = _tiny_dsv4_model(exp_bits=exp_bits)
+
+    spec = QuantSpec.from_model(model)
+    assert (spec.exp_bits, spec.dense_bits) == (exp_bits, 8)
+    assert f"#define QE_VPW  {32 // exp_bits}" in spec.defines()
+
+    prompt = mx.array([[3, 5, 7, 9, 11, 13]], dtype=mx.int32)
+    tok = mx.array([[9]], dtype=mx.int32)
+
+    def decode(native):
+        monkeypatch.setenv("SOLOHEAVEN_NATIVE_DECODE", "1" if native else "0")
+        cache = model.make_cache()
+        mx.eval(model(prompt, cache))
+        out = model(tok, cache)
+        mx.eval(out)
+        return np.array(out.reshape(-1).astype(mx.float32))
+
+    got, exp = decode(True), decode(False)
+    assert not v4._NATIVE_DECODE_BROKEN, "native fell back — kernels rejected the build"
+    assert np.isfinite(got).all()
+    # bf16 kernels accumulating in a different order across 3 layers of an
+    # UNTRAINED model: bound the median, and require the argmax to be a
+    # near-top reference logit (same contract as the full-model plan test).
+    assert np.median(np.abs(got - exp)) < 0.1, np.median(np.abs(got - exp))
+    na = int(got.argmax())
+    assert exp[na] >= exp.max() - 0.15, (na, float(exp[na]), float(exp.max()))
+
+
+def test_quant_spec_rejects_builds_the_kernels_cannot_read():
+    """The guard. Before this existed, SOLOHEAVEN_NATIVE_DECODE=1 on a build
+    with a different recipe read the right addresses with the wrong stride and
+    returned plausible garbage — no exception, no fallback."""
+    from mlx_soloheaven.models.deepseek_v4 import QuantSpec
+
+    class FakeMod:
+        def __init__(self, bits, gs, dtype=mx.bfloat16):
+            self.bits, self.group_size = bits, gs
+            self.scales = mx.zeros((1,), dtype=dtype)
+
+    class FakeModel:
+        def __init__(self, mods):
+            self._mods = mods
+
+        def apply_to_modules(self, fn):
+            for path, m in self._mods:
+                fn(path, m)
+
+    def spec_of(mods):
+        return QuantSpec.from_model(FakeModel(mods))
+
+    dense = ("layers.0.attn.wq_a", FakeMod(8, 64))
+    exp = ("layers.0.ffn.experts.gate_proj", FakeMod(2, 64))
+    assert spec_of([dense, exp]) == QuantSpec(8, 64, 2, 64)
+
+    for bits, gs in [(b, g) for b in QuantSpec.SUPPORTED_BITS
+                     for g in QuantSpec.SUPPORTED_GROUP_SIZES]:
+        sp = spec_of([("layers.0.attn.wq_a", FakeMod(bits, gs)), exp])
+        assert f"#define QD_VPW  {32 // bits}" in sp.defines()
+
+    for mods, why in [
+        ([dense], "no expert weights"),
+        ([exp], "no dense weights"),
+        ([dense, exp, ("layers.1.ffn.experts.up_proj", FakeMod(4, 64))],
+         "two expert recipes"),
+        ([("layers.0.attn.wq_a", FakeMod(3, 64)), exp], "3-bit does not tile a word"),
+        ([("layers.0.attn.wq_a", FakeMod(8, 16)), exp],
+         "group size mlx does not produce"),
+        ([("layers.0.attn.wq_a", FakeMod(8, 64, mx.float16)), exp],
+         "fp16 scales, kernels read bf16"),
+    ]:
+        with pytest.raises(ValueError):
+            spec_of(mods)
+
+
+def test_native_decode_falls_back_when_the_build_is_unsupported(monkeypatch, caplog):
+    """End of the guard's chain: a build the kernels cannot read must reach
+    the user as the COMPILED answer, not as native garbage. QuantSpec raises
+    inside NativeDecoder's constructor and Model.__call__ turns that into the
+    existing fallback."""
+    import logging
+
+    import mlx_soloheaven.models.deepseek_v4 as v4
+
+    monkeypatch.setattr(v4, "_NATIVE_DECODE_BROKEN", False)
+    monkeypatch.setattr(v4, "_COMPILED_DECODE_BROKEN", False)
+    monkeypatch.setenv("SOLOHEAVEN_NATIVE_DECODE", "1")
+    model = _tiny_dsv4_model()
+
+    # Inject the rejection rather than corrupting the weights: a genuinely
+    # mixed build also breaks the COMPILED reference (gather_qmm validates
+    # bits against the scales shape), which would test nothing. Which builds
+    # get rejected is covered by
+    # test_quant_spec_rejects_builds_the_kernels_cannot_read.
+    def reject(cls, _model):
+        raise ValueError("mixed recipe (injected)")
+
+    monkeypatch.setattr(v4.QuantSpec, "from_model", classmethod(reject))
+
+    prompt = mx.array([[3, 5, 7, 9, 11, 13]], dtype=mx.int32)
+    cache = model.make_cache()
+    mx.eval(model(prompt, cache))
+    with caplog.at_level(logging.ERROR):
+        out = model(mx.array([[9]], dtype=mx.int32), cache)
+        mx.eval(out)
+
+    assert v4._NATIVE_DECODE_BROKEN, "native should have disabled itself"
+    got = np.array(out.reshape(-1).astype(mx.float32))
+    assert np.isfinite(got).all()
+
+    # and the answer is the compiled one
+    monkeypatch.setenv("SOLOHEAVEN_NATIVE_DECODE", "0")
+    monkeypatch.setattr(v4, "_NATIVE_DECODE_BROKEN", False)
+    cache2 = model.make_cache()
+    mx.eval(model(prompt, cache2))
+    ref = model(mx.array([[9]], dtype=mx.int32), cache2)
+    mx.eval(ref)
+    assert np.abs(got - np.array(ref.reshape(-1).astype(mx.float32))).max() == 0.0

@@ -245,12 +245,13 @@ def register_quantized_linear(table: BufferTable, qlin) -> tuple[int, int, int]:
     return table.add(qlin.weight), table.add(qlin.scales), table.add(qlin.biases)
 
 
-def load_custom_kernels(rt: Runtime) -> None:
+def load_custom_kernels(rt: Runtime, defines: str) -> None:
     """Compile the generated kernel source (single source of truth: the bodies
-    come from models/deepseek_v4.py — see native/kernels.py)."""
+    come from models/deepseek_v4.py — see native/kernels.py). ``defines`` pins
+    the build's weight packing; a Runtime is only valid for that packing."""
     from mlx_soloheaven.native.kernels import build_source
 
-    rt.load_custom_source(build_source())
+    rt.load_custom_source(build_source(defines))
 
 
 def plan_item(rt: Runtime, kernel: str, custom: bool,

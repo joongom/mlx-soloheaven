@@ -18,7 +18,11 @@ import struct
 from mlx_soloheaven.models.deepseek_v4 import _HC_PRE_SPLIT, _W2_ROWS
 from mlx_soloheaven.native.kernels import BUFFER_SLOTS
 
-_QMV = "affine_qmv_fast_bfloat16_t_gs_64_b_8_batch_0"
+#: MLX's library qmv is specialized per (dtype, group_size, bits); the name
+#: encodes them. Production passes the SERVED model's — see QuantSpec.
+#: qmv_kernel(). This default only spares the plan tests, which all build
+#: 8-bit/gs64 fixtures, from threading it through.
+_QMV_DEFAULT = "affine_qmv_fast_bfloat16_t_gs_64_b_8_batch_0"
 
 
 class ConstBlob:
@@ -39,11 +43,12 @@ class ConstBlob:
 class Planner:
     """Holds the runtime, table, const blob and scratch, and builds items."""
 
-    def __init__(self, rt, table, cb: ConstBlob, scratch: dict):
+    def __init__(self, rt, table, cb: ConstBlob, scratch: dict, qmv: str | None = None):
         self.rt = rt
         self.t = table
         self.cb = cb
         self.S = scratch  # name -> table slot (pre-registered scratch buffers)
+        self.qmv_kernel = qmv or _QMV_DEFAULT
 
     def _pi(self, kernel, custom, bufs, bytes_, grid, group, barrier=True):
         from mlx_soloheaven.native.runtime import plan_item
@@ -52,7 +57,7 @@ class Planner:
     def qmv(self, mod, x, y, K, N, w_off=0, s_off=0, b_off=0, xoff=0, yoff=0):
         ko, _ = self.cb.add("ii", K, N)
         return self._pi(
-            _QMV, False,
+            self.qmv_kernel, False,
             [(self.t.add(mod.weight), 0, w_off), (self.t.add(mod.scales), 1, s_off),
              (self.t.add(mod.biases), 2, b_off), (self.S[x], 3, xoff), (self.S[y], 4, yoff)],
             [(ko, 4, 5), (ko + 4, 4, 6)], (1, (N + 7) // 8, 1), (32, 2, 1))

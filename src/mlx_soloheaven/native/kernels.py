@@ -171,11 +171,13 @@ def _wrap(name: str, body: str, bufs: list[tuple[str, str]]) -> str:
     )
 
 
-def build_source() -> str:
-    """The complete native/kernels source, generated from the model bodies."""
-    # file-scope #defines the shared bodies read (tile widths/splits)
-    parts = ["#include <metal_stdlib>", "using namespace metal;", "",
-             _m._KERNEL_DEFINES]
+def build_source(defines: str) -> str:
+    """The complete native/kernels source, generated from the model bodies.
+
+    ``defines`` carries the tile widths AND the weight packing of the model
+    being served (models.deepseek_v4.QuantSpec), so the library is specific to
+    that build — the kernels index packed uint32 words by those numbers."""
+    parts = ["#include <metal_stdlib>", "using namespace metal;", "", defines]
     for name, (attr, bufs) in _SPECS.items():
         parts.append(_wrap(name, getattr(_m, attr), bufs))
     return "\n".join(parts)

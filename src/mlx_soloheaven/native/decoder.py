@@ -21,19 +21,21 @@ import mlx.core as mx
 from mlx_soloheaven.native import plan as P
 from mlx_soloheaven.native import runtime as rt
 
-_shared_runtime = None
+_shared_runtimes: dict[str, "rt.Runtime"] = {}
 
 
-def shared_runtime():
-    """One Runtime (with its compiled kernel PSOs) per process: rebinding a
+def shared_runtime(defines: str):
+    """One Runtime (with its compiled kernel PSOs) per DEFINE SET: rebinding a
     NativeDecoder to fresh cache arrays after every prefill must not pay the
-    ~second of Metal source compilation again."""
-    global _shared_runtime
-    if _shared_runtime is None:
+    ~second of Metal source compilation again, but two models with different
+    weight packing need different kernels, so the cache is keyed on the
+    defines rather than being a bare singleton."""
+    r = _shared_runtimes.get(defines)
+    if r is None:
         r = rt.Runtime()
-        rt.load_custom_kernels(r)
-        _shared_runtime = r
-    return _shared_runtime
+        rt.load_custom_kernels(r, defines)
+        _shared_runtimes[defines] = r
+    return r
 
 
 class NativeDecoder:
@@ -50,17 +52,24 @@ class NativeDecoder:
         compiled kernels) is shared across rebuilds."""
         self.model = model
         self.cache = cache
+        # Derive the weight packing from the MODEL and compile for it. This is
+        # also the guard: from_model raises on anything these kernels cannot
+        # read — mixed recipes, an unsupported bit width, non-bf16 scales — and
+        # Model._decode_native turns that into a fallback rather than letting a
+        # wrong-stride read return plausible garbage.
+        from mlx_soloheaven.models.deepseek_v4 import QuantSpec, _kernel_defines
+
+        self.quant = QuantSpec.from_model(model)
+        self._defines = _kernel_defines(self.quant)
         # barriers=False strips the per-dispatch buffer barrier — UNSAFE for
         # correctness (hazards), for throughput DIAGNOSIS only: it isolates how
         # much of the decode time is blanket-barrier serialization vs kernel
         # compute (see docs/benchmarks/deepseek-v4.md, real-model bench entry).
         self._barriers = barriers
         a = model.args
-        if runtime is not None:
-            self.rt = runtime
-        else:
-            self.rt = rt.Runtime()
-            rt.load_custom_kernels(self.rt)
+        # Default to the per-defines shared Runtime: rebuilding this decoder
+        # after every prefill must not recompile the kernels.
+        self.rt = runtime if runtime is not None else shared_runtime(self._defines)
         self.hc, self.hidden, self.D = a.hc_mult, a.hidden_size, a.head_dim
         self.win, self.vocab = a.sliding_window, a.vocab_size
         self.topk, self.rscale, self.limit = (a.num_experts_per_tok,
@@ -244,7 +253,8 @@ class NativeDecoder:
         return comp, idx
 
     def _build_plan(self, cb: P.ConstBlob, token: int):
-        pl = P.Planner(self.rt, self.table, cb, self.S)
+        pl = P.Planner(self.rt, self.table, cb, self.S,
+                       qmv=self.quant.qmv_kernel())
         tok_off, _ = cb.add("i", token)
         self._tok_off = tok_off
         items = P.plan_embed(pl, self.model.embed, "ha", self.hc, self.hidden, tok_off)

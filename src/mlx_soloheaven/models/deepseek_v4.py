@@ -25,7 +25,7 @@ from __future__ import annotations
 import functools
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NamedTuple, Optional
 
 MODEL_TYPE = "deepseek_v4"
 
@@ -2187,7 +2187,7 @@ def _get_idx_kernels():
             input_names=["scores", "params", "ioff"],
             output_names=["out_idx"],
             source=_IDX_TOPK_SRC,
-            header=_KERNEL_DEFINES,
+            header=_STATIC_DEFINES,
         )
         _idx_kernels = (score, topk)
     return _idx_kernels
@@ -2201,11 +2201,11 @@ _EMBED_SRC = """
     const int hc = params[1];
     const int token = ioff[0];
     if ((int)tid >= hidden) return;
-    // 8-bit: 4 values / uint32, so hidden/4 packed words per row.
-    uint word = weight[(uint)token * (hidden / 4) + tid / 4];
-    float sc = float(scales[(uint)token * (hidden / 64) + tid / 64]);
-    float bi = float(biases[(uint)token * (hidden / 64) + tid / 64]);
-    float v = float((word >> (8 * (tid % 4))) & 0xFFu) * sc + bi;
+    // QD_VPW values per uint32, so hidden/QD_VPW packed words per row.
+    uint word = weight[(uint)token * (hidden / QD_VPW) + tid / QD_VPW];
+    float sc = float(scales[(uint)token * (hidden / QD_GS) + tid / QD_GS]);
+    float bi = float(biases[(uint)token * (hidden / QD_GS) + tid / QD_GS]);
+    float v = float((word >> (QD_BITS * (tid % QD_VPW))) & QD_MASK) * sc + bi;
     for (int s = 0; s < hc; ++s) h[s * hidden + tid] = T(v);
 """
 
@@ -2289,19 +2289,19 @@ _WO_A_SRC = """
     uint gi = row / o_lora;
     if (gi >= (uint)g) return;
     uint j = row % o_lora;
-    const int words = gin / 4;
+    const int words = gin / QD_VPW;
     const uint wbase = ((uint)gi * o_lora + j) * words;
-    const uint sbase = ((uint)gi * o_lora + j) * (gin / 64);
+    const uint sbase = ((uint)gi * o_lora + j) * (gin / QD_GS);
     const uint xbase = gi * gin;
     float a = 0.0f;
     for (int w = lane; w < words; w += 32) {
         uint p = weight[wbase + w];
-        float sc = float(scales[sbase + w / 16]);
-        float bi = float(biases[sbase + w / 16]);
+        float sc = float(scales[sbase + w / QD_WPG]);
+        float bi = float(biases[sbase + w / QD_WPG]);
         float aw = 0.0f, sw = 0.0f;
-        for (int k = 0; k < 4; ++k) {
-            float xk = float(x[xbase + w * 4 + k]);
-            aw += float((p >> (8 * k)) & 0xFFu) * xk;
+        for (int k = 0; k < QD_VPW; ++k) {
+            float xk = float(x[xbase + w * QD_VPW + k]);
+            aw += float((p >> (QD_BITS * k)) & QD_MASK) * xk;
             sw += xk;
         }
         a += aw * sc + sw * bi;
@@ -2322,23 +2322,23 @@ _SH13_SRC = """
     const int inter = params[1];
     const float limit = feps[0];
     if (row >= (uint)inter) return;
-    const int words = hidden / 4;
+    const int words = hidden / QD_VPW;
     const uint wbase = row * (uint)words;
-    const uint sbase = row * (uint)(hidden / 64);
+    const uint sbase = row * (uint)(hidden / QD_GS);
     float a1 = 0.0f, a3 = 0.0f;
     for (int w = lane; w < words; w += 32) {
         uint p1 = w1[wbase + w];
         uint p3 = w3[wbase + w];
-        float sc1 = float(s1[sbase + w / 16]);
-        float bi1 = float(b1[sbase + w / 16]);
-        float sc3 = float(s3[sbase + w / 16]);
-        float bi3 = float(b3[sbase + w / 16]);
+        float sc1 = float(s1[sbase + w / QD_WPG]);
+        float bi1 = float(b1[sbase + w / QD_WPG]);
+        float sc3 = float(s3[sbase + w / QD_WPG]);
+        float bi3 = float(b3[sbase + w / QD_WPG]);
         float aw1 = 0.0f, aw3 = 0.0f, sx = 0.0f;
         #pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            float xk = float(x[w * 4 + k]);
-            aw1 += float((p1 >> (8 * k)) & 0xFFu) * xk;
-            aw3 += float((p3 >> (8 * k)) & 0xFFu) * xk;
+        for (int k = 0; k < QD_VPW; ++k) {
+            float xk = float(x[w * QD_VPW + k]);
+            aw1 += float((p1 >> (QD_BITS * k)) & QD_MASK) * xk;
+            aw3 += float((p3 >> (QD_BITS * k)) & QD_MASK) * xk;
             sx += xk;
         }
         a1 += aw1 * sc1 + sx * bi1;
@@ -2363,44 +2363,42 @@ _RING_STORE_SRC = """
     for (int i = tid; i < D; i += TG) ring[slot * D + i] = src[i];
 """
 
-_misc_kernels = None
-
-
-def _get_misc_kernels():
-    global _misc_kernels
-    if _misc_kernels is None:
-        store = mx.fast.metal_kernel(
-            name="sh_dsv4_ring_store_k",
-            input_names=["src", "params", "ioff"],
-            output_names=["ring"],
-            source=_RING_STORE_SRC,
-        )
-        swiglu = mx.fast.metal_kernel(
-            name="sh_dsv4_swiglu_k",
-            input_names=["gate", "up", "params", "feps"],
-            output_names=["out"],
-            source=_SWIGLU_SRC,
-        )
-        add = mx.fast.metal_kernel(
-            name="sh_dsv4_add_k",
-            input_names=["a", "b", "params"],
-            output_names=["out"],
-            source=_ADD_SRC,
-        )
-        embed = mx.fast.metal_kernel(
-            name="sh_dsv4_embed_k",
-            input_names=["weight", "scales", "biases", "params", "ioff"],
-            output_names=["h"],
-            source=_EMBED_SRC,
-        )
-        hc_head = mx.fast.metal_kernel(
-            name="sh_dsv4_hc_head_k",
-            input_names=["h", "fn", "scale", "base", "params", "feps"],
-            output_names=["y"],
-            source=_HC_HEAD_SRC,
-        )
-        _misc_kernels = (store, swiglu, add, embed, hc_head)
-    return _misc_kernels
+@functools.lru_cache(maxsize=8)
+def _get_misc_kernels(dense_bits: int, dense_gs: int):
+    """Small shared kernels; `embed` unpacks DENSE weights, so this is
+    compiled per dense recipe like the moe pair."""
+    store = mx.fast.metal_kernel(
+        name="sh_dsv4_ring_store_k",
+        input_names=["src", "params", "ioff"],
+        output_names=["ring"],
+        source=_RING_STORE_SRC,
+    )
+    swiglu = mx.fast.metal_kernel(
+        name="sh_dsv4_swiglu_k",
+        input_names=["gate", "up", "params", "feps"],
+        output_names=["out"],
+        source=_SWIGLU_SRC,
+    )
+    add = mx.fast.metal_kernel(
+        name="sh_dsv4_add_k",
+        input_names=["a", "b", "params"],
+        output_names=["out"],
+        source=_ADD_SRC,
+    )
+    embed = mx.fast.metal_kernel(
+        name="sh_dsv4_embed_k",
+        input_names=["weight", "scales", "biases", "params", "ioff"],
+        output_names=["h"],
+        source=_EMBED_SRC,
+        header=_STATIC_DEFINES + pack_defines("QD", dense_bits, dense_gs),
+    )
+    hc_head = mx.fast.metal_kernel(
+        name="sh_dsv4_hc_head_k",
+        input_names=["h", "fn", "scale", "base", "params", "feps"],
+        output_names=["y"],
+        source=_HC_HEAD_SRC,
+    )
+    return (store, swiglu, add, embed, hc_head)
 
 
 _gate_kernels = None
@@ -2633,7 +2631,7 @@ def _get_hc_kernels():
             input_names=["h", "mixes", "scale", "base", "params", "feps", "iters"],
             output_names=["y", "post", "comb"],
             source=_HC_PRE_SRC,
-            header=_KERNEL_DEFINES,
+            header=_STATIC_DEFINES,
         )
         post = mx.fast.metal_kernel(
             name="sh_dsv4_hc_post_k",
@@ -2679,10 +2677,10 @@ _MOE_K1_SRC = """
     int e = idxs[e_slot];
     if (e < 0) { if (lane == 0) h[e_slot * d_inner + row] = 0.0f; return; }
 
-    const int words = d_model / 16;
-    const int wpg = 4;                        // 64-value group = 4 words
+    const int words = d_model / QE_VPW;
+    const int wpg = QE_WPG;                   // packed words per scale group
     const uint gbase = ((uint)e * (uint)d_inner + row) * (uint)words;
-    const uint sbase = ((uint)e * (uint)d_inner + row) * (uint)(d_model / 64);
+    const uint sbase = ((uint)e * (uint)d_inner + row) * (uint)(d_model / QE_GS);
 
     float acc_g = 0.0f;
     float acc_u = 0.0f;
@@ -2694,13 +2692,13 @@ _MOE_K1_SRC = """
         float bgv = float(gb[sbase + g_]);
         float suv = float(us[sbase + g_]);
         float buv = float(ub[sbase + g_]);
-        const device bfloat* xv = x + w * 16;
+        const device bfloat* xv = x + w * QE_VPW;
         float ag = 0.0f, au = 0.0f, sx = 0.0f;
         #pragma unroll
-        for (int j = 0; j < 16; ++j) {
+        for (int j = 0; j < QE_VPW; ++j) {
             float xj = float(xv[j]);
-            ag += float((pg >> (2 * j)) & 3u) * xj;
-            au += float((pu >> (2 * j)) & 3u) * xj;
+            ag += float((pg >> (QE_BITS * j)) & QE_MASK) * xj;
+            au += float((pu >> (QE_BITS * j)) & QE_MASK) * xj;
             sx += xj;
         }
         acc_g += ag * sgv + sx * bgv;
@@ -2726,10 +2724,103 @@ _W2_ROWS = 4
 #: Threadgroups dsv4_hc_pre_k splits the output dim over (see the kernel body).
 _HC_PRE_SPLIT = 8
 
-#: Compile-time constants the shared kernel bodies read. The bodies are built
-#: twice — once into the native replay library, once per mx.fast twin — so both
-#: get this same text and there is exactly one source of truth for the values.
-_KERNEL_DEFINES = (
+def pack_defines(tag: str, bits: int, gs: int) -> str:
+    """Kernel constants for one weight class: how a packed uint32 is cut up."""
+    vpw = 32 // bits                                  # values per packed word
+    return "".join(f"#define {tag}_{k}{v}\n" for k, v in (
+        ("BITS ", bits), ("VPW  ", vpw), ("MASK ", f"{(1 << bits) - 1}u"),
+        ("GS   ", gs), ("WPG  ", gs // vpw)))         # packed words per group
+
+
+class QuantSpec(NamedTuple):
+    """The weight packing the decode kernels must be compiled for.
+
+    The kernels index packed uint32 words arithmetically — values per word,
+    words per scale group, shift and mask all follow from (bits, group_size) —
+    so these CANNOT be constants: a build with a different recipe would be read
+    at the right addresses with the wrong stride and return plausible garbage
+    rather than failing. Two classes, because the converter quantizes them
+    differently: the ROUTED experts (QuantizedSwitchLinear) and everything
+    DENSE (attention, shared expert, embedding, head).
+    """
+
+    dense_bits: int
+    dense_gs: int
+    exp_bits: int
+    exp_gs: int
+
+    #: bits that tile a uint32 exactly. MLX also packs 3/5/6, but not on a word
+    #: boundary, so the shift/mask form these kernels use does not apply.
+    SUPPORTED_BITS = (2, 4, 8)
+
+    #: what mx.quantize emits; also what MLX's library qmv is specialized for.
+    SUPPORTED_GROUP_SIZES = (32, 64, 128)
+
+    @classmethod
+    def from_model(cls, model) -> "QuantSpec":
+        """Derive the spec from a loaded model, or raise explaining why this
+        build cannot be served by the native path."""
+        seen: dict[str, set] = {"dense": set(), "exp": set()}
+        dtypes: set = set()
+
+        def visit(path, m):
+            bits, gs = getattr(m, "bits", None), getattr(m, "group_size", None)
+            if bits is None or gs is None:
+                return
+            # By PATH, not by class: attn.wo_a is a QuantizedSwitchLinear too
+            # (the o_groups low-rank O projection) but carries the DENSE
+            # recipe, and sh_dsv4_wo_a_k unpacks it as dense. Only the routed
+            # experts under ffn.experts feed moe_w13/moe_w2.
+            kind = "exp" if ".ffn.experts." in f".{path}." else "dense"
+            seen[kind].add((int(bits), int(gs)))
+            sc = getattr(m, "scales", None)
+            if sc is not None:
+                dtypes.add(sc.dtype)
+
+        model.apply_to_modules(visit)
+        for kind in ("dense", "exp"):
+            if not seen[kind]:
+                raise ValueError(
+                    f"native decode needs a quantized build: no {kind} "
+                    f"quantized weights found")
+            if len(seen[kind]) > 1:
+                raise ValueError(
+                    f"native decode needs ONE {kind} recipe, found "
+                    f"{sorted(seen[kind])} — the kernels are compiled per spec")
+        if dtypes != {mx.bfloat16}:
+            raise ValueError(
+                f"native decode reads scales/biases as bfloat16, build has "
+                f"{sorted(str(d) for d in dtypes)}")
+        (db, dg), (eb, eg) = seen["dense"].pop(), seen["exp"].pop()
+        for bits in (db, eb):
+            if bits not in cls.SUPPORTED_BITS:
+                raise ValueError(
+                    f"native decode supports {cls.SUPPORTED_BITS}-bit packing, "
+                    f"build has {bits}-bit")
+        for bits, gs in ((db, dg), (eb, eg)):
+            if gs not in cls.SUPPORTED_GROUP_SIZES:
+                raise ValueError(
+                    f"group_size {gs} is not one MLX affine quantization "
+                    f"produces {cls.SUPPORTED_GROUP_SIZES}")
+            # No divisibility check needed: every SUPPORTED_GROUP_SIZES is a
+            # multiple of the values a uint32 holds at every SUPPORTED_BITS.
+        return cls(db, dg, eb, eg)
+
+    def defines(self) -> str:
+        """Both classes — what the native library needs (it compiles every
+        kernel). A twin that only unpacks one class asks for that one."""
+        return (pack_defines("QD", self.dense_bits, self.dense_gs)
+                + pack_defines("QE", self.exp_bits, self.exp_gs))
+
+    def qmv_kernel(self, dtype: str = "bfloat16") -> str:
+        """MLX's library qmv specialization matching the DENSE recipe."""
+        return f"affine_qmv_fast_{dtype}_t_gs_{self.dense_gs}_b_{self.dense_bits}_batch_0"
+
+
+#: Compile-time constants the shared kernel bodies read that do NOT depend on
+#: the model. The bodies are built twice — once into the native replay library,
+#: once per mx.fast twin — so both get this same text.
+_STATIC_DEFINES = (
     f"#define W2_ROWS {_W2_ROWS}\n"
     f"#define HC_PRE_SPLIT {_HC_PRE_SPLIT}\n"
     # Order-preserving float -> uint: a < b  <=>  key(a) < key(b), so a binary
@@ -2740,7 +2831,12 @@ _KERNEL_DEFINES = (
     "    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);\n"
     "}\n"
 )
-_W2_ROWS_HEADER = _KERNEL_DEFINES
+
+
+def _kernel_defines(spec: "QuantSpec | None") -> str:
+    """Full define block for a kernel build: model-independent tile widths plus
+    the packing of THIS model, when the kernel unpacks weights."""
+    return _STATIC_DEFINES + (spec.defines() if spec is not None else "")
 
 _MOE_K2_SRC = """
     // threadgroup covers 8 output dims; h read straight from device — the
@@ -2761,9 +2857,9 @@ _MOE_K2_SRC = """
     const int n_act = params[0];
     const int d_model = params[1];
     const int d_inner = params[2];
-    const int words = d_inner / 16;
-    const int wpg = 4;
-    const uint meta = (uint)(d_inner / 64);
+    const int words = d_inner / QE_VPW;
+    const int wpg = QE_WPG;
+    const uint meta = (uint)(d_inner / QE_GS);
     // dim0 is uniform across the simdgroup, so this return takes all 32 lanes
     // with it and no simd_sum is left half-populated.
     if (dim0 >= (uint)d_model) return;
@@ -2798,17 +2894,17 @@ _MOE_K2_SRC = """
                 sc[r] = float(ds_[sbase + r * meta + g_]);
                 bi[r] = float(db[sbase + r * meta + g_]);
             }
-            const device float* hv = hs + w * 16;
+            const device float* hv = hs + w * QE_VPW;
             float aw[W2_ROWS];
             #pragma unroll
             for (int r = 0; r < W2_ROWS; ++r) aw[r] = 0.0f;
             float sw = 0.0f;
             #pragma unroll
-            for (int j = 0; j < 16; ++j) {
+            for (int j = 0; j < QE_VPW; ++j) {
                 float hj = hv[j];
                 #pragma unroll
                 for (int r = 0; r < W2_ROWS; ++r)
-                    aw[r] += float((p[r] >> (2 * j)) & 3u) * hj;
+                    aw[r] += float((p[r] >> (QE_BITS * j)) & QE_MASK) * hj;
                 sw += hj;
             }
             #pragma unroll
@@ -2825,27 +2921,27 @@ _MOE_K2_SRC = """
     }
 """
 
-_moe_kernels = None
-
-
-def _get_moe_kernels():
-    global _moe_kernels
-    if _moe_kernels is None:
-        k1 = mx.fast.metal_kernel(
-            name="sh_dsv4_moe_w13",
-            input_names=["x", "gw", "gs_", "gb", "uw", "us", "ub", "idxs", "params", "feps"],
-            output_names=["h"],
-            source=_MOE_K1_SRC,
-        )
-        k2 = mx.fast.metal_kernel(
-            name="sh_dsv4_moe_w2",
-            input_names=["h", "dw", "ds_", "db", "idxs", "wts", "params"],
-            output_names=["y"],
-            source=_MOE_K2_SRC,
-            header=_KERNEL_DEFINES,
-        )
-        _moe_kernels = (k1, k2)
-    return _moe_kernels
+@functools.lru_cache(maxsize=8)
+def _get_moe_kernels(exp_bits: int, exp_gs: int):
+    """The routed-expert kernels, compiled for ONE expert recipe. No default:
+    the packing decides how the body reads every weight word, so the caller
+    must say which build it holds."""
+    hdr = _STATIC_DEFINES + pack_defines("QE", exp_bits, exp_gs)
+    k1 = mx.fast.metal_kernel(
+        name="sh_dsv4_moe_w13",
+        input_names=["x", "gw", "gs_", "gb", "uw", "us", "ub", "idxs", "params", "feps"],
+        output_names=["h"],
+        source=_MOE_K1_SRC,
+        header=hdr,
+    )
+    k2 = mx.fast.metal_kernel(
+        name="sh_dsv4_moe_w2",
+        input_names=["h", "dw", "ds_", "db", "idxs", "wts", "params"],
+        output_names=["y"],
+        source=_MOE_K2_SRC,
+        header=hdr,
+    )
+    return (k1, k2)
 
 
 @functools.lru_cache(maxsize=16)
@@ -2877,7 +2973,7 @@ def _moe_routed_kernel(glu, x, indices, weights, limit: float) -> mx.array:
     """Routed-expert output for one token via the fused kernels.
     ``x`` [1,1,D]; ``indices`` [1,1,K] int32; ``weights`` [1,1,K]. Returns
     [1,1,D] fp32."""
-    k1, k2 = _get_moe_kernels()
+    k1, k2 = _get_moe_kernels(glu.gate_proj.bits, glu.gate_proj.group_size)
     d_model = glu.gate_proj.input_dims
     d_inner = glu.gate_proj.output_dims
     n_act = indices.size
@@ -3201,10 +3297,7 @@ class Model(nn.Module):
         if self._native_stale(dec, cache):
             mx.synchronize()  # cache arrays were written on MLX's queue
             max_ctx = int(os.environ.get("SOLOHEAVEN_NATIVE_MAX_CONTEXT", "32768"))
-            dec = _nd.NativeDecoder(
-                self, max_context=max_ctx, cache=cache,
-                runtime=_nd.shared_runtime(),
-            )
+            dec = _nd.NativeDecoder(self, max_context=max_ctx, cache=cache)
             self._native_dec = dec
         token = int(inputs.reshape(-1)[0])
         logits = dec.decode(token)

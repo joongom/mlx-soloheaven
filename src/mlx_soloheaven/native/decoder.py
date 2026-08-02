@@ -181,10 +181,12 @@ class NativeDecoder:
                 self._reg(p + "sc_a", cs.score_state)
                 self._reg(p + "buf", cs.cache)
                 lay["n"] = int(cs.n)
+                lay["cap"] = int(cs.cache.shape[1])
             else:
                 self._reg(p + "kv_a", self._z(st, mx.float32))
                 self._reg(p + "sc_a", self._ninf(st))
                 self._reg(p + "buf", self._z(self._cap * D))
+                lay["cap"] = self._cap
             lay["comp"] = p
             if ratio == 4:
                 icoff, icd = 2, 2 * ihd
@@ -200,6 +202,7 @@ class NativeDecoder:
                     self._reg(p + "ikv_a", ics.kv_state)
                     self._reg(p + "isc_a", ics.score_state)
                     self._reg(p + "ibuf", ics.cache)
+                    lay["cap"] = min(lay["cap"], int(ics.cache.shape[1]))
                     if int(ics.n) != lay["n"]:
                         raise RuntimeError(
                             f"layer {i}: comp n {lay['n']} != idx n {int(ics.n)}")
@@ -209,6 +212,21 @@ class NativeDecoder:
                     self._reg(p + "ibuf", self._z(self._cap * ihd))
                 lay["idx"] = p
         return lay
+
+    def overflowing(self) -> bool:
+        """True when a borrowed compressed buffer has no room for the group the
+        NEXT step may complete (it is written at row ``n``).
+
+        The decoder cannot grow these buffers itself — they are registered by
+        address and every native write goes straight to that address — so the
+        model integration treats this as staleness and rebuilds over a grown
+        cache. Without the check the compressor kernel writes past the end of
+        the MLX allocation: silent corruption of whatever sits next in the
+        heap, which is how multi-turn serving died (garbage tokens, then a
+        broadcast error on the following prefill)."""
+        return any(
+            lay["ratio"] and lay["n"] >= lay.get("cap", 0) for lay in self._layers
+        )
 
     @staticmethod
     def _cache_dicts(lay: dict):

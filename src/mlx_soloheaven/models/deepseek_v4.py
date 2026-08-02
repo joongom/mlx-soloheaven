@@ -1334,11 +1334,22 @@ def _ensure_comp_capacity(cs: CompressorState, comp: "Compressor", dtype) -> Non
     target = _comp_target_capacity(comp.ratio)
     if cs.cache is None:
         cs.cache = mx.zeros((1, target, comp.head_dim), dtype=dtype)
-    elif cs.n >= cs.cache.shape[1]:
-        new_cap = max(target, cs.n + CompressorState.GROWTH)
-        grown = mx.zeros((1, new_cap, comp.head_dim), dtype=cs.cache.dtype)
-        grown[:, : cs.n] = cs.cache[:, : cs.n]
-        cs.cache = grown
+        return
+    # Reaching `target` must NOT wait until the buffer is already full.
+    # Prefill grows the cache itself (CompressorState.append, rounded to
+    # GROWTH), so a short first prompt leaves a 256-slot buffer here — and an
+    # "only grow when cs.n >= shape[1]" rule never lifts it to `target`. The
+    # compiled path survives that (it re-checks every step); the native one
+    # does not: it registers these buffers ONCE per decoder and afterwards
+    # only advances `n`, so a long turn wrote ~18 groups PAST a 256-slot
+    # indexer cache, corrupting the neighbouring MLX allocation (garbage
+    # output, then a 500 on the next prefill). Grow eagerly instead.
+    if cs.cache.shape[1] >= max(target, cs.n + 1):
+        return
+    new_cap = max(target, cs.n + CompressorState.GROWTH)
+    grown = mx.zeros((1, new_cap, comp.head_dim), dtype=cs.cache.dtype)
+    grown[:, : cs.n] = cs.cache[:, : cs.n]
+    cs.cache = grown
 
 
 def _pack_decode_state(c: DeepSeekV4Cache, layer) -> tuple:
@@ -3028,6 +3039,8 @@ class Model(nn.Module):
         divergence, or per-layer array identity changes (mx setitem allocates
         new buffers, so ANY non-native touch changes identity)."""
         if dec is None or dec.cache is not cache or dec.offset != cache[0].offset:
+            return True
+        if dec.overflowing():  # a compressed buffer is full — rebind over a grown one
             return True
         for i, c in enumerate(cache):
             if dec._arrays[f"L{i}_ring"] is not c.ring:

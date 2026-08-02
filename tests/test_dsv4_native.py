@@ -1684,21 +1684,16 @@ def test_c_encode_cost_is_in_budget():
     assert best < 4e-3, f"CPU encode+commit of 1500 dispatches took {best*1e3:.1f} ms"
 
 
-def test_native_decoder_full_model_matches_reference():
-    """LADDER STEP 8b: the NativeDecoder replays a full multi-layer model
-    decode (all three layer types — dense + ratio-128 + ratio-4) as one
-    command buffer, and its logits' argmax lands in the reference's top-3
-    (bf16 accumulation over layers on an UNTRAINED model puts the top logits
-    within rounding noise). n_routed_experts == num_experts_per_tok so every
-    expert is always selected (no top-k routing tie)."""
+def _tiny_dsv4_model(L=3, vocab=64):
+    """A 3-layer V4 covering all three layer kinds (dense + ratio-128 +
+    ratio-4/indexer), quantized the way the converter deploys the real model.
+    n_routed_experts == num_experts_per_tok so every expert is always selected
+    (no top-k routing tie)."""
     import mlx.nn as nn
 
-    import mlx_soloheaven.models.deepseek_v4 as v4
     from mlx_soloheaven.models.deepseek_v4 import Model, ModelArgs
-    from mlx_soloheaven.native.decoder import NativeDecoder
 
     mx.random.seed(41)
-    L, vocab = 3, 64
     cfg = dict(model_type="deepseek_v4", vocab_size=vocab, hidden_size=512,
                num_hidden_layers=L, num_attention_heads=2, head_dim=512,
                qk_rope_head_dim=64, q_lora_rank=512, o_lora_rank=512, o_groups=2,
@@ -1752,6 +1747,20 @@ def test_native_decoder_full_model_matches_reference():
         blk.ffn.gate.weight = blk.ffn.gate.weight.astype(mx.bfloat16)
     mx.eval(model.parameters())
     mx.synchronize()
+    return model
+
+
+def test_native_decoder_full_model_matches_reference():
+    """LADDER STEP 8b: the NativeDecoder replays a full multi-layer model
+    decode (all three layer types — dense + ratio-128 + ratio-4) as one
+    command buffer, and its logits' argmax lands in the reference's top-3
+    (bf16 accumulation over layers on an UNTRAINED model puts the top logits
+    within rounding noise)."""
+    import mlx_soloheaven.models.deepseek_v4 as v4
+    from mlx_soloheaven.native.decoder import NativeDecoder
+
+    L = 3
+    model = _tiny_dsv4_model(L=L)
 
     offset, D, win = 4, 512, 8
 
@@ -1804,3 +1813,63 @@ def test_native_decoder_full_model_matches_reference():
         assert np.median(np.abs(got - exp)) < 0.1, np.median(np.abs(got - exp))
         na = int(got.argmax())
         assert exp[na] >= exp.max() - 0.1, (na, float(exp[na]), float(exp.max()))
+
+
+def test_native_decode_grows_compressed_cache_instead_of_writing_past_it(monkeypatch):
+    """REGRESSION — multi-turn serving death, 2026-08-02.
+
+    The native decoder registers the session's compressed buffers by ADDRESS
+    (borrow mode) and afterwards only advances the python-side group count
+    `n`. Capacity was checked ONCE, at decoder build, by a
+    `_ensure_comp_capacity` that grew a buffer only when it was ALREADY full —
+    so it never lifted the 256 slots a short first prefill had rounded to.
+    A long turn then walked `n` past the end of the indexer cache and the
+    compressor kernel wrote into the neighbouring MLX allocation: garbage
+    tokens for the rest of the turn, then the next prefill died with
+    `[broadcast_shapes] Shapes (1,256,128) and (1,274,128) cannot be
+    broadcast` (CompressorState.append copying `cache[:, :n]`).
+
+    Scaled down here: GROWTH=4 and a 16-token max context put the ratio-4
+    layer's capacity at 4 groups, which ~30 decoded tokens cross twice.
+    """
+    import mlx_soloheaven.models.deepseek_v4 as v4
+    from mlx_soloheaven.models.deepseek_v4 import CompressorState
+
+    monkeypatch.setattr(CompressorState, "GROWTH", 4)
+    monkeypatch.setenv("SOLOHEAVEN_DSV4_MAX_CONTEXT", "16")
+    monkeypatch.setenv("SOLOHEAVEN_DSV4_NATIVE", "1")
+    monkeypatch.setattr(v4, "_NATIVE_DECODE_BROKEN", False)
+
+    model = _tiny_dsv4_model()
+    cache = model.make_cache()
+
+    def check(where):
+        for i, c in enumerate(cache):
+            for nm, cs in (("comp", c.comp), ("idx", c.idx)):
+                if cs is None or cs.cache is None:
+                    continue
+                assert cs.n <= cs.cache.shape[1], (
+                    f"{where}: layer {i} {nm} wrote {cs.n} groups into a "
+                    f"{cs.cache.shape[1]}-slot buffer")
+
+    lg = model(mx.array([[3, 5, 7, 9, 11, 13]], dtype=mx.int32), cache)  # prefill
+    mx.eval(lg)
+    check("prefill")
+    assert cache[2].comp.cache.shape[1] == 4, cache[2].comp.cache.shape
+
+    tok = int(lg[0, -1].argmax())
+    for step in range(30):
+        out = model(mx.array([[tok]], dtype=mx.int32), cache)
+        mx.eval(out)
+        assert np.isfinite(np.array(out.reshape(-1).astype(mx.float32))).all(), step
+        check(f"decode step {step}")
+        tok = int(out[0, -1].argmax())
+    assert not v4._NATIVE_DECODE_BROKEN, "native decode fell back — see the log"
+    # It really did cross the boundary, i.e. the test would have overflowed.
+    assert cache[2].comp.n > 4, cache[2].comp.n
+    assert cache[2].comp.cache.shape[1] >= cache[2].comp.n
+
+    # The turn-2 move that used to raise: prefill more tokens onto that cache.
+    lg2 = model(mx.array([[17, 19, 23]], dtype=mx.int32), cache)
+    mx.eval(lg2)
+    check("second prefill")

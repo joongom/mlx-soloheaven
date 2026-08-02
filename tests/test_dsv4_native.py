@@ -309,6 +309,82 @@ def test_native_attn_core_matches_mx_fast():
     assert np.abs(ka - kb).max() < 1e-2, np.abs(ka - kb).max()
 
 
+def test_native_moe_routed_chain_matches_mx_fast():
+    """A TWO-item plan (K1 -> K2) sharing an intermediate h buffer, committed
+    once, must reproduce the model's routed-expert output. This is the first
+    real chained multi-kernel plan — the shape the full-layer replay is made
+    of — proving an intermediate buffer written by one dispatch is read by the
+    next within a single command buffer."""
+    from mlx_soloheaven.models.deepseek_v4 import _moe_routed_kernel
+    from mlx_soloheaven.native.kernels import BUFFER_SLOTS
+
+    n_act, d_model, d_inner, E, limit = 6, 256, 192, 16, 10.0
+    import mlx.nn as nn
+    from mlx_lm.models.switch_layers import SwitchGLU
+
+    from mlx_soloheaven.models.deepseek_v4 import ClippedSwiGLU
+
+    glu = SwitchGLU(d_model, d_inner, E, activation=ClippedSwiGLU(limit), bias=False)
+    nn.quantize(glu, group_size=64, bits=2)
+    # The native kernels are specialized to the DEPLOYED build's dtypes:
+    # scales/biases are bf16 there (converter output), while nn.quantize here
+    # yields fp32. Cast to match — this is exactly what the real weights are.
+    for proj in (glu.gate_proj, glu.up_proj, glu.down_proj):
+        proj.scales = proj.scales.astype(mx.bfloat16)
+        proj.biases = proj.biases.astype(mx.bfloat16)
+    x = mx.random.normal((1, 1, d_model)).astype(mx.bfloat16)
+    idxs = mx.array([[[1, 7, 3, 12, 0, 9]]], dtype=mx.int32)
+    wts = mx.array([[[0.3, 0.2, 0.15, 0.15, 0.1, 0.1]]], dtype=mx.float32)
+    ref = _moe_routed_kernel(glu, x, idxs, wts, limit)
+    mx.eval(ref)
+    mx.synchronize()
+
+    rt_mod.load_custom_kernels(_RT)
+    h = mx.zeros((n_act * d_inner,), dtype=mx.float32)
+    y = mx.zeros((d_model,), dtype=mx.float32)
+    idx1 = idxs.reshape(-1)
+    wt1 = wts.reshape(-1)
+    mx.eval(h, y, idx1, wt1)
+    mx.synchronize()
+
+    table = rt_mod.BufferTable()
+    s = {
+        "x": table.add(x.reshape(-1)),
+        "gw": table.add(glu.gate_proj.weight), "gs_": table.add(glu.gate_proj.scales),
+        "gb": table.add(glu.gate_proj.biases),
+        "uw": table.add(glu.up_proj.weight), "us": table.add(glu.up_proj.scales),
+        "ub": table.add(glu.up_proj.biases),
+        "dw": table.add(glu.down_proj.weight), "ds_": table.add(glu.down_proj.scales),
+        "db": table.add(glu.down_proj.biases),
+        "idxs": table.add(idx1), "wts": table.add(wt1),
+        "h": table.add(h), "y": table.add(y),
+    }
+    w13, w2 = BUFFER_SLOTS["dsv4_moe_w13"], BUFFER_SLOTS["dsv4_moe_w2"]
+    const = struct.pack("<iiif", n_act, d_model, d_inner, limit)
+
+    k1 = rt_mod.plan_item(
+        _RT, "dsv4_moe_w13", True,
+        [(s["x"], w13["x"]), (s["gw"], w13["gw"]), (s["gs_"], w13["gs_"]),
+         (s["gb"], w13["gb"]), (s["uw"], w13["uw"]), (s["us"], w13["us"]),
+         (s["ub"], w13["ub"]), (s["idxs"], w13["idxs"]), (s["h"], w13["h"])],
+        [(0, 12, w13["params"]), (12, 4, w13["feps"])],
+        ((n_act * d_inner + 7) // 8, 1, 1), (256, 1, 1),
+    )
+    k2 = rt_mod.plan_item(
+        _RT, "dsv4_moe_w2", True,
+        [(s["h"], w2["h"]), (s["dw"], w2["dw"]), (s["ds_"], w2["ds_"]),
+         (s["db"], w2["db"]), (s["idxs"], w2["idxs"]), (s["wts"], w2["wts"]),
+         (s["y"], w2["y"])],
+        [(0, 12, w2["params"])],
+        ((d_model + 7) // 8, 1, 1), (256, 1, 1),
+    )
+    _RT.commit([k1, k2], table.ptrs, const, wait=True)
+
+    got = np.array(y)
+    exp = np.array(ref.reshape(-1).astype(mx.float32))
+    assert np.abs(got - exp).max() < 2e-2, np.abs(got - exp).max()
+
+
 def test_c_encode_cost_is_in_budget():
     """CPU-side encode+commit of a 1500-dispatch plan (wait=False, so GPU
     time is excluded — this is the per-token CPU cost that must fit in the

@@ -29,6 +29,7 @@ typedef struct {
     int32_t bytes_slot[DSV4_MAX_BYTES];
     uint64_t grid[3];
     uint64_t group[3];
+    int32_t barrier;                   // 1: buffer barrier BEFORE this dispatch
 } DSV4PlanItem;
 
 int dsv4_encode_commit(
@@ -47,6 +48,11 @@ int dsv4_encode_commit(
         int32_t last_pso = -1;
         for (int k = 0; k < n_items; ++k) {
             const DSV4PlanItem* it = &items[k];
+            // MLX buffers are hazard-untracked, so a dispatch that reads what
+            // the previous one wrote needs an explicit buffer barrier.
+            if (it->barrier) {
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
             if (it->pso != last_pso) {
                 [enc setComputePipelineState:
                      (__bridge id<MTLComputePipelineState>)psos_v[it->pso]];

@@ -115,6 +115,7 @@ class _PlanItem(ctypes.Structure):
         ("bytes_slot", ctypes.c_int32 * _MAXBY),
         ("grid", ctypes.c_uint64 * 3),
         ("group", ctypes.c_uint64 * 3),
+        ("barrier", ctypes.c_int32),
     ]
 
 
@@ -250,6 +251,29 @@ def load_custom_kernels(rt: Runtime) -> None:
     from mlx_soloheaven.native.kernels import build_source
 
     rt.load_custom_source(build_source())
+
+
+def plan_item(rt: Runtime, kernel: str, custom: bool,
+              buf_slots: list[tuple[int, int]],
+              byte_binds: list[tuple[int, int, int]],
+              grid: tuple, group: tuple, barrier: bool = True) -> _PlanItem:
+    """Assemble one plan item. ``buf_slots``: (table_index, [[buffer]] slot);
+    ``byte_binds``: (const_blob_offset, length, slot). ``barrier`` inserts a
+    buffer barrier BEFORE this dispatch — default True because MLX buffers are
+    hazard-untracked and the decode chain is almost entirely dependent; set
+    False only for a dispatch provably independent of the previous one."""
+    it = _PlanItem()
+    it.pso = rt.pipeline(kernel, custom=custom)
+    it.n_bufs = len(buf_slots)
+    for i, (bid, slot) in enumerate(buf_slots):
+        it.buf_ids[i], it.buf_slots[i], it.buf_offs[i] = bid, slot, 0
+    it.n_bytes = len(byte_binds)
+    for i, (off, length, slot) in enumerate(byte_binds):
+        it.bytes_off[i], it.bytes_len[i], it.bytes_slot[i] = off, length, slot
+    it.grid[:] = list(grid)
+    it.group[:] = list(group)
+    it.barrier = 1 if barrier else 0
+    return it
 
 
 def plan_qmv(rt: Runtime, buf_ids: tuple, K: int, N: int,

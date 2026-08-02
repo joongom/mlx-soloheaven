@@ -73,6 +73,19 @@ step unless profiling later demands it) owning:
    `SOLOHEAVEN_DSV4_NATIVE=1`, fallback preserved; multi-turn HIT check.
 8. bench: target ≤40 ms/token (≥25 tok/s).
 
+## Chained-plan contracts (learned building the first 2-item plan)
+
+* **MLX buffers are hazard-untracked.** A dispatch reading what the previous
+  one wrote gets garbage/NaN unless an explicit `memoryBarrierWithScope:
+  Buffers` sits between them. `plan_item(barrier=True)` (the default) emits it;
+  set False only for a provably independent dispatch. The decode chain is
+  almost entirely dependent, so default-on is correct.
+* **Kernels are specialized to the DEPLOYED dtypes.** The generated kernels
+  read scales/biases as `bfloat` because the converter writes bf16 (verified
+  on the real build). Test fixtures that quantize with `nn.quantize` get fp32
+  scales and MUST cast to bf16 to feed the kernel its real format;
+  `mx.fast` auto-adapts and hides this, the fixed-signature kernel does not.
+
 ## Known constraints
 
 * scales/biases must be bf16 (T-typed kernels) — our build already is.

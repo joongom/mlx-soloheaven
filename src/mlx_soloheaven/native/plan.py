@@ -56,31 +56,6 @@ class Planner:
              (self.t.add(mod.biases), 2, b_off), (self.S[x], 3, xoff), (self.S[y], 4, yoff)],
             [(ko, 4, 5), (ko + 4, 4, 6)], (1, (N + 7) // 8, 1), (32, 2, 1))
 
-    def qmv8(self, qlin, x, y, K, N):
-        """8-bit affine qmv, FP32 activation in and out (dsv4_qmv8_k). Used
-        for the stacked x-projection so the layer's dominant input carries no
-        bf16 rounding — see _QMV8_SRC."""
-        o, _ = self.cb.add("2i", K, N)
-        k = BUFFER_SLOTS["dsv4_qmv8_k"]
-        return self._pi(
-            "dsv4_qmv8_k", True,
-            [(self.S[x], k["x"]), (self.t.add(qlin.weight), k["weight"]),
-             (self.t.add(qlin.scales), k["scales"]), (self.t.add(qlin.biases), k["biases"]),
-             (self.S[y], k["out"])],
-            [(o, 8, k["params"])], ((N + 7) // 8, 1, 1), (256, 1, 1))
-
-    def rms32(self, w, x, y, y32, d, eps, xoff=0):
-        """RMS over an FP32 stream, emitting the bf16 vector the qmv consumes
-        AND an fp32 copy for the MoE gate (whose expert pick is the decode
-        path's only discrete decision — see _RMS32_SRC)."""
-        o, _ = self.cb.add("if", d, eps)
-        r = BUFFER_SLOTS["dsv4_rms32_k"]
-        return self._pi(
-            "dsv4_rms32_k", True,
-            [(self.S[x], r["x"], xoff), (self.t.add(w), r["w"]), (self.S[y], r["y"]),
-             (self.S[y32], r["y32"])],
-            [(o, 4, r["params"]), (o + 4, 4, r["feps"])], (1, 1, 1), (256, 1, 1))
-
     def rms(self, w, x, y, d, eps, xoff=0):
         o, _ = self.cb.add("if", d, eps)
         r = BUFFER_SLOTS["dsv4_rms_k"]
@@ -202,8 +177,7 @@ def plan_indexer(pl: Planner, idxr, freqs, xin: str, qr: str, idx_cache: dict,
 
 def plan_attention(pl: Planner, attn, xin: str, ring: str, out: str,
                    ioff_off: int, comp_cache: dict | None = None, ncomp: int = 0,
-                   n: int = 0, idx_cache: dict | None = None,
-                   xin32: str | None = None) -> list:
+                   n: int = 0, idx_cache: dict | None = None) -> list:
     """Attention on scratch[xin] (the attn_norm output) -> scratch[out].
     Dense (comp_cache is None) or plain-compressed (ratio-128: comp_cache
     names the compressor state slots, ncomp = visible compressed groups).
@@ -226,17 +200,13 @@ def plan_attention(pl: Planner, attn, xin: str, ring: str, out: str,
     shim = types.SimpleNamespace(weight=sqw, scales=ssc, biases=sbs)
     offs, acc = [], 0
     for sz in sizes:
-        offs.append(acc * 4)  # fp32 bytes (the stacked output is fp32)
+        offs.append(acc * 2)  # bf16 bytes
         acc += sz
-    # xall is FP32: it feeds every projection consumer in the layer, so its
-    # rounding used to dominate the layer's divergence (Stage 4d). q_norm
-    # still emits bf16 qr for the library wq_b; kv_norm's fp32 copy goes to
-    # attn_core, which is ours.
     items = [
-        pl.qmv8(shim, xin32 or f"{xin}32", "xall", hidden, acc),
-        pl.rms32(a.q_norm.weight, "xall", "qr", "qr32", q_lora, a.eps, xoff=offs[0]),
+        pl.qmv(shim, xin, "xall", hidden, acc),
+        pl.rms(a.q_norm.weight, "xall", "qr", q_lora, a.eps, xoff=offs[0]),
         pl.qmv(a.wq_b, "qr", "q_raw", q_lora, NHD),
-        pl.rms32(a.kv_norm.weight, "xall", "kvn", "kvn32", D, a.eps, xoff=offs[1]),
+        pl.rms(a.kv_norm.weight, "xall", "kvn", D, a.eps, xoff=offs[1]),
     ]
     kc, plain = 0, 1
     comp_slot, cidx_slot = "dummy", "dummy_idx"
@@ -258,7 +228,7 @@ def plan_attention(pl: Planner, attn, xin: str, ring: str, out: str,
     fo, _ = pl.cb.add("2f", a.scale, a.eps)
     items.append(pl._pi(
         "dsv4_attn_core", True,
-        [(pl.S["q_raw"], ac["q"]), (pl.S["kvn32"], ac["kv"]), (pl.S[ring], ac["ring"]),
+        [(pl.S["q_raw"], ac["q"]), (pl.S["kvn"], ac["kv"]), (pl.S[ring], ac["ring"]),
          (pl.S[comp_slot], ac["comp"]), (pl.S[cidx_slot], ac["cidx"]),
          (pl.t.add(a.attn_sink), ac["sink"]), (pl.t.add(a._freqs), ac["freqs"]),
          (pl.S["acore"], ac["out"]), (pl.S["kv_roped"], ac["kv_out"])],
@@ -280,7 +250,7 @@ def plan_attention(pl: Planner, attn, xin: str, ring: str, out: str,
          (pl.t.add(a.wo_a.scales), wa["scales"]), (pl.t.add(a.wo_a.biases), wa["biases"]),
          (pl.S["o_lora"], wa["out"])],
         [(wo, 12, wa["params"])], ((g * o_lora + 7) // 8, 1, 1), (256, 1, 1)))
-    items.append(pl.qmv8(a.wo_b, "o_lora", out, g * o_lora, hidden))
+    items.append(pl.qmv(a.wo_b, "o_lora", out, g * o_lora, hidden))
     return items
 
 
@@ -300,7 +270,7 @@ def plan_moe(pl: Planner, ffn, xin: str, out: str, topk: int, rscale: float,
         gh = BUFFER_SLOTS["dsv4_gate_hash_k"]
         items.append(pl._pi(
             "dsv4_gate_hash_k", True,
-            [(pl.S["xn32"], gh["x"]), (pl.t.add(ffn.gate.weight), gh["weight"]),
+            [(pl.S[xin], gh["x"]), (pl.t.add(ffn.gate.weight), gh["weight"]),
              (pl.t.add(ffn.gate.tid2eid), gh["tid2eid"]),
              (pl.S["idx"], gh["out_idx"]), (pl.S["w"], gh["out_w"])],
             [(go, 12, gh["params"]), (go + 12, 4, gh["feps"]), (tok_off, 4, gh["ioff"])],
@@ -311,7 +281,7 @@ def plan_moe(pl: Planner, ffn, xin: str, out: str, topk: int, rscale: float,
         gs = BUFFER_SLOTS["dsv4_gate_score_k"]
         items.append(pl._pi(
             "dsv4_gate_score_k", True,
-            [(pl.S["xn32"], gs["x"]), (pl.t.add(ffn.gate.weight), gs["weight"]),
+            [(pl.S[xin], gs["x"]), (pl.t.add(ffn.gate.weight), gs["weight"]),
              (pl.S["scores"], gs["scores"])],
             [(go, 8, gs["params"])], (n_exp, 1, 1), (256, 1, 1)))
         gt = BUFFER_SLOTS["dsv4_gate_topk_k"]
@@ -325,7 +295,7 @@ def plan_moe(pl: Planner, ffn, xin: str, out: str, topk: int, rscale: float,
     w1 = BUFFER_SLOTS["dsv4_moe_w13"]
     items.append(pl._pi(
         "dsv4_moe_w13", True,
-        [(pl.S["xn32"], w1["x"]), (pl.t.add(exp.gate_proj.weight), w1["gw"]),
+        [(pl.S[xin], w1["x"]), (pl.t.add(exp.gate_proj.weight), w1["gw"]),
          (pl.t.add(exp.gate_proj.scales), w1["gs_"]), (pl.t.add(exp.gate_proj.biases), w1["gb"]),
          (pl.t.add(exp.up_proj.weight), w1["uw"]), (pl.t.add(exp.up_proj.scales), w1["us"]),
          (pl.t.add(exp.up_proj.biases), w1["ub"]), (pl.S["idx"], w1["idxs"]), (pl.S["hexp"], w1["h"])],
@@ -345,7 +315,7 @@ def plan_moe(pl: Planner, ffn, xin: str, out: str, topk: int, rscale: float,
     sf, _ = pl.cb.add("f", limit)
     items.append(pl._pi(
         "dsv4_sh13_k", True,
-        [(pl.S["xn32"], k13["x"]),
+        [(pl.S[xin], k13["x"]),
          (pl.t.add(sh.w1.weight), k13["w1"]), (pl.t.add(sh.w1.scales), k13["s1"]),
          (pl.t.add(sh.w1.biases), k13["b1"]),
          (pl.t.add(sh.w3.weight), k13["w3"]), (pl.t.add(sh.w3.scales), k13["s3"]),
@@ -353,7 +323,7 @@ def plan_moe(pl: Planner, ffn, xin: str, out: str, topk: int, rscale: float,
          (pl.S["sh"], k13["out"])],
         [(so, 8, k13["params"]), (sf, 4, k13["feps"])],
         ((inter + 7) // 8, 1, 1), (256, 1, 1)))
-    items.append(pl.qmv8(sh.w2, "sh", "shared", inter, hidden))
+    items.append(pl.qmv(sh.w2, "sh", "shared", inter, hidden))
     # No add here: the block's hc_post2 fuses y_routed + shared into its x.
     return items
 
@@ -403,14 +373,14 @@ def plan_block(pl: Planner, blk, hin: str, ring: str, hout: str, ioff_off: int,
     items += pl.hc_pre(hin, blk.hc_attn_fn.reshape(-1), blk.hc_attn_scale,
                        blk.hc_attn_base, "hx", "post", "comb", hc, hidden,
                        blk.iters, blk.eps, blk.hc_eps)
-    items.append(pl.rms32(blk.attn_norm.weight, "hx", "xn", "xn32", hidden, blk.eps))
+    items.append(pl.rms(blk.attn_norm.weight, "hx", "xn", hidden, blk.eps))
     items += plan_attention(pl, blk.attn, "xn", ring, "attn_out", ioff_off,
                             comp_cache=comp_cache, ncomp=ncomp, n=n, idx_cache=idx_cache)
     items.append(pl.hc_post("attn_out", hin, "post", "comb", "h1", hc, hidden))
     items += pl.hc_pre("h1", blk.hc_ffn_fn.reshape(-1), blk.hc_ffn_scale,
                        blk.hc_ffn_base, "hx", "post", "comb", hc, hidden,
                        blk.iters, blk.eps, blk.hc_eps)
-    items.append(pl.rms32(blk.ffn_norm.weight, "hx", "xn", "xn32", hidden, blk.eps))
+    items.append(pl.rms(blk.ffn_norm.weight, "hx", "xn", hidden, blk.eps))
     items += plan_moe(pl, blk.ffn, "xn", "moe_out", topk, rscale, limit, tok_off)
     items.append(pl.hc_post2("y_routed", "shared", "h1", "post", "comb", hout, hc, hidden))
     return items

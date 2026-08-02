@@ -125,32 +125,18 @@ class NativeDecoder:
         q_lora, inter, ihd, i_nh = (a.q_lora_rank, a.moe_intermediate_size,
                                     a.index_head_dim, a.index_n_heads)
         s = dict(
-            # HC residual streams + the hc-norm input stay FP32: they are the
-            # only buffers a decode step accumulates across all 43 layers, and
-            # the bf16 write per half (86/token) both loses signal and flips
-            # near-tied MoE experts downstream (Stage 4c).
-            ha=self._z(hc * hidden, mx.float32), hb=self._z(hc * hidden, mx.float32),
-            hx=self._z(hidden, mx.float32), xn32=self._z(hidden, mx.float32),
+            ha=self._z(hc * hidden), hb=self._z(hc * hidden), hx=self._z(hidden),
             post=self._z(hc, mx.float32), comb=self._z(hc * hc, mx.float32), xn=self._z(hidden),
             hc_mixes=self._z((2 + hc) * hc, mx.float32),
             # xall: the stacked x-projection output, sized for the widest layer
             # kind (ratio-4: q_lora + D + 2*(2D) + idx heads + 2*(2*idx_hd)).
-            # fp32: every projection consumer in a layer reads a slice of
-            # this, so its rounding dominated the layer's divergence (4d)
-            xall=self._z(q_lora + D + 4 * D + i_nh + 4 * ihd, mx.float32),
-            qr32=self._z(q_lora, mx.float32), kvn32=self._z(D, mx.float32),
+            xall=self._z(q_lora + D + 4 * D + i_nh + 4 * ihd),
             xp0=self._z(q_lora), qr=self._z(q_lora), q_raw=self._z(NHD), xp1=self._z(D),
-            kvn=self._z(D), kv_roped=self._z(D),
-            # the attention/FFN OUTPUT path stays fp32: these land straight in
-            # the residual (|attn_out| ~4-18 vs |h| ~1.1), so a bf16 round here
-            # injects 1.5-6% per layer — the dominant divergence (Stage 4d).
-            acore=self._z(NHD, mx.float32), o_lora=self._z(NHD, mx.float32),
-            attn_out=self._z(hidden, mx.float32),
-            h1=self._z(hc * hidden, mx.float32), scores=self._z(self._cap, mx.float32),
+            kvn=self._z(D), acore=self._z(NHD), kv_roped=self._z(D), o_lora=self._z(NHD),
+            attn_out=self._z(hidden), h1=self._z(hc * hidden), scores=self._z(self._cap, mx.float32),
             idx=mx.zeros((self.topk,), mx.int32), w=self._z(self.topk, mx.float32),
             hexp=self._z(self.topk * inter, mx.float32), y_routed=self._z(hidden, mx.float32),
-            sg=self._z(inter), su=self._z(inter),
-            sh=self._z(inter, mx.float32), shared=self._z(hidden, mx.float32),
+            sg=self._z(inter), su=self._z(inter), sh=self._z(inter), shared=self._z(hidden),
             moe_out=self._z(hidden), cwkv=self._z(2 * D), cwgate=self._z(2 * D),
             i_ckv=self._z(2 * ihd), i_cwg=self._z(2 * ihd), iw=self._z(i_nh),
             iq=self._z(i_nh * ihd), cidx=mx.zeros((512,), mx.int32),
@@ -255,13 +241,10 @@ class NativeDecoder:
         for i, blk in enumerate(self.model.layers):
             lay = self._layers[i]
             comp, idx = self._cache_dicts(lay)
-            # ioff[1] is the VISIBLE compressed-group count. The reference
-            # attends to the compressor's POST-step count (`ncomp = cn` in
-            # Attention.decode_step_math), so on a completion token the group
-            # this very token finished is visible — native passing the
-            # pre-step count silently dropped the newest (most relevant)
-            # summary every ratio-th token. It varies per token, so it is
-            # patched in decode() alongside the offset; only the structural
+            # ioff[1] is the VISIBLE compressed-group count: the reference
+            # attends to the compressor's POST-step count (`ncomp = cn`), so
+            # the group this token itself completes is visible. It varies per
+            # token, so it is patched in decode(); only the structural KC
             # bound below is baked.
             lioff, _ = cb.add("2i", self.offset, self._visible(lay))
             self._ioff_offs.append(lioff)

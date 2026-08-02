@@ -457,6 +457,50 @@ grouped wo_a 8->1 is the count lever, -301 dispatches), moe 12.4 (near
 bandwidth), attn_core 9.6, hc_pre 7.4, hc_post/mix/rms ~9. Target 40 ms:
 needs the wo_a count cut plus one more of attn_core/hc tail.
 
+### Stage 3h — grouped wo_a fusion: dispatch count DOWN, wall time FLAT ⚠️ (2026-08-02)
+
+`dsv4_wo_a_k` fuses the o_groups (8) wo_a into one grouped 8-bit qmv (one
+simdgroup per output row), so the 8 separate library qmv/attention become one:
+**qmv dispatch count 624 -> 280** (-344). Correct — the dense/ratio-128/ratio-4
+attention plan tests diff-verify it. But end to end it did **nothing**:
+
+| | ms/token |
+|---|---|
+| before (TG-widened, Stage 3g) | 62.6 |
+| after wo_a fusion | 62.6 |
+
+**Prediction FAILED** (expected ~-10 ms from -301 dispatches; measured ~0, within
+noise). Isolated-group timing: qmv 16.57 -> 11.54 ms (-5.0), but the new
+`dsv4_wo_a_k` adds 3.68 ms → net -1.35 ms in the isolated profile, none of which
+shows in wall time. Why: on this replay path per-launch overhead is already ~4 µs
+(Stage 3a), so cutting 301 launches saves ~1 ms at most; the decode wall time is
+dominated by the big serial kernels, NOT dispatch count. The "50 µs/op floor"
+from the in-MLX cost model is an MLX-scheduler property; the single-command-buffer
+replay does NOT pay it per dispatch. Lesson: on the native replay, **dispatch
+COUNT is a weak lever** once launches are ~µs — optimize the big kernels' compute
+(bandwidth/occupancy), not the op count. Kept anyway: correct, and it simplifies
+the plan. NOTE: commit 661c239's message wrongly credits the 72.1 -> 62.6 gain to
+this fusion; that gain was the concurrent attn_core/comp_step TG widening
+(Stage 3g). This ledger entry is the correction of record.
+
+Profile after wo_a fusion (bench8, isolated-group ms; sum > wall by per-group
+commit overhead):
+
+| kernel | count | ms |
+|---|---|---|
+| moe w13+w2 | 86 | 13.3 |
+| library qmv | 280 | 11.54 |
+| dsv4_attn_core | 43 | 9.97 |
+| dsv4_hc_pre_k | 86 | 7.32 |
+| dsv4_comp_step | 62 | 4.89 |
+| dsv4_wo_a_k | 43 | 3.68 |
+| dsv4_hc_post_k | 86 | 3.43 |
+| dsv4_hc_mix_k | 86 | 3.34 |
+| dsv4_rms_k | 173 | 2.61 |
+
+So the real 40 ms levers are the big kernels' compute: moe (13, near bandwidth —
+hard), attn_core (10), hc_pre (7). The easy pathological-kernel wins are spent.
+
 ## 3. Reproduce
 
 ```bash

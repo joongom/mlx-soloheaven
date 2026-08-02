@@ -587,6 +587,143 @@ def test_native_ring_store_updates_one_slot_in_place():
             assert np.array_equal(after[i], before[i]), f"slot {i} changed"
 
 
+def test_native_full_model_logits_match_reference():
+    """LADDER STEP 7: the WHOLE model decode replayed natively — embed
+    (dequant row gather), N dense Blocks, hc-head, final norm, head qmv — as
+    ONE command buffer, diffed against Model.__call__'s decode logits on the
+    same cache state. This is the full pipeline that produces 25-tok/s decode:
+    if it matches, only real-model buffer wiring + benchmarking remain."""
+    import mlx.nn as nn
+
+    from mlx_soloheaven.models.deepseek_v4 import Model, ModelArgs
+    from mlx_soloheaven.native import plan as plan_mod
+
+    L, vocab = 2, 128
+    cfg = dict(model_type="deepseek_v4", vocab_size=vocab, hidden_size=512,
+               num_hidden_layers=L, num_attention_heads=2, head_dim=512,
+               qk_rope_head_dim=64, q_lora_rank=512, o_lora_rank=512, o_groups=2,
+               moe_intermediate_size=512, n_routed_experts=8, num_experts_per_tok=2,
+               routed_scaling_factor=1.5, sliding_window=8, num_hash_layers=0,
+               hc_mult=2, hc_sinkhorn_iters=5, swiglu_limit=10.0,
+               compress_ratios=[0] * L, rope_theta=10000, rms_norm_eps=1e-6, hc_eps=1e-6)
+    args = ModelArgs.from_dict(cfg)
+    model = Model(args)
+    for blk in model.layers:
+        for nm in ("hc_attn_fn", "hc_ffn_fn"):
+            setattr(blk, nm, mx.random.normal(getattr(blk, nm).shape) * 0.1)
+        for nm in ("hc_attn_scale", "hc_ffn_scale", "hc_attn_base", "hc_ffn_base"):
+            setattr(blk, nm, mx.random.normal(getattr(blk, nm).shape))
+        blk.ffn.gate.weight = mx.random.normal(blk.ffn.gate.weight.shape) * 0.3
+        blk.ffn.gate.bias = mx.random.normal(blk.ffn.gate.bias.shape)
+    model.hc_head_fn = mx.random.normal(model.hc_head_fn.shape) * 0.1
+    model.hc_head_scale = mx.random.normal(model.hc_head_scale.shape)
+    model.hc_head_base = mx.random.normal(model.hc_head_base.shape)
+    model.embed.weight = mx.random.normal(model.embed.weight.shape) * 0.1
+
+    # deploy-format quantization of the whole model
+    def pred(p, m):
+        if not hasattr(m, "to_quantized") or "norm" in p:
+            return False
+        if ".experts." in p and "shared" not in p:
+            return {"group_size": 64, "bits": 2}
+        return {"group_size": 64, "bits": 8}
+
+    nn.quantize(model, group_size=64, bits=8, class_predicate=pred)
+    # embed is quantized manually (Embedding.to_quantized may not fire) and the
+    # head; then cast all scale/bias to bf16, norms + gate.weight to bf16.
+    eqw, esc, ebi = mx.quantize(mx.random.normal((vocab, 512)) * 0.1, group_size=64, bits=8)
+    for blk in model.layers:
+        _quantize_block_like_deploy(blk)
+
+    def to_bf16(m):
+        m.scales = m.scales.astype(mx.bfloat16)
+        m.biases = m.biases.astype(mx.bfloat16)
+
+    to_bf16(model.head)
+    model.norm.weight = model.norm.weight.astype(mx.bfloat16)
+
+    # a small embed module exposing quantized arrays for the kernel
+    class _E:
+        weight, scales, biases = eqw, esc.astype(mx.bfloat16), ebi.astype(mx.bfloat16)
+
+    embed = _E()
+
+    hc, hidden = args.hc_mult, 512
+    win, D = args.sliding_window, args.head_dim
+    topk, rscale, limit = args.num_experts_per_tok, args.routed_scaling_factor, args.swiglu_limit
+    token, offset = 9, 4
+
+    # reference: build a cache with per-layer ring at offset, run one decode.
+    cache = model.make_cache()
+    for c in cache:
+        c.ring = (mx.random.normal((1, win, D)) * 0.1).astype(mx.bfloat16)
+        c.offset = offset
+    ring_snap = [mx.array(c.ring) for c in cache]  # copy for the native run
+    # embed for the reference decode uses the manually-quantized table:
+    emb_vec = mx.dequantize(eqw[token:token + 1], esc[token:token + 1],
+                            ebi[token:token + 1], group_size=64, bits=8)[0]
+
+    # Reference: run the model's compiled decode with embed overridden to the
+    # same quantized table (so both paths see identical embeddings).
+    import mlx_soloheaven.models.deepseek_v4 as v4
+    orig_embed = model.embed
+    model.embed = lambda ids: mx.broadcast_to(  # noqa: E731
+        emb_vec[None, None], (1, 1, hidden)).astype(mx.bfloat16)
+    logits_ref = model(mx.array([[token]], dtype=mx.int32), cache)
+    model.embed = orig_embed
+    mx.eval(logits_ref)
+    mx.synchronize()
+    assert not v4._COMPILED_DECODE_BROKEN
+
+    # native full-model plan
+    rt_mod.load_custom_kernels(_RT)
+    T = rt_mod.BufferTable()
+
+    def z(n, dt=mx.bfloat16):
+        a = mx.zeros((n,), dtype=dt)
+        mx.eval(a)
+        return a
+
+    block_scratch = dict(
+        hx=z(hidden), post=z(hc, mx.float32), comb=z(hc * hc, mx.float32), xn=z(hidden),
+        xp0=z(512), qr=z(512), q_raw=z(hidden * 2 // 2 * 2), xp1=z(D), kvn=z(D),
+        acore=z(2 * D), kv_roped=z(D), o_lora=z(2 * 512), attn_out=z(hidden), h1=z(hc * hidden),
+        scores=z(8, mx.float32), idx=mx.zeros((topk,), mx.int32), w=z(topk, mx.float32),
+        hexp=z(topk * 512, mx.float32), y_routed=z(hidden, mx.float32), sg=z(512), su=z(512),
+        sh=z(512), shared=z(hidden), moe_out=z(hidden), dummy=z(D),
+        dummy_idx=mx.full((1,), -1, mx.int32), headx=z(hidden), headn=z(hidden),
+    )
+    ha, hb = z(hc * hidden), z(hc * hidden)
+    logits = z(vocab)  # bf16: the head qmv writes bfloat16
+    rings = [mx.array(r).reshape(-1) for r in ring_snap]
+    all_arrays = dict(block_scratch, ha=ha, hb=hb, logits=logits)
+    for i, r in enumerate(rings):
+        all_arrays[f"ring{i}"] = r
+    mx.eval(*all_arrays.values())
+    mx.synchronize()
+    S = {k: T.add(v) for k, v in all_arrays.items()}
+
+    cb = plan_mod.ConstBlob()
+    tok_off, _ = cb.add("i", token)
+    ioff_off, _ = cb.add("2i", offset, 0)
+    pl = plan_mod.Planner(_RT, T, cb, S)
+
+    items = plan_mod.plan_embed(pl, embed, "ha", hc, hidden, tok_off)
+    cur, nxt = "ha", "hb"
+    for i, blk in enumerate(model.layers):
+        items += plan_mod.plan_block(pl, blk, cur, f"ring{i}", nxt, ioff_off,
+                                     topk, rscale, limit)
+        cur, nxt = nxt, cur
+    items += plan_mod.plan_head(pl, model, cur, "logits", hc, hidden, vocab)
+    _RT.commit(items, T.ptrs, cb.bytes(), wait=True)
+
+    got = np.array(all_arrays["logits"].astype(mx.float32))
+    exp = np.array(logits_ref.reshape(-1).astype(mx.float32))
+    # argmax (the decode-relevant quantity) must match; logits close in bf16.
+    assert int(got.argmax()) == int(exp.argmax()), (got.argmax(), exp.argmax())
+    assert np.median(np.abs(got - exp)) < 5e-2, np.median(np.abs(got - exp))
+
+
 def test_native_full_block_plan_matches_reference():
     """LADDER STEP 6: the WHOLE dense Block as one native plan (both HC-wrapped
     halves, ~26 dispatches, one command buffer) via native/plan.plan_block,

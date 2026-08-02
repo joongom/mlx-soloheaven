@@ -1818,6 +1818,62 @@ _RMS_SRC = """
     for (int i = tid; i < d; i += TG) y[i] = T(float(x[i]) * r * float(w[i]));
 """
 
+_EMBED_SRC = """
+    // dequantize embed row token_id (8-bit gs64) and replicate into hc streams:
+    // h[s*hidden + i] = dequant(weight[token][i]) for every stream s.
+    uint tid = thread_position_in_grid.x;
+    const int hidden = params[0];
+    const int hc = params[1];
+    const int token = ioff[0];
+    if ((int)tid >= hidden) return;
+    // 8-bit: 4 values / uint32, so hidden/4 packed words per row.
+    uint word = weight[(uint)token * (hidden / 4) + tid / 4];
+    float sc = float(scales[(uint)token * (hidden / 64) + tid / 64]);
+    float bi = float(biases[(uint)token * (hidden / 64) + tid / 64]);
+    float v = float((word >> (8 * (tid % 4))) & 0xFFu) * sc + bi;
+    for (int s = 0; s < hc; ++s) h[s * hidden + tid] = T(v);
+"""
+
+_HC_HEAD_SRC = """
+    // x[i] = sum_hc pre[hc] * flat[hc, i], pre = sigmoid(mixes*scale+base)+eps
+    // mixes[r] = (fn[r] . flat) * rms(flat), fn is [hc, hc*hidden].
+    uint tid = thread_position_in_threadgroup.x;
+    const int TG = 256;
+    const int hc = params[0];
+    const int d = params[1];
+    const int hcd = hc * d;
+    const float eps = feps[0];
+    const float hc_eps = feps[1];
+    threadgroup float red[8];
+    threadgroup float mixes[8];
+    threadgroup float rms_s[1];
+
+    float acc = 0.0f;
+    for (int i = tid; i < hcd; i += TG) { float v = float(h[i]); acc += v * v; }
+    acc = simd_sum(acc);
+    if ((tid & 31u) == 0) red[tid / 32] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { float t = 0.0f; for (int i = 0; i < TG/32; ++i) t += red[i]; rms_s[0] = rsqrt(t / hcd + eps); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rms = rms_s[0];
+    for (int r = tid / 32; r < hc; r += TG / 32) {
+        float a = 0.0f;
+        for (int i = tid % 32; i < hcd; i += 32) a += float(fn[r * hcd + i]) * float(h[i]);
+        a = simd_sum(a);
+        if ((tid & 31u) == 0) mixes[r] = a * rms;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0)
+        for (int r = 0; r < hc; ++r)
+            mixes[r] = 1.0f / (1.0f + exp(-(mixes[r] * scale[0] + base[r]))) + hc_eps;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = tid; i < d; i += TG) {
+        float a = 0.0f;
+        for (int r = 0; r < hc; ++r) a += mixes[r] * float(h[r * d + i]);
+        y[i] = T(a);
+    }
+"""
+
 _SWIGLU_SRC = """
     // clipped SwiGLU elementwise: out[i] = silu(min(g,lim)) * clamp(u,-lim,lim)
     uint tid = thread_position_in_grid.x;
@@ -1872,7 +1928,19 @@ def _get_misc_kernels():
             output_names=["out"],
             source=_ADD_SRC,
         )
-        _misc_kernels = (store, swiglu, add)
+        embed = mx.fast.metal_kernel(
+            name="dsv4_embed_k",
+            input_names=["weight", "scales", "biases", "params", "ioff"],
+            output_names=["h"],
+            source=_EMBED_SRC,
+        )
+        hc_head = mx.fast.metal_kernel(
+            name="dsv4_hc_head_k",
+            input_names=["h", "fn", "scale", "base", "params", "feps"],
+            output_names=["y"],
+            source=_HC_HEAD_SRC,
+        )
+        _misc_kernels = (store, swiglu, add, embed, hc_head)
     return _misc_kernels
 
 

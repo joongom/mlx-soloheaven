@@ -92,12 +92,23 @@ step unless profiling later demands it) owning:
    < 0.15 (accumulated bf16 over the deep chain; the per-half tests are the
    tight proof). native/plan.py now has the reusable Planner + plan_attention
    / plan_moe / plan_block builders.
-7. NEXT: build the session BufferTable + scratch from a REAL loaded Model
-   (dense layers 0-1 first; then the compressed layers need the compressor/
-   indexer dispatches added to plan_attention), stack all layers + embed
-   (row gather) + final HC-head + head qmv, and replay a full token; diff
-   logits vs Model.__call__, then integrate behind SOLOHEAVEN_DSV4_NATIVE=1
-   as a third path in Model.__call__ with the existing eager fallback. Bench.
+7. ✅ FULL-MODEL decode replayed natively as ONE command buffer — embed
+   (dequant row gather), N dense Blocks (plan_block), hc-head, final norm,
+   head qmv — and its logits' ARGMAX matches Model.__call__ (median logit
+   diff < 5e-2). plan.py has plan_embed / plan_head / plan_block. Bug caught:
+   embed 8-bit row stride is hidden/4 (not the 2-bit hidden/16).
+8. NEXT (only DENSE-model wiring remains for a bench; compressed layers add
+   the compressor/indexer dispatches to plan_attention):
+   a. compressed-layer plan: extend plan_attention with the compressor step
+      (dsv4_comp_step) + indexer for ratio-4, wiring the per-layer compressor
+      cache buffers; diff a compressed Block.
+   b. real-Model driver: a NativeDecoder holding the Runtime, a session
+      BufferTable built from the loaded model's weights + a DeepSeekV4Cache's
+      ring/compressor buffers, the scratch, and a prebuilt plan; per token
+      write (token, offset) into the uniform buffer and commit.
+   c. integrate as a third path in Model.__call__ behind
+      SOLOHEAVEN_DSV4_NATIVE=1 (after the compiled path), eager fallback kept.
+   d. bench decode tok/s vs the 12 tok/s compiled path; target >=25.
 5. All layer kinds, then the full 43-layer step + embed/head → token-level
    agreement over a 32-token greedy run.
 6. ppl probes through the native path ≈ MLX path (3.65).

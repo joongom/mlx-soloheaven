@@ -55,6 +55,16 @@ _SPECS = {
         "_ADD_SRC",
         [("a", _F), ("b", _B), ("params", _I), ("out", "device bfloat*")],
     ),
+    "dsv4_embed_k": (
+        "_EMBED_SRC",
+        [("weight", _U), ("scales", _B), ("biases", _B), ("params", _I),
+         ("ioff", _I), ("h", "device bfloat*")],
+    ),
+    "dsv4_hc_head_k": (
+        "_HC_HEAD_SRC",
+        [("h", _B), ("fn", _F), ("scale", _F), ("base", _F), ("params", _I),
+         ("feps", _F), ("y", "device bfloat*")],
+    ),
     "dsv4_gate_k": (
         "_GATE_SRC",
         [("x", _B), ("weight", _B), ("bias", _F), ("params", _I), ("feps", _F),

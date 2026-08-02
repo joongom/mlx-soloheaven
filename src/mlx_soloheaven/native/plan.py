@@ -182,6 +182,36 @@ def plan_moe(pl: Planner, ffn, xin: str, out: str, topk: int, rscale: float,
     return items
 
 
+def plan_embed(pl: Planner, embed, hout: str, hc: int, hidden: int,
+               tok_off: int) -> list:
+    """Dequantize the embedding row for the token in the uniform buffer (at
+    byte offset ``tok_off``) into scratch[hout] as hc replicated streams."""
+    ek = BUFFER_SLOTS["dsv4_embed_k"]
+    p, _ = pl.cb.add("2i", hidden, hc)
+    return [pl._pi(
+        "dsv4_embed_k", True,
+        [(pl.t.add(embed.weight), ek["weight"]), (pl.t.add(embed.scales), ek["scales"]),
+         (pl.t.add(embed.biases), ek["biases"]), (pl.S[hout], ek["h"])],
+        [(p, 8, ek["params"]), (tok_off, 4, ek["ioff"])], (hidden, 1, 1), (256, 1, 1))]
+
+
+def plan_head(pl: Planner, model, hin: str, logits: str, hc: int, hidden: int,
+              vocab: int) -> list:
+    """hc-head reduce -> final RMSNorm -> head qmv, scratch[hin] -> scratch[logits]."""
+    hk = BUFFER_SLOTS["dsv4_hc_head_k"]
+    p, _ = pl.cb.add("2i", hc, hidden)
+    f, _ = pl.cb.add("2f", model.eps, model.hc_eps)
+    items = [pl._pi(
+        "dsv4_hc_head_k", True,
+        [(pl.S[hin], hk["h"]), (pl.t.add(model.hc_head_fn.reshape(-1)), hk["fn"]),
+         (pl.t.add(model.hc_head_scale), hk["scale"]), (pl.t.add(model.hc_head_base), hk["base"]),
+         (pl.S["headx"], hk["y"])],
+        [(p, 8, hk["params"]), (f, 8, hk["feps"])], (1, 1, 1), (256, 1, 1))]
+    items.append(pl.rms(model.norm.weight, "headx", "headn", hidden, model.eps))
+    items.append(pl.qmv(model.head, "headn", logits, hidden, vocab))
+    return items
+
+
 def plan_block(pl: Planner, blk, hin: str, ring: str, hout: str, ioff_off: int,
                topk: int, rscale: float, limit: float) -> list:
     """A full dense Block: hc_pre/attn_norm/attention/hc_post, then

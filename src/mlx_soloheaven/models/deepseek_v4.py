@@ -1079,24 +1079,27 @@ _COMP_STEP_SRC = """
         sc_st[slot * cd + i] = float(sc_row[i]) + ape[filled * cd + i];
     }
 
-    // pooled[i] = softmax-weighted sum over rows of W (pre-shift view)
+    // pooled[i] = softmax-weighted sum over rows of W (pre-shift view).
+    // ONLINE softmax (single pass with running rescale) — the two-pass form
+    // walked the row-strided state twice per element (Stage 3o bisection:
+    // 2.3 ms/token). The mn > -inf guard skips empty (-inf score) rows so
+    // the -inf - -inf = NaN intermediate never forms; row `slot` is always
+    // fresh, so the final m is finite.
     for (int i = tid; i < d; i += TG) {
-        float m = -INFINITY;
-        for (int r = 0; r < rows; ++r) {
-            int col = (coff == 2) ? ((r < ratio) ? i : i + d) : i;
-            float scv = (r == slot) ? float(sc_row[col]) + ape[filled * cd + col]
-                                    : sc_st[r * cd + col];
-            m = max(m, scv);
-        }
-        float den = 0.0f, acc = 0.0f;
+        float m = -INFINITY, den = 0.0f, acc = 0.0f;
         for (int r = 0; r < rows; ++r) {
             int col = (coff == 2) ? ((r < ratio) ? i : i + d) : i;
             float scv = (r == slot) ? float(sc_row[col]) + ape[filled * cd + col]
                                     : sc_st[r * cd + col];
             float kvv = (r == slot) ? float(kv_row[col]) : kv_st[r * cd + col];
-            float e = exp(scv - m);
-            den += e;
-            acc += e * kvv;
+            float mn = max(m, scv);
+            if (mn > -INFINITY) {
+                float rs = (m == -INFINITY) ? 0.0f : exp(m - mn);
+                float e = exp(scv - mn);
+                den = den * rs + e;
+                acc = acc * rs + e * kvv;
+                m = mn;
+            }
         }
         pooled[i] = acc / den;
     }

@@ -3201,23 +3201,65 @@ class MLXEngine(SessionCacheMixin):
             lines.append(f"- {fn.get('name')}({args})" + (f" — {desc}" if desc else ""))
         return "\n".join(lines)
 
+    @staticmethod
+    def _tool_call_block(tc: dict) -> str:
+        """One assistant tool call in the block syntax tool_parser accepts —
+        i.e. what the model itself emitted before the parser lifted it out."""
+        fn = tc.get("function") or {}
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (json.JSONDecodeError, ValueError):
+                args = {}
+        params = "".join(
+            f"<parameter={k}>{v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)}"
+            f"</parameter>"
+            for k, v in (args or {}).items()
+        )
+        return f"<tool_call><function={fn.get('name')}>{params}</function></tool_call>"
+
     def _inject_tools_if_template_lacks_slot(
         self, formatted: list[dict], tools: list | None,
     ) -> list[dict]:
-        """Put tool definitions in the SYSTEM message when the template has no
-        place for them. Templates that DO render tools are left alone, so this
-        cannot double-describe the tools for other families."""
-        if not tools or self._template_renders_tools():
+        """Make a template that has no tools slot serve a tool-calling turn.
+
+        Two holes, both in DeepSeek-V4's template, both silent:
+
+        * tool DEFINITIONS have nowhere to go, so the model never learns the
+          names or the call syntax;
+        * an assistant message's ``tool_calls`` are not rendered AT ALL — the
+          branch is ``'<|Assistant|></think>' + (content or '') + eos`` — so a
+          history that contains a call replays as an EMPTY assistant turn
+          followed by a tool result the model never asked for. It then
+          re-issues the same call, and the agent loops.
+
+        Definitions go into the system message; assistant calls are written
+        back into that assistant's content, in the same block syntax the model
+        emitted them in. Templates that DO render tools are untouched.
+        """
+        if self._template_renders_tools():
             return formatted
-        block = self._render_tool_definitions(tools)
-        out, injected = [], False
+        out = []
         for m in formatted:
-            if not injected and m.get("role") == "system":
+            tcs = m.get("tool_calls")
+            if m.get("role") == "assistant" and tcs:
+                blocks = "".join(self._tool_call_block(tc) for tc in tcs)
+                text = m.get("content") or ""
+                m = {k: v for k, v in m.items() if k != "tool_calls"}
+                m["content"] = f"{text}\n{blocks}" if text else blocks
+            out.append(m)
+        if not tools:
+            return out
+        block = self._render_tool_definitions(tools)
+        injected = False
+        for i, m in enumerate(out):
+            if m.get("role") == "system":
                 text = m.get("content") or ""
                 if self._TOOLS_INJECT_MARKER not in text:  # idempotent
-                    m = {**m, "content": (f"{text}\n\n{block}" if text else block)}
+                    out[i] = {**m, "content": (f"{text}\n\n{block}" if text else block)}
                 injected = True
-            out.append(m)
+                break
         if not injected:
             out.insert(0, {"role": "system", "content": block})
         return out

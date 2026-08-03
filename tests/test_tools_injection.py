@@ -97,3 +97,55 @@ def test_the_caller_s_messages_are_not_mutated():
     msgs = [{"role": "system", "content": "sys"}]
     eng._inject_tools_if_template_lacks_slot(msgs, TOOLS)
     assert msgs == [{"role": "system", "content": "sys"}]
+
+
+def test_assistant_tool_calls_are_written_back_into_content():
+    """The other half of the same hole: DeepSeek-V4's assistant branch is
+    `'<|Assistant|></think>' + (content or '') + eos` — `tool_calls` are never
+    rendered. A history containing a call therefore replayed as an EMPTY
+    assistant turn followed by a tool result the model never asked for, and it
+    re-issued the same call. Measured: the round-trip named 0 of 3 files from
+    the tool result and looped straight back into a tool call.
+    """
+    eng = _engine(DEEPSEEK_TMPL)
+    tcs = [{"id": "call_1", "type": "function", "function": {
+        "name": "list_dir", "arguments": {"path": "src", "depth": 2}}}]
+    out = eng._inject_tools_if_template_lacks_slot(
+        [{"role": "user", "content": "what is in src?"},
+         {"role": "assistant", "content": "", "tool_calls": tcs},
+         {"role": "tool", "content": "engine.py"}], None)
+
+    asst = out[1]
+    assert "tool_calls" not in asst, "must not also leave the structured field"
+    assert asst["content"] == (
+        "<tool_call><function=list_dir><parameter=path>src</parameter>"
+        "<parameter=depth>2</parameter></function></tool_call>")
+
+
+def test_assistant_text_before_a_call_is_kept():
+    eng = _engine(DEEPSEEK_TMPL)
+    tcs = [{"id": "c", "type": "function",
+            "function": {"name": "read_file", "arguments": '{"path": "a.py"}'}}]
+    out = eng._inject_tools_if_template_lacks_slot(
+        [{"role": "assistant", "content": "Let me look.", "tool_calls": tcs}], None)
+    assert out[0]["content"].startswith("Let me look.\n<tool_call>")
+    assert "<parameter=path>a.py</parameter>" in out[0]["content"]
+
+
+def test_call_writeback_happens_even_when_this_turn_offers_no_tools():
+    """A follow-up request may omit `tools` while the HISTORY still contains a
+    call; the history must still render."""
+    eng = _engine(DEEPSEEK_TMPL)
+    tcs = [{"id": "c", "type": "function",
+            "function": {"name": "list_dir", "arguments": {"path": "."}}}]
+    out = eng._inject_tools_if_template_lacks_slot(
+        [{"role": "assistant", "content": "", "tool_calls": tcs}], None)
+    assert "<tool_call><function=list_dir>" in out[0]["content"]
+
+
+def test_a_template_that_renders_tools_keeps_structured_calls():
+    eng = _engine(QWEN_TMPL)
+    tcs = [{"id": "c", "type": "function",
+            "function": {"name": "list_dir", "arguments": {"path": "."}}}]
+    msgs = [{"role": "assistant", "content": "", "tool_calls": tcs}]
+    assert eng._inject_tools_if_template_lacks_slot(msgs, TOOLS) == msgs

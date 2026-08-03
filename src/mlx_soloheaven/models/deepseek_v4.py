@@ -2762,6 +2762,7 @@ class QuantSpec(NamedTuple):
         build cannot be served by the native path."""
         seen: dict[str, set] = {"dense": set(), "exp": set()}
         dtypes: set = set()
+        modes: set = set()
 
         def visit(path, m):
             bits, gs = getattr(m, "bits", None), getattr(m, "group_size", None)
@@ -2773,6 +2774,7 @@ class QuantSpec(NamedTuple):
             # experts under ffn.experts feed moe_w13/moe_w2.
             kind = "exp" if ".ffn.experts." in f".{path}." else "dense"
             seen[kind].add((int(bits), int(gs)))
+            modes.add(getattr(m, "mode", "affine"))
             sc = getattr(m, "scales", None)
             if sc is not None:
                 dtypes.add(sc.dtype)
@@ -2787,6 +2789,11 @@ class QuantSpec(NamedTuple):
                 raise ValueError(
                     f"native decode needs ONE {kind} recipe, found "
                     f"{sorted(seen[kind])} — the kernels are compiled per spec")
+        if modes - {"affine"}:
+            raise ValueError(
+                f"native decode unpacks AFFINE quantization; build uses "
+                f"{sorted(modes)} — a different mode packs the same bytes "
+                f"with different meaning")
         if dtypes != {mx.bfloat16}:
             raise ValueError(
                 f"native decode reads scales/biases as bfloat16, build has "
@@ -2970,6 +2977,12 @@ def _moe_kernel_usable(glu) -> bool:
         return False
     projs = (glu.gate_proj, glu.up_proj, glu.down_proj)
     if not all(isinstance(p, QuantizedSwitchLinear) for p in projs):
+        return False
+    # AFFINE packing only. mxfp4 stores a shared exponent instead of a
+    # scale/bias pair and packs differently, so these kernels would read it at
+    # the right addresses with the wrong meaning — plausible garbage, no error.
+    # Qwen3.5-122B-A10B ships mxfp4, so this is not hypothetical.
+    if any(getattr(p, "mode", "affine") != "affine" for p in projs):
         return False
     recipes = {(p.bits, p.group_size) for p in projs}
     if len(recipes) != 1:

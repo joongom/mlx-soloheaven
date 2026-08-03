@@ -2052,6 +2052,14 @@ def test_quant_spec_rejects_builds_the_kernels_cannot_read():
         sp = spec_of([("layers.0.attn.wq_a", FakeMod(bits, gs)), exp])
         assert f"#define QD_VPW  {32 // bits}" in sp.defines()
 
+    # mxfp4 packs the same bytes with a different meaning (shared exponent,
+    # no bias): reading it as affine yields plausible garbage, not an error.
+    # Qwen3.5-122B-A10B ships mxfp4, so this is a build we can actually meet.
+    mxfp4 = FakeMod(4, 32)
+    mxfp4.mode = "mxfp4"
+    with pytest.raises(ValueError, match="AFFINE"):
+        spec_of([dense, ("layers.0.ffn.experts.gate_proj", mxfp4)])
+
     for mods, why in [
         ([dense], "no expert weights"),
         ([exp], "no dense weights"),

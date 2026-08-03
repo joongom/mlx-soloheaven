@@ -591,3 +591,22 @@ def test_moe_kernel_matches_dequantized_reference_at_any_supported_width(bits):
         ref = ref + float(wts[0, 0, slot]) * (dn @ h.astype(mx.float32))
     mx.eval(ref)
     assert np.abs(got.reshape(-1) - np.array(ref)).max() < 2e-2
+
+
+def test_moe_kernel_gate_refuses_non_affine_quantization():
+    """`_moe_kernel_usable` widened to every bit width the kernels can read;
+    it must NOT widen to other MODES. mxfp4 stores a shared exponent instead
+    of scale/bias, so the affine unpack would return plausible garbage with no
+    error — and Qwen3.5-122B-A10B ships mxfp4."""
+    import mlx.nn as nn
+    from mlx_lm.models.switch_layers import SwitchGLU
+
+    from mlx_soloheaven.models.deepseek_v4 import ClippedSwiGLU, _moe_kernel_usable
+
+    glu = SwitchGLU(128, 192, 8, activation=ClippedSwiGLU(10.0), bias=False)
+    nn.quantize(glu, group_size=64, bits=8)
+    assert _moe_kernel_usable(glu)
+
+    for proj in (glu.gate_proj, glu.up_proj, glu.down_proj):
+        proj.mode = "mxfp4"
+    assert not _moe_kernel_usable(glu)

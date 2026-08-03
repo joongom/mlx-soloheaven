@@ -3155,11 +3155,79 @@ class MLXEngine(SessionCacheMixin):
             formatted.append(m)
         return formatted
 
+    #: Marker opening the injected block, so the injection is idempotent and
+    #: greppable in a captured prompt.
+    _TOOLS_INJECT_MARKER = "# Tools (server-rendered)"
+
+    def _template_renders_tools(self) -> bool:
+        """Does this model's chat template have a slot for tool DEFINITIONS?
+
+        Most families' templates do. DeepSeek-V4's does not: it renders tool
+        RESULTS (`<tool_result>`) but never mentions `tools`, so
+        ``apply_chat_template(..., tools=[...])`` silently drops them — the
+        model never learns the tool names or the call syntax, invents its own,
+        and the parser (which expects `<tool_call>`) finds nothing. The client
+        then gets no tool_calls and re-sends the same prompt.
+        """
+        cached = getattr(self, "_tmpl_tools_slot", None)
+        if cached is None:
+            tmpl = getattr(self.tokenizer, "chat_template", None) or ""
+            cached = "tools" in tmpl
+            self._tmpl_tools_slot = cached
+        return cached
+
+    def _render_tool_definitions(self, tools: list) -> str:
+        """Tool definitions as text, in the block syntax the parser expects
+        (tool_parser's chatml/qwen/glm form — the deepseek family falls back
+        to it)."""
+        lines = [
+            self._TOOLS_INJECT_MARKER,
+            "",
+            "Call a tool by emitting EXACTLY this block and nothing else:",
+            "<tool_call><function=NAME><parameter=KEY>VALUE</parameter>"
+            "</function></tool_call>",
+            "",
+            "Available tools:",
+        ]
+        for t in tools:
+            fn = (t.model_dump() if hasattr(t, "model_dump") else t).get("function", {})
+            params = (fn.get("parameters") or {}).get("properties") or {}
+            required = set((fn.get("parameters") or {}).get("required") or [])
+            args = ", ".join(
+                f"{k}{'' if k in required else '?'}: {v.get('type', 'any')}"
+                for k, v in params.items()
+            )
+            desc = (fn.get("description") or "").strip().replace("\n", " ")
+            lines.append(f"- {fn.get('name')}({args})" + (f" — {desc}" if desc else ""))
+        return "\n".join(lines)
+
+    def _inject_tools_if_template_lacks_slot(
+        self, formatted: list[dict], tools: list | None,
+    ) -> list[dict]:
+        """Put tool definitions in the SYSTEM message when the template has no
+        place for them. Templates that DO render tools are left alone, so this
+        cannot double-describe the tools for other families."""
+        if not tools or self._template_renders_tools():
+            return formatted
+        block = self._render_tool_definitions(tools)
+        out, injected = [], False
+        for m in formatted:
+            if not injected and m.get("role") == "system":
+                text = m.get("content") or ""
+                if self._TOOLS_INJECT_MARKER not in text:  # idempotent
+                    m = {**m, "content": (f"{text}\n\n{block}" if text else block)}
+                injected = True
+            out.append(m)
+        if not injected:
+            out.insert(0, {"role": "system", "content": block})
+        return out
+
     def _build_prompt_text(
         self, messages: list[dict], thinking: bool = True, tools: list | None = None,
     ) -> str:
         """Build prompt text from messages using chat template (tokenize=False)."""
-        formatted = self._format_messages(messages)
+        formatted = self._inject_tools_if_template_lacks_slot(
+            self._format_messages(messages), tools)
         kwargs = {
             "tokenize": False,
             "add_generation_prompt": True,
@@ -3175,7 +3243,8 @@ class MLXEngine(SessionCacheMixin):
         self, messages: list[dict], thinking: bool = True, tools: list | None = None,
     ) -> list[int]:
         """Tokenize messages using chat template (tokenize=True)."""
-        formatted = self._format_messages(messages)
+        formatted = self._inject_tools_if_template_lacks_slot(
+            self._format_messages(messages), tools)
         kwargs = {
             "tokenize": True,
             "add_generation_prompt": True,

@@ -2118,3 +2118,40 @@ def test_native_decode_falls_back_when_the_build_is_unsupported(monkeypatch, cap
     ref = model(mx.array([[9]], dtype=mx.int32), cache2)
     mx.eval(ref)
     assert np.abs(got - np.array(ref.reshape(-1).astype(mx.float32))).max() == 0.0
+
+
+def test_native_stale_detects_an_in_place_cache_write(monkeypatch):
+    """REGRESSION: the staleness guard used to rely on python object identity,
+    documented as "mx setitem allocates new buffers, so ANY non-native touch
+    changes identity". Measured, that is false in the half that matters:
+
+        a = mx.zeros(256); p0 = buffer_of(a)
+        a[0:4] = 1                       # same object, DIFFERENT buffer
+        id(a) unchanged, p0 != buffer_of(a)
+
+    So a write that keeps the object would leave the runtime reading and
+    writing a buffer the model no longer uses — silently, because every kernel
+    still runs and every number still looks like a number.
+    """
+    from mlx_soloheaven.native.decoder import NativeDecoder
+
+    monkeypatch.setenv("SOLOHEAVEN_NATIVE_MAX_CONTEXT", "512")
+    model = _tiny_dsv4_model()
+    cache = model.make_cache()
+    mx.eval(model(mx.array([[3, 5, 7, 9]], dtype=mx.int32), cache))
+    mx.synchronize()
+
+    dec = NativeDecoder(model, cache=cache)
+    assert not dec.rebound(), "fresh decoder must not report a rebind"
+    assert not model._native_stale(dec, cache)
+
+    # in-place write: the object survives, the buffer does not
+    ring = cache[0].ring
+    before = id(ring)
+    ring[0, 0, 0] = mx.array(1.0, dtype=ring.dtype)
+    mx.eval(ring)
+    mx.synchronize()
+    assert id(cache[0].ring) == before, "precondition: the object is unchanged"
+
+    assert dec.rebound(), "the borrowed address moved and was not noticed"
+    assert model._native_stale(dec, cache), "guard must force a rebind"

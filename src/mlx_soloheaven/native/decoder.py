@@ -93,6 +93,7 @@ class NativeDecoder:
         self.table = rt.BufferTable()
         self.S: dict[str, int] = {}
         self._arrays: dict[str, mx.array] = {}
+        self._borrowed: dict[str, int] = {}   # name -> MTLBuffer we registered
         self._alloc_scratch()
         self._logits = self._reg("logits", mx.zeros((self.vocab,), mx.bfloat16))
         self._layers = [self._alloc_layer(i) for i in range(self.n_layers)]
@@ -119,7 +120,33 @@ class NativeDecoder:
         slot = self.table.add(arr)
         self.S[name] = slot
         self._arrays[name] = arr
+        if self.cache is not None:
+            # Record the ADDRESS we borrowed, not just the object. See
+            # rebound().
+            self._borrowed[name] = rt.mtl_buffer(arr)[0]
         return slot
+
+    def rebound(self) -> bool:
+        """Has any borrowed cache array moved to a different MTLBuffer?
+
+        The staleness guard used to compare python object identity, on the
+        stated assumption that "mx setitem allocates new buffers, so ANY
+        non-native touch changes identity". Half of that is true and the half
+        that matters is not: `a[i:j] = v` leaves `a` the SAME python object
+        while moving its buffer (measured: id stable, pointer 0x7a53bca80 ->
+        0x7a53bd180). An identity check cannot see that, and the runtime would
+        keep reading and writing the buffer the model has stopped using —
+        silently, since every kernel still runs and every number still looks
+        like a number.
+
+        So compare what we actually borrowed: the addresses.
+        """
+        if self.cache is None:
+            return False
+        for name, ptr in self._borrowed.items():
+            if rt.mtl_buffer(self._arrays[name])[0] != ptr:
+                return True
+        return False
 
     def _z(self, n, dt=mx.bfloat16):
         return mx.zeros((n,), dtype=dt)

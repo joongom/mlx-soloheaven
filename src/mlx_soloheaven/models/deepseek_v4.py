@@ -3331,12 +3331,19 @@ class Model(nn.Module):
     def _native_stale(self, dec, cache) -> bool:
         """The native decoder borrows the cache's arrays; it is stale the
         moment anything replaced them — a prefill batch, a state restore, a
-        different session's cache list — detectable as list identity, offset
-        divergence, or per-layer array identity changes (mx setitem allocates
-        new buffers, so ANY non-native touch changes identity)."""
+        different session's cache list.
+
+        The object-identity checks below catch a REBIND (`c.ring = ...`), which
+        is what a state restore and a growth do. They do NOT catch an in-place
+        write: `a[i:j] = v` keeps the same python object and still moves the
+        buffer (measured). That is what dec.rebound() is for — it compares the
+        addresses actually borrowed. Keep both: identity is free, the address
+        sweep costs ~0.3 ms/token and is the only one that cannot be fooled."""
         if dec is None or dec.cache is not cache or dec.offset != cache[0].offset:
             return True
         if dec.overflowing():  # a compressed buffer is full — rebind over a grown one
+            return True
+        if dec.rebound():      # a borrowed array moved to another MTLBuffer
             return True
         for i, c in enumerate(cache):
             if dec._arrays[f"L{i}_ring"] is not c.ring:

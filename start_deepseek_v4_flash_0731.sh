@@ -42,6 +42,10 @@ MODEL_PATH="${MODEL_PATH:-$HOME/.lmstudio/models/mlx-soloheaven/DeepSeek-V4-Flas
 
 cd "$(dirname "$0")"
 source .venv/bin/activate
+# Native replay decode: 2.0x (37.0 ms / 27.0 tok/s vs 74.3 ms compiled) at
+# equal perplexity. Opt-in, and it disables itself back to the compiled
+# path on any build its kernels cannot read — see docs/benchmarks/deepseek-v4.md.
+export SOLOHEAVEN_NATIVE_DECODE=1
 export SOLOHEAVEN_MODELS=""
 mlx-soloheaven \
   --model "$MODEL_PATH" \

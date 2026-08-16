@@ -610,3 +610,40 @@ def test_moe_kernel_gate_refuses_non_affine_quantization():
     for proj in (glu.gate_proj, glu.up_proj, glu.down_proj):
         proj.mode = "mxfp4"
     assert not _moe_kernel_usable(glu)
+
+
+def test_a_retired_native_flag_name_warns_instead_of_being_silent(monkeypatch, caplog):
+    """A stale export is otherwise invisible: the server starts, serves
+    correct output, and is simply ~2x slower. That cost a whole session of
+    'why is this 15 tok/s'."""
+    import logging
+
+    import mlx_soloheaven.models.deepseek_v4 as v4
+
+    monkeypatch.setattr(v4, "_WARNED_STALE_FLAG", False)
+    monkeypatch.delenv(v4._NATIVE_FLAG, raising=False)
+    monkeypatch.setenv("SOLOHEAVEN_DSV4_NATIVE", "1")
+
+    with caplog.at_level(logging.WARNING):
+        assert v4._NATIVE_DECODE_ENABLED() is False
+    assert "RENAMED" in caplog.text and v4._NATIVE_FLAG in caplog.text
+
+    # warns once, not per decoded token
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        v4._NATIVE_DECODE_ENABLED()
+    assert caplog.text == ""
+
+
+def test_the_current_flag_name_enables_without_warning(monkeypatch, caplog):
+    import logging
+
+    import mlx_soloheaven.models.deepseek_v4 as v4
+
+    monkeypatch.setattr(v4, "_WARNED_STALE_FLAG", False)
+    monkeypatch.setattr(v4, "_NATIVE_DECODE_BROKEN", False)
+    monkeypatch.setenv("SOLOHEAVEN_DSV4_NATIVE", "1")     # stale one also set
+    monkeypatch.setenv(v4._NATIVE_FLAG, "1")
+    with caplog.at_level(logging.WARNING):
+        assert v4._NATIVE_DECODE_ENABLED() is True
+    assert caplog.text == ""

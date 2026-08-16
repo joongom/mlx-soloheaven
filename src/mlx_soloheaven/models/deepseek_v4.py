@@ -1299,10 +1299,38 @@ def _COMPILED_DECODE_ENABLED() -> bool:
 _NATIVE_DECODE_BROKEN = False
 
 
+#: Names this switch has had. A stale export is silent — the server starts,
+#: serves correctly, and is simply 2x slower — which is exactly how it went
+#: unnoticed for a whole session. Say so once, loudly, instead.
+_NATIVE_FLAG = "SOLOHEAVEN_NATIVE_DECODE"
+_NATIVE_FLAG_FORMER = ("SOLOHEAVEN_DSV4_NATIVE",)
+
+
+def _warn_stale_native_flag() -> None:
+    """Warn once if a RETIRED name for the native switch is exported."""
+    global _WARNED_STALE_FLAG
+    if _WARNED_STALE_FLAG or os.environ.get(_NATIVE_FLAG):
+        return
+    stale = [n for n in _NATIVE_FLAG_FORMER if os.environ.get(n)]
+    if stale:
+        import logging
+
+        _WARNED_STALE_FLAG = True
+        logging.getLogger(__name__).warning(
+            "[deepseek_v4] %s is set but was RENAMED to %s — native decode is "
+            "OFF and this build is running the ~2x slower compiled path. "
+            "Export %s=1 instead.",
+            ", ".join(stale), _NATIVE_FLAG, _NATIVE_FLAG)
+
+
+_WARNED_STALE_FLAG = False
+
+
 def _NATIVE_DECODE_ENABLED() -> bool:
+    _warn_stale_native_flag()
     return (
         not _NATIVE_DECODE_BROKEN
-        and os.environ.get("SOLOHEAVEN_NATIVE_DECODE", "0") == "1"
+        and os.environ.get(_NATIVE_FLAG, "0") == "1"
     )
 
 

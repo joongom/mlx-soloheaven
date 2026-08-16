@@ -281,7 +281,7 @@ class NativeDecoder:
 
     def _build_plan(self, cb: P.ConstBlob, token: int):
         pl = P.Planner(self.rt, self.table, cb, self.S,
-                       qmv=self.quant.qmv_kernel())
+                       qmv=self.quant.qmv_kernel(), scores_cap=self._cap)
         tok_off, _ = cb.add("i", token)
         self._tok_off = tok_off
         items = P.plan_embed(pl, self.model.embed, "ha", self.hc, self.hidden, tok_off)

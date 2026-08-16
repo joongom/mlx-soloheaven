@@ -43,12 +43,16 @@ class ConstBlob:
 class Planner:
     """Holds the runtime, table, const blob and scratch, and builds items."""
 
-    def __init__(self, rt, table, cb: ConstBlob, scratch: dict, qmv: str | None = None):
+    def __init__(self, rt, table, cb: ConstBlob, scratch: dict, qmv: str | None = None,
+                 scores_cap: int | None = None):
         self.rt = rt
         self.t = table
         self.cb = cb
         self.S = scratch  # name -> table slot (pre-registered scratch buffers)
         self.qmv_kernel = qmv or _QMV_DEFAULT
+        #: length of the shared `scores` scratch, so the indexer can refuse to
+        #: dispatch past it instead of writing out of bounds.
+        self.scores_cap = scores_cap
 
     def _pi(self, kernel, custom, bufs, bytes_, grid, group, barrier=True):
         from mlx_soloheaven.native.runtime import plan_item
@@ -174,7 +178,20 @@ def plan_indexer(pl: Planner, idxr, freqs, xin: str, qr: str, idx_cache: dict,
                              idx_cache, ioff_off, n,
                              kv_off=ickv_off, sc_off=icwg_off)
     isk, itk = BUFFER_SLOTS["sh_dsv4_idx_score_k"], BUFFER_SLOTS["sh_dsv4_idx_topk_k"]
-    cap = 256
+    # One threadgroup per compressed group. This MUST cover every group the
+    # top-k may look at, which is `ncomp` (= n+1, the post-step visible count
+    # this plan serves) — NOT a constant. It was hardcoded to 256: past that,
+    # groups were never dispatched, so their score slots held whatever the
+    # shared scratch had (zeros, or the previous layer's gate scores) and the
+    # indexer ranked the older conversation on garbage. Invisible below
+    # index_topk groups, because there the top-k takes its "select everything"
+    # fast path and never reads a score at all — which is why 272-token probes
+    # and a 400-token generation both passed.
+    cap = max(int(ncomp), 1)
+    if pl.scores_cap is not None and cap > pl.scores_cap:
+        raise RuntimeError(
+            f"indexer needs {cap} score slots but the scratch holds "
+            f"{pl.scores_cap} — grow SOLOHEAVEN_NATIVE_MAX_CONTEXT")
     sp, _ = pl.cb.add("4i", n_h, hd, rd, cap)
     sf, _ = pl.cb.add("f", hd ** -0.5 * n_h ** -0.5)
     tp, _ = pl.cb.add("2i", cap, idxr.topk)

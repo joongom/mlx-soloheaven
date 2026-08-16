@@ -2155,3 +2155,88 @@ def test_native_stale_detects_an_in_place_cache_write(monkeypatch):
 
     assert dec.rebound(), "the borrowed address moved and was not noticed"
     assert model._native_stale(dec, cache), "guard must force a rebind"
+
+
+def test_native_indexer_scores_every_visible_group_not_just_256():
+    """REGRESSION — the long-context quality bug.
+
+    plan_indexer dispatched a CONSTANT 256 threadgroups for the score kernel
+    while the top-k reads `n2` of them. Past 256 completed groups the rest were
+    never dispatched, so their slots in the shared `scores` scratch held zeros
+    or the previous layer's MoE gate scores, and the indexer ranked the older
+    conversation on that. In production the model then answers as if it cannot
+    see the system prompt: everything older than the 128-token sliding window
+    is reachable ONLY through these groups.
+
+    Invisible until n2 exceeds index_topk — below that the top-k selects
+    everything and never reads a score — which is why every short probe passed.
+
+    Two halves: the score kernel must WRITE every visible slot (including the
+    -inf tail), and the selection over a DIRTY scratch must still match the
+    reference top-k.
+    """
+    from mlx_soloheaven.models.deepseek_v4 import _IDX_SCORE_SRC  # noqa: F401
+    from mlx_soloheaven.native.kernels import BUFFER_SLOTS
+
+    hd, n_h, topk = 128, 4, 8
+    n2, cap = 400, 512            # n2 > 256 (the old constant) and > topk
+    offset = n2 * 4 - 1
+    rt_mod.load_custom_kernels(_RT, _TEST_DEFINES)
+
+    rng = np.random.default_rng(5)
+    buf = mx.array((rng.standard_normal((cap, hd)) * 0.5).astype(np.float32)).astype(mx.bfloat16)
+    q = mx.array((rng.standard_normal((n_h, hd)) * 0.5).astype(np.float32)).astype(mx.bfloat16)
+    w = mx.array((rng.standard_normal((n_h,)) * 0.5).astype(np.float32)).astype(mx.bfloat16)
+    freqs = mx.array((1.0 / (10000 ** (np.arange(32) / 32))).astype(np.float32))
+    # DIRTY scratch: zeros would flatter the bug, real runs share this buffer
+    # with the MoE gate.
+    scores = mx.full((4096,), 7.0, dtype=mx.float32)
+    oi = mx.full((topk,), -1, dtype=mx.int32)
+    mx.eval(buf, q, w, freqs, scores, oi)
+    mx.synchronize()
+
+    table = rt_mod.BufferTable()
+    s = {n: table.add(a) for n, a in
+         [("q", q.reshape(-1)), ("buf", buf.reshape(-1)), ("w", w),
+          ("freqs", freqs), ("scores", scores), ("cidx", oi)]}
+    isk, itk = BUFFER_SLOTS["sh_dsv4_idx_score_k"], BUFFER_SLOTS["sh_dsv4_idx_topk_k"]
+    cb = ConstBlob()
+    rd = 64
+    sp, _ = cb.add("4i", n_h, hd, rd, n2)          # cap == the visible count
+    sf, _ = cb.add("f", hd ** -0.5 * n_h ** -0.5)
+    tp, _ = cb.add("2i", n2, topk)
+    io, _ = cb.add("2i", offset, n2)
+    it_sc = rt_mod.plan_item(
+        _RT, "sh_dsv4_idx_score_k", True,
+        [(s["q"], isk["q"]), (s["buf"], isk["buf"]), (s["w"], isk["w"]),
+         (s["freqs"], isk["freqs"]), (s["scores"], isk["scores"])],
+        [(sp, 16, isk["params"]), (sf, 4, isk["fscal"]), (io, 8, isk["ioff"])],
+        (n2, 1, 1), (256, 1, 1))
+    it_tk = rt_mod.plan_item(
+        _RT, "sh_dsv4_idx_topk_k", True,
+        [(s["scores"], itk["scores"]), (s["cidx"], itk["out_idx"])],
+        [(tp, 8, itk["params"]), (io, 8, itk["ioff"])], (1, 1, 1), (256, 1, 1))
+    _RT.commit([it_sc, it_tk], table.ptrs, cb.bytes(), wait=True)
+    mx.synchronize()
+
+    sc = np.array(scores)[:n2]
+    assert not np.any(sc == 7.0), (
+        f"{int((sc == 7.0).sum())} visible slots were never written — the "
+        "score dispatch does not cover every group")
+
+    exp = set(np.argsort(-sc, kind="stable")[:topk].tolist())
+    got = set(int(v) for v in np.array(oi))
+    assert -1 not in got, f"padding leaked into a full selection: {sorted(got)}"
+    assert got == exp, f"extra {sorted(got - exp)}, missed {sorted(exp - got)}"
+
+
+def test_plan_indexer_sizes_the_score_dispatch_from_ncomp():
+    """The wiring half: the grid must follow ncomp, never a constant."""
+    import inspect
+
+    from mlx_soloheaven.native import plan as plan_mod
+
+    src = inspect.getsource(plan_mod.plan_indexer)
+    assert "cap = 256" not in src, "the constant dispatch width is back"
+    assert "ncomp" in src.split("isk, itk")[1], (
+        "the score dispatch width must derive from ncomp")

@@ -13,11 +13,15 @@ whose ppl on the same harness is 3.649. **The 27 tok/s goal is MET**; ds4 on
 this machine is 27.34 tok/s (36.6 ms), so this is parity within 0.3 ms.
 Opt-in via `SOLOHEAVEN_NATIVE_DECODE=1`.
 
-**Quote the context length with any decode number here.** Serving lives at
-thousands of tokens, and the numbers move: 43.4 ms at 1k, 52.7 ms at 2k,
-54.3 ms at 4k (compiled: 81 / 87 / 87). Native stays 1.6-1.9x ahead across
-that range — but only since Stage 4m, which found a 7x long-context
-regression that every short-prompt benchmark in this file had missed.
+**Quote the context length with any decode number here — and with any QUALITY
+number too.** Serving lives at thousands of tokens, and both move. Speed:
+43.4 ms at 1k, 52.7 ms at 2k, 54.3 ms at 4k (compiled: 81 / 87 / 87); native
+stays 1.6-1.9x ahead across that range, but only since Stage 4m, which found
+a 7x long-context regression every short-prompt benchmark here had missed.
+Quality: the 3.6516 ppl above is a **272-token** measurement and Stage 4n is
+what it failed to see — a native-only defect that could not fire below 2048
+tokens of context. Native-vs-compiled logit agreement is now flat to 12k
+(median |Δ| 0.13-0.16, top-1 100%); anything longer is unmeasured.
 
 Open work, in priority order:
 
@@ -1288,6 +1292,63 @@ key, 32 exact halvings, one parallel emit pass, deterministic tie top-up).
   runs the deployed shape and carries a **time budget** (3 ms/dispatch; the
   old code fails it at 627 ms). Where a kernel has a size-dependent
   algorithm, assert the cost, not only the answer.
+
+### Stage 4n — the indexer scored 256 groups and ranked n2 of them (2026-08-16)
+
+Reported from serving, not from a probe: with the native path the model
+answers as if the system prompt does not exist — a generic greeting, no user
+name, no project names — while the compiled path uses all of it. Sometimes it
+switches to reasoning in Chinese.
+
+That shape is diagnostic. The sliding window covers the last 128 tokens;
+**everything older is reachable ONLY through the compressed groups the DSA
+indexer selects.** An answer that has the recent turn but none of the prompt
+is the compressed path failing, not the attention math.
+
+Cause, in `native/plan.py`: the score dispatch was sized by a hardcoded
+`cap = 256` while `sh_dsv4_idx_topk_k` reads `n2` slots. Past 256 completed
+groups the rest were never dispatched — not even the `-inf` tail the kernel
+writes for `g >= n2` — so those slots held whatever the SHARED `scores`
+scratch had: zeros at first, then the previous layer's MoE gate scores. All
+21 ratio-4 layers ranked the older conversation on that. `ncomp` was already
+a parameter of `plan_indexer`; it was simply ignored.
+
+Measured, native vs compiled logits from an IDENTICAL cache state, 32
+teacher-forced positions each:
+
+| context | median \|Δlogit\| before | after |
+|---|---:|---:|
+| 512 | 0.0625 | 0.0625 |
+| 4,096 | 0.469 | **0.141** |
+| 8,192 | 0.813 | **0.133** |
+| 12,288 | 0.914 | **0.156** |
+
+Before the fix the divergence GREW with context; after it is flat at the
+bf16-accumulation-order floor the short-context rows already showed. 512 is
+unchanged because the bug cannot fire there — see below.
+
+**Why every gate missed it.** Below `index_topk` completed groups the top-k
+takes a "select everything" fast path and never reads a score at all. With
+index_topk=512 at ratio 4 that is 2048 tokens of context. The perplexity
+gate runs 272 tokens. The long generation probe ran 400. The multi-turn
+harness ran 31 tokens a turn. Every plan test builds n2 < 256. **The quality
+gate and the bug's regime never intersected.**
+
+This is the same lesson as Stage 4m, which was written into this file after
+the long-context SPEED cliff and then not applied to quality. Both gates now
+need to state the context length they cover:
+
+* **Stage 4m (speed):** benchmark the regime you serve.
+* **Stage 4n (quality):** and gate quality in it too. `ppl` at 272 tokens is
+  not evidence about a 12k-token session.
+
+Honest limit of the verification: top-1 agreement was 100% at every context
+BOTH before and after, so on synthetic repetitive text a 0.9 logit error
+never flipped a token. The production symptom is far more dramatic, which
+means either the real sessions are longer than 12k (server metrics put a
+real agent client's prompts at 5k-24k tokens by TTFT) or something else
+contributes.
+Not closed on the strength of this table alone.
 
 ## 3. Reproduce
 

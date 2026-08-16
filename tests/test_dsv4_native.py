@@ -1974,7 +1974,11 @@ def test_native_idx_topk_selects_true_topk_at_deployed_scale():
     for _ in range(20):
         _RT.commit([it], table.ptrs, blob, wait=True)
     ms = (time.perf_counter() - t0) / 20 * 1e3
-    assert ms < 3.0, f"idx_topk at the deployed shape took {ms:.2f} ms/dispatch"
+    # Budget, not a benchmark: the rewrite runs ~0.05 ms and the single-thread
+    # selection sort it replaced took 627 ms. 20 ms sits 30x under the bug and
+    # 400x over the fix, so it still fails loudly without flaking when the
+    # machine is busy (a 3 ms bound did flake right after a 94 GB model run).
+    assert ms < 20.0, f"idx_topk at the deployed shape took {ms:.2f} ms/dispatch"
 
 
 @pytest.mark.parametrize("exp_bits", [2, 4])

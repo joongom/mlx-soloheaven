@@ -922,7 +922,7 @@ def test_u12_r2_gemma4_multicycle_engine_extracts_and_strips(monkeypatch):
     # Finding B gate: gemma4 + thinking=False takes an honest MISS/rebuild
     # (never a HIT) — stub full tokenization so the drive proceeds; the
     # parse/strip behavior under test is post-stream and path-independent.
-    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None: list(stored)
+    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None, **_kw: list(stored)
     _restamp_contract(
         eng, thinking=False, tools=type(eng)._canonical_tools(_TOOLS),
     )
@@ -2171,7 +2171,7 @@ def test_r4_f4_gemma4_orphan_close_engine_parse_and_strip(monkeypatch):
     # Finding B gate: gemma4 + thinking=False takes an honest MISS/rebuild
     # (never a HIT) — stub full tokenization so the drive proceeds; the
     # parse/strip behavior under test is post-stream and path-independent.
-    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None: list(stored)
+    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None, **_kw: list(stored)
     _restamp_contract(
         eng, thinking=False, tools=type(eng)._canonical_tools(_TOOLS),
     )

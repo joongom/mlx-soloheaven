@@ -399,7 +399,7 @@ def _e2e_engine(base_entry, full_prompt):
     eng._sliding_window_size = 0
     eng._base_caches = {base_entry.system_hash: base_entry}
     eng._tokenize_prompt = (
-        lambda msgs, thinking=None, tools=None: list(full_prompt)
+        lambda msgs, thinking=None, tools=None, **_kw: list(full_prompt)
     )
     return eng
 

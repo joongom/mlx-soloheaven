@@ -110,7 +110,7 @@ def test_vlm_path_token_ids_extended_with_generated(monkeypatch):
     prompt_text = "hello"
     expected_prompt_ids = [ord(c) for c in f"<user>{prompt_text}"]
     # Override _tokenize_prompt for total control.
-    eng._tokenize_prompt = lambda messages, thinking=True, tools=None: list(
+    eng._tokenize_prompt = lambda messages, thinking=True, tools=None, **_kw: list(
         expected_prompt_ids
     )
 
@@ -160,7 +160,7 @@ def test_mlx_lm_path_token_ids_extended_with_generated(monkeypatch):
 
     prompt_text = "world"
     expected_prompt_ids = [ord(c) for c in f"<user>{prompt_text}"]
-    eng._tokenize_prompt = lambda messages, thinking=True, tools=None: list(
+    eng._tokenize_prompt = lambda messages, thinking=True, tools=None, **_kw: list(
         expected_prompt_ids
     )
 
@@ -222,7 +222,7 @@ def test_generation_install_marks_session_dirty_engine_side(monkeypatch):
     del eng._mark_dirty
     eng._dirty_lock = threading.Lock()
 
-    eng._tokenize_prompt = lambda messages, thinking=True, tools=None: [1, 2, 3]
+    eng._tokenize_prompt = lambda messages, thinking=True, tools=None, **_kw: [1, 2, 3]
     monkeypatch.setattr(
         mlx_engine_module,
         "vlm_stream_generate",

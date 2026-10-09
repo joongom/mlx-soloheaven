@@ -2350,7 +2350,7 @@ def test_generate_locked_cancel_before_any_token_hybrid_invalidates(monkeypatch)
     assert [m.get("content") for m in orig_sess.messages] == ["u1", "a1"]
 
     # Next request: no live cache -> MISS -> full tokenized prompt cold-fill.
-    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None: [11, 12, 13, 14]
+    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None, **_kw: [11, 12, 13, 14]
     _drive_full(eng, messages, max_tokens=1)
     assert prompts_seen[1] == [11, 12, 13, 14]
     new_cs = eng._sessions["s"].cache_state
@@ -2423,7 +2423,7 @@ def test_generate_locked_mtp_cancel_session_consistent_next_turn(monkeypatch):
     # Next same-history request: HIT requires a live cache -> honest MISS ->
     # the FULL tokenized prompt is cold-filled (no stale splice), and the
     # new MTP session finalizes into the consistent head-trailing layout.
-    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None: [11, 12, 13, 14]
+    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None, **_kw: [11, 12, 13, 14]
     chunks2 = _drive_full(eng, messages, max_tokens=3)
     # U7: the scripted cold-fill exhausts max_tokens without an EOS — a
     # normal (non-error) terminal that now correctly reports "length".
@@ -2604,7 +2604,7 @@ def test_generate_locked_cancel_chatml_close_unavailable_invalidates(
 
     # Next same-history request: HIT requires a live cache → honest MISS →
     # the FULL tokenized prompt cold-fills (no stale splice).
-    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None: [11, 12, 13, 14]
+    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None, **_kw: [11, 12, 13, 14]
     _drive_full(eng, messages, max_tokens=1)
     assert prompts_seen[1] == [11, 12, 13, 14]
 

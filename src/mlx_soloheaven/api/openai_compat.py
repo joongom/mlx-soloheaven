@@ -6,6 +6,7 @@ GET  /v1/models
 
 import asyncio
 import json
+import re
 import math
 import time
 import uuid
@@ -39,16 +40,21 @@ from mlx_soloheaven.api.errors import (
     structured_output_unavailable_response,
     CODE_ENGINE_BUSY,
     CODE_ENGINE_NOT_READY,
+    CODE_INVALID_REQUEST,
     CODE_NOT_FOUND,
     CODE_SERVER_ERROR,
     RETRY_AFTER_ENGINE_NOT_READY,
     TYPE_ENGINE_BUSY,
     TYPE_ENGINE_NOT_READY,
+    TYPE_INVALID_REQUEST,
     TYPE_NOT_FOUND,
     TYPE_SERVER_ERROR,
 )
 from mlx_soloheaven.engine.process_client import EngineRestartingError
-from mlx_soloheaven.engine.types import EngineBusyError
+from mlx_soloheaven.engine.types import (
+    EngineBusyError,
+    InvalidPromptParameterError,
+)
 from mlx_soloheaven.executors import run_critical, run_long, run_read
 from mlx_soloheaven import inference_queue
 from mlx_soloheaven.api import metrics
@@ -184,6 +190,68 @@ def _effective_thinking(request: ChatCompletionRequest, default: bool) -> bool:
     return bool(default)
 
 
+#: A reasoning-effort label is a short bare word (the values a chat template
+#: compares against: "xhigh", "medium", "low", ...). The ACCEPTED SET is the
+#: template's business, not ours — different families declare different
+#: vocabularies — so the API boundary only rejects shapes that could never be
+#: a label (non-strings, empty, whitespace, injection-length blobs). An
+#: unknown-but-well-formed label reaches the template, which raises its own
+#: "Unexpected reasoning effort ..." message; that is surfaced as a 400 by
+#: _reasoning_effort_render_error rather than guessed at here.
+_REASONING_EFFORT_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,31}")
+
+
+def _effective_reasoning_effort(request: ChatCompletionRequest):
+    """Resolve the ONE effective reasoning-effort label from the request.
+
+    Two inputs can carry it, mirroring the thinking flag (see
+    ``_effective_thinking``):
+      - the top-level ``reasoning_effort`` field (OpenAI-style), and
+      - ``chat_template_kwargs.reasoning_effort`` (the nested form, the shape
+        the value actually has in the chat template).
+
+    PRECEDENCE: an explicit top-level ``reasoning_effort`` wins when BOTH are
+    set; otherwise the nested one; otherwise None (the template's own default
+    applies — for Qwen3.8 that is "xhigh").
+
+    Returns the RAW value (not coerced): validation is a separate step so a
+    non-string can be reported as a 400 instead of silently stringified.
+    """
+    # getattr, not attribute access: internal callers (compaction, RPC
+    # paths, tests) pass duck-typed request objects that predate this
+    # field — the same defensive shape the session attrs use.
+    top = getattr(request, "reasoning_effort", None)
+    if top is not None:
+        return top
+    ctk = getattr(request, "chat_template_kwargs", None)
+    if ctk:
+        nested = ctk.get("reasoning_effort")
+        if nested is not None:
+            return nested
+    return None
+
+
+def _validate_reasoning_effort(value) -> Optional[JSONResponse]:
+    """400 for a reasoning-effort value that cannot be a template label.
+
+    Rejected at the boundary (before any stream starts) because the value is
+    rendered INSIDE the chat template: a non-string reaches jinja's comparison
+    as a foreign type and a long blob is prompt content wearing a parameter's
+    name. Well-formed-but-unknown labels are deliberately NOT rejected here —
+    only the model's own template knows its vocabulary."""
+    if value is None:
+        return None
+    # fullmatch, not match + "$": "$" also matches just before a trailing
+    # newline, so "low\n" passed and only failed later inside the template —
+    # after an SSE stream had already started with HTTP 200.
+    if not isinstance(value, str) or not _REASONING_EFFORT_RE.fullmatch(value):
+        return _invalid_request(
+            "'reasoning_effort': expected a short label string "
+            "(e.g. 'low', 'medium', 'xhigh' for Qwen3.8)"
+        )
+    return None
+
+
 def _validate_sampling_params(request: ChatCompletionRequest) -> Optional[JSONResponse]:
     """U20: validate sampling parameters at the API boundary.
 
@@ -282,6 +350,14 @@ async def chat_completions(
     if sampling_error is not None:
         return sampling_error
 
+    # Same boundary, same reason: the reasoning-effort label is rendered
+    # inside the chat template, so a malformed one is rejected before a
+    # stream can start (see _validate_reasoning_effort).
+    reasoning_effort = _effective_reasoning_effort(request)
+    effort_error = _validate_reasoning_effort(reasoning_effort)
+    if effort_error is not None:
+        return effort_error
+
     # U24: validate the ``stop`` parameter early (OpenAI: a string or an
     # array of up to 4 non-empty strings). Anything else is a 400, matching
     # OpenAI's invalid_request_error behavior.
@@ -377,6 +453,7 @@ async def chat_completions(
     logger.info(
         f"[Request] user={request.user!r}, model={request.model} -> {engine.model_id}, "
         f"stream={request.stream}, thinking={request.thinking}, "
+        f"reasoning_effort={reasoning_effort!r}, "
         f"max_tokens={request.max_tokens or request.max_completion_tokens}, "
         f"messages={len(request.messages)} | roles=[{roles_str}] (content redacted)"
     )
@@ -524,6 +601,8 @@ def _error_code_for_exception(exc: Exception) -> str:
     its reason (queue_full / engine_not_ready); anything else -> server_error.
     Kept to the SAME small vocabulary the HTTP error contract uses so the metric
     cardinality stays bounded."""
+    if isinstance(exc, InvalidPromptParameterError):
+        return "invalid_request"
     if isinstance(exc, EngineRestartingError):
         return "engine_not_ready"
     if isinstance(exc, EngineBusyError):
@@ -631,6 +710,7 @@ def _sync_completion(request: ChatCompletionRequest, engine: "MLXEngine"):
     # Batch B item 3: normalize top-level `thinking` and the nested
     # chat_template_kwargs.enable_thinking to ONE effective bool.
     enable_thinking = _effective_thinking(request, engine.cfg.enable_thinking)
+    reasoning_effort = _effective_reasoning_effort(request)
     tools = [t.model_dump() for t in request.tools] if request.tools else None
 
     response_format = request.response_format
@@ -692,6 +772,7 @@ def _sync_completion(request: ChatCompletionRequest, engine: "MLXEngine"):
         session_id=request.user,
         thinking=enable_thinking,
         thinking_budget=request.thinking_budget,
+        reasoning_effort=reasoning_effort,
         response_format=response_format,
         stop=request.stop,
     )
@@ -787,6 +868,22 @@ async def _stream_completion(
     try:
         async for chunk in body:
             yield chunk
+    except InvalidPromptParameterError as exc:
+        # A caller parameter the chat template refused (e.g. an unknown
+        # reasoning_effort label). The SSE response has already started, so the
+        # 400 cannot be sent as a status — emit the canonical envelope in band
+        # and terminate the stream properly. Without this the stream just STOPS
+        # after the role chunk: no error, no [DONE], nothing for the client to
+        # act on. The template's own message names the accepted labels and
+        # carries no prompt content, so it is passed through.
+        logger.warning(
+            f"[Stream] user={request.user!r} | invalid prompt parameter: {exc}"
+        )
+        if metric_sink is not None:
+            metric_sink.update(finish_reason="error", error_code="invalid_request")
+        err = error_dict(str(exc), TYPE_INVALID_REQUEST, CODE_INVALID_REQUEST)
+        yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
     except EngineRestartingError as exc:
         logger.error(
             f"[Stream] user={request.user!r} | engine unavailable mid-stream: {exc}"
@@ -833,6 +930,7 @@ async def _stream_completion_body(
     # Batch B item 3: top-level `thinking` and nested
     # chat_template_kwargs.enable_thinking normalize to ONE effective bool.
     enable_thinking = _effective_thinking(request, engine.cfg.enable_thinking)
+    reasoning_effort = _effective_reasoning_effort(request)
     thinking_budget = request.thinking_budget
 
     tools = [t.model_dump() for t in request.tools] if request.tools else None
@@ -996,6 +1094,7 @@ async def _stream_completion_body(
         tools=tools,
         thinking=enable_thinking,
         thinking_budget=thinking_budget,
+        reasoning_effort=reasoning_effort,
         response_format=response_format,
         stop=request.stop,
     )

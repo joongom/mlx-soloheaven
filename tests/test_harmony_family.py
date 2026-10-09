@@ -1213,7 +1213,7 @@ def test_hit_foreign_eos_untrimmable_honest_miss(monkeypatch):
     eng, cs, messages = _harmony_hit_engine(
         stored, suffix=[END_ID, 55, 66], cache=untrimmable,
     )
-    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None: [11, 12, 13]
+    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None, **_kw: [11, 12, 13]
     prompts_seen: list = []
     _scripted_lm_stream(monkeypatch, prompts_seen, [[(101, "a"), (102, "b")]])
 

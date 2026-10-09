@@ -11,6 +11,21 @@ from dataclasses import dataclass, asdict
 from typing import Optional
 
 
+class InvalidPromptParameterError(ValueError):
+    """A CALLER-supplied prompt-render parameter was rejected by the model's
+    chat template — a 400, not a 500.
+
+    The API boundary can only validate the SHAPE of such a parameter
+    (``reasoning_effort`` must look like a label); the accepted VOCABULARY
+    belongs to the template, which raises its own message ("Unexpected
+    reasoning effort high. Supported types are xhigh (default), medium, and
+    low."). Without this type that raise surfaced as an uncaught 500 and would
+    page someone for a client typo. Lives here (no mlx imports) so the
+    generation child, the parent proxy and the API layer share one type; the
+    process wire carries it as ``code="invalid_request"`` on the error frame.
+    """
+
+
 class EngineBusyError(RuntimeError):
     """A READ-ONLY engine query could not be served within its bounded wait
     because a generation currently owns the engine (in-process mode: the

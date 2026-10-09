@@ -65,10 +65,14 @@ def register_engine_error_handlers(app: FastAPI):
     NO ``detail: str(exc)`` in any body; the exception is logged only."""
     from mlx_soloheaven.api.errors import (
         engine_not_ready_response,
+        invalid_request_response,
         queue_full_response,
     )
     from mlx_soloheaven.engine.process_client import EngineRestartingError
-    from mlx_soloheaven.engine.types import EngineBusyError
+    from mlx_soloheaven.engine.types import (
+        EngineBusyError,
+        InvalidPromptParameterError,
+    )
 
     @app.exception_handler(EngineRestartingError)
     async def _engine_restarting_handler(request, exc):
@@ -76,6 +80,18 @@ def register_engine_error_handlers(app: FastAPI):
             f"[503] {request.method} {request.url.path} — engine unavailable: {exc}"
         )
         return engine_not_ready_response()
+
+    @app.exception_handler(InvalidPromptParameterError)
+    async def _invalid_prompt_parameter_handler(request, exc):
+        # A caller-supplied render parameter the model's chat template refused
+        # (e.g. reasoning_effort="high" on a template that accepts only
+        # xhigh/medium/low). The template's own message names the accepted
+        # values, so pass it through — it is the useful part for the caller and
+        # carries no prompt content.
+        logger.warning(
+            f"[400] {request.method} {request.url.path} — invalid prompt parameter: {exc}"
+        )
+        return invalid_request_response(str(exc))
 
     @app.exception_handler(EngineBusyError)
     async def _engine_busy_handler(request, exc):

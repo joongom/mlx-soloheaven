@@ -631,7 +631,7 @@ def test_wrapper_disk_resume_still_works_inside_gate(tmp_path, name, call):
     eng, loads = _preluded_shell(tmp_path)
     rebuilt: list = []
     eng._rebuild_session_locked = (
-        lambda sid, msgs, tools=None, thinking=True:
+        lambda sid, msgs, tools=None, thinking=True, **_kw:
             rebuilt.append(sid) or {"status": "ok", "cached_tokens": 1}
     )
 
@@ -924,7 +924,7 @@ def test_begin_shutdown_fires_cooperative_prefill_cancel(tmp_path):
     eng2._shutdown_cancel_event = threading.Event()
     seen: dict = {}
     eng2._touch_gpu = lambda: None
-    eng2._tokenize_prompt = lambda msgs, thinking=True, tools=None: [1, 2, 3]
+    eng2._tokenize_prompt = lambda msgs, thinking=True, tools=None, **_kw: [1, 2, 3]
     eng2._find_base_cache = lambda msgs, tools=None: None
     eng2._prefill_cache = (
         lambda cache, tokens, cancel_event=None:

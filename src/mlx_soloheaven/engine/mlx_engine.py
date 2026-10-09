@@ -209,6 +209,30 @@ CHATML_DIALECT_DEEPSEEK = ChatMLDialect(
 )
 
 
+def _retype_template_error(tokenizer, formatted, exc: Exception, kwargs: dict) -> Exception:
+    """Re-type a chat-template render failure ONLY when the caller's label
+    actually caused it.
+
+    "A label was present" is NOT evidence: the same templates raise for
+    reasons that are ours, not the caller's ("No user query found in
+    messages."), and blaming those on ``reasoning_effort`` both misleads the
+    caller and downgrades a real 500 into a 400 that echoes internal text.
+
+    So attribute it by EXPERIMENT, not by string-sniffing: re-render without
+    the label. Still fails => not the label's fault, keep the original type
+    (500). Succeeds => the label is what the template refused (400). The retry
+    runs only on the already-failed path, so it costs nothing in steady state.
+    """
+    if kwargs.get("reasoning_effort") is None:
+        return exc
+    probe = {k: v for k, v in kwargs.items() if k != "reasoning_effort"}
+    try:
+        tokenizer.apply_chat_template(formatted, **probe)
+    except Exception:  # noqa: BLE001 — fails without the label too => ours
+        return exc
+    return InvalidPromptParameterError(f"'reasoning_effort': {exc}")
+
+
 def detect_chatml_dialect(chat_template: str | None) -> ChatMLDialect | None:
     """Identify a ChatML dialect by template signature (name-independent).
 
@@ -637,6 +661,7 @@ from mlx_soloheaven.engine.types import (
     EngineBusyError,
     GenerationCancelled,
     GenerationResult,
+    InvalidPromptParameterError,
 )
 
 
@@ -3264,8 +3289,77 @@ class MLXEngine(SessionCacheMixin):
             out.insert(0, {"role": "system", "content": block})
         return out
 
+    def _template_declares_reasoning_effort(self) -> bool:
+        """Whether THIS model's chat template declares ``reasoning_effort``.
+
+        Qwen3.8 renders a reasoning-effort instruction from it (xhigh default,
+        medium, low); gemma4 / Qwen3.6 / glm / harmony never mention the name.
+        Forwarding the kwarg to a template that ignores it would be harmless
+        for RENDERING — jinja drops unknown render variables — but NOT for the
+        KV contract: the label would enter the prompt fingerprint and shard one
+        cache into one-per-label for prompts that render byte-identically. So
+        this probe gates BOTH the render kwarg and the fingerprint key.
+
+        Probed once from the template source and memoized; a tokenizer without
+        a template reads as "does not declare"."""
+        cached = getattr(self, "_reasoning_effort_supported", None)
+        if cached is None:
+            tmpl = getattr(self.tokenizer, "chat_template", None) or ""
+            cached = "reasoning_effort" in tmpl
+            self._reasoning_effort_supported = cached
+            if cached:
+                logger.info(
+                    f"[{self.model_id}] chat template declares reasoning_effort "
+                    f"— per-request labels are honored"
+                )
+        return cached
+
+    def _effective_reasoning_effort(
+        self, reasoning_effort: str | None, thinking: bool = True,
+    ) -> str | None:
+        """The label to actually render/fingerprint with, or None to drop it.
+
+        Dropped in two cases, and the SAME function decides for both the render
+        kwarg and the fingerprint — that coupling is what makes a wrong cache
+        reuse impossible: whatever is dropped from the prompt is dropped from
+        the contract, so the two can never disagree.
+
+        1. The template does not declare the variable (gemma4, Qwen3.6, glm,
+           harmony). Silent and deliberate: one client label may fan out to a
+           fleet whose other models ignore it, and those models must neither
+           fail nor shard their KV cache. Logged ONCE per model so a caller
+           experimenting with effort can see it is not taking effect.
+        2. Thinking is OFF for this turn. Reasoning effort is a control over
+           reasoning; with none happening the label is inert — Qwen3.8's
+           template skips the whole effort block when ``enable_thinking`` is
+           false, so low/medium/xhigh render byte-identically. Keeping the
+           label in the contract there would rebuild the KV cache on every
+           label change for a prompt that never changed.
+        """
+        if not reasoning_effort:
+            return None
+        if not self._template_declares_reasoning_effort():
+            if not getattr(self, "_reasoning_effort_drop_warned", False):
+                self._reasoning_effort_drop_warned = True
+                logger.warning(
+                    f"[{self.model_id}] reasoning_effort={reasoning_effort!r} "
+                    f"IGNORED — this model's chat template does not declare it "
+                    f"(requests are served unchanged; further drops not logged)"
+                )
+            return None
+        if not thinking:
+            return None
+        return reasoning_effort
+
+    def _fp_reasoning_effort(
+        self, reasoning_effort: str | None, thinking: bool = True,
+    ) -> str:
+        """Fingerprint form of the label ("" = absent, key omitted)."""
+        return self._effective_reasoning_effort(reasoning_effort, thinking) or ""
+
     def _build_prompt_text(
         self, messages: list[dict], thinking: bool = True, tools: list | None = None,
+        reasoning_effort: str | None = None,
     ) -> str:
         """Build prompt text from messages using chat template (tokenize=False)."""
         formatted = self._inject_tools_if_template_lacks_slot(
@@ -3275,14 +3369,21 @@ class MLXEngine(SessionCacheMixin):
             "add_generation_prompt": True,
             "enable_thinking": thinking,
         }
+        _effort = self._effective_reasoning_effort(reasoning_effort, thinking)
+        if _effort is not None:
+            kwargs["reasoning_effort"] = _effort
         if tools:
             kwargs["tools"] = [
                 t.model_dump() if hasattr(t, "model_dump") else t for t in tools
             ]
-        return self.tokenizer.apply_chat_template(formatted, **kwargs)
+        try:
+            return self.tokenizer.apply_chat_template(formatted, **kwargs)
+        except Exception as e:  # noqa: BLE001 — retype ONLY a caller-parameter fault
+            raise _retype_template_error(self.tokenizer, formatted, e, kwargs) from e
 
     def _tokenize_prompt(
         self, messages: list[dict], thinking: bool = True, tools: list | None = None,
+        reasoning_effort: str | None = None,
     ) -> list[int]:
         """Tokenize messages using chat template (tokenize=True)."""
         formatted = self._inject_tools_if_template_lacks_slot(
@@ -3292,11 +3393,17 @@ class MLXEngine(SessionCacheMixin):
             "add_generation_prompt": True,
             "enable_thinking": thinking,
         }
+        _effort = self._effective_reasoning_effort(reasoning_effort, thinking)
+        if _effort is not None:
+            kwargs["reasoning_effort"] = _effort
         if tools:
             kwargs["tools"] = [
                 t.model_dump() if hasattr(t, "model_dump") else t for t in tools
             ]
-        result = self.tokenizer.apply_chat_template(formatted, **kwargs)
+        try:
+            result = self.tokenizer.apply_chat_template(formatted, **kwargs)
+        except Exception as e:  # noqa: BLE001 — retype ONLY a caller-parameter fault
+            raise _retype_template_error(self.tokenizer, formatted, e, kwargs) from e
         # Some tokenizers return BatchEncoding instead of list[int]
         if hasattr(result, "input_ids"):
             return list(result.input_ids)
@@ -4041,6 +4148,7 @@ class MLXEngine(SessionCacheMixin):
         cancel_event: threading.Event | None = None,
         thinking: bool | None = None,
         thinking_budget: int | None = None,
+        reasoning_effort: str | None = None,
         response_format=None,
         stop: str | list[str] | None = None,
     ) -> Generator[GenerationResult, None, None]:
@@ -4095,6 +4203,8 @@ class MLXEngine(SessionCacheMixin):
                     _fp_thinking,
                     template_rev=self._suffix_template_rev(),
                     model_identity=self._model_identity(),
+                    reasoning_effort=self._fp_reasoning_effort(
+                        reasoning_effort, _fp_thinking),
                 ),
             )
             logger.debug(f"[Queue] session={sid} | lock acquired | waited={wait_ms:.0f}ms")
@@ -4118,6 +4228,7 @@ class MLXEngine(SessionCacheMixin):
                     cancel_event=cancel_event,
                     thinking=thinking,
                     thinking_budget=thinking_budget,
+                    reasoning_effort=reasoning_effort,
                     response_format=response_format,
                     stop_sequences=stop_sequences,
                 )
@@ -4422,6 +4533,7 @@ class MLXEngine(SessionCacheMixin):
         cancel_event: threading.Event | None = None,
         thinking: bool | None = None,
         thinking_budget: int | None = None,
+        reasoning_effort: str | None = None,
         top_p: float = 1.0,
         min_p: float = 0.0,
         top_k: int = 0,
@@ -4515,6 +4627,8 @@ class MLXEngine(SessionCacheMixin):
             _tools_canonical, use_thinking,
             template_rev=self._suffix_template_rev(),
             model_identity=self._model_identity(),
+            reasoning_effort=self._fp_reasoning_effort(
+                reasoning_effort, use_thinking),
         )
         _reusable = (
             session is not None
@@ -4705,6 +4819,7 @@ class MLXEngine(SessionCacheMixin):
         if cache_mode != "hit":
             prompt_token_ids = self._tokenize_prompt(
                 prompt_messages, thinking=use_thinking, tools=tools,
+                reasoning_effort=reasoning_effort,
             )
         total_prompt_tokens = len(prompt_token_ids)
 
@@ -5393,6 +5508,7 @@ class MLXEngine(SessionCacheMixin):
                         new_messages=new_messages,
                         accumulated_text=accumulated_text,
                         use_thinking=use_thinking,
+                        reasoning_effort=reasoning_effort,
                         hit_prior_len=_hit_prior_len,
                         prompt_len=len(full_prompt_token_ids),
                         reason=reason,
@@ -5766,6 +5882,7 @@ class MLXEngine(SessionCacheMixin):
                     new_messages=new_messages,
                     accumulated_text=accumulated_text,
                     use_thinking=use_thinking,
+                    reasoning_effort=reasoning_effort,
                     hit_prior_len=_hit_prior_len,
                     prompt_len=len(full_prompt_token_ids),
                     reason="cancelled",
@@ -5830,6 +5947,7 @@ class MLXEngine(SessionCacheMixin):
                         new_messages=new_messages,
                         accumulated_text=accumulated_text,
                         use_thinking=use_thinking,
+                        reasoning_effort=reasoning_effort,
                         hit_prior_len=_hit_prior_len,
                         prompt_len=len(full_prompt_token_ids),
                         reason="empty response",
@@ -5985,6 +6103,8 @@ class MLXEngine(SessionCacheMixin):
                 # verify + re-render it.
                 tools=_tools_canonical,
                 thinking=use_thinking,
+                reasoning_effort=self._effective_reasoning_effort(
+                    reasoning_effort, use_thinking),
                 prompt_fingerprint=_incoming_fp,
                 # U26: carry the cumulative drafter stats — this install used
                 # to reset them every turn (the finalize above wrote to the
@@ -7087,6 +7207,7 @@ class MLXEngine(SessionCacheMixin):
         new_messages: list[dict],
         accumulated_text: str,
         use_thinking: bool,
+        reasoning_effort: str | None = None,
         hit_prior_len: int,
         prompt_len: int,
         reason: str,
@@ -7265,6 +7386,8 @@ class MLXEngine(SessionCacheMixin):
             # carried fp=None would re-open the legacy leniency indefinitely.
             tools=tools_canonical,
             thinking=use_thinking,
+            reasoning_effort=self._effective_reasoning_effort(
+                reasoning_effort, use_thinking),
             prompt_fingerprint=(
                 prompt_fingerprint
                 if prompt_fingerprint is not None
@@ -7272,6 +7395,8 @@ class MLXEngine(SessionCacheMixin):
                     tools_canonical, use_thinking,
                     template_rev=self._suffix_template_rev(),
                     model_identity=self._model_identity(),
+                    reasoning_effort=self._fp_reasoning_effort(
+                        reasoning_effort, use_thinking),
                 )
             ),
             # U26: the interrupted commit is a reinstall too — keep the
@@ -7424,6 +7549,7 @@ class MLXEngine(SessionCacheMixin):
         session_id: str | None = None,
         thinking: bool | None = None,
         thinking_budget: int | None = None,
+        reasoning_effort: str | None = None,
         response_format=None,
         stop: str | list[str] | None = None,
     ) -> CompletionResult:
@@ -7459,6 +7585,7 @@ class MLXEngine(SessionCacheMixin):
                 tools=tools,
                 thinking=thinking,
                 thinking_budget=thinking_budget,
+                reasoning_effort=reasoning_effort,
                 response_format=response_format,
                 stop=stop,
             ):
@@ -7589,9 +7716,14 @@ class MLXEngine(SessionCacheMixin):
                     self._sessions[session_id] = prev
             sess_tools = getattr(prev, "tools", None) if prev else None
             sess_thinking = getattr(prev, "thinking", True) if prev else True
+            # The compacted prefix must render under the SAME reasoning-effort
+            # label the session was built with, or the rebuilt cache silently
+            # carries a different system preamble than the turns before it.
+            sess_effort = getattr(prev, "reasoning_effort", None) if prev else None
 
             prompt_tokens = self._tokenize_prompt(
                 messages, thinking=sess_thinking, tools=sess_tools,
+                reasoning_effort=sess_effort,
             )
 
             # Try base cache first
@@ -7635,10 +7767,13 @@ class MLXEngine(SessionCacheMixin):
                 total_cache_tokens=new_offset,
                 tools=sess_tools,
                 thinking=sess_thinking,
+                reasoning_effort=sess_effort,
                 prompt_fingerprint=self._prompt_fingerprint(
                     sess_tools, sess_thinking,
                     template_rev=self._suffix_template_rev(),
                     model_identity=self._model_identity(),
+                    reasoning_effort=self._fp_reasoning_effort(
+                        sess_effort, sess_thinking),
                 ),
                 # U26: compaction rebuilds the cache, not the session identity
                 # — keep the cumulative drafter stats.
@@ -7765,6 +7900,7 @@ class MLXEngine(SessionCacheMixin):
         tools: list | None = None,
         thinking: bool | None = None,
         thinking_budget: int | None = None,
+        reasoning_effort: str | None = None,
         response_format=None,
         stop: str | list[str] | None = None,
     ) -> AsyncGenerator[GenerationResult, None]:
@@ -7787,6 +7923,7 @@ class MLXEngine(SessionCacheMixin):
                 cancel_event=cancel_event,
                 thinking=thinking,
                 thinking_budget=thinking_budget,
+                reasoning_effort=reasoning_effort,
                 response_format=response_format,
                 stop=stop,
             )
@@ -7875,6 +8012,7 @@ class MLXEngine(SessionCacheMixin):
         tools: list | None = None,
         thinking: bool | None = None,
         thinking_budget: int | None = None,
+        reasoning_effort: str | None = None,
         response_format=None,
         stop: str | list[str] | None = None,
     ) -> AsyncGenerator[list[GenerationResult], None]:
@@ -7931,6 +8069,7 @@ class MLXEngine(SessionCacheMixin):
                 cancel_event=cancel_event,
                 thinking=thinking,
                 thinking_budget=thinking_budget,
+                reasoning_effort=reasoning_effort,
                 response_format=response_format,
                 stop=stop,
             )
@@ -8123,6 +8262,9 @@ class MLXEngine(SessionCacheMixin):
             engine_messages,
             tools=getattr(source, "tools", None) if source else None,
             thinking=getattr(source, "thinking", True) if source else True,
+            reasoning_effort=(
+                getattr(source, "reasoning_effort", None) if source else None
+            ),
         )
 
     def prepare_regenerate(self, session_id: str) -> dict:
@@ -8181,6 +8323,7 @@ class MLXEngine(SessionCacheMixin):
             restore_messages,
             tools=getattr(session, "tools", None),
             thinking=getattr(session, "thinking", True),
+            reasoning_effort=getattr(session, "reasoning_effort", None),
         )
 
     def _rebuild_session(
@@ -8189,12 +8332,14 @@ class MLXEngine(SessionCacheMixin):
         messages: list[dict],
         tools: list | None = None,
         thinking: bool = True,
+        reasoning_effort: str | None = None,
     ) -> dict:
         """Gated entry point kept for direct callers/tests; the public
         wrappers above gate at THEIR entry and call the lock-free body."""
         with self._mutate_locked("session rebuild (truncate/branch)"):
             return self._rebuild_session_locked(
                 session_id, messages, tools=tools, thinking=thinking,
+                reasoning_effort=reasoning_effort,
             )
 
     def _rebuild_session_locked(
@@ -8203,6 +8348,7 @@ class MLXEngine(SessionCacheMixin):
         messages: list[dict],
         tools: list | None = None,
         thinking: bool = True,
+        reasoning_effort: str | None = None,
     ) -> dict:
         """Build a fresh KV cache for the given messages (caller holds the
         engine lock via a ``_mutate_locked`` wrapper).
@@ -8216,6 +8362,7 @@ class MLXEngine(SessionCacheMixin):
 
         prompt_tokens = self._tokenize_prompt(
             messages, thinking=thinking, tools=tools,
+            reasoning_effort=reasoning_effort,
         )
 
         # Try base cache first
@@ -8253,9 +8400,13 @@ class MLXEngine(SessionCacheMixin):
             pending_build_time=elapsed,
             tools=tools,
             thinking=thinking,
+            reasoning_effort=self._effective_reasoning_effort(
+                reasoning_effort, thinking),
             prompt_fingerprint=self._prompt_fingerprint(
                 tools, thinking, template_rev=self._suffix_template_rev(),
                 model_identity=self._model_identity(),
+                reasoning_effort=self._fp_reasoning_effort(
+                    reasoning_effort, thinking),
             ),
             # U26: rebuild reinstalls the state — keep the cumulative
             # drafter stats.

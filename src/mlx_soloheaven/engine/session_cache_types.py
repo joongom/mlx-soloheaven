@@ -83,6 +83,12 @@ class SessionState:
     # pre-upgrade session (see the HIT gate's legacy rule).
     tools: list | None = None
     thinking: bool = True
+    # Reasoning-effort label this cache was BUILT under (None = the
+    # template default). Part of the prompt contract: it changes the
+    # rendered system preamble, so it participates in
+    # _prompt_fingerprint and internal rebuild/compaction paths reuse
+    # the session's own label instead of silently dropping to default.
+    reasoning_effort: str | None = None
     prompt_fingerprint: str | None = None
 
     # Cumulative drafter acceptance stats across all requests in this session.

@@ -126,7 +126,7 @@ def test_thinking_false_hit_demoted_to_honest_miss(monkeypatch):
     suffix splice. PRE-FIX: fails — the HIT spliced [EOT, 55, 66]."""
     stored = [1, 2, 3, 4, EOT]
     eng, cs, messages = _gemma4_engine(stored, suffix=[EOT, 55, 66])
-    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None: [11, 12, 13]
+    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None, **_kw: [11, 12, 13]
     prompts_seen: list = []
     _scripted_lm_stream(monkeypatch, prompts_seen, [[(101, "a"), (102, "b")]])
 
@@ -146,7 +146,7 @@ def test_thinking_false_second_turn_still_misses(monkeypatch):
     by cold-fill every turn. PRE-FIX: fails (second turn HIT)."""
     stored = [1, 2, 3, 4, EOT]
     eng, cs, messages = _gemma4_engine(stored, suffix=[EOT, 55, 66])
-    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None: [11, 12, 13]
+    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None, **_kw: [11, 12, 13]
     prompts_seen: list = []
     _scripted_lm_stream(
         monkeypatch, prompts_seen,
@@ -157,7 +157,7 @@ def test_thinking_false_second_turn_still_misses(monkeypatch):
     messages2 = list(eng._sessions["s"].messages) + [
         {"role": "user", "content": "u3"},
     ]
-    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None: [21, 22, 23, 24]
+    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None, **_kw: [21, 22, 23, 24]
     _drive(eng, messages2, thinking=False)
 
     assert prompts_seen[1] == [21, 22, 23, 24]  # MISS again, no splice
@@ -199,7 +199,7 @@ def test_gate_logs_once_per_session(monkeypatch, caplog):
     """The demotion is logged ONCE per session id (not per turn)."""
     stored = [1, 2, 3, 4, EOT]
     eng, cs, messages = _gemma4_engine(stored, suffix=[EOT, 55, 66])
-    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None: [11, 12, 13]
+    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None, **_kw: [11, 12, 13]
     prompts_seen: list = []
     _scripted_lm_stream(
         monkeypatch, prompts_seen,

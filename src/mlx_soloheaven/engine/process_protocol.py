@@ -17,7 +17,7 @@ generate (cmd):
         "messages":[...],
         "params":{session_id, max_tokens, temperature, top_p, min_p, top_k,
                   repetition_penalty, tools, thinking, thinking_budget,
-                  response_format}}}
+                  reasoning_effort, response_format}}}
 generate_scalar (cmd):
     Same shape as ``generate`` but op == "generate_scalar". Drives
     ``engine.generate_stream_async`` (scalar, one GenerationResult per frame —
@@ -52,7 +52,9 @@ final (resp):
 done (resp):
     {"id":<str>, "type":"done"}
 error (resp):
-    {"id":<str>, "type":"error", "error":<str>, "traceback":<str>}
+    {"id":<str>, "type":"error", "error":<str>, "traceback":<str>,
+     "code":<str|absent>}  -- code="invalid_request" => a caller parameter was
+     rejected (parent raises InvalidPromptParameterError -> HTTP 400).
 """
 
 PROTOCOL_VERSION = 1
@@ -200,5 +202,11 @@ def make_done(request_id: str) -> dict:
     return {"id": request_id, "type": "done"}
 
 
-def make_error(request_id: str, error: str, tb: str) -> dict:
-    return {"id": request_id, "type": "error", "error": error, "traceback": tb}
+def make_error(request_id: str, error: str, tb: str, code: str | None = None) -> dict:
+    """Error frame. ``code`` (optional) classifies the fault for the parent:
+    "invalid_request" means a CALLER parameter was rejected (400), not an
+    engine fault (500). Omitted when absent so existing frames are unchanged."""
+    frame = {"id": request_id, "type": "error", "error": error, "traceback": tb}
+    if code is not None:
+        frame["code"] = code
+    return frame

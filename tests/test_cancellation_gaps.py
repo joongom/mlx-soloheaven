@@ -513,7 +513,7 @@ def test_prefill_cancel_miss_discards_fresh_cache(monkeypatch):
     )
     # Force a MISS: no stored session for this id.
     eng._sessions.pop("s")
-    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None: list(range(10))
+    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None, **_kw: list(range(10))
     eng._language_model.make_cache = lambda: [MockKV() for _ in range(5)]
 
     cancel = threading.Event()
@@ -954,7 +954,7 @@ def test_generate_locked_wires_cancel_event_into_base_registration(monkeypatch):
     )
     # Force a MISS: no stored session for this id.
     eng._sessions.pop("s")
-    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None: list(range(10))
+    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None, **_kw: list(range(10))
     eng._language_model.make_cache = lambda: [MockKV() for _ in range(5)]
 
     recorded = {}

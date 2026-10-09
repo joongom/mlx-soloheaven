@@ -75,7 +75,7 @@ class SessionCacheMixin:
     @staticmethod
     def _prompt_fingerprint(
         tools_canonical: list | None, thinking: bool, template_rev: str = "",
-        model_identity: str = "",
+        model_identity: str = "", reasoning_effort: str = "",
     ) -> str:
         """Hash of everything that alters the tokenized prompt prefix
         OUTSIDE the messages: the canonical tool schema + the thinking flag.
@@ -92,6 +92,17 @@ class SessionCacheMixin:
         is omitted when empty so families without a revision (chatml,
         gemma4) keep their historical fingerprints — no spurious rebuilds.
 
+        ``reasoning_effort`` is the chat-template label the prefix was rendered
+        under (Qwen3.8: xhigh|medium|low). It changes the SYSTEM preamble the
+        template emits, so two labels produce different prefixes for identical
+        messages and reuse across them would serve a cache built under the
+        wrong instruction. Like the keys below it is OMITTED when empty, so
+        families whose template never mentions the name — and every session
+        that predates this key — keep their historical fingerprints and take
+        no spurious rebuild. The caller is responsible for passing "" when the
+        template does not declare the variable (see
+        MLXEngine._effective_reasoning_effort).
+
         ``model_identity`` (Batch D, spec item 9) is a stable per-model-build
         identity (see ``_model_identity``). It participates in the contract so a
         KV built by model A can NEVER be reused by a DIFFERENT model B that
@@ -103,6 +114,8 @@ class SessionCacheMixin:
         historical fingerprints and a legacy cache takes exactly one cold
         rebuild that restamps the current identity."""
         payload_obj: dict = {"tools": tools_canonical, "thinking": bool(thinking)}
+        if reasoning_effort:
+            payload_obj["reasoning_effort"] = reasoning_effort
         if template_rev:
             payload_obj["template_rev"] = template_rev
         if model_identity:
@@ -1597,6 +1610,7 @@ class SessionCacheMixin:
             # keep the tool schema and the HIT gate can verify it.
             "tools": json.dumps(_sess_tools, ensure_ascii=False) if _sess_tools else "",
             "thinking": "1" if getattr(session, "thinking", True) else "0",
+            "reasoning_effort": getattr(session, "reasoning_effort", None) or "",
             "prompt_fingerprint": getattr(session, "prompt_fingerprint", None) or "",
             # Batch D (spec item 9): stamp THIS model's identity so a loader on a
             # DIFFERENT model refuses to reuse the cache (see
@@ -1931,6 +1945,7 @@ class SessionCacheMixin:
             _tools_meta = metadata.get("tools", "")
             sess_tools = json.loads(_tools_meta) if _tools_meta else None
             sess_thinking = metadata.get("thinking", "1") != "0"
+            sess_effort = metadata.get("reasoning_effort") or None
             sess_fp = metadata.get("prompt_fingerprint") or None
 
             # Batch D (spec item 9) — cross-model cache safety, IN ADDITION to
@@ -2076,6 +2091,7 @@ class SessionCacheMixin:
                 last_used=last_used,
                 tools=sess_tools,
                 thinking=sess_thinking,
+                reasoning_effort=sess_effort,
                 prompt_fingerprint=sess_fp,
                 # U26: a disk-reloaded session reclaims its in-memory drafter
                 # stats (the registry outlives active-LRU eviction).
@@ -2591,6 +2607,13 @@ class SessionCacheMixin:
                 bool(getattr(getattr(self, "cfg", None), "enable_thinking", True)),
                 template_rev=self._suffix_template_rev(),
                 model_identity=self._model_identity(),
+                # Advisory preflight: no request in scope, so mirror the
+                # session's OWN label — otherwise every effort-bearing session
+                # reports a spurious contract mismatch here.
+                reasoning_effort=self._fp_reasoning_effort(
+                    getattr(session_state, "reasoning_effort", None),
+                    bool(getattr(getattr(self, "cfg", None), "enable_thinking", True)),
+                ),
             )
         except Exception:  # noqa: BLE001 — advisory: any failure => MISS
             _incoming_fp = None

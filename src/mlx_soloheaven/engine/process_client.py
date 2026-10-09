@@ -42,7 +42,11 @@ from dataclasses import asdict
 from types import SimpleNamespace
 
 from mlx_soloheaven.engine import process_protocol as proto
-from mlx_soloheaven.engine.types import EngineBusyError, GenerationResult
+from mlx_soloheaven.engine.types import (
+    EngineBusyError,
+    GenerationResult,
+    InvalidPromptParameterError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -921,6 +925,11 @@ class EngineProcessProxy:
                 raise EngineRestartingError(
                     f"process-mode RPC {method!r} failed: {err}"
                 )
+            if frame.get("code") == "invalid_request":
+                logger.warning(
+                    f"[ProcessProxy] RPC {method!r} invalid request parameter: {err}"
+                )
+                raise InvalidPromptParameterError(err)
             logger.error(f"[ProcessProxy] RPC {method!r} error: {err}\n{tb}")
             raise _RpcError(f"process-mode RPC {method!r} error: {err}")
         return _deserialize_rpc_result(frame.get("result"))
@@ -995,6 +1004,7 @@ class EngineProcessProxy:
             "tools": params.get("tools"),
             "thinking": params.get("thinking"),
             "thinking_budget": params.get("thinking_budget"),
+            "reasoning_effort": params.get("reasoning_effort"),
             "response_format": proto.serialize_response_format(rf),
             # U24: OpenAI stop sequences (plain str/list — wire-safe as-is).
             "stop": params.get("stop"),
@@ -1052,6 +1062,14 @@ class EngineProcessProxy:
                         raise EngineRestartingError(
                             f"engine child worker died mid-generation: {err}"
                         )
+                    if frame.get("code") == "invalid_request":
+                        # Caller-parameter fault (see make_error): re-raise the
+                        # TYPE so the app maps it to 400 with the template's own
+                        # message. Logged at warning — it is not an incident.
+                        logger.warning(
+                            f"[ProcessProxy] rid={rid} invalid request parameter: {err}"
+                        )
+                        raise InvalidPromptParameterError(err)
                     logger.error(f"[ProcessProxy] child error rid={rid}: {err}\n{tb}")
                     raise RuntimeError(f"process-mode generation error: {err}")
                 elif ftype == "done":

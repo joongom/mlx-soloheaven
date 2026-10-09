@@ -83,6 +83,19 @@ class ChatCompletionRequest(BaseModel):
     # drives thinking exactly like the top-level ``thinking`` flag (top-level
     # wins if BOTH are set — see openai_compat._effective_thinking).
     chat_template_kwargs: Optional[dict] = None
+    # Reasoning-effort render variable for chat templates that declare it
+    # (Qwen3.8: xhigh|medium|low, default xhigh; families whose template does
+    # not reference ``reasoning_effort`` ignore the value entirely). Accepted
+    # top-level (OpenAI-style) AND nested as
+    # chat_template_kwargs.reasoning_effort — top-level wins when both are set
+    # (see openai_compat._effective_reasoning_effort).
+    # Typed loosely ON PURPOSE. As ``Optional[str]`` a non-string top-level
+    # value is rejected by pydantic as a 422 while the SAME value nested in
+    # chat_template_kwargs (an untyped dict) reaches the route and answers 400
+    # — two statuses for one mistake, breaking the "both forms behave
+    # identically" contract. Accept anything here and let
+    # _validate_reasoning_effort answer ONE 400 for both.
+    reasoning_effort: Optional[Any] = None
     thinking_budget: Optional[int] = None  # Override thinking token budget
     # Extended sampling parameters
     top_k: Optional[int] = None

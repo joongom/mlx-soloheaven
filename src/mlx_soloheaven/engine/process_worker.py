@@ -23,6 +23,7 @@ import traceback
 from collections import OrderedDict
 
 from mlx_soloheaven.engine import process_protocol as proto
+from mlx_soloheaven.engine.types import InvalidPromptParameterError
 
 logger = logging.getLogger(__name__)
 
@@ -565,7 +566,14 @@ def worker_main(cfg_dict, cmd_conn, resp_conn, ctrl_conn):
                 try:
                     _run_rpc(engine, rid, method, args, kwargs, resp_conn)
                 except Exception as e:  # noqa: BLE001
-                    resp_conn.send(proto.make_error(rid, str(e), traceback.format_exc()))
+                    # Same classification as the generate path: a rejected
+                    # CALLER parameter is a 400, not an engine fault. The
+                    # non-streaming completion runs through THIS RPC path.
+                    resp_conn.send(proto.make_error(
+                        rid, str(e), traceback.format_exc(),
+                        code=("invalid_request"
+                              if isinstance(e, InvalidPromptParameterError) else None),
+                    ))
                 finally:
                     # F5: retire the started mark and remember the
                     # COMPLETION (bounded) so a late rpc_cancel acks
@@ -644,7 +652,16 @@ def worker_main(cfg_dict, cmd_conn, resp_conn, ctrl_conn):
                     coalesce_n, coalesce_ms, coalescing, scalar=scalar,
                 )
             except Exception as e:  # noqa: BLE001
-                resp_conn.send(proto.make_error(rid, str(e), traceback.format_exc()))
+                # A rejected CALLER parameter (e.g. an unknown reasoning_effort
+                # label) is a 400, not an engine fault — tag the frame so the
+                # parent re-raises the typed error instead of a bare 500.
+                _code = (
+                    "invalid_request"
+                    if isinstance(e, InvalidPromptParameterError) else None
+                )
+                resp_conn.send(
+                    proto.make_error(rid, str(e), traceback.format_exc(), code=_code)
+                )
             finally:
                 with active_lock:
                     active.pop(rid, None)
@@ -752,6 +769,7 @@ def _run_generate(engine, rid, messages, params, cancel_event, resp_conn,
         cancel_event=cancel_event,
         thinking=params.get("thinking"),
         thinking_budget=params.get("thinking_budget"),
+        reasoning_effort=params.get("reasoning_effort"),
         response_format=response_format,
         stop=params.get("stop"),
     )

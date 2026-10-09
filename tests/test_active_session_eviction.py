@@ -300,7 +300,7 @@ def test_prepare_regenerate_resumes_evicted_session(monkeypatch):
     # the inner call is the lock-free _rebuild_session_locked.)
     rebuilt: list[tuple[str, list]] = []
 
-    def _fake_rebuild(session_id, messages, tools=None, thinking=True):
+    def _fake_rebuild(session_id, messages, tools=None, thinking=True, **_kw):
         rebuilt.append((session_id, list(messages)))
         eng._sessions[session_id] = reloaded  # rebuilt session is resident
         return {"status": "ok", "cached_tokens": 1}
@@ -343,7 +343,7 @@ def test_truncate_session_resumes_evicted_session(monkeypatch):
     # U3: the rebuild now receives the session's prompt contract too.
     # Round 5 finding 3b: whole-op gate at wrapper entry — the inner call
     # is the lock-free _rebuild_session_locked.
-    def _fake_rebuild(session_id, messages, tools=None, thinking=True):
+    def _fake_rebuild(session_id, messages, tools=None, thinking=True, **_kw):
         rebuilt.append((session_id, list(messages)))
         eng._sessions[session_id] = reloaded
         return {"status": "ok", "cached_tokens": 1}

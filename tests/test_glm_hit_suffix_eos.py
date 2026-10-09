@@ -731,7 +731,7 @@ def test_hit_foreign_eos_untrimmable_honest_miss(monkeypatch):
     eng, cs, messages = _glm_hit_engine(
         stored, suffix=[USER, 55, 66], cache=untrimmable,
     )
-    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None: [11, 12, 13]
+    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None, **_kw: [11, 12, 13]
     prompts_seen: list = []
     _scripted_lm_stream(monkeypatch, prompts_seen, [[(101, "a"), (102, "b")]])
 
@@ -771,7 +771,7 @@ def test_old_glm_session_fingerprint_migrates_to_miss(monkeypatch):
     eng._sessions["s"].prompt_fingerprint = MLXEngine._prompt_fingerprint(
         None, False,
     )
-    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None: [11, 12, 13]
+    eng._tokenize_prompt = lambda msgs, thinking=True, tools=None, **_kw: [11, 12, 13]
     prompts_seen: list = []
     _scripted_lm_stream(monkeypatch, prompts_seen, [[(101, "a"), (102, "b")]])
 

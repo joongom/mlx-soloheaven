@@ -6890,16 +6890,51 @@ class MLXEngine(SessionCacheMixin):
             "prefill_step_size": self.cfg.prefill_step_size,
             "logits_processors": logits_processors if logits_processors else None,
         }
-        if cancel_event is not None:
-            # U13: mlx-lm's generate_step invokes this between prefill
-            # chunks — raising here aborts the prefill within one chunk of
-            # the disconnect instead of finishing the whole prompt.
-            def _abort_prefill_on_cancel(processed, total):
-                if cancel_event.is_set():
-                    raise GenerationCancelled(
-                        f"prefill cancelled at {processed}/{total} prompt tokens"
-                    )
-            lm_kwargs["prompt_progress_callback"] = _abort_prefill_on_cancel
+        # mlx-lm's generate_step invokes this between prefill chunks. It
+        # carries TWO jobs:
+        #   U13 cancellation — raising here aborts the prefill within one
+        #     chunk of a client disconnect instead of finishing the whole
+        #     prompt (only armed when a cancel_event was supplied);
+        #   prefill visibility — a long cold prefill is otherwise SILENT:
+        #     the server looks hung for the tens of seconds a 30K-token
+        #     prompt takes, and its throughput was unmeasurable from the
+        #     logs. One throttled line per second shows movement and the
+        #     rate, and the final chunk logs the totals.
+        # The callback is now installed UNCONDITIONALLY (it used to exist
+        # only when cancel_event was set, which is why prefill progress
+        # vanished for requests that carried none).
+        _prefill = {"t0": time.perf_counter(), "last_log": 0.0, "done": False}
+
+        def _prefill_progress(processed, total):
+            if cancel_event is not None and cancel_event.is_set():
+                raise GenerationCancelled(
+                    f"prefill cancelled at {processed}/{total} prompt tokens"
+                )
+            now = time.perf_counter()
+            # The first callback fires at processed=0 (before any chunk is
+            # through); a "0/N (0%) | 0 tok/s" line carries no information.
+            if not processed:
+                return
+            final = total and processed >= total
+            # Throttle to ~1 line/s: a 100K-token prefill at a 2048-token
+            # step would otherwise emit ~50 lines, and every record is
+            # broadcast to the admin log stream.
+            if not final and (now - _prefill["last_log"]) < 1.0:
+                return
+            if final and _prefill["done"]:
+                return
+            _prefill["last_log"] = now
+            _prefill["done"] = bool(final)
+            elapsed = now - _prefill["t0"]
+            rate = processed / elapsed if elapsed > 0 else 0.0
+            pct = (processed / total * 100.0) if total else 100.0
+            logger.info(
+                f"[Prefill] {processed}/{total} ({pct:.0f}%) | "
+                f"{rate:.0f} tok/s | {elapsed:.1f}s"
+                + (" | done" if final else "")
+            )
+
+        lm_kwargs["prompt_progress_callback"] = _prefill_progress
         if self.cfg.kv_bits:
             lm_kwargs["kv_bits"] = self.cfg.kv_bits
             lm_kwargs["kv_group_size"] = self.cfg.kv_group_size
